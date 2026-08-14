@@ -38,3 +38,10 @@ apps/web/dist/
 worktrees/
 .agents/worktrees/
 .typert-*/
+# Added by code-review-graph
+.code-review-graph/
+
+# Local-only fork exclusions: never commit these
+Deepseek-OpenRouter-key
+openrouter.patch.yml
+MEMORY.md
