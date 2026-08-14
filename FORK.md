@@ -6,11 +6,20 @@ makes **code-review-graph** the default way every coding agent explores and
 reviews this codebase.
 
 Everything here is an addition on top of stock `deepseek-harness` — no upstream
-behavior is changed. The fork's value is the "graph-first" developer experience:
-instead of grep/read-driven exploration, every supported coding agent is wired to
-ask a pre-built knowledge graph of the repository for structural context first.
-That graph is token-cheaper and faster than file scanning, and it surfaces
-callers, dependents, and test coverage that flat search cannot.
+behavior is changed. The fork bundles three layers of integration that are
+useful together when using this checkout as a **delegated / embedded coding
+harness**:
+
+1. **Graph-first code review & exploration** — a `code-review-graph` knowledge
+   graph wired into every coding agent surface so structural understanding beats
+   grep/read scanning (token-cheaper, faster, surfaces callers/dependents).
+2. **OpenRouter LLM routing** — the headless one-shot profile can route its model
+   requests through OpenRouter to `deepseek/deepseek-v4-flash-0731`.
+3. **Hermes/agent delegation** — the checkout is designed to be driven as a local
+   coding sub-agent from Hermes (or any host that shells out to the `dsh` CLI),
+   not just run standalone.
+
+Each is documented below.
 
 ## What this fork implements
 
@@ -60,13 +69,95 @@ Reusable `.agents/skills/*` skills (also mirrored under `.codebuddy/` and
 - **`.gitignore`** — added `.code-review-graph/` so each clone builds its own
   graph and the build artifact is never committed.
 
+### 5. OpenRouter LLM routing
+
+`dsh`'s LLM capability is an adapter seam. The base mounts two adapters:
+`llm-deepseek` (DeepSeek-native wire, `DEEPSEEK_API_KEY`) and `llm-pi-ai`
+(generic multi-provider with **shipped OpenRouter support**). Stock headless
+runs use `deepseek-official` → `DEEPSEEK_API_KEY`.
+
+This fork documents and supports routing **through OpenRouter** instead, so the
+same checkout can run its one-shot tasks on `deepseek/deepseek-v4-flash-0731`
+(the same model Hermes itself runs on) with only an `OPENROUTER_API_KEY`:
+
+```
+OPENROUTER_API_KEY=<key> pnpm dsh --profile headless --patch openrouter.patch.yml "<task>"
+```
+
+The runtime overlay (reproduced inline below so the mechanism is part of the
+repo's documentation) registers an `openrouter` provider profile on the already
+mounted `llm-pi-ai` adapter and points `agent-default-model` at it:
+
+```yaml
+# Route the headless profile's model requests through OpenRouter.
+# Adapter: llm-pi-ai (shipped openrouter catalog entry).
+- id: llm-pi-ai
+  config:
+    providers:
+      openrouter:
+        apiKeyEnv: OPENROUTER_API_KEY
+        baseURL: https://openrouter.ai/api/v1
+        models:
+          - id: !!js "process.env.DSH_OPENROUTER_MODEL ?? 'deepseek/deepseek-v4-flash-0731'"
+            name: DeepSeek-V4-Flash-0731
+        retryPolicy:
+          mode: normal
+          backoff:
+            initialDelayMs: 500
+            maxDelayMs: 10000
+            jitterRatio: 0.1
+
+# Point the headless one-shot default at the OpenRouter route.
+- id: agent-default-model
+  config:
+    provider: openrouter
+    model: !!js "process.env.DSH_OPENROUTER_MODEL ?? 'deepseek/deepseek-v4-flash-0731'"
+```
+
+The model is overridable via `DSH_OPENROUTER_MODEL`. Because the key comes from
+the environment (`apiKeyEnv`), the overlay itself holds no secret — but the live
+patch file is a local-only artifact and is **not** shipped in this fork (see
+below). Recreate it from the snippet above with your own env var if you want the
+OpenRouter route.
+
+### 6. Hermes / agent delegation
+
+The checkout is designed to be driven not just standalone but as a **local
+coding sub-agent** from Hermes (sibling to the `codex` / `claude-code`
+delegation targets). Hermes holds a `deepseek-harness` skill that shells out to
+the `dsh` CLI for one-shot tasks:
+
+```
+terminal(command="pnpm dsh --profile headless '<task>'", workdir="<checkout>", timeout=600)
+```
+
+Key properties this fork relies on:
+
+- `pnpm dsh` is the **source-launch** script (tsx, no rebuild needed between
+  runs), so delegation works against `apps/cli/src` directly.
+- `--profile headless "<task>"` builds a fresh persisted Agent, prints the final
+  answer on stdout, and exits `0` on `completed`, `1` otherwise — an easy,
+  parseable contract for a host agent.
+- The invoking directory is the workspace root, and `AGENTS.md` (this repo's
+  agent rules, including the graph-first section above) is loaded into the model
+  context.
+- Optional `--patch <overlay>` layers an extra cordis.yml patch (e.g. the
+  OpenRouter route above) on top of the profile.
+
+This integration is an **environment/consumer-side** capability (it lives in the
+host agent's skill library, not in this repo's code) — but it is a first-class
+purpose of the fork, which is why this document records it. Building the
+checkout (`pnpm install && pnpm run build`) is a one-time prerequisite for both
+standalone and delegated use.
+
 ## What is deliberately NOT included
 
 The following local-only, machine-specific files are intentionally **excluded**
 from this fork (they are gitignored and never committed):
 
 - `Deepseek-OpenRouter-key` — a private API key file.
-- `openrouter.patch.yml` — a private OpenRouter routing overlay for local runs.
+- `openrouter.patch.yml` — the live local OpenRouter routing overlay (its
+  mechanism is documented inline above; recreate it with your own env var).
 - `MEMORY.md` — a private local agent-memory file with machine-specific paths.
 
 If you clone this fork, build the graph and install the MCP server yourself:
