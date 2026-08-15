@@ -1,4 +1,4 @@
-# Why This Fork Exists
+## Why This Fork Exists
 
 This fork tracks deepseek-ai/deepseek-harness upstream master and adds a set of workflow scaffolding that makes the harness far more effective as a delegated coding engine. Nothing in upstream behavior is changed — everything here is additive.
 The fork layers three integrations that work together when using this checkout as an embedded coding harness:
