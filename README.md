@@ -1,3 +1,17 @@
+# Why This Fork Exists
+
+This fork tracks deepseek-ai/deepseek-harness upstream master and adds a set of workflow scaffolding that makes the harness far more effective as a delegated coding engine. Nothing in upstream behavior is changed — everything here is additive.
+The fork layers three integrations that work together when using this checkout as an embedded coding harness:
+
+1. Graph‑first code review & exploration
+A code-review-graph knowledge graph is wired into every coding agent surface. Agents explore and understand the codebase structurally — callers, dependents, cross‑module relationships — instead of relying on grep or linear scanning. This makes review cheaper, faster, and dramatically more accurate.
+
+2. OpenRouter LLM routing
+The headless one‑shot profile can route its model requests through OpenRouter, using deepseek/deepseek-v4-flash-0731 by default. This enables consistent model behavior across environments and aligns the harness with modern OpenAI‑compatible gateways.
+
+3. Hermes / agent delegation
+This checkout is designed to be driven as a local coding sub‑agent from Hermes (or any host that shells out to the dsh CLI). The harness becomes a deterministic execution engine inside a larger orchestration system, not just a standalone CLI.
+
 # DeepSeek Harness
 
 English | [中文](README.zh.md)
