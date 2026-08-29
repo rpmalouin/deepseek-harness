@@ -13,8 +13,10 @@ harness**:
 1. **Graph-first code review & exploration** — a `code-review-graph` knowledge
    graph wired into every coding agent surface so structural understanding beats
    grep/read scanning (token-cheaper, faster, surfaces callers/dependents).
-2. **OpenRouter LLM routing** — the headless one-shot profile can route its model
-   requests through OpenRouter to `deepseek/deepseek-v4-flash-0731`.
+2. **LLM routing** — the headless one-shot profile can run on the **DeepSeek-native**
+   `DEEPSEEK_API_KEY` (the working path for *agentic* tool-calling delegation) or
+   belt-and-braces through OpenRouter to `deepseek/deepseek-v4-flash-0731`
+   (**text-only; tool calls do NOT execute** — see the OpenRouter caveat below).
 3. **Hermes/agent delegation** — the checkout is designed to be driven as a local
    coding sub-agent from Hermes (or any host that shells out to the `dsh` CLI),
    not just run standalone.
@@ -69,16 +71,39 @@ Reusable `.agents/skills/*` skills (also mirrored under `.codebuddy/` and
 - **`.gitignore`** — added `.code-review-graph/` so each clone builds its own
   graph and the build artifact is never committed.
 
-### 5. OpenRouter LLM routing
+### 5. LLM routing — native DeepSeek key (working) vs OpenRouter (text-only)
 
 `dsh`'s LLM capability is an adapter seam. The base mounts two adapters:
 `llm-deepseek` (DeepSeek-native wire, `DEEPSEEK_API_KEY`) and `llm-pi-ai`
 (generic multi-provider with **shipped OpenRouter support**). Stock headless
 runs use `deepseek-official` → `DEEPSEEK_API_KEY`.
 
-This fork documents and supports routing **through OpenRouter** instead, so the
-same checkout can run its one-shot tasks on `deepseek/deepseek-v4-flash-0731`
-(the same model Hermes itself runs on) with only an `OPENROUTER_API_KEY`:
+**For agentic / tool-calling delegation, use the DeepSeek-native key.** This is the
+path where dsh's agent actually executes its tool calls (bash, filesystem, running a
+test suite) and completes end-to-end:
+
+```
+DEEPSEEK_API_KEY=<native key> pnpm dsh --profile headless "<task>"
+```
+
+Practical requirements observed on dockerVM (verified 2026-08):
+- The native key value starts `sk-` (NOT `sk-or-`); it is a DeepSeek platform key,
+  distinct from any OpenRouter key.
+- Set `DSH_PERMISSION_MODE=danger-full-access`: the `workspace-write` preset has no
+  usable bash sandbox on this VM, so an agent in that mode correctly bails with
+  `CANNOT_RUN_BASH` instead of acting.
+- dsh's workspace root is the **invocation/`--dir` directory** (the checkout root),
+  not the shell `cwd` — point it at the repo you want edited and look for output
+  files there.
+
+**OpenRouter route (belt-and-braces) is TEXT-ONLY and must not be used for
+tool-calling.** DeepSeek v4 emits tool calls as **DSML tags**; the OpenRouter
+proxy passes them through as **plain text**, so a dsh agent routed through
+OpenRouter reads its own tool calls as prose and **never actually executes** bash /
+file writes / `python3 -m pytest`. The run looks alive (produces text, may write
+partial files) but never completes a real agentic task — this is why some dsh runs
+"wait forever and don't actually complete." Keep the OpenRouter route only for pure
+text generation / no-tool one-shots:
 
 ```
 OPENROUTER_API_KEY=<key> pnpm dsh --profile headless --patch openrouter.patch.yml "<task>"
@@ -169,9 +194,12 @@ is the complete, self-contained procedure:
    session whose repo it is relevant to.
 3. **Point the skill at your checkout.** The whole procedure is one terminal
    call from the repo root plus a few conventions; edit the skill's
-   `Prerequisites`/commands to match your `<checkout>` path and either a
-   `DEEPSEEK_API_KEY` or (preferred) the OpenRouter route below.
-4. **(Optional) Route through OpenRouter** instead of the DeepSeek-native key:
+   `Prerequisites`/commands to match your `<checkout>` path and set
+   `DEEPSEEK_API_KEY` (the working path for tool-calling) plus
+   `DSH_PERMISSION_MODE=danger-full-access` where bash is needed.
+4. **(Text-only option) Route through OpenRouter** instead of the DeepSeek-native
+   key only for no-tool one-shots (tool calls do NOT execute — see the caveat in
+   §5):
    ```sh
    OPENROUTER_API_KEY=<key> pnpm dsh --profile headless --patch openrouter.patch.yml "<task>"
    ```
@@ -206,10 +234,11 @@ terminal, targeting a local checkout of this repo (not the npm-published binary)
 ## Prerequisites (local checkout)
 - Node.js `^22.19 || >=24`; `pnpm` on PATH (`corepack prepare pnpm@11.7.0`)
 - Checkout installed and built: `cd <checkout> && pnpm install && pnpm run build`
-- A `DEEPSEEK_API_KEY` in the env (or `OPENROUTER_API_KEY` when using the
-  OpenRouter overlay). Provider credentials resolve from the inherited
-  environment, `$DSH_HOME/.credentials.yaml`, the invoking dir's `.env`, then
-  `$DSH_HOME/.env`.
+- A `DEEPSEEK_API_KEY` in the env (the working route for agentic tool-calling;
+  value starts `sk-`, not `sk-or-`). Set `DSH_PERMISSION_MODE=danger-full-access`
+  when the task needs bash (the `workspace-write` preset has no bash sandbox on
+  this VM). Provider credentials resolve from the inherited environment,
+  `$DSH_HOME/.credentials.yaml`, the invoking dir's `.env`, then `$DSH_HOME/.env`.
 
 ## One-Shot Tasks
 ```
@@ -236,7 +265,11 @@ add `pty=true` only if a run hangs on stdin.
 - `--patch <path>` — extra cordis.yml patch overlay (e.g. the OpenRouter route)
 - `$DSH_HOME` — harness home (default `~/.dsh`)
 
-## Routing through OpenRouter
+## Routing
+Use the DeepSeek-native key for any task that needs tool-calling (build, refactor,
+test loop). **Do NOT use OpenRouter for tool-calling** — DeepSeek v4's DSML tool
+tags pass through OpenRouter as plain text, so the agent never executes bash/file
+writes and the run hangs without completing. OpenRouter is text-only:
 ```
 OPENROUTER_API_KEY=<key> pnpm dsh --profile headless --patch <openrouter overlay> "<task>"
 ```
