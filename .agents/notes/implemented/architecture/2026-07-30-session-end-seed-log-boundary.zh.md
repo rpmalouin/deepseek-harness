@@ -40,7 +40,7 @@ Status: implemented
 
 **在 loop 启动时追加边界。** loop 调用 `resumeWith`，因此覆盖恢复路径，但完全漏掉 `fork()` 与 `adopt()`，而且事件不得不在 `'startup'` 上触发——那是 fork 子会话发布的来源——于是 `SessionStartSource` 将不再具有区分力。它还会在追加标记之前就发布会话，因此 `session/created` 监听方可能观察到一份没有边界的带种子日志。
 
-**复用 `header.seedLength`。** 它是持久的 *fork 血缘*边界，并且刻意在恢复时保留原始 fork 取值——而恢复时构造种子是整份存储日志。这两个事实并不相同，混同会同时失去两者。
+**复用 `Session.inheritedEventCount`。** 它是持久的 *fork 血缘* cut，并且刻意在恢复时保留原始 fork 取值——而恢复时构造种子是整份存储日志。这两个事实并不相同，混同会同时失去两者。
 
 **让崩溃修复连同轮次边界一起关闭 `compaction/*`。** 否决：这会把每个插件的括号语义搬进核心的修复流程，而核心无法知道关闭另一个包的括号应该记录什么。
 
@@ -52,4 +52,4 @@ Status: implemented
 
 `session/end-seed` 加入了落盘词汇表。在预发布立场下（`SESSION_FORMAT_VERSION` 固定为 `0`，不作兼容承诺），更旧的日志只是没有它，而没有边界的日志会正确地判定没有任何内容属于构造种子历史。
 
-[排队手动压缩决策](../feature/2026-07-30-queued-manual-compaction.md)如今提供了第一个消费方。其尾部扫描会分别查找未匹配的 `compaction/start` 与最新 end-seed，只把位于该边界之后的 start 视为存活，并在同一个回放转换上清除不变量追踪状态。该谓词仍位于压缩功能所在的包中，不会成为通用核心辅助函数。
+[排队手动压缩决策](../feature/2026-07-30-queued-manual-compaction.zh.md)如今提供了第一个消费方。其尾部扫描会分别查找未匹配的 `compaction/start` 与最新 end-seed，只把位于该边界之后的 start 视为存活，并在同一个回放转换上清除不变量追踪状态。该谓词仍位于压缩功能所在的包中，不会成为通用核心辅助函数。

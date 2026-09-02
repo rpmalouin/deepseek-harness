@@ -13,10 +13,13 @@ import type { Context } from '@deepseek-ai/cordis'
 // (`commands/change` rides the allowlist) into this program.
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
 import type { CommandResult } from '@deepseek-ai/dsh-commands/types'
-import type { ClientContext, ISessions, SessionId } from '@deepseek-ai/dsh-client-runtime/client'
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
+import type { ISessions } from '@deepseek-ai/dsh-api-session-controller/client'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import type { TranslateNS } from '@deepseek-ai/dsh-client-locale/client'
 import type {
   CandidateRequest, ClientSessionContext, CommandClaim, PickOutcome, InputTriggerCandidate, InputTriggerPick,
-  SubmitOutcome,
+  SubmitEnvelope, SubmitImageAttachment, SubmitOutcome,
 } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
 import type { CommandContribution, CommandDecoration, CommandUiContract } from './contract.ts'
 import type { CommandDescriptor } from './directory.ts'
@@ -122,6 +125,8 @@ export class CommandUiRuntime extends Service implements CommandUiContract {
 
   private readonly directory: CommandDirectory
   private readonly live: LiveState = { contributions: new Map(), decorations: new Map(), popups: new Map() }
+  /** `command`-namespace translator (composer refusal notices). */
+  private readonly t: TranslateNS<'command'>
 
   /**
    * @param ctx - owning root context (plugin fiber; the service registers
@@ -129,6 +134,9 @@ export class CommandUiRuntime extends Service implements CommandUiContract {
    */
   constructor(ctx: Context) {
     super(ctx, 'commandUi')
+    const locale = ctx.get('locale')
+    if (locale === undefined) throw new Error('ui-commands: locale service unavailable')
+    this.t = locale.bind('command')
     this.directory = new CommandDirectory(async (sessionId) => {
       if (this.sessions().subagentAddress(sessionId) !== undefined) return []
       const result = await ctx.remote.commands.list(sessionId)
@@ -143,15 +151,14 @@ export class CommandUiRuntime extends Service implements CommandUiContract {
       candidates: (session, req) => this.candidates(session, req),
       onPick: pick => this.dispatch(pick),
       matchSpace: (session, token) => this.matchSpace(session, token),
-      matchEnter: (session, line, signal) => this.matchEnter(session, line, signal),
+      matchEnter: (session, line, signal, envelope) => this.matchEnter(session, line, signal, envelope),
       warm: (session) => { this.directory.warm(session.sessionId) },
     }), 'command: slash source')
     ctx.remote.$on('commands/change', () => { this.directory.invalidateAll() })
     // A preset switch changes which commands one session's agent resolves and
-    // registers nothing globally, so the registry-wide signal above never
-    // fires for it: repull that key alone, soft, so the old snapshot serves
-    // the menu until the new one lands.
-    ctx.remote.$on('agent-preset/selected', (sessionId) => { void this.directory.refresh(sessionId) })
+    // registers nothing globally. Drop that key's old composition before
+    // prewarming so a newly opened menu waits for the replacement catalog.
+    ctx.remote.$on('agent-preset/selected', (sessionId) => { this.directory.resetSession(sessionId) })
     ctx.on('connection/reset', () => { this.directory.resetConnected() })
   }
 
@@ -302,8 +309,19 @@ export class CommandUiRuntime extends Service implements CommandUiContract {
    * warmup failure rejects — never a silent downgrade). Contributions and
    * bare host commands act on the bare token only; leadingInput claims
    * args-tolerant.
+   *
+   * Envelope policy: an enter submission carrying images resolves only
+   * through a command declaring image acceptance. Every other command route —
+   * popup, non-accepting claim, bare detached execute — throws the refusal
+   * so the machine surfaces one composer notice and the draft and images
+   * stay in place; nothing executes and nothing is dropped.
    */
-  private async matchEnter(session: ClientSessionContext, line: string, signal: AbortSignal): Promise<PickOutcome> {
+  private async matchEnter(
+    session: ClientSessionContext,
+    line: string,
+    signal: AbortSignal,
+    envelope: SubmitEnvelope,
+  ): Promise<PickOutcome> {
     const trimmed = line.trim()
     if (!trimmed.startsWith('/')) return undefined
     const ws = trimmed.search(/\s/)
@@ -311,9 +329,13 @@ export class CommandUiRuntime extends Service implements CommandUiContract {
     const bare = ws === -1
     const name = token.slice(1)
     if (name === '') return undefined
+    const refuseImages = (): never => {
+      throw new Error(this.t('notice.imagesUnsupported', { command: name }))
+    }
     const contribution = this.live.contributions.get(name)
     if (contribution !== undefined && contribution.available(session)) {
       if (!bare) return undefined
+      if (envelope.images > 0) refuseImages()
       this.openPopup(name, contribution.ui, session, { via: 'enter', token })
       return 'handled'
     }
@@ -325,12 +347,17 @@ export class CommandUiRuntime extends Service implements CommandUiContract {
     if (bare) {
       const decoration = this.live.decorations.get(name)
       if (decoration !== undefined && decoration.available(session)) {
+        if (envelope.images > 0) refuseImages()
         this.openPopup(name, decoration.ui, session, { via: 'enter', token })
         return 'handled'
       }
     }
-    if (desc.input !== undefined) return { claim: this.leadingClaim(desc, session) }
+    if (desc.input !== undefined) {
+      if (envelope.images > 0 && desc.input.images !== true) refuseImages()
+      return { claim: this.leadingClaim(desc, session) }
+    }
     if (!bare) return undefined
+    if (envelope.images > 0) refuseImages()
     this.consumeVia(session.sessionId, { via: 'enter', token })
     this.runDetached(desc, session, trimmed)
     return 'handled'
@@ -354,7 +381,8 @@ export class CommandUiRuntime extends Service implements CommandUiContract {
     return {
       token,
       ...(desc.input !== undefined ? { hint: desc.input.hint } : {}),
-      submit: (args, _actx) => this.execute(session, token + args),
+      ...(desc.input?.images === true ? { images: true } : {}),
+      submit: (args, _actx, images) => this.execute(session, token + args, images),
     }
   }
 
@@ -365,16 +393,24 @@ export class CommandUiRuntime extends Service implements CommandUiContract {
    * plain success regardless of its handler outcome, because the host
    * executor durably logged the lifecycle (`command/run`/`command/done`) and
    * the outcome renders as a persistent flow node — the composer never
-   * echoes it. Transport failures throw.
+   * echoes it. A handler error result reports an error outcome so the
+   * composer keeps the submission (draft and images) for correction.
+   * A refused call throws.
    */
   private async execute(
     session: ClientSessionContext,
     line: string,
+    images: readonly SubmitImageAttachment[] = [],
   ): Promise<SubmitOutcome> {
-    const result = await this.ctx.remote.commands.execute(session.sessionId, line)
+    const result = await this.ctx.remote.commands.execute(session.sessionId, line, images)
     if (!result.ok) throw new Error(`command.execute failed: ${result.error.code}: ${result.error.message}`)
     if (result.value === undefined) return { kind: 'error', text: `unknown or malformed command: ${line}` }
     this.notifyExecuted(session.sessionId, submittedCommandName(line), result.value.result)
+    // An image-carrying submission consumed its images only on handler
+    // success; an error outcome keeps draft and images in the composer.
+    if (images.length > 0 && result.value.result.kind === 'error') {
+      return { kind: 'error', text: result.value.result.text }
+    }
     return { kind: 'success' }
   }
 
@@ -405,9 +441,9 @@ export class CommandUiRuntime extends Service implements CommandUiContract {
    * Fire-and-forget execute for the internal ('handled') paths. Outcomes are
    * NOT surfaced here: the host executor durably logs the command lifecycle
    * (`command/run`/`command/done`), and the mux-broadcast events render as a
-   * persistent flow node on every tab. Only a transport/admission failure —
-   * which never entered a handler and therefore never logged — falls back to
-   * the composer notice as immediate feedback.
+   * persistent flow node on every tab. Only an admission failure — which never
+   * entered a handler and therefore never logged — falls back to the composer
+   * notice as immediate feedback.
    */
   private runDetached(desc: CommandDescriptor, session: ClientSessionContext, line: string): void {
     void this.execute(session, line).then(
@@ -432,7 +468,7 @@ export class CommandUiRuntime extends Service implements CommandUiContract {
     })
   }
 
-  /** Route an admission/transport failure to the session's composer notice channel (scope gone = attempt died with it). */
+  /** Route an admission failure to the session's composer notice channel (scope gone = attempt died with it). */
   private noticeFor(id: SessionId, level: 'info' | 'error', text: string): void {
     const actx = this.scopeFor(id)
     if (actx === undefined) return

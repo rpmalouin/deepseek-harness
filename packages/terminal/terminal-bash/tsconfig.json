@@ -18,6 +18,9 @@
       "path": "../../../vendor/schemastery"
     },
     {
+      "path": "../../shell/pwsh-local"
+    },
+    {
       "path": "../../core/agent"
     },
     {
@@ -34,9 +37,6 @@
     },
     {
       "path": "../../subprocess/subprocess"
-    },
-    {
-      "path": "../../runtime-diagnostics/invariants"
     }
   ]
 }

@@ -1,12 +1,31 @@
+import { readFile, writeFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vite'
 import type { Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
+import { clientBuildEnvironmentDefines } from '../../scripts/client-build-environment.ts'
 
 const src = (rel: string): string => fileURLToPath(new URL(rel, import.meta.url))
 const STANDALONE_ERROR = 'apps/web is not a standalone application: bare Vite cannot inject window.__DSH_BOOT__. '
   + 'From a repository checkout, run `pnpm dsh web`; an installed package uses `dsh web`. '
   + 'For client-plugin HMR, run `pnpm dsh web` together with `pnpm run dev:web`.'
+const DEFAULT_CLIENT_TITLE = 'DSH Local Build'
+
+/** Escape build-time text before placing it in the HTML title element. */
+function escapeHtmlText(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+/** Project the public build title into the initial HTML document. */
+function clientDocumentTitle(): Plugin {
+  const title = escapeHtmlText(process.env.DSH_CLIENT_TITLE ?? DEFAULT_CLIENT_TITLE)
+  return {
+    name: 'dsh-client-document-title',
+    transformIndexHtml(html) {
+      return html.replace('<title>DSH Local Build</title>', `<title>${title}</title>`)
+    },
+  }
+}
 
 /** Fail before a Vite dev or preview server can expose the boot-manifest-free shell. */
 function rejectStandaloneServe(): Plugin {
@@ -14,6 +33,35 @@ function rejectStandaloneServe(): Plugin {
     name: 'dsh-reject-standalone-web-serve',
     config(_config, env) {
       if (env.command === 'serve') throw new Error(STANDALONE_ERROR)
+    },
+  }
+}
+
+/**
+ * Emit preview.html beside index.html: the built index page with one module
+ * script — the worker bootstrap entry — spliced ahead of its entry tag. Both
+ * pages share every chunk; the extra tag is the only difference, so the
+ * static worker deployment ships the served page verbatim plus its
+ * bootstrap.
+ */
+function emitPreviewPage(): Plugin {
+  let bootstrapFile: string | undefined
+  return {
+    name: 'dsh-emit-preview-page',
+    generateBundle(_options, bundle) {
+      for (const item of Object.values(bundle)) {
+        if (item.type === 'chunk' && item.isEntry && item.name === 'bootstrap') bootstrapFile = item.fileName
+      }
+      if (bootstrapFile === undefined) throw new Error('vite: preview bootstrap entry missing from the bundle')
+    },
+    async closeBundle() {
+      // A build that failed before generateBundle has no page to splice.
+      if (bootstrapFile === undefined) return
+      const page = await readFile(src('./dist/index.html'), 'utf8')
+      const anchor = page.indexOf('<script type="module"')
+      if (anchor === -1) throw new Error('vite: built index.html lost its module entry tag')
+      const tag = `<script type="module" crossorigin src="./${bootstrapFile}"></script>`
+      await writeFile(src('./dist/preview.html'), `${page.slice(0, anchor)}${tag}${page.slice(anchor)}`)
     },
   }
 }
@@ -90,11 +138,30 @@ function npmPackageOf(id: string): string | undefined {
 }
 
 export default defineConfig({
-  plugins: [rejectStandaloneServe(), react()],
+  // Relative asset URLs: preview.html mounts the same output under any base
+  // directory, and the served index resolves identically from the site root.
+  base: './',
+  plugins: [rejectStandaloneServe(), clientDocumentTitle(), react(), emitPreviewPage()],
   build: {
+    // The worker bootstrap holds its page at top-level await; Vite's default
+    // `modules` target (es2020-era) rejects that syntax.
+    target: 'es2022',
     sourcemap: true,
     rollupOptions: {
+      input: {
+        index: src('./index.html'),
+        // Standalone entry, not an index.html script tag: Vite folds every
+        // module tag of one page into a single synthetic entry, and only a
+        // separate input keeps the shared page chunks bootstrap-free.
+        bootstrap: src('./src/preview.ts'),
+      },
       output: {
+        // The worker-preview surface groups under dist/preview/ (the page
+        // itself stays at dist/preview.html), so the published payload can
+        // exclude it as one directory.
+        entryFileNames(chunk): string {
+          return chunk.name === 'bootstrap' ? 'preview/[name]-[hash].js' : 'assets/[name]-[hash].js'
+        },
         // Output layout: the two main chunks stay at assets/ root; lazy
         // @shikijs/langs grammar chunks group under assets/langs/; fonts
         // (all KaTeX faces referenced by vendor.css) group under
@@ -126,29 +193,31 @@ export default defineConfig({
       },
     },
   },
+  worker: {
+    // The preview worker rides dist/preview/ with the rest of that surface.
+    rollupOptions: { output: { entryFileNames: 'preview/[name]-[hash].js' } },
+  },
   resolve: {
-    // Workspace packages resolve to SOURCE: package.json exports point at lib
-    // for Node/type consumers, but the browser bundle must compile src directly
-    // so CSS rides vite's pipeline instead of the CSS-externalized lib bundle.
-    // Only the shell's normal package entry is aliased — plugin packages are
-    // NEVER bundled here (shell self-sufficiency — see
-    // packages/client/web/README.md); they arrive as runtime
-    // bundles through the client module system. Order matters — subpath
-    // aliases must win over bare-name prefixes.
+    // One instance per shared npm identity: a bare specifier otherwise resolves
+    // from the importer's directory, so a diverging range ships a second React
+    // and splits hook and element identity. Entries are package ids — they cover
+    // react/jsx-runtime and react-dom/client — and resolve from this package's
+    // node_modules, so react must stay a devDependency here and any watcher must
+    // run vite from this directory (scripts/dev-web.ts). Workspace packages need
+    // no entry: pnpm links each of them to a single directory.
+    dedupe: ['react', 'react-dom'],
+    // Workspace packages are consumed as built lib products: each resolves
+    // through its own package.json exports from the importer's directory, and
+    // CSS still rides Vite's pipeline because the client build preset emits it
+    // beside the bundle. Plugin packages never enter this graph; they arrive as
+    // runtime bundles through the client module system. The remaining alias
+    // browserizes the vendored Cordis Loader's only Node import.
     alias: [
-      // Browserization of the vendored cordis Loader: its only node-only
-      // import; the two process probes are mapped by `define` below.
       { find: /^node:module$/, replacement: src('./src/node-module-stub.ts') },
-      { find: /^@deepseek-ai\/dsh-client-web$/, replacement: src('../../packages/client/web/src/boot.tsx') },
-      { find: /^@deepseek-ai\/dsh-client-web-react$/, replacement: src('../../packages/client/web-react/src/index.ts') },
-      { find: /^@deepseek-ai\/dsh-client-ui-slots$/, replacement: src('../../packages/client/ui-slots/src/index.ts') },
-      { find: /^@deepseek-ai\/dsh-client-ui-primitives$/, replacement: src('../../packages/client/ui-primitives/src/index.ts') },
-      { find: /^@deepseek-ai\/dsh-client-ui-attachment$/, replacement: src('../../packages/client/ui-attachment/src/index.ts') },
-      { find: /^@deepseek-ai\/dsh-client-schema-form$/, replacement: src('../../packages/client/schema-form/src/index.ts') },
-      { find: /^@deepseek-ai\/dsh-client-modules\/client$/, replacement: src('../../packages/client/modules/src/client/index.ts') },
     ],
   },
   define: {
+    ...clientBuildEnvironmentDefines(process.env),
     // vendored loader internal.ts: fromInternal() probes the Node major —
     // "0.0.0" takes neither branch, returning undefined (exactly the empty
     // internal slot the shell boot fills with the client module loader).

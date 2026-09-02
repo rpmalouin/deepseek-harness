@@ -6,7 +6,8 @@ import type { Agent, AgentStatus } from '@deepseek-ai/dsh-agent'
 import CommandRuntime from '@deepseek-ai/dsh-commands'
 import GoalService from '@deepseek-ai/dsh-goal'
 import type { GoalRef } from '@deepseek-ai/dsh-goal'
-import SessionStore, { Session, SessionId } from '@deepseek-ai/dsh-session'
+import SessionStore, { Session, SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import * as commandGoal from '@deepseek-ai/dsh-command-goal'
 
 interface Harness {
@@ -46,6 +47,7 @@ async function harness(): Promise<Harness> {
   await ctx.plugin(SessionStore)
   await ctx.plugin(CommandRuntime)
   await ctx.plugin(AgentRegistry)
+  await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(GoalService)
   const plugin = await ctx.plugin(commandGoal)
   const { agent, session } = stubAgent(ctx, `command-goal-${Math.random()}`)
@@ -54,18 +56,18 @@ async function harness(): Promise<Harness> {
 }
 
 /** The log with executor-owned command lifecycle bookkeeping stripped (goal assertions target domain events). */
-function domainEvents(session: Session): readonly Session['events'][number][] {
+function domainEvents(session: Session): readonly SessionEvent[] {
   const lifecycle = new Set<number>()
-  for (const event of session.events) {
+  for (const event of session.snapshotEvents()) {
     if (event.type !== 'command/run' && event.type !== 'command/done') continue
     lifecycle.add(event.seq)
     // The zero-step wrap around a lifecycle event is bookkeeping too.
-    const before = session.events[event.seq - 1]
-    const after = session.events[event.seq + 1]
+    const before = session.snapshotEvents()[event.seq - 1]
+    const after = session.snapshotEvents()[event.seq + 1]
     if (before?.type === 'turn/start') lifecycle.add(before.seq)
     if (after?.type === 'turn/end') lifecycle.add(after.seq)
   }
-  return session.events.filter(event => !lifecycle.has(event.seq))
+  return session.snapshotEvents().filter(event => !lifecycle.has(event.seq))
 }
 
 /** Execute `/goal` through the same registry boundary as a UI adapter. */
@@ -73,6 +75,7 @@ async function run(test: Harness, suffix = ''): Promise<NonNullable<Awaited<Retu
   const execution = await test.ctx.commands.execute(
     test.agent,
     `/goal${suffix}`,
+    [],
     new AbortController().signal,
   )
   if (execution === undefined) throw new Error('goal command was not registered')
@@ -96,7 +99,7 @@ describe('@deepseek-ai/dsh-command-goal registration', () => {
     expect(test.ctx.commands.list(test.agent)).toContainEqual({
       name: 'goal',
       description: 'set or view the goal for a long-running task',
-      input: { hint: '[<objective>|clear|edit <objective>|pause|resume]' },
+      input: { hint: '[<objective>|clear|edit <objective>|pause|resume]', images: true },
     })
     expect(test.ctx.commands.find(test.agent, 'goal')).toBeDefined()
 
@@ -230,5 +233,101 @@ describe('/goal human command', () => {
     const test = await harness()
     vi.spyOn(test.ctx.goals, 'get').mockImplementationOnce(() => { throw new Error('unexpected failure') })
     await expect(run(test)).rejects.toThrow('unexpected failure')
+  })
+})
+
+describe('/goal image attachments', () => {
+  const PNG = 'AAAA'
+
+  /** Wire the fake store the executor admits through (once per harness). */
+  function provideStore(test: Harness): void {
+    let saved = 0
+    const saveImage = (input: { mediaType: string; name?: string }) => {
+      saved += 1
+      return Promise.resolve({
+        attachmentId: `att-${saved}`, mediaType: input.mediaType, bytes: 3, width: 1, height: 1,
+        ...input.name === undefined ? {} : { name: input.name },
+      })
+    }
+    test.ctx.provide('attachments', {
+      imageLimits: {
+        maxImageBytes: 1024, maxImagesPerMessage: 4, maxMessageImageBytes: 1024,
+        maxImagePixels: 1_000_000, mediaTypes: ['image/png'],
+      },
+      validateImage: () => Promise.resolve(),
+      saveImage,
+      async saveImages(inputs: readonly { mediaType: string; name?: string }[]) {
+        const refs = []
+        for (const input of inputs) refs.push(await saveImage(input))
+        return refs
+      },
+    })
+  }
+
+  /** Run /goal with `count` composer images through the executor boundary. */
+  async function runWithImages(test: Harness, suffix: string, count: number) {
+    const images = Array.from({ length: count }, (_, index) => ({
+      mediaType: 'image/png' as const, data: PNG, name: `ref-${index + 1}.png`,
+    }))
+    const execution = await test.ctx.commands.execute(test.agent, `/goal${suffix}`, images, new AbortController().signal)
+    if (execution === undefined) throw new Error('goal command was not registered')
+    return execution.result
+  }
+
+  it('submits one user followup carrying the admitted images ahead of the round prompt', async () => {
+    const test = await harness()
+    provideStore(test)
+    const followup = vi.fn()
+    ;(test.agent as unknown as { followup: typeof followup }).followup = followup
+    const result = await runWithImages(test, ' rebuild the cathedral', 2)
+    expect(result.kind).toBe('success')
+    expect(followup).toHaveBeenCalledTimes(1)
+    const message = followup.mock.calls[0]?.[0] as {
+      content: ReadonlyArray<Record<string, unknown>>
+      source: { kind: string }
+    }
+    expect(message.source).toEqual({ kind: 'user' })
+    expect(message.content.map(block => block.type)).toEqual(['image', 'image', 'text'])
+    expect(message.content.at(-1)).toEqual({ type: 'text', text: 'Reference images for the goal objective.' })
+    expect((message.content[0] as { attachment: { name: string } }).attachment.name).toBe('ref-1.png')
+  })
+
+  it('accompanies an edit and a post-complete recreate the same way', async () => {
+    const test = await harness()
+    provideStore(test)
+    const followup = vi.fn()
+    ;(test.agent as unknown as { followup: typeof followup }).followup = followup
+    test.ctx.goals.create(test.agent, { objective: 'initial objective' })
+    const result = await runWithImages(test, ' edit refined objective', 1)
+    expect(result.kind).toBe('success')
+    expect(followup).toHaveBeenCalledTimes(1)
+  })
+
+  it('rejects attachments on sub-commands that cannot use them, leaving the domain untouched', async () => {
+    const test = await harness()
+    provideStore(test)
+    const followup = vi.fn()
+    ;(test.agent as unknown as { followup: typeof followup }).followup = followup
+    test.ctx.goals.create(test.agent, { objective: 'active objective' })
+    for (const suffix of [' pause', '', ' clear']) {
+      const result = await runWithImages(test, suffix, 1)
+      expect(result).toEqual({
+        kind: 'error',
+        text: 'Image attachments only accompany a goal objective: /goal <objective> or /goal edit <objective>.',
+      })
+    }
+    expect(followup).not.toHaveBeenCalled()
+    expect(test.ctx.goals.get(test.agent)?.phase).toBe('active')
+  })
+
+  it('does not submit attachments when goal creation is refused', async () => {
+    const test = await harness()
+    provideStore(test)
+    const followup = vi.fn()
+    ;(test.agent as unknown as { followup: typeof followup }).followup = followup
+    test.ctx.goals.create(test.agent, { objective: 'existing objective' })
+    const result = await runWithImages(test, ' replacement objective', 1)
+    expect(result.kind).toBe('error')
+    expect(followup).not.toHaveBeenCalled()
   })
 })

@@ -5,13 +5,20 @@
  * @module @deepseek-ai/dsh-session-reference
  */
 
-import { Context, Service } from '@deepseek-ai/cordis'
+import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import type { Agent } from '@deepseek-ai/dsh-agent'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
+import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
+import { createUserMessage, freezeMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, UserMessage } from '@deepseek-ai/dsh-llm'
+import { SessionLogOffset } from '@deepseek-ai/dsh-session'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import type { SessionSurfaceSnapshot, SessionTitleObservationResult } from '@deepseek-ai/dsh-session-query'
+// Type-only: the `title` projection key plus the live registry and durable
+// cache Context merges — the two projection faces discovery labels from.
+import type { ProjectionSnapshot } from '@deepseek-ai/dsh-session-projection'
+import type {} from '@deepseek-ai/dsh-session-projection-cache'
+import type {} from '@deepseek-ai/dsh-session-title'
+import type { SessionRecord, SessionSurfaceSnapshot } from '@deepseek-ai/dsh-session-query'
 import {
   DEFAULT_CANDIDATE_LIMIT,
   DEFAULT_MAX_REFERENCE_BYTES,
@@ -21,7 +28,11 @@ import {
 } from './config.ts'
 import { retainReferencedSession, type ReferenceRetentionStats, type ReferencedSessionData } from './projection.ts'
 import { stringifyTagSafeJson } from './serialization.ts'
-import type { PreparedReferencedMessage, SessionReferenceCandidate, SessionReferenceInput, SessionReferenceSource } from './types.ts'
+import type {
+  PreparedReferencedMessage, SessionReferenceCandidate, SessionReferenceInput,
+  SessionReferenceMentionCandidate, SessionReferenceSource,
+} from './types.ts'
+import { formatSessionReferenceMention, parseSessionReferenceText } from './uri.ts'
 
 export type * from './types.ts'
 export type { Config, SessionReferenceErrorCode } from './config.ts'
@@ -67,7 +78,7 @@ interface RenderedSource {
 }
 
 /** Exact-read consumer that prepares immutable cross-session message context. */
-export class SessionReferenceResolver extends Service {
+export class SessionReferenceResolver extends TypertRemoteService {
   static inject = ['sessionQuery']
   static Config: z<Config> = z.object({
     maxReferences: z.number().step(1).min(1).max(MAX_REFERENCES).default(MAX_REFERENCES),
@@ -98,10 +109,56 @@ export class SessionReferenceResolver extends Service {
         'SESSION_REFERENCE_INVALID_CONFIG',
       )
     }
+    ctx.on('agent/pre-step', async ({ agent, signal }, next): Promise<PreStepDecision> => {
+      const decision = await next()
+      if (decision.kind === 'reject') return decision
+      return {
+        ...decision,
+        messages: await this.prepareDirectMessages(agent, decision.messages, signal),
+      }
+    }, { prepend: true })
+  }
+
+  /**
+   * Replace canonical mentions in direct user messages and place each prepared
+   * snapshot immediately after the message that cited it.
+   * @param agent - agent entering the model step.
+   * @param messages - messages accepted by downstream pre-step listeners.
+   * @param signal - active turn cancellation.
+   * @returns direct messages followed by their session-reference context in citation order.
+   */
+  private async prepareDirectMessages(
+    agent: Agent,
+    messages: readonly UserMessage[],
+    signal: AbortSignal,
+  ): Promise<UserMessage[]> {
+    const prepared = await Promise.all(messages.map(async (message): Promise<UserMessage[]> => {
+      if (message.source.kind !== 'user') return [message]
+      const references: SessionReferenceInput[] = []
+      const content = message.content.map((block): ContentBlock => {
+        if (block.type !== 'text') return block
+        const parsed = parseSessionReferenceText(block.text)
+        references.push(...parsed.references)
+        return { type: 'text', text: parsed.text }
+      })
+      if (references.length === 0) return [message]
+      const resolved = await this.prepare(agent, content, references, signal)
+      const direct = freezeMessage({ ...message, content: resolved.content })
+      /* v8 ignore if -- a parsed canonical mention always leaves one normalized reference */
+      if (resolved.additionalContext === undefined) {
+        throw new Error('session-reference preparation omitted context for a canonical mention')
+      }
+      return [direct, resolved.additionalContext]
+    }))
+    return prepared.flat()
   }
 
   /**
    * List reference candidates, ranked by working-directory affinity.
+   *
+   * Discovery runs at keystroke rate, so a title only ever comes from a
+   * projection read: see {@link SessionReferenceResolver.projectedTitle} for
+   * which sessions can answer one and which fall back to their id.
    * @param agent - target agent; self is excluded and its cwd drives ranking.
    * @param query - optional case-insensitive session-id/cwd/title substring.
    * @param limit - optional positive result cap.
@@ -123,26 +180,12 @@ export class SessionReferenceResolver extends Service {
     const records = (await settleWithCancellation(this.ctx.sessionQuery.listSessions(signal), signal))
       .filter(record => record.header.id !== agent.id)
       .map((record, index) => ({ record, index }))
-    const inspected = needle === ''
-      ? records
-        .sort((a, b) => candidateRank(a.record.header.cwd, targetCwd) - candidateRank(b.record.header.cwd, targetCwd)
-          || a.index - b.index)
-        .slice(0, limit)
-      : records
-    const observations = await settleWithCancellation(
-      this.ctx.sessionQuery.readTitleSnapshots(inspected.map(({ record }) => record.header.id), signal),
-      signal,
-    )
-    return inspected.map(({ record, index }, observationIndex) => {
-      const observation = observations[observationIndex] as SessionTitleObservationResult
-      return {
-        record,
-        index,
-        label: observation.status === 'fulfilled'
-          ? observation.value.title?.title ?? record.header.id
-          : record.header.id,
-      }
-    }).filter(({ record, label }) => {
+    const labelled = records.map(({ record, index }) => ({
+      record,
+      index,
+      label: this.projectedTitle(record) ?? record.header.id,
+    }))
+    return labelled.filter(({ record, label }) => {
       if (needle === '') return true
       return record.header.id.toLocaleLowerCase().includes(needle)
         || record.header.cwd?.toLocaleLowerCase().includes(needle) === true
@@ -154,16 +197,75 @@ export class SessionReferenceResolver extends Service {
         sessionId: record.header.id,
         label,
         ...record.header.cwd === undefined ? {} : { cwd: record.header.cwd },
+        sameWorkspace: record.header.cwd !== undefined && record.header.cwd === targetCwd,
         createdAt: record.header.createdAt,
       }))
   }
 
   /**
-   * Snapshot all references before enqueue and return one aggregated durable context.
+   * The title a session's projections can answer without reading its log.
+   *
+   * Attachment is decided by the store at read time, not by the listing:
+   * a session that attached in between would otherwise be answered from a
+   * checkpoint its live log has already moved past.
+   *
+   * An attached session answers from its live registry cut, which advances
+   * with every committed event, so a rename or a just-generated title is
+   * visible immediately; its events are already in memory, so the lazy fold
+   * costs no I/O. A cold session answers from the durable checkpoint the
+   * projection cache wrote when it went cold.
+   *
+   * Nothing else is attempted. Folding a title from a log costs the whole
+   * log, and this call sits under every keystroke of `@` completion. A
+   * session that no projection can answer for — one persisted before the
+   * cache was composed, or seeded straight to disk — is labeled by its id
+   * and cannot be found by its title until it is opened once, which
+   * checkpoints it.
+   * @param record - the listed session, live or cold.
+   * @returns the projected title, or undefined when no projection holds one.
+   */
+  private projectedTitle(record: SessionRecord): string | undefined {
+    const attached = this.ctx.get('sessions')?.get(record.header.id)
+    const projections = this.ctx.get('sessionProjections')
+    if (attached !== undefined && projections !== undefined) {
+      return titleOf(projections.snapshot(attached, ['title']))
+    }
+    if (record.header.isSeeded) return undefined
+    return titleOf(this.ctx.get('sessionProjectionCache')?.cachedSnapshot(
+      record.header,
+      SessionLogOffset(0),
+      ['title'],
+    ))
+  }
+
+  /**
+   * Remote face of {@link listCandidates}: the configured candidate limit
+   * applies, and every candidate carries the canonical mention a host inserts
+   * into the prompt draft.
+   * @param agent - target agent; self is excluded and its cwd drives ranking.
+   * @param query - optional case-insensitive session-id/cwd/title substring.
+   * @param signal - caller cancellation.
+   * @returns mention-carrying candidates in rank order.
+   */
+  @Remote('candidates')
+  async remoteExportCandidates(
+    agent: Agent,
+    query: string,
+    signal: AbortSignal,
+  ): Promise<SessionReferenceMentionCandidate[]> {
+    const candidates = await this.listCandidates(agent, query, this.config.candidateLimit, signal)
+    return candidates.map(candidate => ({
+      ...candidate,
+      mention: formatSessionReferenceMention({ sessionId: candidate.sessionId, label: candidate.label }),
+    }))
+  }
+
+  /**
+   * Snapshot all references for one accepted direct message and return one aggregated durable context.
    * @param agent - target agent; references to it are rejected.
    * @param content - already host-normalized readable message content.
    * @param references - structured source sessions in mention order.
-   * @param signal - optional cancellation boundary for host request teardown.
+   * @param signal - optional cancellation boundary for the active turn.
    * @returns detached content and optional referenced-session context.
    */
   async prepare(
@@ -265,6 +367,12 @@ function normalizeReferences(
 
 function renderPrompt(data: readonly ReferencedSessionData[]): string {
   return `${PROMPT_PREFIX}${stringifyTagSafeJson(data)}${PROMPT_SUFFIX}`
+}
+
+/** The title in one projection snapshot; undefined when the unit is absent or still untitled. */
+function titleOf(snapshot: ProjectionSnapshot | undefined): string | undefined {
+  const title = snapshot?.values.title
+  return title === undefined || title === null ? undefined : title
 }
 
 function candidateRank(candidateCwd: string | undefined, targetCwd: string | undefined): number {

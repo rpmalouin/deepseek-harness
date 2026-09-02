@@ -9,6 +9,9 @@
   ],
   "references": [
     {
+      "path": "../../api/workspace-controller/tsconfig.client.json"
+    },
+    {
       "path": "../../../vendor/cordis"
     },
     {
@@ -18,19 +21,16 @@
       "path": "../ui-primitives"
     },
     {
-      "path": "../web-react"
+      "path": "../ui-renderer"
     },
     {
-      "path": "../runtime"
+      "path": "../ui-session"
     },
     {
       "path": "../ui-layout"
     },
     {
       "path": "../locale"
-    },
-    {
-      "path": "../../runtime-diagnostics/invariants"
     }
   ]
 }

@@ -18,9 +18,19 @@ function finalText(blocks: ContentBlock[]): string {
     .join('')
 }
 
+/** Render a failed stop reason with optional provider-authored detail. */
+function failureDetail(result: SubagentResult): string {
+  const stopReason = result.stopReason
+  return result.diagnostic === undefined
+    ? stopReason
+    : `${stopReason}; diagnostic: ${result.diagnostic}`
+}
+
 /**
- * Map a child result to the task outcome: completed carries final text,
- * aborted is killed, and every other reason is failed without partial output.
+ * Map a child result to the task outcome: completed carries final text, local
+ * cancellation (`aborted` without a diagnostic) is killed, and provider-
+ * diagnosed remote aborts plus every other reason are failed without partial
+ * output.
  * @param result - child terminal result.
  * @returns outcome for the `ctx.jobs` registration.
  */
@@ -29,14 +39,16 @@ function runOutcome(result: SubagentResult): JobOutcome {
     case 'completed':
       return { status: 'completed', output: finalText(result.output) }
     case 'aborted':
-      return { status: 'killed' }
+      return result.diagnostic === undefined
+        ? { status: 'killed' }
+        : { status: 'failed', detail: failureDetail(result) }
     case 'error':
     case 'max-tokens':
     case 'refusal':
-      return { status: 'failed', detail: result.stopReason }
-    // Merge-extensible reasons remain failures with their raw detail.
+      return { status: 'failed', detail: failureDetail(result) }
+    // Merge-extensible reasons remain failures with provider-authored detail.
     default:
-      return { status: 'failed', detail: String(result.stopReason) }
+      return { status: 'failed', detail: failureDetail(result) }
   }
 }
 

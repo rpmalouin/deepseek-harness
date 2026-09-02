@@ -6,7 +6,7 @@ Status: implemented
 
 ## 问题
 
-composer 的[上下文仪表](../feature/2026-08-05-composer-context-meter-breakdown.md)的圆环、百分比与 `~已用 / 容量` 标题都取自 `contextPressure.pressureTokens`，即提供方报告的最新提示词规模。这个数字只在某个请求报告用量时才会移动，而压缩（compaction）不报告用量：`compaction-basic` 通过直连的 `ctx.llm.stream()` 调用生成摘要，只追加 `compaction/start`、`compaction/summary`、用作替换的 `user/message` 和 `compaction/end`——没有 `assistant/message`，也没有用量分片。
+composer 的[上下文仪表](../feature/2026-08-05-composer-context-meter-breakdown.zh.md)的圆环、百分比与 `~已用 / 容量` 标题都取自 `contextPressure.pressureTokens`，即提供方报告的最新提示词规模。这个数字只在某个请求报告用量时才会移动，而压缩（compaction）不报告用量：`compaction-basic` 通过直连的 `ctx.llm.stream()` 调用生成摘要，只追加 `compaction/start`、`compaction/summary`、用作替换的 `user/message` 和 `compaction/end`——没有 `assistant/message`，也没有用量分片。
 
 于是在唯一一个专门用来改变它的操作面前，这块仪表纹丝不动。通过真实的 agent loop（智能体循环）驱动一次 `compactNow`：
 
@@ -23,11 +23,11 @@ AFTER  compact:  ring=4%  header=~4227/100000   rows=[system 18, tools 0, messag
 
 只有增量部分是估算的。锚点保持提供方精确值，从而把估算器对 CJK 文本与 JSON Schema 的系统性低估挡在占用率数字之外，同时又让这个数字能在内容落地或某段区间被遮蔽的瞬间做出反应。`contextOccupancy` 读取 `projectedTokens`，并回退到裸样本，因此从不含该字段的检查点恢复出来的投影会退化为旧行为，而不是直接消失。
 
-这推翻了[上下文仪表决策](../feature/2026-08-05-composer-context-meter-breakdown.md)中「圆环、标题与进度条总长保持提供方精确值」的那一半。那条决策真正想守住的东西——不要把启发式明细行按比例缩放到提供方总量、从而伪造精度——依然守住了：明细行仍未被缩放，标题仍不等于它们之和。改变的是这样一个认识：「提供方精确、但描述的是两次压缩之前那个请求」并不是更真实的数字。
+这推翻了[上下文仪表决策](../feature/2026-08-05-composer-context-meter-breakdown.zh.md)中「圆环、标题与进度条总长保持提供方精确值」的那一半。那条决策真正想守住的东西——不要把启发式明细行按比例缩放到提供方总量、从而伪造精度——依然守住了：明细行仍未被缩放，标题仍不等于它们之和。改变的是这样一个认识：「提供方精确、但描述的是两次压缩之前那个请求」并不是更真实的数字。
 
 ## 备选方案
 
-**改为投影 `measure().totalTokens`。** 测量服务本来就合成了正是这个量（`baseline` 锚点加有符号的 `surfaceDeltaTokens`），而且反应正确——同一次压缩前后实测为 4383 → 304。但它是一个建立在私有重放状态上的服务，不是纯折叠，投影无法调用它。要在 `ProjectionDefinition` 内部复现它的锚点，需要 `_estimateProviderAssistant` 对按 seq 引用的分片事件进行随机访问（`session.events[seq]`），而 `apply(state, event)` 拿不到。以取样时的表层总量作为锚点，是同一个思路在纯逐事件折叠中可达的版本。
+**改为投影 `measure().totalTokens`。** 测量服务本来就合成了正是这个量（`baseline` 锚点加有符号的 `surfaceDeltaTokens`），而且反应正确——同一次压缩前后实测为 4383 → 304。但它是一个建立在私有重放状态上的服务，不是纯折叠，投影无法调用它。要在 `ProjectionDefinition` 内部复现它的锚点，需要 `_estimateProviderAssistant` 对按 seq 引用的分片事件进行随机访问（`session.eventAt(seq)`），而 `apply(state, event)` 拿不到。以取样时的表层总量作为锚点，是同一个思路在纯逐事件折叠中可达的版本。
 
 **在压缩结束时补写一条合成的用量记录。** 这确实能推动 `pressureTokens` 本身，但压缩手上唯一的用量是摘要请求自己的用量——那是完全另一个提示词。把它记成本对话的提示词规模，等于把谎言写进持久日志，而不只是写进某一处展示。
 

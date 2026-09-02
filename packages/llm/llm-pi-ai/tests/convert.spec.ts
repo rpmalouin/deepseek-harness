@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
-import { AttachmentId } from '@deepseek-ai/dsh-attachment'
-import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
-import { createUserMessage, CallId, CONTEXT_WINDOW_EXCEEDED_CODE, EMPTY_RESPONSE_CODE, LlmError, createMessage } from '@deepseek-ai/dsh-llm'
+import { AttachmentId, ImageVariantId } from '@deepseek-ai/dsh-attachment'
+import type { AttachmentStore, ImageAttachmentRef, ImageRequestPolicy, RequestImageAttachment } from '@deepseek-ai/dsh-attachment'
+import { createUserMessage, ToolCallId, CONTEXT_WINDOW_EXCEEDED_CODE, EMPTY_RESPONSE_CODE, createMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { AssistantMessage, AssistantMessageEvent, Usage } from '@earendil-works/pi-ai'
 import { toPiContext } from '../src/context.ts'
@@ -43,6 +43,33 @@ async function collect(stream: AsyncIterable<StreamChunk>): Promise<StreamChunk[
   return out
 }
 
+function requestVersion(ref: ImageAttachmentRef): RequestImageAttachment {
+  return {
+    variantId: ImageVariantId(`sha256:${'e'.repeat(64)}`),
+    attachment: ref,
+    data: Uint8Array.of(1, 2, 3),
+    mediaType: ref.mediaType,
+    bytes: 3,
+    width: ref.width,
+    height: ref.height,
+    depth: 'uchar',
+    space: 'srgb',
+    hasAlpha: true,
+  }
+}
+
+function attachmentStore(readImageRequest: (
+  ref: ImageAttachmentRef,
+  policy: ImageRequestPolicy,
+  signal?: AbortSignal,
+) => Promise<RequestImageAttachment>): AttachmentStore {
+  return { readImageRequest, imageHostPath: () => undefined } as unknown as AttachmentStore
+}
+
+function imageContext(attachments: AttachmentStore) {
+  return { attachments, resolveImageAccess: () => undefined }
+}
+
 describe('toPiContext', () => {
   it('maps system prompt, user text, and tools', () => {
     const context = toPiContext({
@@ -76,7 +103,9 @@ describe('toPiContext', () => {
       width: 1,
       height: 1,
     }
-    const readImage = vi.fn().mockResolvedValue({ ref: attachment, data: Uint8Array.of(1, 2, 3) })
+    const readImageRequest = vi.fn((value: ImageAttachmentRef, _policy: ImageRequestPolicy) => (
+      Promise.resolve(requestVersion(value))
+    ))
     const context = await toPiContext({
       provider: 'openai',
       model: 'gpt-4.1',
@@ -84,13 +113,18 @@ describe('toPiContext', () => {
         content: [{ type: 'text', text: 'describe' }, { type: 'image', attachment }],
         source: { kind: 'plugin', plugin: 'test' },
       })],
-    }, { readImage } as unknown as AttachmentStore)
+    }, imageContext(attachmentStore(readImageRequest)))
 
-    expect(readImage).toHaveBeenCalledWith(attachment)
+    expect(readImageRequest).toHaveBeenCalledWith(
+      attachment,
+      { maxPixels: 2048 * 2048, maxBytes: 1024 * 1024 },
+      undefined,
+    )
     expect(context.messages[0]).toEqual({
       role: 'user',
       content: [
         { type: 'text', text: 'describe' },
+        { type: 'text', text: expect.stringContaining(`Image ${attachment.attachmentId}`) as string },
         { type: 'image', data: 'AQID', mimeType: 'image/png' },
       ],
       timestamp: 0,
@@ -105,21 +139,23 @@ describe('toPiContext', () => {
       width: 1,
       height: 1,
     }
-    const readImage = vi.fn().mockResolvedValue({ ref: attachment, data: Uint8Array.of(1, 2, 3) })
+    const readImageRequest = vi.fn((value: ImageAttachmentRef, _policy: ImageRequestPolicy) => (
+      Promise.resolve(requestVersion(value))
+    ))
     const context = await toPiContext({
       provider: 'openai',
       model: 'gpt-4.1',
       messages: [createUserMessage({
         content: [{
           type: 'tool-result',
-          toolCallId: CallId('outer'),
+          toolCallId: ToolCallId('outer'),
           content: [
-            { type: 'tool-result', toolCallId: CallId('empty'), content: [] },
+            { type: 'tool-result', toolCallId: ToolCallId('empty'), content: [] },
             { type: 'text', text: 'before' },
-            { type: 'tool-result', toolCallId: CallId('text'), content: [{ type: 'text', text: 'middle' }] },
+            { type: 'tool-result', toolCallId: ToolCallId('text'), content: [{ type: 'text', text: 'middle' }] },
             {
               type: 'tool-result',
-              toolCallId: CallId('inner'),
+              toolCallId: ToolCallId('inner'),
               content: [
                 { type: 'image', attachment },
                 { type: 'text', text: 'after' },
@@ -129,7 +165,7 @@ describe('toPiContext', () => {
         }],
         source: { kind: 'plugin', plugin: 'test' },
       })],
-    }, { readImage } as unknown as AttachmentStore)
+    }, imageContext(attachmentStore(readImageRequest)))
 
     expect(context.messages).toEqual([{
       role: 'toolResult',
@@ -138,6 +174,7 @@ describe('toPiContext', () => {
       content: [
         { type: 'text', text: 'before' },
         { type: 'text', text: 'middle' },
+        { type: 'text', text: expect.stringContaining(`Image ${attachment.attachmentId}`) as string },
         { type: 'image', data: 'AQID', mimeType: 'image/png' },
         { type: 'text', text: 'after' },
       ],
@@ -171,7 +208,7 @@ describe('toPiContext', () => {
         content: [
           { type: 'reasoning', text: 'hmm' },
           { type: 'text', text: 'calling' },
-          { type: 'tool-call', id: CallId('c1'), name: 'f', arguments: '{"a":1}' },
+          { type: 'tool-call', id: ToolCallId('c1'), name: 'f', arguments: '{"a":1}' },
         ],
         source: { kind: 'plugin', plugin: 'test' },
       })],
@@ -222,7 +259,7 @@ describe('toPiContext', () => {
       model: 'm',
       messages: [createMessage({
         role: 'assistant',
-        content: [{ type: 'tool-call', id: CallId('c1'), name: 'f', arguments: '{broken' }],
+        content: [{ type: 'tool-call', id: ToolCallId('c1'), name: 'f', arguments: '{broken' }],
         source: { kind: 'plugin', plugin: 'test' },
       })],
     })
@@ -236,7 +273,7 @@ describe('toPiContext', () => {
       model: 'm',
       messages: [createMessage({
         role: 'assistant',
-        content: [{ type: 'tool-call', id: CallId('c1'), name: 'f', arguments: '[1,2]' }],
+        content: [{ type: 'tool-call', id: ToolCallId('c1'), name: 'f', arguments: '[1,2]' }],
         source: { kind: 'plugin', plugin: 'test' },
       })],
     })
@@ -250,16 +287,16 @@ describe('toPiContext', () => {
       messages: [
         createMessage({
           role: 'assistant',
-          content: [{ type: 'tool-call', id: CallId('c1'), name: 'get_weather', arguments: '{}' }],
+          content: [{ type: 'tool-call', id: ToolCallId('c1'), name: 'get_weather', arguments: '{}' }],
           source: { kind: 'plugin', plugin: 'test' },
         }),
         createUserMessage({
           content: [{
             type: 'tool-result',
-            toolCallId: CallId('c1'),
+            toolCallId: ToolCallId('c1'),
             content: [
               { type: 'text', text: 'Sunny' },
-              { type: 'tool-result', toolCallId: CallId('nested'), content: [{ type: 'text', text: '!' }] },
+              { type: 'tool-result', toolCallId: ToolCallId('nested'), content: [{ type: 'text', text: '!' }] },
               { type: 'chart', data: 'ignored' } as unknown as ContentBlock,
             ],
           }],
@@ -282,7 +319,7 @@ describe('toPiContext', () => {
       provider: 'deepseek',
       model: 'm',
       messages: [createUserMessage({
-        content: [{ type: 'tool-result', toolCallId: CallId('zz'), content: [], isError: true }],
+        content: [{ type: 'tool-result', toolCallId: ToolCallId('zz'), content: [], isError: true }],
         source: { kind: 'plugin', plugin: 'test' },
       })],
     })
@@ -306,7 +343,7 @@ describe('toPiContext', () => {
         createUserMessage({
           content: [
             { type: 'text', text: 'note' },
-            { type: 'tool-result', toolCallId: CallId('c1'), content: [{ type: 'text', text: 'ok' }] },
+            { type: 'tool-result', toolCallId: ToolCallId('c1'), content: [{ type: 'text', text: 'ok' }] },
           ],
           source: { kind: 'plugin', plugin: 'test' },
         }),
@@ -353,7 +390,7 @@ describe('toPiContext', () => {
         content: [
           { type: 'reasoning', text: 'private reasoning' },
           { type: 'text', text: 'calling' },
-          { type: 'tool-call', id: CallId('c1'), name: 'f', arguments: '{"a":1}' },
+          { type: 'tool-call', id: ToolCallId('c1'), name: 'f', arguments: '{"a":1}' },
         ],
         source: {
           kind: 'model',
@@ -394,7 +431,7 @@ describe('toPiContext', () => {
         content: [
           { type: 'reasoning', text: 'private reasoning' },
           { type: 'text', text: 'calling' },
-          { type: 'tool-call', id: CallId('c1'), name: 'f', arguments: '{"a":1}' },
+          { type: 'tool-call', id: ToolCallId('c1'), name: 'f', arguments: '{"a":1}' },
         ],
         source: {
           kind: 'model',
@@ -415,35 +452,68 @@ describe('toPiContext', () => {
     expect(context.messages[0]).not.toHaveProperty('responseId')
   })
 
-  it('rejects unsupported replay-state versions with a stable error code', () => {
-    try {
-      toPiContext({
-        provider: 'deepseek',
-        model: 'm',
-        messages: [createMessage({
-          role: 'assistant',
-          content: [{ type: 'text', text: 'done' }],
-          source: {
-            kind: 'model',
-            ...{
-              provider: 'deepseek',
-              model: 'old',
-              replayState: { kind: 'pi-ai', version: 2 },
-            },
+  it('degrades unsupported replay-state versions to provider-neutral history', () => {
+    const onDegrade = vi.fn()
+    const context = toPiContext({
+      provider: 'deepseek',
+      model: 'm',
+      messages: [createMessage({
+        role: 'assistant',
+        content: [{ type: 'text', text: 'done' }],
+        source: {
+          kind: 'model',
+          ...{
+            provider: 'deepseek',
+            model: 'old',
+            replayState: { response: { kind: 'pi-ai', version: 3 }, blocks: [] },
           },
-        })],
-      })
-      expect.fail('expected invalid replay state')
-    } catch (error: unknown) {
-      expect(error).toBeInstanceOf(LlmError)
-      expect((error as LlmError).code).toBe('INVALID_REPLAY_STATE')
-      expect((error as Error).message).toContain('unsupported version 2')
-    }
+        },
+      })],
+    }, undefined, onDegrade)
+    expect(context.messages[0]).toMatchObject({
+      role: 'assistant',
+      api: 'dsh-foreign',
+      provider: 'deepseek',
+      model: 'old',
+      content: [{ type: 'text', text: 'done' }],
+    })
+    expect(onDegrade).toHaveBeenCalledWith(expect.stringContaining('unsupported version 3'))
   })
 
-  it('rejects replay metadata whose blocks do not match the durable content', () => {
+  it('degrades the flat pre-envelope replay state a legacy session log carries', () => {
+    const onDegrade = vi.fn()
+    const context = toPiContext({
+      provider: 'deepseek',
+      model: 'm',
+      messages: [createMessage({
+        role: 'assistant',
+        content: [{ type: 'text', text: 'done' }],
+        source: {
+          kind: 'model',
+          ...{
+            provider: 'deepseek',
+            model: 'deepseek-v4-flash',
+            replayState: {
+              kind: 'pi-ai',
+              version: 1,
+              api: 'openai-completions',
+              provider: 'deepseek',
+              model: 'deepseek-v4-flash',
+              stopReason: 'stop',
+              blocks: [{ type: 'text' }],
+            },
+          },
+        },
+      })],
+    }, undefined, onDegrade)
+    expect(context.messages[0]).toMatchObject({ role: 'assistant', api: 'dsh-foreign' })
+    expect(onDegrade).toHaveBeenCalledWith(expect.stringContaining('expected a response object'))
+  })
+
+  it('degrades replay metadata whose blocks do not match the durable content', () => {
+    const onDegrade = vi.fn()
     const state = toPiReplayState(assistant({ content: [{ type: 'text', text: 'done' }] }))
-    expect(() => toPiContext({
+    const context = toPiContext({
       provider: 'deepseek',
       model: 'm',
       messages: [createMessage({
@@ -454,12 +524,19 @@ describe('toPiContext', () => {
           ...{ provider: 'deepseek', model: 'deepseek-v4-flash', replayState: state },
         },
       })],
-    })).toThrow(/block 0 does not match assistant content/)
+    }, undefined, onDegrade)
+    expect(context.messages[0]).toMatchObject({
+      role: 'assistant',
+      api: 'dsh-foreign',
+      content: [{ type: 'thinking', thinking: 'done' }],
+    })
+    expect(onDegrade).toHaveBeenCalledWith(expect.stringContaining('block 0 does not match assistant content'))
   })
 
-  it('rejects replay metadata whose block count differs from durable content', () => {
+  it('degrades replay metadata whose block count differs from durable content', () => {
+    const onDegrade = vi.fn()
     const state = toPiReplayState(assistant())
-    expect(() => toPiContext({
+    const context = toPiContext({
       provider: 'deepseek',
       model: 'm',
       messages: [createMessage({
@@ -470,66 +547,34 @@ describe('toPiContext', () => {
           ...{ provider: 'deepseek', model: 'deepseek-v4-flash', replayState: state },
         },
       })],
-    })).toThrow(/block count does not match assistant content/)
+    }, undefined, onDegrade)
+    expect(context.messages[0]).toMatchObject({
+      role: 'assistant',
+      api: 'dsh-foreign',
+      provider: 'deepseek',
+      model: 'deepseek-v4-flash',
+      content: [{ type: 'text', text: 'done' }],
+      stopReason: 'stop',
+    })
+    expect(onDegrade).toHaveBeenCalledWith(expect.stringContaining('block count does not match assistant content'))
   })
 
-  const validReplay = {
+  const validResponse = {
     kind: 'pi-ai',
-    version: 1,
+    version: 2,
     api: 'openai-completions',
     provider: 'deepseek',
     model: 'deepseek-v4-flash',
     stopReason: 'stop',
-    blocks: [{ type: 'text' }],
   }
+  const validReplay = { response: validResponse, blocks: [{ type: 'text' }] }
 
-  it.each([
-    ['provider', { ...validReplay, provider: 'openai' }],
-    ['model', { ...validReplay, model: 'deepseek-v4-pro' }],
-  ])('rejects replay metadata whose %s differs from assistant source', (field, replayState) => {
-    try {
-      toPiContext({
-        provider: 'deepseek',
-        model: 'next-model',
-        messages: [createMessage({
-          role: 'assistant',
-          content: [{ type: 'text', text: 'done' }],
-          source: {
-            kind: 'model',
-            ...{ provider: 'deepseek', model: 'deepseek-v4-flash', replayState },
-          },
-        })],
-      })
-      expect.fail('expected invalid replay state')
-    } catch (error: unknown) {
-      expect(error).toBeInstanceOf(LlmError)
-      expect((error as LlmError).code).toBe('INVALID_REPLAY_STATE')
-      expect((error as Error).message).toContain(`${field} does not match assistant source`)
-    }
-  })
-
-  it.each([
-    ['number state', 1, 'expected an object'],
-    ['null state', null, 'expected an object'],
-    ['array state', [], 'expected an object'],
-    ['unknown kind', { ...validReplay, kind: 'other' }, 'unknown state kind'],
-    ['non-string api', { ...validReplay, api: 1 }, 'api must be a non-empty string'],
-    ['empty provider', { ...validReplay, provider: '' }, 'provider must be a non-empty string'],
-    ['missing model', { ...validReplay, model: undefined }, 'model must be a non-empty string'],
-    ['unknown stop reason', { ...validReplay, stopReason: 'pause' }, 'unknown stopReason'],
-    ['non-string response model', { ...validReplay, responseModel: 1 }, 'responseModel must be a string'],
-    ['non-string response id', { ...validReplay, responseId: 1 }, 'responseId must be a string'],
-    ['non-array blocks', { ...validReplay, blocks: 'text' }, 'blocks must be an array'],
-    ['number block', { ...validReplay, blocks: [1] }, 'block 0 must be an object'],
-    ['null block', { ...validReplay, blocks: [null] }, 'block 0 must be an object'],
-    ['array block', { ...validReplay, blocks: [[]] }, 'block 0 must be an object'],
-    ['unknown block type', { ...validReplay, blocks: [{ type: 'audio' }] }, 'block 0 has an unknown type'],
-    ['non-string signature', { ...validReplay, blocks: [{ type: 'text', textSignature: 1 }] }, 'textSignature must be a string'],
-    ['non-boolean redaction', { ...validReplay, blocks: [{ type: 'reasoning', redacted: 'yes' }] }, 'redacted must be boolean'],
-  ])('rejects malformed replay state: %s', (_name, replayState, message) => {
-    expect(() => toPiContext({
+  /** Convert with the given state and assert the message degraded to foreign with the given reason. */
+  function expectDegraded(replayState: unknown, message: string): void {
+    const onDegrade = vi.fn()
+    const context = toPiContext({
       provider: 'deepseek',
-      model: 'm',
+      model: 'next-model',
       messages: [createMessage({
         role: 'assistant',
         content: [{ type: 'text', text: 'done' }],
@@ -538,7 +583,45 @@ describe('toPiContext', () => {
           ...{ provider: 'deepseek', model: 'deepseek-v4-flash', replayState },
         },
       })],
-    })).toThrow(message)
+    }, undefined, onDegrade)
+    expect(context.messages[0]).toMatchObject({
+      role: 'assistant',
+      api: 'dsh-foreign',
+      content: [{ type: 'text', text: 'done' }],
+    })
+    expect(onDegrade).toHaveBeenCalledWith(expect.stringContaining(message))
+  }
+
+  it.each([
+    ['provider', { ...validReplay, response: { ...validResponse, provider: 'openai' } }],
+    ['model', { ...validReplay, response: { ...validResponse, model: 'deepseek-v4-pro' } }],
+  ])('degrades replay metadata whose %s differs from assistant source', (field, replayState) => {
+    expectDegraded(replayState, `${field} does not match assistant source`)
+  })
+
+  it.each([
+    ['number state', 1, 'expected a replay envelope'],
+    ['null state', null, 'expected a replay envelope'],
+    ['array state', [], 'expected a replay envelope'],
+    ['missing response', { blocks: [] }, 'expected a response object'],
+    ['array response', { ...validReplay, response: [] }, 'expected a response object'],
+    ['unknown kind', { ...validReplay, response: { ...validResponse, kind: 'other' } }, 'unknown state kind'],
+    ['non-string api', { ...validReplay, response: { ...validResponse, api: 1 } }, 'api must be a non-empty string'],
+    ['empty provider', { ...validReplay, response: { ...validResponse, provider: '' } }, 'provider must be a non-empty string'],
+    ['missing model', { ...validReplay, response: { ...validResponse, model: undefined } }, 'model must be a non-empty string'],
+    ['unknown stop reason', { ...validReplay, response: { ...validResponse, stopReason: 'pause' } }, 'unknown stopReason'],
+    ['non-string response model', { ...validReplay, response: { ...validResponse, responseModel: 1 } }, 'responseModel must be a string'],
+    ['non-string response id', { ...validReplay, response: { ...validResponse, responseId: 1 } }, 'responseId must be a string'],
+    ['missing blocks', { response: validResponse }, 'blocks must be an array'],
+    ['non-array blocks', { ...validReplay, blocks: 'text' }, 'blocks must be an array'],
+    ['number block', { ...validReplay, blocks: [1] }, 'block 0 must be an object'],
+    ['null block', { ...validReplay, blocks: [null] }, 'block 0 must be an object'],
+    ['array block', { ...validReplay, blocks: [[]] }, 'block 0 must be an object'],
+    ['unknown block type', { ...validReplay, blocks: [{ type: 'audio' }] }, 'block 0 has an unknown type'],
+    ['non-string signature', { ...validReplay, blocks: [{ type: 'text', textSignature: 1 }] }, 'textSignature must be a string'],
+    ['non-boolean redaction', { ...validReplay, blocks: [{ type: 'reasoning', redacted: 'yes' }] }, 'redacted must be boolean'],
+  ])('degrades malformed replay state: %s', (_name, replayState, message) => {
+    expectDegraded(replayState, message)
   })
 })
 
@@ -560,17 +643,19 @@ describe('toStreamChunks', () => {
       { type: 'block-start', index: 0, blockType: 'text' },
       { type: 'text-delta', index: 0, text: 'hi' },
       { type: 'block-end', index: 0, block: { type: 'text', text: 'hi' } },
-      { type: 'usage', usage: { inputTokens: 3, outputTokens: 2 } },
+      { type: 'usage', usage: { inputTokens: 3, outputTokens: 2, totalTokens: 5 } },
       {
         type: 'finish',
         reason: { kind: 'stop' },
         replayState: {
-          kind: 'pi-ai',
-          version: 1,
-          api: 'openai-completions',
-          provider: 'deepseek',
-          model: 'deepseek-v4-flash',
-          stopReason: 'stop',
+          response: {
+            kind: 'pi-ai',
+            version: 2,
+            api: 'openai-completions',
+            provider: 'deepseek',
+            model: 'deepseek-v4-flash',
+            stopReason: 'stop',
+          },
           blocks: [{ type: 'text' }],
         },
       },
@@ -609,17 +694,19 @@ describe('toStreamChunks', () => {
       { type: 'tool-call-delta', index: 0, id: 'call-1', name: 'f', argumentsDelta: '{"a"' },
       { type: 'tool-call-delta', index: 0, id: 'call-1', name: 'f', argumentsDelta: ':1}' },
       { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call-1', name: 'f', arguments: '{"a":1}' } },
-      { type: 'usage', usage: { inputTokens: 0, outputTokens: 0 } },
+      { type: 'usage', usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } },
       {
         type: 'finish',
         reason: { kind: 'tool-calls' },
         replayState: {
-          kind: 'pi-ai',
-          version: 1,
-          api: 'openai-completions',
-          provider: 'deepseek',
-          model: 'deepseek-v4-flash',
-          stopReason: 'toolUse',
+          response: {
+            kind: 'pi-ai',
+            version: 2,
+            api: 'openai-completions',
+            provider: 'deepseek',
+            model: 'deepseek-v4-flash',
+            stopReason: 'toolUse',
+          },
           blocks: [{ type: 'tool-call' }],
         },
       },
@@ -641,7 +728,7 @@ describe('toStreamChunks', () => {
       { type: 'error', reason: 'error', error },
     )))
     expect(chunks).toEqual([
-      { type: 'usage', usage: { inputTokens: 1, outputTokens: 0 } },
+      { type: 'usage', usage: { inputTokens: 1, outputTokens: 0, totalTokens: 1 } },
       { type: 'finish', reason: { kind: 'error', failure: { message: 'boom', code: 'PI_AI_ERROR' } } },
     ])
   })
@@ -675,6 +762,14 @@ describe('mapStopReason / mapUsage', () => {
     ['stop', { kind: 'stop' }],
     ['length', { kind: 'max-tokens' }],
     ['toolUse', { kind: 'tool-calls' }],
+    ['pending', {
+      kind: 'error',
+      failure: { message: 'pi-ai stream for model "deepseek-v4-flash" ended pending', code: 'PI_AI_ERROR' },
+    }],
+    ['deferred', {
+      kind: 'error',
+      failure: { message: 'pi-ai deferred response for model "deepseek-v4-flash" is not supported', code: 'PI_AI_ERROR' },
+    }],
     ['aborted', { kind: 'aborted', failure: { message: 'pi-ai stream aborted', code: 'ABORTED' } }],
   ] as const)('maps %s', (stopReason, expected) => {
     expect(mapStopReason(assistant({ stopReason, content: [{ type: 'text', text: 'ok' }] }))).toEqual(expected)
@@ -729,6 +824,16 @@ describe('mapStopReason / mapUsage', () => {
       stopReason: 'error',
       errorMessage: 'HTTP 400: invalid input: temperature exceeds maximum allowed value',
     }))).toMatchObject({ kind: 'error', failure: { code: 'INVALID_REQUEST' } })
+    expect(mapStopReason(assistant({ stopReason: 'error', errorMessage: 'HTTP 413: Payload Too Large' })))
+      .toMatchObject({ kind: 'error', failure: { code: 'INVALID_REQUEST' } })
+    expect(mapStopReason(assistant({
+      stopReason: 'error',
+      errorMessage: 'Failed to buffer the request body: length limit exceeded',
+    }))).toMatchObject({ kind: 'error', failure: { code: 'INVALID_REQUEST' } })
+    expect(mapStopReason(assistant({
+      stopReason: 'error',
+      errorMessage: 'vector length limit exceeded',
+    }))).toMatchObject({ kind: 'error', failure: { code: 'PI_AI_ERROR' } })
   })
 
   it.each([
@@ -785,10 +890,11 @@ describe('mapStopReason / mapUsage', () => {
     expect(mapUsage(usage(10, 5, 8, 2))).toEqual({
       inputTokens: 10,
       outputTokens: 5,
+      totalTokens: 25,
       cacheReadTokens: 8,
       cacheWriteTokens: 2,
     })
-    expect(mapUsage(usage(10, 5))).toEqual({ inputTokens: 10, outputTokens: 5 })
+    expect(mapUsage(usage(10, 5))).toEqual({ inputTokens: 10, outputTokens: 5, totalTokens: 15 })
   })
 })
 

@@ -2,18 +2,19 @@
 import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it, vi } from 'vitest'
 import { resolveSlotLabel } from '@deepseek-ai/dsh-client-ui-slots'
-import { SlotRegistry } from '@deepseek-ai/dsh-client-runtime/client'
+import { SlotRegistry } from '@deepseek-ai/dsh-client-ui-renderer/client'
 import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
-import { usePinnedBrowserLanguages } from '@deepseek-ai/dsh-client-test-runtime'
+import { TestRemote } from '@deepseek-ai/dsh-client-test-runtime'
+import { apply as settingsApply, inject as settingsInject } from '@deepseek-ai/dsh-client-ui-settings/client'
 import { apply, inject } from '@deepseek-ai/dsh-client-ui-settings-general/client'
 import { CloseLabel, HeaderContent, TriggerContent } from '../src/client/chrome.tsx'
 import { GeneralSection } from '../src/client/GeneralSection.tsx'
 import { SettingsDocumentAction } from '../src/client/SettingsDocumentAction.tsx'
 import type { SettingsDocumentActionInjected } from '../src/client/SettingsDocumentAction.tsx'
 
-// The service reads its initial locale from the browser; these specs assert
-// the shipped Chinese copy, so they state the browser they assume.
-usePinnedBrowserLanguages('zh-CN')
+// These specs assert the shipped Chinese copy. The lane has no jsdom `window`,
+// so browser-language detection never runs and a fresh LocaleRuntime opens on
+// FALLBACK_LOCALE (en); bench stages zh explicitly on the locale instead.
 
 /** The seats this plugin fills for a loopback browser (slot name → expected component). */
 const SEATS = [
@@ -28,26 +29,29 @@ async function bench(isLoopback = true) {
   const ctx = new Context()
   await ctx.plugin(SlotRegistry).await()
   const locale = new LocaleRuntime(ctx)
+  locale.setLocale('zh')
   ctx.provide('locale', locale)
   const settingsDescribe = vi.fn(() => Promise.resolve({
-    rpcId: 'settings-general' as never,
-    result: {
-      ok: true as const,
-      value: {
-        writable: true,
-        hasDocument: true,
-        namespaces: [],
-      },
+    ok: true as const,
+    value: {
+      writable: true,
+      hasDocument: true,
+      namespaces: [],
     },
   }))
   const settingsOpenDocument = vi.fn(() => Promise.resolve({
-    rpcId: 'settings-open' as never,
-    result: { ok: true as const, value: { opened: true as const } },
+    ok: true as const, value: { opened: true as const },
   }))
+  const remote = new TestRemote(ctx, {
+    settings: { describe: settingsDescribe, openSettingsDocument: settingsOpenDocument },
+  })
+  // The fixed Host facts the shell reads its loopback-only action from.
+  remote.$host = { home: undefined, isLoopback }
   ctx.provide('connection', {
-    api: { settings: { describe: settingsDescribe, openDocument: settingsOpenDocument } },
-    isLoopback,
+    state: { getSnapshot: () => 'connected', subscribe: () => () => {} },
+    reconnect: () => {},
   } as never)
+  await ctx.plugin({ inject: [...settingsInject], apply: settingsApply }).await()
   return { ctx, slots: ctx.get('slots') as SlotRegistry, locale, settingsDescribe, settingsOpenDocument }
 }
 
@@ -75,7 +79,7 @@ function generalEntry(slots: SlotRegistry) {
 
 describe('ui-settings-general apply', () => {
   it('declares the services it uses', () => {
-    expect(inject).toEqual(['slots', 'locale', 'connection'])
+    expect(inject).toEqual(['slots', 'locale', 'connection', 'remote', 'remote.settings', 'settingsScope'])
   })
 
   it('fills all five seats for declarations before or after apply', async () => {
@@ -97,7 +101,7 @@ describe('ui-settings-general apply', () => {
     const action = before.slots.entries('settings.action')[0]!
     const actionInjected = (action.inject as unknown as () => SettingsDocumentActionInjected)()
     expect(actionInjected.controller.store.getSnapshot().status).toBe('idle')
-    expect(actionInjected.useSnapshot).toEqual(expect.any(Function))
+    expect(actionInjected.hooks.snapshot).toBe(actionInjected.controller.store)
     // Copy rides the standard locale seat: every seat declares the namespace.
     for (const [name] of SEATS) {
       expect(before.slots.entries(name)[0]!.locale).toBe('settings')
@@ -123,8 +127,12 @@ describe('ui-settings-general apply', () => {
     const fiber = b.ctx.plugin({ inject: [...inject], apply })
     await fiber.await()
     expect(b.locale.bind('settings')('title')).toBe('设置')
+    expect(b.locale.bind('settings')('connection.error')).toBe('连接异常')
+    expect(b.locale.bind('settings')('connection.connecting')).toBe('连接中')
+    expect(b.locale.bind('settings')('connection.connected')).toBe('连接成功')
     b.locale.setLocale('en')
     expect(b.locale.bind('settings')('close')).toBe('Close')
+    expect(b.locale.bind('settings')('connection.reconnect')).toBe('Disconnected, reconnect now')
     b.locale.setLocale('zh')
     await fiber.dispose()
     // The (ns, locale) seats are free again — the dictionary disposer ran.
@@ -149,21 +157,22 @@ describe('ui-settings-general apply', () => {
     expect(resolveSlotLabel(generalEntry(b.slots)!.options.label)).toBe('通用设置')
   })
 
-  it('refreshes loaded document availability on reconnect without reading it eagerly', async () => {
+  it('reads availability from the shared mirror and follows its reconnect refresh', async () => {
     const b = await bench()
     declare(b.slots)
     await b.ctx.plugin({ inject: [...inject], apply }).await()
     const entry = b.slots.entries('settings.action')[0]!
     const { controller } = (entry.inject as unknown as () => SettingsDocumentActionInjected)()
-    b.ctx.emit('connection/reset')
-    expect(b.settingsDescribe).not.toHaveBeenCalled()
+    // The mirror read once at its own boot; the action's load adds no read.
+    await vi.waitFor(() => { expect(b.settingsDescribe).toHaveBeenCalledOnce() })
     await controller.load()
     expect(b.settingsDescribe).toHaveBeenCalledOnce()
+    expect(controller.store.getSnapshot().status).toBe('ready')
     b.ctx.emit('connection/reset')
     await vi.waitFor(() => { expect(b.settingsDescribe).toHaveBeenCalledTimes(2) })
   })
 
-  it('withholds the loopback-only document action off-loopback', async () => {
+  it('withholds the Host document action off-loopback', async () => {
     const b = await bench(false)
     declare(b.slots)
     const fiber = b.ctx.plugin({ inject: [...inject], apply })

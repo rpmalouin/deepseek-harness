@@ -24,13 +24,13 @@
       "path": "../ui-primitives"
     },
     {
-      "path": "../web-react"
+      "path": "../store"
     },
     {
-      "path": "../runtime"
+      "path": "../ui-renderer"
     },
     {
-      "path": "../../runtime-diagnostics/invariants"
+      "path": "../ui-session"
     }
   ]
 }

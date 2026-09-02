@@ -9,6 +9,9 @@
   ],
   "references": [
     {
+      "path": "../store"
+    },
+    {
       "path": "../../../vendor/cordis"
     },
     {
@@ -21,22 +24,10 @@
       "path": "../ui-slots"
     },
     {
-      "path": "../ui-attachment"
-    },
-    {
       "path": "../ui-primitives"
     },
     {
-      "path": "../schema-form"
-    },
-    {
-      "path": "../web-react"
-    },
-    {
-      "path": "../runtime"
-    },
-    {
-      "path": "../../runtime-diagnostics/invariants"
+      "path": "../ui-renderer"
     }
   ],
   "exclude": [

@@ -4,7 +4,7 @@ Status: implemented
 
 [English](2026-07-21-continuable-background-subagents.md) | 中文
 
-本记录已由[可继续的 subagent](2026-07-28-continuable-subagent-conversations.md)取代——后者以一个持久 Session 加至多一个进程内 Activation（驻留期）替换了其基于 Task 的 activation 模型、路由、取消和持久性语义。其服务放置与提供方功能策略此前已由[将 subagent 控制合并到 subagent 服务](../simplification/2026-07-26-merge-subagent-control-service.md)和[以意图命名的 subagent 继续执行操作](../simplification/2026-07-27-intent-named-subagent-continuation-operations.md)取代。仅持久 child 会话与 descriptor 的设计依据仍然有效。
+本记录已由[可继续的 subagent](2026-07-28-continuable-subagent-conversations.zh.md)取代——后者以一个持久 Session 加至多一个进程内 Activation（驻留期）替换了其基于 Task 的 activation 模型、路由、取消和持久性语义。其服务放置与提供方功能策略此前已由[将 subagent 控制合并到 subagent 服务](../simplification/2026-07-26-merge-subagent-control-service.zh.md)和[以意图命名的 subagent 继续执行操作](../simplification/2026-07-27-intent-named-subagent-continuation-operations.zh.md)取代。仅持久 child 会话与 descriptor 的设计依据仍然有效。
 
 ## 问题
 
@@ -27,7 +27,7 @@ durable child Session
 
 前台委派保持一次性行为。继续执行覆盖后台的进程内 spawn 和 fork child。每个 `tool-subagent` 实例都会选择 `backgroundMode: 'one-shot' | 'continuable'`；配置为可继续模式时，所挂载提供方必须具备 `resume` 功能，而可恢复的提供方仍可采用一次性后台策略。在下述 ACP（Agent Client Protocol）后续工作完成前，ACP child 仍保持一次性行为。
 
-`ctx.subagents` 是唯一的公开服务。普通 `start` 不感知 child 集合、Activation 与持久化：它校验提供方功能、解析一次性描述符、分发一个 run、观察 run 生命周期，并返回由持有方负责的 run。注入的内部继续执行管理器负责管理稳定的 child id、可继续描述符持久化与查找、Activation 生命周期，以及通过 `startContinuable` 和 `followup` 进行的路由；管理器自行组合 child 之前，提供方通过私有闭包提供准备数据。按提供方绑定的 `@deepseek-ai/dsh-tool-subagent` 插件及面向用户的适配器调用这些意图操作来处理可继续后台工作；前台和一次性后台委派使用普通 `start`。全局命名的模型工具是 `@deepseek-ai/dsh-tool-subagent-control` 中的可选轻量适配器，它是否存在不会决定是否启动可继续工作。parent 到 child 的枚举、一次性／可继续模式共享的描述符身份与 `list_agents` 属于[持久化 subagent 目录](2026-07-22-durable-subagent-catalog-and-list-agents.md)。
+`ctx.subagents` 是唯一的公开服务。普通 `start` 不感知 child 集合、Activation 与持久化：它校验提供方功能、解析一次性描述符、分发一个 run、观察 run 生命周期，并返回由持有方负责的 run。注入的内部继续执行管理器负责管理稳定的 child id、可继续描述符持久化与查找、Activation 生命周期，以及通过 `startContinuable` 和 `followup` 进行的路由；管理器自行组合 child 之前，提供方通过私有闭包提供准备数据。按提供方绑定的 `@deepseek-ai/dsh-tool-subagent` 插件及面向用户的适配器调用这些意图操作来处理可继续后台工作；前台和一次性后台委派使用普通 `start`。全局命名的模型工具是 `@deepseek-ai/dsh-tool-subagent-control` 中的可选轻量适配器，它是否存在不会决定是否启动可继续工作。parent 到 child 的枚举、一次性／可继续模式共享的描述符身份与 `list_agents` 属于[持久化 subagent 目录](2026-07-22-durable-subagent-catalog-and-list-agents.zh.md)。
 
 ### Task 与取消的所有权
 
@@ -35,7 +35,7 @@ durable child Session
 
 后续每个轮次都会创建另一个 Task。该轮 producer 持有的执行资源仅服务于这次激活，不属于 child 会话。它只会到达一次终态、只产生一个结果，也不会重新打开。Task 注册表中当前注册的那个存活 parent agent 实例仍是其 owner：dispose 该实例会取消、等待并移除其 Task。Task API 会授权 session id 与该 owner 匹配的调用方，但 id 相同的替代实例不会成为通知或资源清理目标。这一设计保留 `settleRun()` 约定，并使 Task 所拥有的存活 child 数量受并发工作量限制，而不是随历史会话数量增长。
 
-用户界面适配器打开 child 会话时，只读取持久化 transcript，不会仅为展示而恢复 agent。用户输入通过继续执行管理器，启动或加入与 parent 输入相同的 Task 激活。由用户启动的 Task 会保留当前加载的精确 parent Agent 作为通知目标，`job_output` 仍是唯一结果路径。只要 Task 尚未标记为已报告，现有完成监听器最多注入一条主动通知；`kill`、终态读取或终态等待都可能将其标记为已报告，并抑制这条通知。因此，仅允许在该 parent 实例保持存活时进行用户交互。可以比 parent 存活更久、并将结论显式合并回去的用户自有会话属于[交互式 side session](../../proposed/feature/2026-07-08-interactive-side-sessions.md)，不属于这一由 Task 持有的生命周期。
+用户界面适配器打开 child 会话时，只读取持久化 transcript，不会仅为展示而恢复 agent。用户输入通过继续执行管理器，启动或加入与 parent 输入相同的 Task 激活。由用户启动的 Task 会保留当前加载的精确 parent Agent 作为通知目标，`job_output` 仍是唯一结果路径。只要 Task 尚未标记为已报告，现有完成监听器最多注入一条主动通知；`kill`、终态读取或终态等待都可能将其标记为已报告，并抑制这条通知。因此，仅允许在该 parent 实例保持存活时进行用户交互。可以比 parent 存活更久、并将结论显式合并回去的用户自有会话属于[交互式 side session](../../proposed/feature/2026-07-08-interactive-side-sessions.zh.md)，不属于这一由 Task 持有的生命周期。
 
 如果没有附加任务控制器，`JobRegistry.start()` 会拒绝 producer。因此，接受 child 输入的用户界面适配器必须附加任务控制器，或运行于加载了 `@deepseek-ai/dsh-tool-jobs` 的部署中；仅加载 Task 服务并不足够。这项依赖是 parent 和用户启动的激活共用 Task 结果、取消和通知路径所付出的代价。
 
@@ -57,7 +57,7 @@ durable child Session
 
 ### 面向模型的 `send_message`
 
-模型获得一个由 `SubagentRuntime.followup()` 支撑的 `send_message(subagent_id, message)` 工具，与 `Agent` 上的意图动词一致。该服务操作负责在 steering 与恢复之间编排；它不同于 run 的 `SubagentRun.steer?()`，后者只能向已活跃的 run 发送消息。工具本身不执行生命周期路由。该工具将后续消息的来源标记为 `{ kind: 'coordinator', senderSessionId: parent.id }`，并转发 `{ source, signal }`；服务要求在一个选项对象中同时提供这两项信息。来源会贯穿在线 steering 和 cold resume 两条路径，而取消只控制尚未完成的在线投递等待，因为 cold resume Task 会立即返回，并自行负责后续取消。child 模型收到的仍是普通的 user role 内容，而持久化的来源信息可防止模型生成的后续消息被归类为直接用户输入。用户适配器则提供 `{ kind: 'user' }` 及其交互信号。该工具位于单独加载的 `@deepseek-ai/dsh-tool-subagent-control` 包中，因此按提供方绑定的 `@deepseek-ai/dsh-tool-subagent` 实例可以继续为 spawn、fork 或 ACP 注册不同的委派工具，而不会重复注册全局控制工具。
+模型获得一个由 `SubagentRuntime.sendMessage()` 支撑的全局 `send_message(agent_id, message)` 工具。确切在线 sender 只能指定其直接 parent 或直接可继续 child；服务负责相邻关系检查、冷恢复、固定 Steer 调度，以及持久化 `{ kind: 'agent-message', senderSessionId }` 来源信息。取消只负责 inbox 接受前的工作。用户适配器保持分离，因为浏览器编写的输入携带用户来源信息与请求身份，而不是 Agent 权限。该工具位于单独加载的 `@deepseek-ai/dsh-tool-subagent-control` 包中，因此按提供方绑定的 `@deepseek-ai/dsh-tool-subagent` 实例可以继续为 spawn、fork 或 ACP 注册不同的委派工具，而不会重复注册全局控制工具。
 
 - 如果 child 存在运行中的 Task 并支持在线消息，服务会调用 `run.steer(message, source)` 并返回现有 job id；它不会创建新 Task。
 - 如果 child 没有运行中的 Task，`send_message` 会创建新 Task，使用该消息从持久化存储恢复会话，并返回新的 job id。
@@ -71,9 +71,9 @@ durable child Session
 
 ### 持久化 child handle 与从持久化存储恢复
 
-继续执行管理器在创建 Task 前，通过 seam 的 `snapshotSubagentDescriptor()`（基于 [`snapshotJsonValue`](../../../../packages/core/session/src/json.ts) 构建）对每项描述符输入建立快照；这一边界与 Agent 消息现有的分离式无损 JSON 边界一致。作用于 child 作用域的 setup contribution——由进程内驱动前置安装的一次性 `agent/prompt-submit` 监听器——会在下游 prompt admission 能够阻止请求或抛出异常之前追加一个对模型隐藏的 `subagent/descriptor` 事件。admission 获准后才会开启 child 的初始轮次；admission 被拒绝时，描述符会作为轮次前的仅日志事实保留，并由该 activation 最终的必需检查点持久化。该事件不携带 `surfaceOp`，不进入模型历史，并在压缩替换 surface 历史时继续保留。只有在加载已知 child id 对应的 child 会话后，能在该 child 自身的后缀中（`seedLength` 之后，因此 fork seed 不会泄露祖先的描述符）得到受支持的描述符，且会话 header 将调用方标识为直接 parent 时，该 id 才可恢复。
+继续执行管理器在创建 Task 前，通过 seam 的 `snapshotSubagentDescriptor()`（基于 [`snapshotJsonValue`](../../../../packages/util/values/src/index.ts) 构建）对每项描述符输入建立快照；这一边界与 Agent 消息现有的分离式无损 JSON 边界一致。作用于 child 作用域的 setup contribution——由进程内驱动前置安装的一次性 `agent/prompt-submit` 监听器——会在下游 prompt admission 能够阻止请求或抛出异常之前追加一个对模型隐藏的 `subagent/descriptor` 事件。admission 获准后才会开启 child 的初始轮次；admission 被拒绝时，描述符会作为轮次前的仅日志事实保留，并由该 activation 最终的必需检查点持久化。该事件不携带 `surfaceOp`，不进入模型历史，并在压缩替换 surface 历史时继续保留。只有在加载已知 child id 对应的 child 会话后，能在其精确 `inheritedEventCount` 位置或之后得到受支持的描述符，从而阻止 fork seed 泄露祖先描述符，且会话 header 将调用方标识为直接 parent 时，该 id 才可恢复。
 
-版本化描述符的可继续分支（[descriptor.ts](../../../../packages/subagent/subagent/src/descriptor.ts) 中的 `SUBAGENT_DESCRIPTOR_VERSION`）携带 `mode: 'continuable'`、subagent 提供方名称、已解析的 child `agentOptions.provider` 和 `agentOptions.model`，以及可选的 `persona` 与 `toolFilter`。它不会对可通过声明合并扩展的 `AgentOptions` 对象建立快照：与此无关的扩展值不会仅因无法表示为 JSON 而导致继续执行失败。描述符会特意省略 `subagentDepth`；从持久化存储恢复时，系统依赖持久化 header 中的 `delegationDepth`，而不根据描述符重建深度。`outputSchema` 属于单次激活的结果约定，不属于持久化 child 组合配置。child header 仍是 child id、`cwd`、`parentSession`、`seedLength` 和 `delegationDepth` 的权威信息，持久化 child transcript 则负责保存 fork seed 和后续历史。[`delegationDepthOf()`](../../../../packages/subagent/subagent/src/index.ts) 会在 header 值和运行时值中取最大值，因此重建后的运行时选项可以加深持久化值，但绝不能降低它，恢复后的 child 无法重新获得顶层委派预算。
+版本化描述符的可继续分支（[descriptor.ts](../../../../packages/subagent/subagent/src/descriptor.ts) 中的 `SUBAGENT_DESCRIPTOR_VERSION`）携带 `mode: 'continuable'`、subagent 提供方名称、已解析的 child `agentOptions.provider` 和 `agentOptions.model`，以及可选的 `persona` 与 `toolFilter`。它不会对可通过声明合并扩展的 `AgentOptions` 对象建立快照：与此无关的扩展值不会仅因无法表示为 JSON 而导致继续执行失败。描述符会特意省略 `subagentDepth`；从持久化存储恢复时，系统依赖持久化 header 中的 `delegationDepth`，而不根据描述符重建深度。`outputSchema` 属于单次激活的结果约定，不属于持久化 child 组合配置。child header 仍是 child id、`cwd`、`parentSession`、`isSeeded` 和 `delegationDepth` 的权威信息；含正文的持久化 metadata 拥有精确 `inheritedEventCount`，child transcript 则负责保存 fork seed 和后续历史。[`delegationDepthOf()`](../../../../packages/subagent/subagent/src/index.ts) 会在 header 值和运行时值中取最大值，因此重建后的运行时选项可以加深持久化值，但绝不能降低它，恢复后的 child 无法重新获得顶层委派预算。
 
 从持久化存储恢复不能依赖 `SubagentRun` 的可选方法，因为该 run 已被 dispose，并且进程重启后不会保留。run 表示一次可 dispose 的激活，只暴露作用于当前激活的操作。`SubagentRun.steer?()` 这一名称明确指代提供确认语义且仅适用于在线消息的功能，以免该功能与服务编排或面向模型的工具混淆。
 
@@ -103,7 +103,7 @@ Task 记录和活跃 run 关联都位于进程内。持久化使 child 会话可
 
 **在已 dispose 的 run 上保留 `resume?()`。** 如果仅为调用 `resume()` 而保留已 dispose 的 `SubagentRun`，旧 run 会同时充当持久化 child handle，而且进程重启后无法重建该对象。由服务分发、提供方重建，可明确表达持久化边界。
 
-**将控制编排放在 `SubagentRuntime` 上。** 这一服务放置方案即[服务合并决策](../simplification/2026-07-26-merge-subagent-control-service.md)；[意图操作细化](../simplification/2026-07-27-intent-named-subagent-continuation-operations.md)将提供方 start／resume 分发的复用限制在服务内部，同时将可选的 Task 与持久化工作隔离在注入的内部管理器中。
+**将控制编排放在 `SubagentRuntime` 上。** 这一服务放置方案即[服务合并决策](../simplification/2026-07-26-merge-subagent-control-service.zh.md)；[意图操作细化](../simplification/2026-07-27-intent-named-subagent-continuation-operations.zh.md)将提供方 start／resume 分发的复用限制在服务内部，同时将可选的 Task 与持久化工作隔离在注入的内部管理器中。
 
 **增加显式激活阶段。** 公开的 `starting`／`running`／`settling` 状态可以准确描述准入和清理，但会引入实现本身并不需要的生命周期协议。同步安装关联无需暴露这些阶段，即可消除进程内重复的 cold resume。
 
@@ -112,7 +112,7 @@ Task 记录和活跃 run 关联都位于进程内。持久化使 child 会话可
 - `packages/subagent/subagent-in-process-driver/tests/subagent-in-process-driver.spec.ts` 固定可继续执行的持久性边界：缺少 flush 监听器、flush 监听器已脱离或监听器持续失败时，均会以 `DURABILITY_FAILED` 拒绝；循环检查点的瞬时失败可在最终确认成功后继续完成，发生取消时最终检查点无论成功还是失败都由取消优先决定结果，resume 同样会确认持久性，而前台运行仍采用尽力而为策略。`packages/subagent/subagent/tests/continuation.spec.ts` 以无密钥方式驱动真实栈（agent loop、JSONL 持久化、spawn／fork 提供方、Task 服务和 `ctx.subagents`）：初始及恢复后的激活都会创建新 Task，并在进入终态前 dispose 各自的 run；描述符事件位于轮次前、对模型隐藏、带版本、在服务分配的 child id 下持久化，并在初始 prompt admission 阻止请求或抛出异常时仍保留；取消、steering、cold follow-up、授权、所有权冲突与 resume 竞态保留上述约定。
 - `packages/subagent/tool-subagent-control/tests/tool-subagent-control.spec.ts` 固定 `send_message` 的 schema、coordinator 来源标记、两种路由渲染、未送达失败、无 agent 时的拒绝，以及 HMR（热模块替换）dispose。
 - `packages/subagent/tool-subagent/tests/tool-subagent.spec.ts` 覆盖配置的后台路由：可继续模式要求提供方可恢复，并在不要求 `send_message` 的情况下返回两个 id；即使提供方可以恢复，一次性模式仍保持普通的 Task 确认消息；它还固定 Task 服务集成及面向模型的 Task 控制工具。
-- 无密钥 ACP 快照场景 `subagent-continuable`（examples/acp-agent）固定模型可见的 transcript：双 id 确认消息、最终持久性确认失败（该失败通过 `job_output` 呈现，且不包含未经确认的 child 输出），以及一次 `send_message` 后续操作——其已启动的 Task 会带着「id 不可用」失败。
+- 无密钥 SDK 快照场景 [`subagent-continuable`](../../../../snapshots/sdk/subagent-continuable/)固定模型可见的 transcript：双 id 确认消息、最终持久性确认失败（该失败通过 `job_output` 呈现，且不包含未经确认的 child 输出），以及一次 `send_message` 后续操作——其已启动的 Task 会带着「id 不可用」失败。
 
 ## 影响
 

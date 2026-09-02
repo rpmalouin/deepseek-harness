@@ -12,28 +12,34 @@
       "path": "../../../vendor/cordis"
     },
     {
+      "path": "../../../vendor/schemastery"
+    },
+    {
       "path": "../ui-slots"
     },
     {
       "path": "../ui-primitives"
     },
     {
-      "path": "../runtime"
+      "path": "../ui-renderer"
+    },
+    {
+      "path": "../ui-session"
+    },
+    {
+      "path": "../store"
     },
     {
       "path": "../ui-settings"
     },
     {
-      "path": "../web-react"
-    },
-    {
       "path": "../locale"
     },
     {
-      "path": "../../settings/settings"
+      "path": "../connection/tsconfig.client.json"
     },
     {
-      "path": "../../runtime-diagnostics/invariants"
+      "path": "../../settings/settings"
     },
     {
       "path": "../../api/remotes/tsconfig.client.json"

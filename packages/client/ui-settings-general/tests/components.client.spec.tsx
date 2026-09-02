@@ -1,13 +1,20 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { bindSnapshotSelector } from '@deepseek-ai/dsh-client-web-react'
+import { bindSnapshotSelector, RemoteError } from '@deepseek-ai/dsh-client-test-runtime'
 import type { GeneralSectionComponentProps } from '../src/client/GeneralSection.tsx'
 import { GeneralSection } from '../src/client/GeneralSection.tsx'
 import { CloseLabel, HeaderContent, TriggerContent } from '../src/client/chrome.tsx'
 import type { TriggerContentProps } from '../src/client/chrome.tsx'
 import { SettingsDocumentAction } from '../src/client/SettingsDocumentAction.tsx'
+import { SettingsDescribeMirror } from '@deepseek-ai/dsh-client-ui-settings/src/client/settings-mirror.ts'
 import { SettingsDocumentStore } from '../src/client/settings-document-store.ts'
+
+/** Store over a real mirror derived from the same scripted context. */
+function derivedDocumentStore(remote: object) {
+  const ctx = { remote } as never
+  return new SettingsDocumentStore(ctx, new SettingsDescribeMirror(ctx))
+}
 import { en } from '../src/client/locales.ts'
 
 afterEach(cleanup)
@@ -18,7 +25,10 @@ const t: TriggerContentProps['t'] = key => (en as Record<string, string>)[key] ?
 
 // Global standard kit stubs: none of these components consume the hooks.
 const unusedHook = (() => { throw new Error('unused by settings-general components') }) as never
-const kit = { useSessions: unusedHook, useWorkspaces: unusedHook }
+type AttentionSnapshot = Parameters<Parameters<TriggerContentProps['useSessionPendingInteraction']>[0]>[0]
+const noAttention: AttentionSnapshot = new Map()
+const useSessionPendingInteraction: TriggerContentProps['useSessionPendingInteraction'] = selector => selector(noAttention)
+const kit = { useSessions: unusedHook, useSessionPendingInteraction, useWorkspaces: unusedHook }
 
 describe('chrome content', () => {
   it('TriggerContent renders the icon with the label in the wide column', () => {
@@ -61,21 +71,17 @@ describe('GeneralSection', () => {
 describe('SettingsDocumentAction', () => {
   it('appears only for a file-backed provider and requests its Host-owned document', async () => {
     const openDocument = vi.fn(() => Promise.resolve({
-      rpcId: 'document-open' as never,
-      result: { ok: true as const, value: { opened: true as const } },
+      ok: true as const, value: { opened: true as const },
     }))
-    const controller = new SettingsDocumentStore({
+    const controller = derivedDocumentStore({
       settings: {
         describe: vi.fn(() => Promise.resolve({
-          rpcId: 'document-action' as never,
-          result: {
-            ok: true as const,
-            value: { writable: true, hasDocument: true, namespaces: [] },
-          },
+          ok: true as const,
+          value: { writable: true, hasDocument: true, namespaces: [] },
         })),
-        openDocument,
+        openSettingsDocument: openDocument,
       },
-    } as never)
+    })
     render(<SettingsDocumentAction
       {...kit}
       t={t}
@@ -84,25 +90,16 @@ describe('SettingsDocumentAction', () => {
     />)
     const action = await screen.findByRole('button', { name: 'Open configuration file' })
     fireEvent.click(action)
-    await waitFor(() => { expect(openDocument).toHaveBeenCalledWith({}) })
+    await waitFor(() => { expect(openDocument).toHaveBeenCalledWith() })
   })
 
-  it('stays absent without a document and retries availability after remount', async () => {
+  it('stays absent without a document and follows a mirror refresh to available', async () => {
     const describe = vi.fn()
-      .mockResolvedValueOnce({
-        rpcId: 'document-action-absent' as never,
-        result: { ok: true as const, value: { writable: true, hasDocument: false, namespaces: [] } },
-      })
-      .mockResolvedValueOnce({
-        rpcId: 'document-action-ready' as never,
-        result: { ok: true as const, value: { writable: true, hasDocument: true, namespaces: [] } },
-      })
-    const controller = new SettingsDocumentStore({
-      settings: {
-        describe,
-        openDocument: vi.fn(),
-      },
-    } as never)
+      .mockResolvedValueOnce({ ok: true as const, value: { writable: true, hasDocument: false, namespaces: [] } })
+      .mockResolvedValueOnce({ ok: true as const, value: { writable: true, hasDocument: true, namespaces: [] } })
+    const ctx = { remote: { settings: { describe, openSettingsDocument: vi.fn() } } } as never
+    const mirror = new SettingsDescribeMirror(ctx)
+    const controller = new SettingsDocumentStore(ctx, mirror)
     const first = render(<SettingsDocumentAction
       {...kit}
       t={t}
@@ -118,26 +115,28 @@ describe('SettingsDocumentAction', () => {
       controller={controller}
       useSnapshot={bindSnapshotSelector(controller.store)}
     />)
+    // A remount alone re-reads nothing; availability moves with the mirror's
+    // own refresh (a document commit or reconnect in production).
+    await waitFor(() => { expect(controller.store.getSnapshot().status).toBe('unavailable') })
+    expect(describe).toHaveBeenCalledTimes(1)
+    await mirror.load()
     expect(await screen.findByRole('button', { name: 'Open configuration file' })).toBeTruthy()
     expect(describe).toHaveBeenCalledTimes(2)
   })
 
   it('keeps the action available and reports a native-open failure', async () => {
-    const controller = new SettingsDocumentStore({
+    const controller = derivedDocumentStore({
       settings: {
         describe: vi.fn(() => Promise.resolve({
-          rpcId: 'document-action' as never,
-          result: {
-            ok: true as const,
-            value: { writable: true, hasDocument: true, namespaces: [] },
-          },
+          ok: true as const,
+          value: { writable: true, hasDocument: true, namespaces: [] },
         })),
-        openDocument: vi.fn(() => Promise.resolve({
-          rpcId: 'document-open-failed' as never,
-          result: { ok: false as const, error: { code: 'internal' as const, message: 'xdg-open missing', details: {} } },
+        openSettingsDocument: vi.fn(() => Promise.resolve({
+          ok: false as const,
+          error: new RemoteError('gateway/internal', 'xdg-open missing', {}),
         })),
       },
-    } as never)
+    })
     render(<SettingsDocumentAction
       {...kit}
       t={t}

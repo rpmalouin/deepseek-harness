@@ -6,7 +6,12 @@ import { tmpdir } from 'node:os'
 import { PassThrough, Writable } from 'node:stream'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import * as agentCore from '@deepseek-ai/dsh-agent-spine-demo'
+import Loader from '@deepseek-ai/cordis-plugin-loader'
+import AgentLoop from '@deepseek-ai/dsh-agent-loop'
+import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
+import { LlmAdapter } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import * as jsonrpc from '../src/index.ts'
 
@@ -38,6 +43,13 @@ interface ApplyHarness {
   dispose(): Promise<void>
 }
 
+/** Adapter whose route registration is the delayed Loader entry's readiness fact. */
+class DelayedAdapter extends LlmAdapter {
+  async * stream(_options: GenerateOptions): AsyncIterable<StreamChunk> {
+    throw new Error('not exercised')
+  }
+}
+
 /** Poll asynchronous output for up to five seconds. */
 async function waitFor<T>(get: () => T | undefined, description: string): Promise<T> {
   const deadline = Date.now() + 5000
@@ -57,12 +69,19 @@ async function settle(): Promise<void> {
 /** Mount the real plugin on a minimal harness with in-memory stdio and exit. */
 async function mountPlugin(
   storageDir: string,
-  options: { writeDelayMs?: number; failFlush?: boolean } = {},
+  options: {
+    writeDelayMs?: number
+    failFlush?: boolean
+    beforeServer?: (ctx: Context) => Promise<void> | void
+  } = {},
 ): Promise<ApplyHarness> {
   const ctx = new Context()
-  await ctx.plugin(agentCore, { workspaceContext: false })
+  await mountAgentLoopTestDependencies(ctx)
+  await ctx.plugin(SessionProjectionRegistry)
+  await ctx.plugin(AgentLoop, { agents: [] })
   await ctx.plugin(JsonlSessionPersistence, { root: storageDir })
   await new Promise(resolve => setTimeout(resolve, 50))
+  await options.beforeServer?.(ctx)
 
   const input = new PassThrough()
   const events: WireEvent[] = []
@@ -101,7 +120,11 @@ async function mountPlugin(
   const exit = (code: number): void => { events.push({ kind: 'exit', code }) }
 
   ctx.effect(() => () => { events.push({ kind: 'root-disposed' }) }, 'jsonrpc test root-disposal witness')
-  const fiber = await ctx.plugin(jsonrpc, { input, output, exit })
+  const fiber = await ctx.plugin(jsonrpc, {
+    input,
+    output,
+    exit,
+  })
 
   const frames = (): Record<string, unknown>[] =>
     events.flatMap(event => event.kind === 'frame' ? [event.frame] : [])
@@ -165,6 +188,61 @@ describe('dsh-sdk-jsonrpc-server plugin apply', () => {
       })
       expect(harness.exits()).toEqual([])
     } finally {
+      await harness.dispose()
+      await rm(storageDir, { recursive: true, force: true })
+    }
+  })
+
+  it('waits for Loader-owned adapter registration before initialize', async () => {
+    const storageDir = await mkdtemp(join(tmpdir(), 'dsh-jsonrpc-apply-readiness-'))
+    vi.stubEnv('DEEPSEEK_API_KEY', 'test-key')
+    let markStarted!: () => void
+    let release!: () => void
+    const started = new Promise<void>((resolve) => { markStarted = resolve })
+    const ready = new Promise<void>((resolve) => { release = resolve })
+    let delayedEntry: Promise<string> | undefined
+    const harness = await mountPlugin(storageDir, {
+      beforeServer: async (ctx) => {
+        await ctx.plugin(Loader)
+        ctx.loader.builtins['delayed-readiness'] = {
+          inject: ['llm'],
+          async apply(entryCtx: Context) {
+            markStarted()
+            await ready
+            entryCtx.llm.registerAdapter(['delayed-private'], new DelayedAdapter())
+          },
+        }
+        delayedEntry = ctx.loader.create({ name: 'cordis:delayed-readiness' })
+        await started
+      },
+    })
+    try {
+      const initialize = {
+        jsonrpc: '2.0',
+        id: 'init-delayed',
+        method: 'initialize',
+        params: { cwd: storageDir, provider: 'delayed-private', model: 'apply-model' },
+      }
+      const probe = { jsonrpc: '2.0', id: 'probe-during-delay', method: 'nope/unknown' }
+      harness.sendRaw(`${JSON.stringify(initialize)}\n${JSON.stringify(probe)}\n`)
+
+      // The transport processes independent requests concurrently. Receiving
+      // this later probe proves the preceding initialize handler has reached
+      // its Loader wait, without relying on a scheduler delay.
+      await harness.waitForFrame(frame => frame.id === 'probe-during-delay', 'probe while initialize waits')
+      expect(harness.frames().some(frame => frame.id === 'init-delayed')).toBe(false)
+
+      release()
+      await delayedEntry
+      const response = await harness.waitForFrame(frame => frame.id === 'init-delayed', 'initialize response after Loader settlement')
+      expect(response).toMatchObject({
+        id: 'init-delayed',
+        result: { serverInfo: { name: 'deepseek-harness-sdk-runtime' } },
+      })
+      expect(harness.ctx.llm.listProviders()).toContainEqual({ id: 'delayed-private', name: 'delayed-private' })
+    } finally {
+      release()
+      await Promise.allSettled(delayedEntry === undefined ? [] : [delayedEntry])
       await harness.dispose()
       await rm(storageDir, { recursive: true, force: true })
     }

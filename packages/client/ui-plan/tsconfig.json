@@ -15,9 +15,6 @@
       "path": "../../../vendor/cordis"
     },
     {
-      "path": "../runtime"
-    },
-    {
       "path": "../locale"
     },
     {
@@ -27,16 +24,16 @@
       "path": "../ui-primitives"
     },
     {
+      "path": "../ui-renderer"
+    },
+    {
+      "path": "../ui-session"
+    },
+    {
       "path": "../ui-slots"
     },
     {
-      "path": "../web-react"
-    },
-    {
       "path": "../../plan/plan-mode"
-    },
-    {
-      "path": "../../runtime-diagnostics/invariants"
     }
   ]
 }

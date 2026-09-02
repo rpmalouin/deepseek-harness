@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-// AttachmentRail behavior in the jsdom lane: item rendering and callbacks,
-// arrow paging over stubbed scroll geometry (jsdom lays nothing out), the
-// exclusive vertical-wheel pan, and the new-item end reveal.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render } from '@testing-library/react'
@@ -108,6 +105,15 @@ describe('AttachmentRail', () => {
     act(() => { observers.at(-1)!.callback([], undefined as never) })
     expect(view.getByLabelText('向左滚动图片')).toBeTruthy()
     expect(view.getByLabelText('向右滚动图片')).toBeTruthy()
+  })
+
+  it('keeps scrolling available when ResizeObserver is unavailable', () => {
+    vi.stubGlobal('ResizeObserver', undefined)
+    const view = render(
+      <AttachmentRail items={[item('a')]} labels={labels} onOpen={vi.fn()} onRemove={vi.fn()} />,
+    )
+    expect(view.getByRole('group', { name: '待发送图片' })).toBeTruthy()
+    view.unmount()
   })
 
   it('pans horizontally on a vertical wheel, consuming the event, with clamped normalized travel', () => {

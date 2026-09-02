@@ -1,26 +1,15 @@
-/**
- * Subagent reference plugin, browser half: registers the '@' source —
- * candidates filtered from the session list snapshot's running children
- * (zero RPC; the list rides the plugin's root-context sessions service, the
- * scoped session comes from the per-call projection), pick inserts the
- * literal `@label ` text (plain-text-reference decision, see
- * .agents/notes/implemented/architecture/2026-07-25-web-input-machine-and-slash-pipeline.md:
- * the draft carries plain text, chip
- * visuals are derived by scanning against the source lexicon, and the
- * prompt ships the same literal). Consumption semantics stay with future
- * business work. No adjudication hooks: subagent
- * references never enter command adjudication.
- */
-import type {
-  ClientContext, SessionId, SubagentAddress,
-} from '@deepseek-ai/dsh-client-runtime/client'
+/** Web subagent catalog, navigation, and addressed-session composer owner. */
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
+import type { SubagentAddress } from '@deepseek-ai/dsh-subagent/client'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { ComposerChainProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
-import type { ClientSessionContext, InputTriggerServiceContract, InputTriggerSource } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
-import { SubagentCatalogAction, type SubagentCatalogInjected } from './SubagentCatalogAction.tsx'
+import { SubagentHeaderLineage, type SubagentCatalogInjected } from './SubagentHeaderLineage.tsx'
 import {
   SubagentReadOnlyComposer, type SubagentReadOnlyMatch,
 } from './SubagentReadOnlyComposer.tsx'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type {} from '@deepseek-ai/dsh-client-ui-session/client'
 import { en, NS, zh, type SubagentKey } from './locales.ts'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
@@ -31,21 +20,24 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 }
 
 export type {
-  SubagentCatalogActionProps, SubagentCatalogInjected,
-} from './SubagentCatalogAction.tsx'
+  SubagentCatalogInjected, SubagentHeaderLineageProps,
+} from './SubagentHeaderLineage.tsx'
 export type {
   SubagentReadOnlyComposerProps, SubagentReadOnlyMatch,
 } from './SubagentReadOnlyComposer.tsx'
 
-/** Required services for references, conversation slots, and session navigation. */
-export const inject = ['inputTriggers', 'sessions', 'slots', 'locale']
+/** Required services for conversation slots and session navigation. */
+export const inject = ['sessions', 'slots', 'locale']
 
 /** Claim the composer for one-shot history or an unavailable continuation owner. */
 function selectReadOnlySubagent(owner: ComposerChainProps): SubagentReadOnlyMatch | null {
   const subagent = owner.session?.subagent
   if (subagent === undefined || subagent === null) return null
   if (subagent.address.mode === 'one-shot') return { reason: 'one-shot' }
-  if (subagent.parentAvailable) return null
+  // The parent catalog is fetched ahead of the selected Session. Until it
+  // resolves, leave the normal disabled composer in place instead of briefly
+  // claiming that the parent is offline.
+  if (subagent.parentAvailable !== false) return null
   // A RUNNING parent-offline continuable child keeps the default composer:
   // its input is disabled there, but the same primary Stop stays available so
   // the child can be interrupted. Once it stops, this takeover returns.
@@ -53,49 +45,12 @@ function selectReadOnlySubagent(owner: ComposerChainProps): SubagentReadOnlyMatc
 }
 
 /**
- * Client plugin body: register the '@' subagent source over the root session list.
+ * Client plugin body: register the subagent catalog and read-only composer seats.
  * @param ctx - client root context.
  */
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'ui-subagent: dictionaries')
   const sessions = ctx.sessions
-  // Child labels live on the session list (parentId lineage + displayTitle),
-  // not the conversation snapshot — the list store is the zero-RPC candidate feed.
-  const childLabels = (session: ClientSessionContext, query: string): string[] => {
-    const { byId } = sessions.list.getSnapshot()
-    return Object.values(byId)
-      .filter(child => child.parentId === session.sessionId && child.running && child.displayTitle.includes(query))
-      .map(child => child.displayTitle)
-  }
-  const source: InputTriggerSource = {
-    trigger: '@',
-    name: 'subagent',
-    candidates(session, { query }) {
-      return Promise.resolve(childLabels(session, query).map(name => ({ name })))
-    },
-    lexicon(session) {
-      // The list snapshot is always warm — the full running-children roster.
-      return childLabels(session, '')
-    },
-    subscribeLexicon(_session, listener) {
-      // The roll derives from the list snapshot, so its change feed IS the list's.
-      return sessions.list.subscribe(listener)
-    },
-    onPick({ candidate }) {
-      // Plain-text reference: the literal lands in the draft
-      // and ships to the model verbatim (trailing space closes the token).
-      return { text: `@${candidate.name} ` }
-    },
-    codec: {
-      clipboardText: ref => `@${ref}`,
-      // TODO: serialize returns the raw label until the '@' consumption
-      // feature defines a model representation.
-      serialize: ref => Promise.resolve(`@${ref}`),
-    },
-  }
-  const inputTriggers = ctx.get('inputTriggers') as InputTriggerServiceContract
-  ctx.effect(() => inputTriggers.registerSource(source), 'ui-subagent: @ source')
-
   const catalogActions = (_parentSessionId: SessionId): SubagentCatalogInjected => ({
     openChild(address: SubagentAddress) {
       sessions.openSubagent(address)
@@ -108,14 +63,12 @@ export function apply(ctx: ClientContext): void {
     },
   })
   ctx.slots.inject(
-    'conversation.session.header.actions',
+    'conversation.session.header.lineage',
     () => ctx.slots.register({
-      name: 'conversation.session.header.actions',
-      id: 'subagent-catalog',
-      order: 10,
+      name: 'conversation.session.header.lineage',
       locale: NS,
       inject: catalogActions,
-    }, SubagentCatalogAction),
+    }, SubagentHeaderLineage),
   )
   ctx.slots.inject(
     'conversation.composer',

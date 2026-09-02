@@ -1,10 +1,13 @@
 /**
- * Pins shared client-bundle preset rules: the module-edge purity gate and
- * the physical watch dependencies hidden behind virtual CSS Modules.
+ * Pins shared client-bundle preset rules: module-edge purity, source-map
+ * chaining, and physical watch dependencies hidden behind virtual CSS Modules.
  */
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it, vi } from 'vitest'
-import { CLIENT_EXTERNALS, clientBundle } from '../packages/client/tsdown.client.ts'
+import { clientBundle, requestedExternals } from '../packages/client/tsdown.client.ts'
 
 type ResolveId = (source: string) => null | { id: string; external: boolean }
 
@@ -14,7 +17,15 @@ interface CssModulePlugin {
   load?: (this: { addWatchFile: (id: string) => void }, id: string) => Promise<unknown>
 }
 
-function clientConfigs(id = '@deepseek-ai/dsh-client-test') {
+interface SourceMapPlugin {
+  name: string
+  load?: (id: string) => Promise<unknown>
+}
+
+/** A representative dynamic bundle using the shared client baseline. */
+const REQUESTING_PACKAGE = '@deepseek-ai/dsh-client-ui-conversation'
+
+function clientConfigs(id = REQUESTING_PACKAGE) {
   return clientBundle(id, ['lib/types/index.js', 'lib/types/invariant.js'])(
     { env: { DSH_BUILD_FACE: 'client' } },
   ).filter(config => config.platform === 'browser')
@@ -36,10 +47,10 @@ function clientSourceMapPath(packagePath: string): string {
   return fileURLToPath(new URL(`../packages/${packagePath}/lib/client.js.map`, import.meta.url))
 }
 
-function purityResolveId(): ResolveId {
+function purityResolveId(id = REQUESTING_PACKAGE): ResolveId {
   // libEntry is spelled at every call site (no default) so the
   // package-invariants text check can see the invariant entry per package.
-  const configs = clientConfigs()
+  const configs = clientConfigs(id)
   const plugins = (configs[0] as { plugins: { name: string; resolveId?: unknown }[] }).plugins
   const gate = plugins.find(p => p.name === 'dsh-client-bundle-purity')
   if (gate?.resolveId === undefined) throw new Error('purity plugin missing from client config')
@@ -56,25 +67,38 @@ function cssModulePlugin(): CssModulePlugin {
   return plugin
 }
 
+function sourceMapPlugin(): SourceMapPlugin {
+  const configs = clientConfigs()
+  const plugins = (configs[0] as { plugins: SourceMapPlugin[] }).plugins
+  const plugin = plugins.find(candidate => candidate.name === 'dsh-tsc-sourcemap')
+  if (plugin?.load === undefined) throw new Error('tsc sourcemap plugin missing from client config')
+  return plugin
+}
+
 describe('client bundle purity gate', () => {
   const resolveId = purityResolveId()
 
-  it('leaves platform table entries and non-scoped specifiers alone', () => {
+  it('leaves default externals and non-scoped specifiers alone', () => {
+    expect(resolveId('@deepseek-ai/dsh-client-store')).toBeNull()
     expect(resolveId('@deepseek-ai/dsh-client-ui-slots')).toBeNull()
-    expect(resolveId('@deepseek-ai/dsh-client-web-react')).toBeNull()
     expect(resolveId('@deepseek-ai/dsh-client-ui-primitives')).toBeNull()
     expect(resolveId('react')).toBeNull()
     expect(resolveId('zod')).toBeNull()
   })
 
-  it('rejects retired table entries (web-react/store left the 8-entry seed)', () => {
+  it('rejects the retired web-react platform package', () => {
+    expect(() => resolveId('@deepseek-ai/dsh-client-web-react')).toThrow(/purity/)
     expect(() => resolveId('@deepseek-ai/dsh-client-web-react/store')).toThrow(/purity/)
   })
 
-  it('lets inline-safe wire layers inline', () => {
-    expect(resolveId('@deepseek-ai/dsh-host-apiproxy/api')).toBeNull()
+  it('lets inline-safe libraries inline', () => {
     expect(resolveId('@deepseek-ai/dsh-session/surface')).toBeNull()
     expect(resolveId('@deepseek-ai/dsh-brand')).toBeNull()
+    expect(resolveId('@deepseek-ai/dsh-deque')).toBeNull()
+    expect(resolveId('@deepseek-ai/dsh-util-values')).toBeNull()
+    expect(resolveId('@deepseek-ai/dsh-token-meter/client')).toBeNull()
+    expect(() => resolveId('@deepseek-ai/dsh-token-meter')).toThrow(/purity/)
+    expect(() => resolveId('@deepseek-ai/dsh-token-meter/client/internal')).toThrow(/purity/)
   })
 
   it('lets exact generated Remote contributions inline without admitting their package implementation', () => {
@@ -89,17 +113,49 @@ describe('client bundle purity gate', () => {
     expect(() => resolveId('@deepseek-ai/dsh-client-web')).toThrow(/purity/)
   })
 
-  it('throws on cross-plugin value imports — bare plugin names and /client subpaths alike (the rewrite arm is gone)', () => {
+  it('throws on cross-plugin value imports — bare plugin names and /client subpaths alike', () => {
     expect(() => resolveId('@deepseek-ai/dsh-client-connection')).toThrow(/purity/)
-    expect(() => resolveId('@deepseek-ai/dsh-client-runtime')).toThrow(/purity/)
+    expect(() => resolveId('@deepseek-ai/dsh-client-ui-session')).toThrow(/purity/)
     expect(() => resolveId('@deepseek-ai/dsh-client-ui-layout/client')).toThrow(/purity/)
   })
 
-  it('carries exactly one documented temporary exemption: runtime/client (store engine pending rehoming)', () => {
-    expect(resolveId('@deepseek-ai/dsh-client-runtime/client')).toBeNull()
-    const clientChannels = CLIENT_EXTERNALS.filter(
-      entry => entry.startsWith('@deepseek-ai/') && entry.endsWith('/client'))
-    expect(clientChannels).toEqual(['@deepseek-ai/dsh-client-runtime/client'])
+  it('admits package-specific requests only for the declaring bundle', () => {
+    const requesting = purityResolveId('@deepseek-ai/dsh-api-session-controller')
+    expect(requesting('@deepseek-ai/dsh-api-gateway/client')).toBeNull()
+    expect(() => resolveId('@deepseek-ai/dsh-api-gateway/client')).toThrow(/purity/)
+  })
+
+  it('externalizes the baseline independently of each package manifest', () => {
+    const requesting = clientConfigs()[0]?.deps as { neverBundle: (specifier: string) => boolean }
+    const plain = clientConfigs('@deepseek-ai/dsh-client-connection')[0]?.deps as {
+      neverBundle: (specifier: string) => boolean
+    }
+
+    expect(requesting.neverBundle('react')).toBe(true)
+    expect(requesting.neverBundle('zod')).toBe(false)
+    expect(plain.neverBundle('react')).toBe(true)
+    expect(plain.neverBundle('@deepseek-ai/dsh-client-store')).toBe(true)
+  })
+})
+
+describe('client bundle module requests', () => {
+  it('requests what the declaration lists', () => {
+    const requests = requestedExternals('@deepseek-ai/dsh-client-fixture', {
+      external: ['react', 'react/jsx-runtime', '@deepseek-ai/dsh-client-ui-slots'],
+    })
+
+    expect([...requests].sort()).toEqual([
+      '@deepseek-ai/dsh-client-ui-slots', 'react', 'react/jsx-runtime',
+    ])
+  })
+
+  it('requests nothing when the declaration is absent', () => {
+    expect(requestedExternals('@deepseek-ai/dsh-client-fixture', {}).size).toBe(0)
+  })
+
+  it('rejects a malformed declaration instead of reading past it', () => {
+    expect(() => requestedExternals('@deepseek-ai/dsh-client-fixture', { external: 'react' }))
+      .toThrow(/dsh\.client\.external must be a string array/)
   })
 })
 
@@ -107,6 +163,28 @@ describe('client bundle debug artifacts', () => {
   it('emits source maps for plugin TS and TSX outside the Vite module graph', () => {
     const configs = clientConfigs()
     expect(configs[0]?.sourcemap).toBe(true)
+    expect(configs[0]?.outputOptions).toMatchObject({ sourcemapExcludeSources: false })
+  })
+
+  it('chains emitted tsc maps when the production Client build consumes lib/types', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-client-sourcemap-'))
+    try {
+      const entry = join(root, 'lib', 'types', 'client', 'index.js')
+      const source = join(root, 'src', 'client', 'index.ts')
+      const map = { version: 3, names: [], mappings: 'AAAA', sources: ['../../../src/client/index.ts'] }
+      mkdirSync(join(root, 'lib', 'types', 'client'), { recursive: true })
+      mkdirSync(join(root, 'src', 'client'), { recursive: true })
+      writeFileSync(entry, 'export const marker = true\n//# sourceMappingURL=index.js.map\n')
+      writeFileSync(`${entry}.map`, JSON.stringify(map))
+      writeFileSync(source, 'export const marker: true = true\n')
+
+      await expect(sourceMapPlugin().load!(entry)).resolves.toEqual({
+        code: 'export const marker = true',
+        map: { ...map, sourcesContent: ['export const marker: true = true\n'] },
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 
   it('maps first-party sources to their repository package paths', () => {
@@ -141,10 +219,10 @@ describe('client bundle debug artifacts', () => {
     if (transform === undefined) throw new Error('client sourcemap path transform missing')
 
     const sourceMapPath = clientSourceMapPath('client/connection')
-    const workspaceSource = transform('../../../host/apiproxy/src/api/rpc.ts', sourceMapPath)
-    expect(workspaceSource).toBe('../../../packages/host/apiproxy/src/api/rpc.ts')
+    const workspaceSource = transform('../src/rpc.ts', sourceMapPath)
+    expect(workspaceSource).toBe('../../../packages/client/connection/src/rpc.ts')
     const resolved = new URL(workspaceSource, 'https://dsh.test/plugins/@deepseek-ai/dsh-client-connection/client.js.map')
-    expect(resolved.pathname).toBe('/packages/host/apiproxy/src/api/rpc.ts')
+    expect(resolved.pathname).toBe('/packages/client/connection/src/rpc.ts')
 
     const dependencySource = '../../../../node_modules/.pnpm/zod@4.4.3/node_modules/zod/index.js'
     expect(transform(dependencySource, sourceMapPath)).toBe(dependencySource)

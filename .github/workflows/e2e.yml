@@ -60,8 +60,9 @@ jobs:
     if: >-
       github.event_name != 'pull_request'
       || !(github.event.pull_request.head.repo.fork || github.event.pull_request.user.login == 'dependabot[bot]')
-    # Bounded file parallelism (DSH_E2E_MAX_WORKERS), 120s/test, retry 2. 45m
-    # still bounds retry storms against a slow API while the happy path fans out.
+    # Profile e2e files can each own several complete dsh subprocess trees, so
+    # four file workers preserve process/PTY headroom. Tests retain 120s/test
+    # and retry 2; 45m still bounds retry storms against a slow API.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
@@ -76,15 +77,11 @@ jobs:
       - name: Install (immutable)
         run: pnpm install --frozen-lockfile
 
-      # The with-key escalation e2e self-skips without a usable runner. Install
-      # bwrap so trusted CI exercises it; the userns knob is best-effort and the
-      # test's functional probe decides.
-      - name: Install bubblewrap (unrestrict userns)
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -yq bubblewrap
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 \
-            || echo "apparmor userns knob absent — the functional probe decides"
+      # The with-key escalation e2e self-skips without a usable runner. Prepare
+      # bwrap so trusted CI exercises it; the functional probe remains the
+      # authority on whether the runner can use the sandbox.
+      - name: Prepare bubblewrap (unrestrict userns)
+        run: bash scripts/prepare-ci-bubblewrap.sh
 
       # Guard against a false green: the e2e suites self-skip when the key is
       # absent, so a missing/misconfigured secret would otherwise pass as
@@ -108,16 +105,17 @@ jobs:
       # the built artifact under plain Node, resolving plugins through real package
       # exports — the shape a real consumer runs. That requires a prior build.
       - name: Build (lib for the e2e example bins)
-        run: pnpm run build
+        run: pnpm run build:official
 
       # Real-API end-to-end tests only. The keyless gates (lint/typecheck/
-      # coverage/snapshot/etc.) already run in ci.yml on every push/PR.
+      # coverage/snapshot/etc.) already run in ci.yml (pull requests) and
+      # ci-master.yml (master push standby).
       # DEEPSEEK_BASE_URL is pinned to the external API; the secret is scoped to
       # this step (and preflight) only — never exposed to checkout/setup/install.
       - name: E2E tests (real DeepSeek API)
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY_EXTERNAL }}
           DEEPSEEK_BASE_URL: https://api.deepseek.com
-          DSH_E2E_MAX_WORKERS: 14
+          DSH_E2E_MAX_WORKERS: 4
           DSH_EXAMPLE_MODE: lib
         run: pnpm run test:e2e

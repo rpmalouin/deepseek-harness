@@ -1,4 +1,5 @@
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -11,7 +12,9 @@ import type { TerminalSendOperation } from '@deepseek-ai/dsh-terminal'
 import SandboxProvider from '@deepseek-ai/dsh-sandbox'
 import type { ConfinedArgv, SandboxPolicy } from '@deepseek-ai/dsh-sandbox'
 import SandboxPolicyService from '@deepseek-ai/dsh-sandbox-policy'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
+import { resolvePwshPath } from '@deepseek-ai/dsh-pwsh-local/src/resolve.ts'
 import * as ptyLocal from '@deepseek-ai/dsh-terminal-bash'
 
 const roots: string[] = []
@@ -49,6 +52,7 @@ function stubAgent(ctx: Context, rawId: string): Agent {
 async function harness(
   mode: 'danger-full-access' | 'workspace-write',
   timing: { idleSilenceMs?: number; handoffGraceMs?: number; timeoutMs?: number } = {},
+  dialect: 'bash' | 'pwsh' = 'bash',
 ) {
   const root = mkdtempSync(join(tmpdir(), 'dsh-pty-local-'))
   roots.push(root)
@@ -57,9 +61,11 @@ async function harness(
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(TerminalSessionService)
   await ctx.plugin(PassthroughSandbox)
+  await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(SandboxPolicyService, { mode, workspaceRoot: root })
   await ctx.plugin(LocalSubprocessRuntime)
   const fiber = await ctx.plugin(ptyLocal, {
+    shellDialect: dialect,
     pollIntervalMs: 10,
     exactProbeAfterMs: 20,
     idleSilenceMs: timing.idleSilenceMs ?? 250,
@@ -114,7 +120,20 @@ function processIsRunning(pid: number): boolean {
   }
 }
 
-describe('terminal-bash real shell', () => {
+function canReadLinuxProcessSyscall(pid: number): boolean {
+  try {
+    readFileSync(`/proc/${pid}/task/${pid}/syscall`, 'utf8')
+    return true
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'EACCES' || code === 'EPERM') return false
+    throw error
+  }
+}
+
+// The real-shell suite drives a POSIX bash over the actual node-pty terminal;
+// Windows has no bash, and its pwsh counterpart lives in the describe below.
+describe.skipIf(process.platform === 'win32')('terminal-bash real shell', () => {
   it('persists cwd and environment across sends, scrubs secrets, and closes', async () => {
     const previous = process.env.DSH_TEST_SECRET
     process.env.DSH_TEST_SECRET = 'must-not-leak'
@@ -136,6 +155,51 @@ describe('terminal-bash real shell', () => {
       else process.env.DSH_TEST_SECRET = previous
     }
   }, 10_000)
+
+  it('restores the controlled prompt after an in-shell PS1 override', async () => {
+    // The silence tier is pushed beyond every assertion below, so each settle
+    // proves prompt-based readiness survives the override rather than the
+    // inferred_idle fallback absorbing a broken prompt.
+    const { ctx, agent } = await harness('danger-full-access', {
+      idleSilenceMs: 5_000,
+      timeoutMs: 8_000,
+    })
+    const created = await ctx.terminals.spawn(agent, { type: 'shell' })
+
+    const override = ctx.terminals.startSend(agent, created.sessionId, { text: 'PS1=broken-prompt', submit: true })
+    expect((await override.done).waitReason).toBe('stdin_read')
+
+    const after = ctx.terminals.startSend(agent, created.sessionId, { text: 'printf "healed=[%s]\\n" "$PS1"', submit: true })
+    const result = await after.done
+    expect(result.waitReason).toBe('stdin_read')
+    expect(result.viewport).toContain('healed=[dsh> ]')
+    await ctx.terminals.kill(agent, created.sessionId)
+  }, 20_000)
+
+  it.skipIf(process.platform !== 'linux')('recognizes a foreground read opened through /dev/tty', async () => {
+    const { ctx, root, agent } = await harness('danger-full-access', {
+      idleSilenceMs: 5_000,
+      timeoutMs: 8_000,
+    })
+    const created = await ctx.terminals.spawn(agent, { type: 'shell' })
+    const readerPidFile = join(root, 'tty-reader.pid')
+
+    const waiting = ctx.terminals.startSend(agent, created.sessionId, {
+      text: `bash -c 'exec </dev/tty; printf "%s" "$BASHPID" > "$1"; printf "WAITING\\n"; read -r answer; printf "ANSWER=%s\\n" "$answer"' dsh "${readerPidFile}"`,
+      submit: true,
+    })
+    await waitForOutput(waiting, 'WAITING')
+    const result = await waiting.done
+    const readerPid = Number(readFileSync(readerPidFile, 'utf8'))
+    expect(readerPid).toBeGreaterThan(0)
+    expect(result.waitReason).toBe(canReadLinuxProcessSyscall(readerPid) ? 'stdin_read' : 'inferred_idle')
+
+    const answer = ctx.terminals.startSend(agent, created.sessionId, { text: 'accepted', submit: true })
+    const answered = await answer.done
+    expect(answered.waitReason).toBe('stdin_read')
+    expect(answered.viewport).toContain('ANSWER=accepted')
+    await ctx.terminals.kill(agent, created.sessionId)
+  }, 20_000)
 
   it('wraps the exact shell argv under confined policy and unregisters on reload', async () => {
     const { ctx, root, agent, fiber, sandbox } = await harness('workspace-write')
@@ -246,4 +310,73 @@ describe('terminal-bash real shell', () => {
     expectReadyForNextSend((await after.done).waitReason)
     await ctx.terminals.kill(agent, created.sessionId)
   }, 35_000)
+})
+
+const hasPwsh = spawnSync(
+  resolvePwshPath(), ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '$true'],
+  { encoding: 'utf8' },
+).status === 0
+
+describe.skipIf(!hasPwsh)('terminal-bash pwsh real shell', () => {
+  it('bootstraps a persistent pwsh, persists state, and scrubs secrets', async () => {
+    const previous = process.env.DSH_TEST_SECRET
+    process.env.DSH_TEST_SECRET = 'must-not-leak'
+    try {
+      const { ctx, root, agent } = await harness('danger-full-access', {
+        idleSilenceMs: 300,
+        handoffGraceMs: 300,
+        timeoutMs: 8_000,
+      }, 'pwsh')
+      const created = await ctx.terminals.spawn(agent, { type: 'shell', name: 'main', cwd: root })
+      expect(created.motd).toContain('dsh> ')
+
+      const first = ctx.terminals.startSend(agent, created.sessionId, {
+        text: '$env:KEEP = "ok"; Set-Location /',
+        submit: true,
+      })
+      expect((await first.done).waitReason).toBe('stdin_read')
+      const second = ctx.terminals.startSend(agent, created.sessionId, {
+        text: 'Write-Output "keep=$env:KEEP secret=$env:DSH_TEST_SECRET"',
+        submit: true,
+      })
+      const result = await second.done
+      expect(result.viewport).toContain('keep=ok')
+      expect(result.viewport).toContain('secret=')
+      expect(result.viewport).not.toContain('must-not-leak')
+
+      expect(ctx.terminals.read(agent, created.sessionId, { offset: 0, count: 40 }).text).toContain('keep=ok')
+      expect(await ctx.terminals.kill(agent, created.sessionId)).toBe(true)
+      expect(ctx.terminals.list(agent)).toEqual([])
+    } finally {
+      if (previous === undefined) delete process.env.DSH_TEST_SECRET
+      else process.env.DSH_TEST_SECRET = previous
+    }
+  }, 30_000)
+
+  it('pins UTF-8 output encoding so non-ASCII output survives the byte decode', async () => {
+    const { ctx, root, agent } = await harness('danger-full-access', {
+      idleSilenceMs: 300,
+      handoffGraceMs: 300,
+      timeoutMs: 8_000,
+    }, 'pwsh')
+    const created = await ctx.terminals.spawn(agent, { type: 'shell', name: 'main', cwd: root })
+    // The bootstrap itself must have pinned both encodings: the session byte
+    // decode is UTF-8, so an un-pinned console writing its host code page
+    // garbles every non-ASCII byte that follows.
+    const pinned = ctx.terminals.startSend(agent, created.sessionId, {
+      text: '"console=" + [Console]::OutputEncoding.WebName + " out=" + $OutputEncoding.WebName',
+      submit: true,
+    })
+    const pinnedResult = await pinned.done
+    expect(pinnedResult.viewport).toContain('console=utf-8 out=utf-8')
+    // Char codes keep the submitted line ASCII-only, so the assertion is a
+    // pure output-decode check.
+    const sent = ctx.terminals.startSend(agent, created.sessionId, {
+      text: "[Console]::Write([char]0x4E2D + [char]0x6587 + ' encoding-ok')",
+      submit: true,
+    })
+    const result = await sent.done
+    expect(result.viewport).toContain('中文 encoding-ok')
+    await ctx.terminals.kill(agent, created.sessionId)
+  }, 30_000)
 })

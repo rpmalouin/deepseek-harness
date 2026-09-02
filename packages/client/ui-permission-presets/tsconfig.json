@@ -15,10 +15,7 @@
       "path": "../../../vendor/cordis"
     },
     {
-      "path": "../runtime"
-    },
-    {
-      "path": "../schema-form"
+      "path": "../store"
     },
     {
       "path": "../ui-commands"
@@ -27,22 +24,25 @@
       "path": "../ui-primitives"
     },
     {
+      "path": "../ui-renderer"
+    },
+    {
+      "path": "../ui-session"
+    },
+    {
       "path": "../ui-input-trigger"
     },
     {
       "path": "../ui-slots"
     },
     {
-      "path": "../web-react"
-    },
-    {
       "path": "../../interaction/permission-presets"
     },
     {
-      "path": "../../runtime-diagnostics/invariants"
+      "path": "../../api/remotes/tsconfig.client.json"
     },
     {
-      "path": "../../api/remotes/tsconfig.client.json"
+      "path": "../../api/session-controller/tsconfig.client.json"
     },
     {
       "path": "../ui-settings"

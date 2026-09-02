@@ -8,7 +8,7 @@ Sources: [`packages/session/session-title/src/index.ts`](../../packages/session/
 
 ## Durable title state
 
-`SessionTitleProviderId` is recorded for provider-produced revisions. `SessionTitleEventData` lists the exact human-message seqs used for the title, while `SessionTitleSnapshot` adds the durable event envelope facts selected by `foldSessionTitle()`.
+`SessionTitleProviderId` is recorded for provider-produced revisions. `SessionTitleEventData` lists the exact human-message seqs used for the title, while `SessionTitleSnapshot` adds the durable event envelope facts returned by `ctx.sessionTitle.get()` and `foldSessionTitle()`. The `title` projection keeps its version-1 state and client view as only the title string or `null`, so existing persisted cache rows remain readable.
 
 ```ts type-equiv
 /** Identifies one session-title provider registration. */
@@ -46,7 +46,7 @@ interface SessionTitleEventData {
   /** Normalized non-empty title text. */
   readonly title: string
   /** Exact human `user/message` seqs used to derive this title; empty for an explicit user rename. */
-  readonly messageSeqs: number[]
+  readonly messageSeqs: SessionSeq[]
   /** Whether the built-in fallback, a registered provider, or the user supplied the title. */
   readonly source: SessionTitleSource
 }
@@ -56,7 +56,7 @@ interface SessionTitleEventData {
 /** Latest folded title plus the title event's durable envelope facts. */
 interface SessionTitleSnapshot extends SessionTitleEventData {
   /** Seq of the latest `session/title` event. */
-  readonly eventSeq: number
+  readonly eventSeq: SessionSeq
   /** Timestamp of the latest `session/title` event. */
   readonly updatedAt: number
 }
@@ -72,7 +72,7 @@ interface SessionTitleLlmRequestEventData {
   /** Registered title-provider identity responsible for the request. */
   readonly titleProvider: SessionTitleProviderId
   /** Exact human `user/message` seqs represented in `messages`. */
-  readonly messageSeqs: number[]
+  readonly messageSeqs: SessionSeq[]
   /** Exact auxiliary LLM route. */
   readonly route: SessionTitleModelProvenance
   /** Exact auxiliary system prompt. */
@@ -92,7 +92,7 @@ The service snapshots eligible messages through one revision. A provider returns
 /** One eligible human text message exposed to title providers. */
 interface SessionTitleUserMessage {
   /** Source `user/message` event seq. */
-  readonly seq: number
+  readonly seq: SessionSeq
   /** Exact concatenated text-block content. */
   readonly text: string
 }
@@ -123,7 +123,7 @@ interface SessionTitleProviderResult {
   /** Proposed title text. */
   readonly title: string
   /** Exact seqs from `request.messages` used by this result. */
-  readonly messageSeqs: readonly number[]
+  readonly messageSeqs: readonly SessionSeq[]
   /** Auxiliary LLM route, when generation used a model. */
   readonly model?: SessionTitleModelProvenance
 }
@@ -151,7 +151,7 @@ interface SessionTitleProvider {
 
 ## Cordis API
 
-Generated from source by `scripts/gen-cordis-catalog.ts` (verified fresh by `pnpm run verify-cordis-catalog` in doc-sync; regenerate with `pnpm run gen-cordis-catalog`) — this section is byte-identical in both language sides of the page. Signature blocks use a `ts cordis-catalog` fence and keep the original source JSDoc; dispatch modes are defined in the [primer](../cordis-primer.md#dispatch-modes), and the framework-inherited `ctx` API lives in [cordis-api/inherited.md](../cordis-api/inherited.md).
+Generated from source by `scripts/gen-cordis-catalog.ts` (verified fresh by `pnpm run verify-cordis-catalog` in doc-sync; regenerate with `pnpm run gen-cordis-catalog`) — the language sides differ only in locale-specific paired document paths. Signature blocks use a `ts cordis-catalog` fence and keep the original source JSDoc; dispatch modes are defined in the [primer](../cordis-primer.md#dispatch-modes), and the framework-inherited `ctx` API lives in [cordis-api/inherited.md](../cordis-api/inherited.md).
 
 <a id="ctxsessiontitle--sessiontitleservice"></a>
 
@@ -200,5 +200,5 @@ register(provider: SessionTitleProvider): () => Promise<void>
 
 Types: [Session](session.md)
 
-Source: [`packages/session/session-title/src/index.ts:261`](../../packages/session/session-title/src/index.ts)
+Source: [`packages/session/session-title/src/index.ts`](../../packages/session/session-title/src/index.ts)
 <!-- END GENERATED cordis-surface -->

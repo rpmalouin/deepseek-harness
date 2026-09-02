@@ -15,10 +15,16 @@
       "path": "../../../vendor/cordis"
     },
     {
+      "path": "../../attachment/attachment"
+    },
+    {
       "path": "../../core/agent"
     },
     {
       "path": "../../core/scope"
+    },
+    {
+      "path": "../../llm/llm"
     },
     {
       "path": "../../core/session"
@@ -31,6 +37,9 @@
     },
     {
       "path": "../../typert/protocol"
+    },
+    {
+      "path": "../../util/crypto"
     }
   ]
 }

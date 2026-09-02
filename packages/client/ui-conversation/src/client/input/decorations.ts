@@ -1,27 +1,11 @@
 /**
- * Draft decoration pure core (chips render from the occurrence
- * table at placeholder offsets; the claim token renders as a mirror-layer
- * highlight, the claim hint as ghost text). Zero React — the skeleton renders
- * the instructions; tests drive this directly.
+ * Plain-text reference scan (the plain-text-reference decision;
+ * see .agents/notes/implemented/architecture/2026-07-25-web-input-machine-and-slash-pipeline.md):
+ * a `/name` or `@name` token whose name is on the trigger's lexicon, and
+ * syntax-recognizable `@dir/` folder tokens. Pure derivation — the editor's
+ * text-ref entity transform consumes these ranges; editing the text out of
+ * match shape simply drops the range next scan.
  */
-import type { InputState } from './contract.ts'
-
-/** The claim-token highlight range (always draft-leading while the watch holds). */
-export interface TokenRange {
-  readonly start: number
-  readonly end: number
-}
-
-/** One chip render instruction: the placeholder at `offset` draws as `label`. */
-export interface ChipRender {
-  /** Stable render key (same-labeled chips stay independent). */
-  readonly occurrenceId: number
-  /** Placeholder offset in the draft (the chip occupies [offset, offset+1)). */
-  readonly offset: number
-  readonly label: string
-  /** Owner-resolution failure styling bit. */
-  readonly invalid: boolean
-}
 
 /**
  * One plain-text reference range (the plain-text-reference decision;
@@ -36,20 +20,9 @@ export interface TextRefRange {
   readonly trigger: '/' | '@'
 }
 
-/** Decoration product: claim token range + chip instructions + text-ref ranges + the ghost hint. */
-export interface DraftDecorations {
-  /** Claim token range while claimed/submitting and the prefix watch holds; null otherwise. */
-  readonly token: TokenRange | null
-  /** Chip render instructions in draft order (occurrence table is offset-sorted). */
-  readonly chips: readonly ChipRender[]
-  /** Scan-derived plain-text reference ranges (empty without a lexicon). */
-  readonly textRefs: readonly TextRefRange[]
-  /** Ghost hint shown while the claim's args are blank; null otherwise. */
-  readonly hint: string | null
-}
-
 /** Token matcher: a trigger char at line start or after whitespace, then a word-ish name (never crosses \n). */
 const TEXT_REF_RE = /(^|\s)([/@])([\w-]+)/g
+const FOLDER_REF_RE = /(^|\s)(@(?:"[^"\n]*\/|[^\s"]+\/))/g
 
 /**
  * Scan the draft for plain-text reference tokens against the hot lexicons.
@@ -63,45 +36,29 @@ const TEXT_REF_RE = /(^|\s)([/@])([\w-]+)/g
 export function scanTextRefs(
   draft: string, lexicon: ReadonlyMap<'/' | '@', readonly string[]>,
 ): TextRefRange[] {
-  if (lexicon.size === 0 || draft === '') return []
+  if (draft === '') return []
   const out: TextRefRange[] = []
-  TEXT_REF_RE.lastIndex = 0
-  let m: RegExpExecArray | null
-  while ((m = TEXT_REF_RE.exec(draft)) !== null) {
-    const trigger = m[2] as '/' | '@'
-    const name = m[3] ?? ''
-    if (lexicon.get(trigger)?.includes(name)) {
-      const start = m.index + (m[1]?.length ?? 0)
-      out.push({ start, end: start + 1 + name.length, trigger })
+  if (lexicon.size > 0) {
+    TEXT_REF_RE.lastIndex = 0
+    let m: RegExpExecArray | null
+    while ((m = TEXT_REF_RE.exec(draft)) !== null) {
+      const trigger = m[2] as '/' | '@'
+      const name = m[3] ?? ''
+      if (lexicon.get(trigger)?.includes(name)) {
+        const start = m.index + (m[1]?.length ?? 0)
+        out.push({ start, end: start + 1 + name.length, trigger })
+      }
     }
   }
-  return out
-}
-
-/** The empty lexicon (default: zero text-ref decorations, old call sites unchanged). */
-const EMPTY_LEXICON: ReadonlyMap<'/' | '@', readonly string[]> = new Map()
-
-/**
- * Derive the mirror-layer decorations from the input state.
- * @param state - published input state.
- * @param lexicon - optional per-trigger reference lexicons (plain-text-reference scan).
- * @returns token range, chip instructions, text-ref ranges, and the ghost hint.
- */
-export function deriveDecorations(
-  state: InputState, lexicon: ReadonlyMap<'/' | '@', readonly string[]> = EMPTY_LEXICON,
-): DraftDecorations {
-  const { draft, claim, phase, occurrences } = state
-  const claimActive = (phase === 'claimed' || phase === 'submitting')
-    && claim !== undefined && draft.startsWith(claim.token)
-  const token: TokenRange | null = claimActive ? { start: 0, end: claim.token.length } : null
-  const chips = occurrences.map(o => ({
-    occurrenceId: o.occurrenceId,
-    offset: o.offset,
-    label: o.label,
-    invalid: o.invalid === true,
-  }))
-  const hint = claimActive && claim.hint !== undefined && draft.slice(claim.token.length).trim() === ''
-    ? claim.hint
-    : null
-  return { token, chips, textRefs: scanTextRefs(draft, lexicon), hint }
+  FOLDER_REF_RE.lastIndex = 0
+  let folder: RegExpExecArray | null
+  while ((folder = FOLDER_REF_RE.exec(draft)) !== null) {
+    const token = folder[2] ?? ''
+    const start = folder.index + (folder[1]?.length ?? 0)
+    const end = start + token.length
+    if (!out.some(range => range.start < end && range.end > start)) {
+      out.push({ start, end, trigger: '@' })
+    }
+  }
+  return out.sort((left, right) => left.start - right.start)
 }

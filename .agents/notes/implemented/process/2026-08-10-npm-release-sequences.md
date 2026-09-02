@@ -22,8 +22,8 @@ Two hard blockers sat in the way. All 217 workspace manifests set `private: true
 
 | Sequence | Members | Version baseline | Tag | Workflow |
 |---|---|---|---|---|
-| dsh | `packages/*/*` + `apps/*` (`@deepseek-ai/dsh` and `@deepseek-ai/dsh-web-frontend`) | one version for the family and the workspace root, `0.0.x` | `dsh-v<version>` | `release.yml` |
-| vendored framework | the nine `vendor/*` packages | each package on its own version line | `vendor-<package>-v<version>` (one per package) | `release-vendor.yml` |
+| dsh | Publish set: non-experimental `packages/*/*` + `apps/*`; private experimental packages join only the shared version bump | one version for the publish set, private dsh packages, and workspace root, `0.0.x` | `dsh-v<version>` | `release.yml` (pack) / `release-publish.yml` (publish) |
+| vendored framework | the nine `vendor/*` packages | each package on its own version line | `vendor-<package>-v<version>` (one per package) | `release-vendor.yml` (pack) / `release-vendor-publish.yml` (publish) |
 | native | `native/landlock-run/packages/*` | its own `0.0.x` | `landlock-run-v<version>` | `landlock-run-release.yml` |
 
 All three publish to the `@deepseek-ai` scope on npmjs.com, and access is per sequence rather than per scope: the vendored framework and the native packages are `public`, the dsh family is `restricted` ([rationale](2026-08-13-public-vendor-and-native-sequences.md)). No publish path passes `--access`, because one flag cannot serve sequences that disagree and would override the manifest that owns the level.
@@ -32,7 +32,9 @@ All three publish to the `@deepseek-ai` scope on npmjs.com, and access is per se
 
 Each sequence has one bump-and-commit command: it derives the target version, writes it into the relevant manifests, runs `pnpm install --lockfile-only`, and commits the manifests with the lockfile. The published version is therefore readable from the repository. A human creates the tag after the commit merges to master; CI never writes to the repository and needs no write permission.
 
-`release:dsh` accepts `major`, `minor`, `patch`, or an explicit version, and writes one version across the family **and the workspace root** — the workspace constraint requires every member's version to equal the root's, so the root carries the family version, and the root check accepts a prerelease segment. A prerelease such as `0.0.1-rc.1` drives pack, the installed-artifact probe, and one real private publication before numbered versions follow. The dist-tag decision is the one `landlock-run-release.yml` already made: a version with a prerelease segment publishes under `--tag next`, anything else takes `latest`.
+`release:dsh` accepts `major`, `minor`, `patch`, or an explicit version, and writes one version across the publishable family, every private package under `packages/*/*`, **and the workspace root**. Private packages receive no release tag and remain outside pack and publish; they follow the version because the workspace constraint requires every dsh package's version to equal the root's. The root check accepts a prerelease segment, so explicit versions such as `0.0.1-alpha.1`, `0.0.1-canary.1`, and `0.0.1-rc.1` drive the same pack, installed-artifact probe, and publication path. `dsh` publication maps `alpha` and `canary` to their matching npm dist-tags, maps other prereleases including `rc` to `next`, and leaves stable versions to npm's `latest` default. Other release families retain their own dist-tag policy.
+
+For equal release numbers, SemVer compares alphanumeric prerelease identifiers lexically: `alpha` is lower than `canary`, `canary` is lower than `rc`, and every prerelease is lower than the stable version. npm dist-tags are mutable aliases and do not participate in version precedence.
 
 ### vendor: publish what changed, and let tags be the ledger
 
@@ -80,6 +82,20 @@ Every reference to a workspace member uses `workspace:^`, so `pnpm pack` substit
 
 `scripts/check-workspace-constraints.ts` requires the protocol, so a new package cannot reintroduce a hand-written range; the invariant-companion rule requires `workspace:^` for `@deepseek-ai/dsh-invariants` for the same reason.
 
+### Published dependency faces use an explicit policy
+
+[`verify-package-dependencies`](../../../../scripts/verify-package-dependencies.ts) classifies workspace relationships by their published Client and Host use, keeps only Cordis as a peer in covered packages, and applies a small explicit Host roster. [Published dependency faces and bounded peer relays](2026-08-26-published-dependency-faces.md) owns the selection rules and rationale.
+
+`pnpm run benchmark:npm-resolution` measures this graph manually with the installed npm executable. `pnpm run benchmark:npm-resolution:next` additionally tries each reachable unconfigured Host package and serially remeasures the leading candidates. Both commands use a loopback metadata registry and reject archive requests, so their duration excludes package downloads. Neither command is an aggregate gate because scheduler load and metadata completion order make wall-clock thresholds nondeterministic.
+
+### An optional dependency is never loaded at module scope
+
+A dependency in `optionalDependencies`, or a peer carrying `peerDependenciesMeta.<name>.optional`, may be absent from an installed tree — that absence is the whole promise of "optional". A static import is evaluated when the importing module loads, so one absent package stops being "this capability is unavailable" and becomes a load failure for everything that reaches the importing module. The failure appears only in an installed tree missing that package, and no test here constructs one: a workspace install always has every package, so the unit tests, the snapshots, and the packed-install probe all pass while the published package is broken for the consumer who declined the optional peer.
+
+[`verify-optional-dependency-imports`](../../../../scripts/verify-optional-dependency-imports.ts) closes that hole. It reads each package's own manifest for what that package allows to be absent, then scans the files that ship — `packages/*/*/src/` and `apps/*/src/` — across both compiler faces. `vendor/` is out of scope, as pinned upstream source under the [vendoring policy](../../../../vendor/README.md). Value-versus-type is decided against a bound Program rather than the import syntax, because `verbatimModuleSyntax` is off: the compiler already erases an import whose bindings resolve to types, so `import type {}`, `import {}`, an inline `type` specifier, and a named binding that resolves to a type all emit nothing and are allowed, while a bare import, a value binding, and a star re-export are kept and rejected. Only the type phase erases an import: `import defer` still resolves and links its module, deferring evaluation alone, so the gate counts it as a load.
+
+A violation names the package, the declaration that made it optional, and the way out in order — import it as a type, which is all that declaration merging needs, or restructure so module scope does not need the package. A dynamic `import()` only moves the failure to first use, so it belongs to a caller that genuinely requires the package and handles its absence; reaching for it is a sign the dependency is not optional, and the gate does not offer it as the remedy.
+
 ### Release family objects
 
 The entity in this domain is a **release family**: a set of packages sharing one version baseline and tag naming that publishes as a unit. Adding a family means adding a subclass and a workflow lane, not changing the core.
@@ -88,22 +104,22 @@ The entity in this domain is a **release family**: a set of packages sharing one
 |---|---|
 | `ReleaseFamily` | a family's identity: member discovery, version baseline, tag prefix, packed-payload rule, installed entry |
 | `ReleaseMember` | one publishable package: directory, name, version, manifest |
-| `publishOrder` | topological order over runtime dependencies, ties broken by package name; a cycle is reported rather than resolved arbitrarily |
+| `publishOrder` | topological order over the sections npm installs plus peer declarations, ties broken by package name; a cycle among installed dependencies is reported rather than resolved arbitrarily, and a peer edge no order can honour is dropped and named |
 | `pack` | packs a whole family into one directory and records the upload order |
-| `verify` | the family's version baseline, and — when publishing — that the run comes from that family's tag and its members are publishable |
+| `verify` | the family's version baseline, the publish order it prints in full, and — when publishing — that the run comes from that family's tag and its members are publishable |
 | `verify-packed-install` | installs the tarballs of one or more pack directories into a throwaway consumer and drives the installed executable |
 | `publish` | the three registry states above |
 | `process` / `tarball` | the one home for spawning commands and for reading a packed tarball, including the entry guard that keeps every script importable |
 
 The dsh family applies the repository's publication payload policy, which rejects sources and declaration maps. The vendored family keeps upstream's payload, because those manifests export `./src/*` and dropping `src` would publish an export map pointing at absent files.
 
-### Workflow shape: pack everything at once, then publish as one set
+### Workflow shape: pack on PR/push, publish from a manual dispatch workflow
 
-The `pack` job walks the whole release set once, packing each member into one directory, writes the upload order, and uploads that directory as one artifact; the `publish` job downloads that artifact and publishes each entry in order. The release set is one unit — half the packages can never reach the registry while the other half is still building.
+The `pack` job walks the whole release set once, packing each member into one directory, writes the upload order, and uploads that directory as one artifact; it lives in `release.yml` / `release-vendor.yml`. The release set is one unit — half the packages can never reach the registry while the other half is still building.
 
-`pack` carries no credentials and runs on every pull request and master push, so a pull request proves the release set still packs. `publish` is a manual dispatch, sits behind the `npm-publish` environment for human approval, and neither builds nor rebuilds — it uploads the bytes pack produced. Pack runs are grouped per ref so concurrent pull requests do not displace each other; the publish job carries the global group, because dist-tags are shared registry state.
+`pack` carries no credentials and runs on every pull request and master push, so a pull request proves the release set still packs. Publication lives in a separate `release-publish.yml` / `release-vendor-publish.yml` workflow that is `workflow_dispatch`-only (so it never appears as a PR check): it repacks the current tree and then publishes each entry in order, behind the `npm-publish` environment for human approval. Pack runs are grouped per ref so concurrent pull requests do not displace each other; the `publish` job carries the global `Release-publish` group, because dist-tags are shared registry state.
 
-A dsh verification installs the vendored family's pack output too. The harness packages declare the vendored framework as a peer, those packages live in another sequence, and the credential-free job cannot fetch them from a private registry — so `release.yml` packs the vendored family for verification while publishing only its own set.
+A dsh verification installs the vendored family's pack output too. The harness packages declare the vendored framework as a peer, those packages live in another sequence, and the credential-free job cannot fetch them from a private registry — so the dsh `pack` job packs the vendored family for verification while publishing only the dsh set. The publish workflow (`release-publish.yml`) repacks the current tree and publishes only the dsh set.
 
 The verification also packs the Landlock entry, which `dsh-sandbox-local` declares as a plain dependency, and omits optional dependencies. The platform packages behind those optional entries need a musl toolchain and one build per architecture, so a job on one runner cannot produce them; a consumer that cannot install them must still start, which is what optional means here. The verification therefore reads a directory by its contents rather than a pack order, because a directory can hold tarballs packed only to satisfy a cross-sequence dependency.
 
@@ -138,7 +154,7 @@ This Agent Note replaces the version scheme and the release-set boundary in [art
 
 **Verifying only the packed install, with no local registry.** The reference flow unpacks tarballs into a tree and drives it with plain Node, which bypasses version-range resolution. Running a local registry in CI to cover that layer was rejected: artifact correctness is covered by existing tests, the publication path is exercised by the master rehearsal, and a pull request only needs to prove the release set packs. Installing from `file:` specifiers still exercises range resolution for every internal dependency.
 
-**Selecting a subset by entry closure.** Crawling `dependencies` from `@deepseek-ai/dsh` and `@deepseek-ai/dsh-web-frontend` yields 156 packages, 61 fewer than the whole set. But this repository's plugins are mounted by name from `cordis.yml` rather than imported: `vendor/cordis-plugin-group` and `vendor/cordis-plugin-logger-console` fall outside the dependency closure while being required at runtime. Selecting by code dependency fails as "the consumer installs it and it will not start", and it would need a standing proof that no mounted package was missed. Under a private scope the extra packages are invisible outside the organization. `python/`, the root `examples/`, `docs/`, and `website/` are not members.
+**Selecting a subset by entry closure.** Crawling `dependencies` from `@deepseek-ai/dsh` and `@deepseek-ai/dsh-web-frontend` yields 156 packages, 61 fewer than the whole set. But this repository's plugins are mounted by name from `cordis.yml` rather than imported: `vendor/cordis-plugin-group` and `vendor/cordis-plugin-logger-console` fall outside the dependency closure while being required at runtime. Selecting by code dependency fails as "the consumer installs it and it will not start", and it would need a standing proof that no mounted package was missed. Under a private scope the extra packages are invisible outside the organization. `python/`, `docs/`, and `website/` are not release-family members.
 
 **Extending `scripts/publish-npm-baseline.ts`.** It is a local publication script that packs and publishes in one process, the opposite of separating credential-free packing from protected publication. Its verified parts — payload validation and installed-artifact probes — are reused so `pnpm run duplication` does not report clones.
 

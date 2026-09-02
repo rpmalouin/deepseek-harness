@@ -14,10 +14,11 @@ import {
 import TerminalSessionService, { TerminalSessionId } from '@deepseek-ai/dsh-terminal'
 import { BashTerminalBackend } from '@deepseek-ai/dsh-terminal-bash'
 import SandboxPolicyService from '@deepseek-ai/dsh-sandbox-policy'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import E2BSubprocessRuntime from '@deepseek-ai/dsh-subprocess-e2b'
 
-const fixtureRoot = fileURLToPath(new URL('../../../../examples/headless-agent/tests/fixtures/e2b/e2b/', import.meta.url))
+const fixtureRoot = fileURLToPath(new URL('./fixtures/composition/', import.meta.url))
 const binScript = join(fixtureRoot, 'bin.ts')
 const configPath = join(fixtureRoot, 'cordis.yml')
 const tsconfigPath = fileURLToPath(new URL('../../../../tsconfig.json', import.meta.url))
@@ -52,6 +53,7 @@ describe.skipIf(!process.env.E2B_API_KEY)('E2B live Loader composition', () => {
         runtimeRoot: '/home/user/.dsh-e2b',
         getSandbox: async () => sandbox,
       } as never)
+      await ctx.plugin(SessionProjectionRegistry)
       const sandboxPolicyFiber = await ctx.plugin(SandboxPolicyService, {
         mode: 'danger-full-access',
         workspaceRoot: '/home/user',
@@ -97,7 +99,7 @@ describe.skipIf(!process.env.E2B_API_KEY)('E2B live Loader composition', () => {
         whenIdle: () => Promise.resolve(),
       }
       const backend = new BashTerminalBackend(ctx, {
-        backendType: 'shell', shellPath: '/bin/bash', shellArgs: ['--noprofile', '--norc', '-i'],
+        backendType: 'shell', shellDialect: 'bash', shellPath: '/bin/bash', shellArgs: ['--noprofile', '--norc', '-i'],
         rows: 24, cols: 80,
         scrollbackLines: 100, scrollbackMaxBytes: 65_536, maxReadBytes: 16_384,
         pollIntervalMs: 25, exactProbeAfterMs: 150, idleSilenceMs: 1_000,

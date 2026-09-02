@@ -42,7 +42,7 @@ async function readTree(path: string): Promise<TreeState> {
 async function captureIdentities(inspector: ProcessInspector, state: TreeState): Promise<ProcessIdentity[]> {
   return vi.waitFor(() => {
     const expected = new Set([state.root, state.descendant])
-    const identities = inspector.processTree(state.root).filter(identity => expected.has(identity.pid))
+    const identities = inspector.snapshot().tree(state.root).filter(identity => expected.has(identity.pid))
     if (identities.length !== expected.size) throw new Error('managed tree is not fully observable yet')
     return identities
   }, { interval: 10, timeout: scenarioTimeoutMs })
@@ -106,11 +106,9 @@ async function runScenario(kind: ManagedKind, trigger: ExitTrigger) {
   let settled = false
   let treeGone = false
   try {
+    // The host validates tree.json before waiting for proceed, so observing it
+    // is sufficient readiness; a second marker only adds a redundant Windows poll.
     state = await readTree(join(root, 'tree.json'))
-    await vi.waitFor(() => readFile(join(root, 'ready'), 'utf8'), {
-      interval: 10,
-      timeout: scenarioTimeoutMs,
-    })
     if (process.platform !== 'win32') identities = await captureIdentities(createProcessInspector(), state)
     await writeFile(join(root, 'proceed'), 'proceed')
     const outcome = await child

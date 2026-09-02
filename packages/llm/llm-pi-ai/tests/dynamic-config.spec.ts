@@ -6,13 +6,13 @@ import { join } from 'node:path'
 import LlmRuntime, { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { LocalCredentialProvider } from '@deepseek-ai/dsh-credentials-local'
-import { settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { FileSettingsProvider } from '@deepseek-ai/dsh-settings-file'
 import * as LlmPiAi from '@deepseek-ai/dsh-llm-pi-ai'
+import AuthorizationService from '@deepseek-ai/dsh-authorization'
 import { assemble } from './assemble.ts'
 import { closeMockServers, mockServer, textEvents } from './mock-server.ts'
 
-const NS = settingsNamespace('llm-pi-ai')
+const NS = 'llm-pi-ai'
 
 /** Minimal foreign adapter: only needs to own a route the pi-ai plugin then wants. */
 class StubAdapter extends LlmAdapter {
@@ -36,8 +36,11 @@ async function home(): Promise<string> {
   return dir
 }
 
-/** Real dynamic composition mirroring the deepseek twin's harness. */
-async function boot(dir: string, config: LlmPiAi.Config): Promise<Context> {
+async function boot(
+  dir: string,
+  config: LlmPiAi.Config,
+  options: { authorization?: boolean } = {},
+): Promise<Context> {
   const ctx = new Context()
   cleanups.push(async () => {
     await ctx.fiber.dispose()
@@ -45,9 +48,30 @@ async function boot(dir: string, config: LlmPiAi.Config): Promise<Context> {
   await ctx.plugin(LlmRuntime)
   await ctx.plugin(FileSettingsProvider, { path: join(dir, 'settings.yaml'), watch: false })
   await ctx.plugin(LocalCredentialProvider, { path: join(dir, '.credentials.yaml'), watch: false })
+  if (options.authorization === true) await ctx.plugin(AuthorizationService)
   await ctx.plugin(LlmPiAi, config)
   return ctx
 }
+
+describe('login flows in a real composition', () => {
+  it('offers a sign-in for a provider no route names, once the seam is mounted', async () => {
+    const ctx = await boot(await home(), {}, { authorization: true })
+
+    // Zero routes configured: signing in is what makes a route worth adding,
+    // so the offer cannot wait for a profile to name the provider.
+    const codex = ctx.authorization.describe(LlmPiAi.recordKeyFor('openai-codex'))
+    expect(codex?.methods.map(method => method.id)).toEqual(['oauth'])
+  })
+
+  it('mounts without the seam, and simply offers no sign-in', async () => {
+    const ctx = await boot(await home(), {})
+
+    // A headless or ACP composition has no surface to sign in from; everything
+    // else this plugin does still works.
+    expect(ctx.get('authorization')).toBeUndefined()
+    expect(ctx.llm.listConfigurableProviders().length).toBeGreaterThan(0)
+  })
+})
 
 describe('request-level dynamic profiles', () => {
   it('mounts bare and dormant, then registers routes the moment settings supply providers', async () => {
@@ -55,7 +79,7 @@ describe('request-level dynamic profiles', () => {
     const dir = await home()
     await writeFile(
       join(dir, '.credentials.yaml'),
-      'PI_DYNAMIC_KEY: pk-from-settings\nPI_LIVE_KEY: live-key\nPI_OTHER_KEY: other\n',
+      'version: 1\nrefs:\n  PI_DYNAMIC_KEY: pk-from-settings\n  PI_LIVE_KEY: live-key\n  PI_OTHER_KEY: other\n',
       { mode: 0o600 },
     )
     const server = await mockServer([{ events: textEvents }])
@@ -93,7 +117,7 @@ describe('request-level dynamic profiles', () => {
     const dir = await home()
     await writeFile(
       join(dir, '.credentials.yaml'),
-      'PI_LIVE_KEY: live-key\nPI_OTHER_KEY: other\n',
+      'version: 1\nrefs:\n  PI_LIVE_KEY: live-key\n  PI_OTHER_KEY: other\n',
       { mode: 0o600 },
     )
     const server = await mockServer([{ events: textEvents }])
@@ -122,7 +146,7 @@ describe('request-level dynamic profiles', () => {
   it('rotates the per-request credential referenced by apiKeyEnv', async () => {
     vi.stubEnv('PI_DYNAMIC_KEY', '')
     const dir = await home()
-    await writeFile(join(dir, '.credentials.yaml'), 'PI_DYNAMIC_KEY: pk-one\n', { mode: 0o600 })
+    await writeFile(join(dir, '.credentials.yaml'), 'version: 1\nrefs:\n  PI_DYNAMIC_KEY: pk-one\n', { mode: 0o600 })
     const server = await mockServer([{ events: textEvents }, { events: textEvents }])
     const ctx = await boot(dir, {
       providers: { deepseek: { apiKeyEnv: 'PI_DYNAMIC_KEY', baseURL: server.url } },
@@ -167,13 +191,18 @@ describe('request-level dynamic profiles', () => {
     await expect(ctx.settings.update(NS, { providers: { 'not-a-real-provider': {} } }))
       .rejects.toThrow(/resolves no models/)
     expect(ctx.llm.listProviders().map(provider => provider.id)).toEqual(['openai'])
+
+    await expect(ctx.settings.update(NS, {
+      providers: { openai: { headers: { 'bad header name': 'value' } } },
+    })).rejects.toThrow(/provider "openai" header "bad header name" is not valid for Fetch/)
+    expect(ctx.llm.listProviders().map(provider => provider.id)).toEqual(['openai'])
   })
 
   it('keeps serving its routes when a settings-born route collides with another adapter', async () => {
     const dir = await home()
     await writeFile(
       join(dir, '.credentials.yaml'),
-      'PI_LIVE_KEY: live-key\nPI_OTHER_KEY: other\n',
+      'version: 1\nrefs:\n  PI_LIVE_KEY: live-key\n  PI_OTHER_KEY: other\n',
       { mode: 0o600 },
     )
     const server = await mockServer([{ events: textEvents }, { events: textEvents }])

@@ -1,21 +1,3 @@
-/* One-glyph font: maps ONLY U+FFFC to a blank 4em-advance glyph (every other
-   codepoint falls through to the next family). Loaded first in the composer
-   font stack, it gives the placeholder a real cell width INSIDE the textarea,
-   so the backdrop chip (same char, same stack) matches it by construction —
-   the two layers cannot drift and the chip gets a usable label cell. */
-@font-face {
-  font-family: 'DshChipCell';
-  src: url('data:font/ttf;base64,AAEAAAAKAIAAAwAgT1MvMkT8SmIAAAEoAAAAYGNtYXAADQBPAAABkAAAADRnbHlmAAAAAAAAAcwAAAABaGVhZCwtPGoAAACsAAAANmhoZWEDIg7bAAAA5AAAACRobXR4EZQAAAAAAYgAAAAIbG9jYQAAAAAAAAHEAAAABm1heHAAAwACAAABCAAAACBuYW1lvljk2gAAAdAAAABscG9zdNNweNQAAAI8AAAALQABAAAAAQAAdia1tV8PPPUAAwPoAAAAAOaLfcUAAAAA5ot9xQAAAAAAAAAAAAAAAwACAAAAAAAAAAEAAAMg/zgAAA+gAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAACAAEAAAACAAAAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAAAAAwjKAZAABQAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAPz8/PwAA//z//AMg/zgAAAMgAMgAAAAAAAAAAAAAAAAAAAAgAAAB9AAAD6AAAAAAAAIAAAADAAAAFAADAAEAAAAUAAQAIAAAAAQABAABAAD//P//AAD//P//AAUAAQAAAAAAAAAAAAAAAAAAAAAAAAAEADYAAQAAAAAAAQALAAAAAQAAAAAAAgAHAAsAAwABBAkAAQAWABIAAwABBAkAAgAOAChEc2hDaGlwQ2VsbFJlZ3VsYXIARABzAGgAQwBoAGkAcABDAGUAbABsAFIAZQBnAHUAbABhAHIAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAABAgZvYmpyZXAAAAA=') format('truetype');
-}
-
-/* Floating capsule input (figma Input_Bottom 75:8208): card floats above the
-   viewport bottom inside the centered message column; textarea on top, action
-   row below, primary action controls bottom-right. Input width rides the
-   column (--dsh-composer-card-max-width = chat content + 32px, 16px per side,
-   is a cap, not a fixed size — layout rule: the box shrinks with the center
-   column keeping its clearance). Hero variant = the same card centered in the
-   empty state; the transition between the two is a position move of one
-   component. */
 
 .root {
   display: flex;
@@ -24,7 +6,7 @@
   /* Side pads ride the shared clearance (figma Input_Bottom drew L32/R32/B8;
      the sides narrow with the shared width axis); the bottom gradient mask
      is owned by the chat scroller. No top pad: the composer stack's gap owns
-     the space above; error/status strips still carry their own margin. */
+     the space above; the status strip still carries its own margin. */
   padding: 0 var(--dsh-composer-side-clearance) 8px;
 }
 
@@ -47,11 +29,6 @@
   line-height: 18px;
 }
 
-.noticeError {
-  background: var(--dsw-alias-interactive-bg-hover-danger);
-  color: var(--dsw-alias-state-error-primary);
-}
-
 .card {
   box-sizing: border-box;
   position: relative; /* overlay anchor positioning context */
@@ -63,15 +40,20 @@
   width: 100%;
   max-width: var(--dsh-composer-card-max-width);
   padding-top: 10px;
-  /* Input stroke: black/0.10 light, white/0.06 dark (figma darkmode note says
-     the input border is one notch weaker than buttons) — exactly the
-     l2-darkmode-thin pair. Fill: the input surface token (elevated in dark). */
-  border: 1px solid var(--dsw-alias-border-l2-darkmode-thin);
+  /* Input stroke: the light neutral (l2, one step above the menus' l1),
+     drawn as the elevation hairline so it costs no layout; the shadow is the
+     soft elevation tier. Fill: the input surface token (elevated in dark). */
+  border: 0;
+  --dsw-elevation-stroke-color: var(--dsw-alias-border-l2);
   border-radius: 22px;
   background: var(--dsw-specific-input-major);
-  box-shadow: var(--dsw-shadow-lv2);
-  font-size: 16px;
-  line-height: 24px;
+  box-shadow: var(--dsw-elevation-soft);
+  /* The draft text follows the Settings font-size preference (the textarea,
+     mirror, and backdrop all inherit from here, so the three layers stay in
+     step); the line height keeps the default 10px leading via the shared px
+     delta. */
+  font-size: var(--dsh-content-font-size, 14px);
+  line-height: calc(24px + var(--dsh-content-font-delta, 0px));
   /* Elevated surface in dark, same as the menus: the draft scrollport inside
      scrolls once the composer hits its height cap, so the thumb takes the l2
      pair. Declared on the card because the elevation belongs to the surface,
@@ -88,7 +70,7 @@
    by an SVG dash ring (stroke-width 2 centered on the box edge = 1px visible
    inside), which keeps the 22px radius and both themes. */
 .cardWorkspaceTrigger {
-  border-color: transparent;
+  --dsw-elevation-stroke-color: transparent;
   cursor: pointer;
 }
 
@@ -122,15 +104,6 @@
   padding: 10px 12px 0;
 }
 
-/* Rail seat: the card's top padding (10px) plus this 4px matches DeepSeek
-   Chat's spacing above the thumbnails; the card's 12px flex gap owns the space
-   below. The rail itself (arrows, hidden scrollbar, card geometry) is the
-   ui-attachment atom's. */
-.attachments {
-  min-width: 0;
-  padding: 4px 12px 0;
-}
-
 /* Floating overlay anchor (menu / popupSelect shell): entries position
    themselves against the card (bottom: 100% + gap); closed entries render null. */
 .overlayAnchor {
@@ -139,50 +112,29 @@
   height: 0;
 }
 
-/* The draft's scrollport, and the ONLY scrolling box in the composer: the
-   caret is the textarea's and every visible glyph is the backdrop's, so the two
-   layers stay together only by riding one offset the browser applies to both at
-   once. Scrolling one box and assigning the offset to the other cannot hold —
-   a wheel gesture is composited off the main thread, so the assignment lands
-   frames late and the words visibly trail the caret. The 14-line cap lives here
+/* The draft's scrollport, and the ONLY scrolling box in the composer. The
+   contenteditable grows with its content inside; the 14-line cap lives here
    because this is the box the cap describes. */
 .scroll {
   max-height: var(--dsh-composer-text-max-height);
   overflow-y: auto;
+  /* Keeps the bar off the card's right border; .input's right pad gives the
+     4px back so the text column is unchanged. */
+  margin-right: 4px;
 }
 
-/* Mirror-div auto-grow stack: the hidden mirror is in normal flow and sets the FULL draft
-   height (min 2 lines in hero); backdrop and textarea ride it absolutely, so both layers are
-   as tall as the draft and the scrollport above shows a window onto them. Mirror and textarea
-   MUST share font, line-height, padding and wrapping rules or heights diverge. */
+/* The card's 22px corner arc still overlaps the scrollport's top (10px top
+   pad reaches only y=10): start the thumb's travel below the arc so it never
+   pokes outside the capsule. WebKit-path only; Firefox's thin bar has no
+   track margin, an accepted remainder. */
+.scroll::-webkit-scrollbar-track {
+  margin-top: 8px;
+}
+
+/* Auto-grow anchor: the contenteditable is in normal flow and sets the
+   draft's height; the placeholder rides it absolutely. */
 .grow {
   position: relative;
-}
-
-/* Decoration backdrop: same metrics as the textarea, transparent glyphs; only
-   the highlight backgrounds and the ghost hint show through the transparent
-   textarea background above it. */
-.backdrop {
-  position: absolute;
-  inset: 0;
-  overflow: hidden;
-  color: var(--dsw-alias-label-primary);
-  pointer-events: none;
-}
-
-.hlToken {
-  background-color: transparent;
-  color: var(--dsw-alias-state-warn-label);
-}
-
-.hlSegment {
-  border-radius: 4px;
-  background-color: transparent;
-  color: transparent;
-}
-
-.hint {
-  color: var(--dsw-alias-label-caption);
 }
 
 /* Machine pending dot (adjudicating / submitting). */
@@ -190,6 +142,7 @@
   width: 8px;
   height: 8px;
   border-radius: 50%;
+  corner-shape: round;
   background: var(--dsw-alias-state-business-primary);
   animation: input-pending 1s ease-in-out infinite alternate;
 }
@@ -199,68 +152,49 @@
   to { opacity: 1; }
 }
 
+/* The contenteditable draft surface (grows with its content; .scroll caps
+   and scrolls it). figma .InputText 34:10434: pl 16 / pr 12 / pt 4 — the
+   right pad is 8 here plus .scroll's 4px bar inset. */
 .input {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  resize: none;
-  /* Never a scroller of its own: it is as tall as the draft, so it has no
-     scrollable overflow to hold an offset that could differ from the glyphs'.
-     The browser still reveals the caret — the scroll-into-view walks up to
-     .scroll and moves both layers together. */
-  overflow: hidden;
-  border: none;
-  outline: none;
-  background: transparent;
-  color: transparent;
-  /* Business blue, not brand-primary: that token resolves to ink in this sheet. */
-  caret-color: var(--dsw-alias-state-business-primary);
-}
-
-.input,
-.mirror,
-.backdrop {
-  /* Textareas default to content-box (unlike buttons/inputs): without this the
-     width:100% textarea gains its padding OUTSIDE the card and text runs past
-     the right padding — and wraps 28px later than the mirror/backdrop layers. */
   box-sizing: border-box;
-  /* figma .InputText 34:10434: pl 16 / pr 12 / pt 4. Backdrop MUST share these
-     metrics or the highlight ranges drift off the glyphs. */
-  padding: 4px 12px 0 16px;
-  /* DshChipCell first: ONLY U+FFFC resolves there (4em blank cell — the chip
-     slot); everything else falls through to the app stack. All three layers
-     share the stack, so placeholder advances agree by construction. */
-  font-family: 'DshChipCell', var(--dsw-font-family);
+  padding: 4px 8px 0 16px;
+  font-family: var(--dsw-font-family);
   font-size: inherit;
-  /* Three consumers, not two: the mirror sizes the stack, the layers must break
-     lines identically, and the caret reveal parses this value to step one line
-     down for a caret that sits after a newline. That parse needs a length, so a
-     theme resolving this to `normal` would make the reveal a silent no-op. */
   line-height: inherit;
   white-space: pre-wrap;
   word-break: break-word;
   overflow-wrap: anywhere;
-  /* These three MUST wrap at one width: the mirror decides the box height
-     the other two are laid out in, and a glyph layer that breaks lines
-     elsewhere than the textarea puts the words under the wrong caret. They do
-     so by construction now that all three sit INSIDE .scroll — a scrollbar
-     that consumes layout space narrows the scrollport, which is their shared
-     containing block, so it costs all three the same width on every engine.
-     A textarea that scrolls itself would break this, and no property fixes
-     it: WebKit reserves gutter space for an overflow-y:auto textarea and not
-     for the overflow:hidden layers beside it, leaving them 8px apart
-     (768 against 776) — worth 2 to 5 wrapped lines on a long draft. */
+  outline: none;
+  color: var(--dsw-alias-label-primary);
+  /* Business blue, not brand-primary: that token resolves to ink in this sheet. */
+  caret-color: var(--dsw-alias-state-business-primary);
 }
 
-/* figma 34:10434: #ADB2B8 light / #81858C dark — the caption pair exactly. */
-.input::placeholder {
+/* Lexical paragraphs are <p> blocks: strip the UA margins so the surface
+   keeps the textarea's line rhythm. */
+.input p {
+  margin: 0;
+}
+
+/* Claim ghost hint as generated content after the last paragraph: the bar
+   sets --dsh-composer-hint (a quoted string) while the claim's args are
+   blank; without the variable the declaration is invalid and nothing shows. */
+.input p:last-child::after {
+  content: var(--dsh-composer-hint);
   color: var(--dsw-alias-label-caption);
+}
+
+/* figma 34:10434: #ADB2B8 light / #81858C dark — the caption pair exactly.
+   Right inset mirrors .input's 8px pad (the other 4px sits on .scroll). */
+.placeholder {
+  position: absolute;
+  inset: 4px 8px auto 16px;
+  color: var(--dsw-alias-label-caption);
+  pointer-events: none;
   user-select: none;
 }
 
-/* Running lock: grayed but the draft stays visible; the turn ending re-enables. */
-.input:disabled {
+.inputDisabled {
   color: var(--dsw-alias-label-tertiary);
   cursor: not-allowed;
 }
@@ -269,14 +203,9 @@
   cursor: pointer;
 }
 
-.mirror {
-  visibility: hidden;
-  pointer-events: none;
-}
-
 /* Hero (centered empty-state) keeps the 2-line floor (figma min-h 52 = ~2 × 24
    line + 4pt); the docked composer collapses to the content height. */
-.hero .mirror {
+.hero .input {
   min-height: 52px;
 }
 
@@ -284,6 +213,7 @@
    (figma Input_Bottom chrome). */
 .row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
@@ -320,6 +250,12 @@
 
 .trailing {
   flex: none;
+  /* Wrap keeps the left mode chips and the right controls apart when the card
+     runs out of row width: the trailing group (model + send) moves to its own
+     line instead of the left group shrinking until its chip overlaps the
+     model trigger (external:107). The auto margin re-anchors it right on the
+     wrapped line; on a single line space-between already pins it right. */
+  margin-left: auto;
   gap: 12px;
 }
 
@@ -332,6 +268,7 @@
   height: 28px;
   border: none;
   border-radius: 999px;
+  corner-shape: round;
   background: var(--dsw-specific-selector);
   color: var(--dsw-alias-label-primary);
   cursor: pointer;
@@ -389,6 +326,7 @@
   height: 34px;
   border: none;
   border-radius: 999px;
+  corner-shape: round;
   background: var(--dsw-alias-button-info-fill);
   /* Static white, not the foreground token: the arrow stays white on the blue
      fill in both themes (design 34:10465). */
@@ -419,58 +357,4 @@
   color: inherit;
   font-size: 12px;
   cursor: pointer;
-}
-
-/* Plain-text reference highlight: a pure range mark over the
-   draft's own glyphs — advance untouched, so the two layers cannot drift.
-   Chip family colors; clone keeps rounded ends on soft-wrap fragments. */
-.textRef {
-  background-color: transparent;
-  color: var(--dsw-alias-state-business-primary);
-  box-decoration-break: clone;
-  -webkit-box-decoration-break: clone;
-}
-.textRef:after {
-  display: none;
-}
-
-/* Reference chip: rendered in the backdrop at the placeholder offset. Hard
-   alignment constraint: the chip's advance must equal the textarea's U+FFFC
-   advance EXACTLY or every glyph after it drifts (caret/selection follow the
-   textarea character stream). The ::before renders the same U+FFFC through
-   the same font stack (DshChipCell 4em cell), so both layers agree by
-   construction — no measured widths. The label overlays the cell, clipped
-   with an ellipsis; the full name rides the title tooltip. */
-.chip {
-  position: relative;
-  border-radius: 6px;
-  background: rgba(97, 135, 216, 0.22);
-}
-
-.chip::before {
-  content: '\FFFC';
-  color: transparent;
-}
-
-.chipLabel {
-  /* Compensated-scale centering: overflow clipping happens BEFORE transform,
-     so the box is laid out at 1/0.72 of the cell and scaled back down — the
-     clip edge then lands on the visual cell edge, not mid-glyph. */
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  width: calc(100% / 0.72 - 10px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  overflow: hidden;
-  color: var(--dsw-alias-label-primary);
-  white-space: nowrap;
-  transform: translate(-50%, -50%) scale(0.72);
-}
-
-.chipInvalid {
-  background: rgba(216, 97, 97, 0.2);
-  text-decoration: line-through;
-  opacity: 0.7;
 }

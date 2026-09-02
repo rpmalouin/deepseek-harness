@@ -1,50 +1,86 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { bindSnapshotSelector } from '@deepseek-ai/dsh-client-web-react'
+import { bindSnapshotSelector, RemoteError } from '@deepseek-ai/dsh-client-test-runtime'
+import { Context } from '@deepseek-ai/cordis'
+import { SettingsSchemaService } from '@deepseek-ai/dsh-client-ui-settings/src/client/schema.ts'
+import { SettingsDescribeMirror } from '@deepseek-ai/dsh-client-ui-settings/src/client/settings-mirror.ts'
+import { SettingsScopeController } from '@deepseek-ai/dsh-client-ui-settings/src/client/settings-scope.ts'
+
+/** Stateless schema service for scope construction in this jsdom fixture. */
+const schemaService = new SettingsSchemaService(new Context())
 import { WelcomeNotice } from '../src/client/WelcomeNotice.tsx'
 import type { WelcomeNoticeProps } from '../src/client/WelcomeNotice.tsx'
-import { WelcomeNoticeStore } from '../src/client/welcome-store.ts'
+import { decodeWelcomeSection, WelcomeNoticeStore } from '../src/client/welcome-store.ts'
+import type { WelcomeSection } from '../src/client/welcome-store.ts'
 import { en, zh } from '../src/client/locales.ts'
 import {
-  WELCOME_NOTICE_ACK_FIELD, WELCOME_NOTICE_COPY, WELCOME_NOTICE_SETTINGS_NAMESPACE,
+  WELCOME_NOTICE_ACK_FIELD, WELCOME_NOTICE_SETTINGS_NAMESPACE,
   WELCOME_NOTICE_VERSION,
 } from '../src/onboarding-copy.ts'
+
+const WELCOME_NOTICE_COPY = {
+  en: { title: en.welcomeTitle, body: en.welcomeBody, continueLabel: en.welcomeContinue },
+  zh: { title: zh.welcomeTitle, body: zh.welcomeBody, continueLabel: zh.welcomeContinue },
+}
 
 afterEach(() => {
   cleanup()
   document.getElementById('root')?.remove()
 })
 
-function response<T>(value: T) {
-  return { rpcId: 'welcome-rpc' as never, result: { ok: true as const, value } }
+/** The settings namespace answers over the Remote carrier, which has no envelope. */
+function remoteAnswer<T>(value: T) {
+  return { ok: true as const, value }
 }
 
-function mount(version?: string, mutateImpl: () => Promise<unknown> = () => Promise.resolve(response({}))) {
+function welcomeView(value: unknown, revision = 0) {
+  return {
+    ns: WELCOME_NOTICE_SETTINGS_NAMESPACE,
+    schema: {},
+    value,
+    base: {},
+    user: {},
+    applies: 'live' as const,
+    secrets: [],
+    revision,
+  }
+}
+
+type AttentionSnapshot = Parameters<Parameters<WelcomeNoticeProps['useSessionPendingInteraction']>[0]>[0]
+const noAttention: AttentionSnapshot = new Map()
+const useSessionPendingInteraction: WelcomeNoticeProps['useSessionPendingInteraction'] = selector => selector(noAttention)
+
+function mount(
+  version?: string,
+  mutateImpl: () => Promise<unknown> = () =>
+    Promise.resolve(remoteAnswer(welcomeView({ [WELCOME_NOTICE_ACK_FIELD]: WELCOME_NOTICE_VERSION }, 1))),
+) {
   const appRoot = document.createElement('div')
   appRoot.id = 'root'
   document.body.append(appRoot)
   const mutate = vi.fn(mutateImpl)
   const api = {
     settings: {
-      describe: () => Promise.resolve(response({
+      describe: () => Promise.resolve(remoteAnswer({
         writable: true,
         hasDocument: false,
-        namespaces: [{
-          ns: WELCOME_NOTICE_SETTINGS_NAMESPACE,
-          schema: {},
-          value: version === undefined ? {} : { [WELCOME_NOTICE_ACK_FIELD]: version },
-          base: {},
-          user: {},
-          applies: 'live' as const,
-          secrets: [],
-          revision: 0,
-        }],
+        namespaces: [welcomeView(version === undefined ? {} : { [WELCOME_NOTICE_ACK_FIELD]: version })],
       })),
       mutate,
     },
   }
-  const controller = new WelcomeNoticeStore(api as never)
+  const ctx = { remote: api } as never
+  const mirror = new SettingsDescribeMirror(ctx)
+  const scope = new SettingsScopeController<WelcomeSection>(
+    ctx,
+    { namespace: WELCOME_NOTICE_SETTINGS_NAMESPACE, decode: decodeWelcomeSection },
+    mirror,
+    'host',
+    schemaService,
+  )
+  const controller = new WelcomeNoticeStore(scope)
+  void mirror.load()
   const complete = vi.fn()
   const unusedHook = (() => { throw new Error('unused standard hook') }) as never
   const props: WelcomeNoticeProps = {
@@ -52,12 +88,13 @@ function mount(version?: string, mutateImpl: () => Promise<unknown> = () => Prom
     complete,
     openSection: vi.fn(),
     useSessions: unusedHook,
+    useSessionPendingInteraction,
     useWorkspaces: unusedHook,
     controller,
     useWelcome: bindSnapshotSelector(controller.store),
     t: key => zh[key],
   }
-  return { ...render(<WelcomeNotice {...props} />), complete, controller, mutate, appRoot }
+  return { ...render(<WelcomeNotice {...props} />), complete, controller, mirror, mutate, appRoot }
 }
 
 describe('WelcomeNotice', () => {
@@ -100,7 +137,10 @@ describe('WelcomeNotice', () => {
 
   it('skips itself when this exact version was already acknowledged', async () => {
     const h = mount(WELCOME_NOTICE_VERSION)
-    await act(async () => { await h.controller.load() })
+    await act(async () => {
+      await h.mirror.load()
+      await h.controller.load()
+    })
     expect(screen.queryByRole('dialog')).toBeNull()
     expect(h.complete).toHaveBeenCalledOnce()
   })
@@ -114,15 +154,8 @@ describe('WelcomeNotice', () => {
     fireEvent.click(action)
     expect(action.disabled).toBe(true)
     resolveWrite({
-      rpcId: 'welcome-refused' as never,
-      result: {
-        ok: false,
-        error: {
-          code: 'settings-rejected',
-          message: 'read only',
-          details: { ns: WELCOME_NOTICE_SETTINGS_NAMESPACE },
-        },
-      },
+      ok: false,
+      error: new RemoteError('settings/rejected', 'read only', { ns: WELCOME_NOTICE_SETTINGS_NAMESPACE }),
     })
     expect((await screen.findByRole('alert')).textContent).toBe(zh.welcomeError)
     expect(h.complete).not.toHaveBeenCalled()

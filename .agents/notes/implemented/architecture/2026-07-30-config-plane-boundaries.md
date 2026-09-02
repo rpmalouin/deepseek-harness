@@ -6,6 +6,8 @@ English | [中文](2026-07-30-config-plane-boundaries.zh.md)
 
 > Scope: boundary hardening of the [web configuration plane](2026-07-30-web-config-plane.md) — which namespaces reach the wire, which callers reach them, and how an editor holding a partial, possibly stale view writes without destroying what it cannot see.
 
+> The caller boundary, the redaction, and the revision fencing remain current. Restricting which namespaces reach the wire to the configurable-provider directory is superseded by the [plugin-owned settings surface](2026-08-12-plugin-owned-settings-surface.md), which serves every registered namespace.
+
 ## Problem
 
 The plane worked and was reachable by more callers, and with more authority, than its design claimed.
@@ -18,9 +20,9 @@ Three smaller defects sat beside them. `llm/adapters-updated` documented contain
 
 ## Decision
 
-**Reading configuration is as privileged as writing it.** `settings.describe` and `credentials.describe` join the loopback-only set, so the whole configuration plane stays same-origin until real authentication exists. The model catalog (`llm.providers`, `llm.models`) deliberately does not: it carries provider ids, display names, and model lists — no endpoints, no key state — and a LAN client's model picker needs it. The boundary is asserted over a real HTTP server rather than a hand-assembled request, because the `Host` header a browser actually sends is what decides it.
+**Reading configuration is as privileged as writing it.** `settings.describe`, `credentials.describe`, the model catalog, and every other Host operation require one browser session. The configuration plane still redacts secrets independently of authentication. The boundary is asserted over a real HTTP server rather than a hand-assembled request, proving that a forged loopback `Host` value never establishes identity.
 
-**The plane serves exactly the namespaces a registered model provider addresses.** `ctx.llm.listConfigurableProviders()` is the allow-list, so the product boundary is enforced rather than inferred from today's plugin set, and a future namespace becomes web-configurable only by joining that directory. An unregistered namespace and an unexposed one answer identically (`settings-not-exposed`), so probing cannot enumerate the registry.
+**The plane serves exactly the namespaces a registered model provider addresses.** `ctx.llm.listConfigurableProviders()` is the allow-list, so the product boundary is enforced rather than inferred from the installed plugin set, and a future namespace becomes web-configurable only by joining that directory. An unregistered namespace and an unexposed one answer identically (`settings-not-exposed`), so probing cannot enumerate the registry.
 
 **A caller with a partial view names the field it means.** `SettingsProvider.mutate(ns, ops)` applies `set`/`unset` path ops to the section as it stands at the front of the write queue. The client builds ops by diffing its opening snapshot against its draft, so it mentions only fields it can see: a secret absent from both sides produces no op and survives by construction, not by care. `replace` remains the deliberate wholesale reset.
 

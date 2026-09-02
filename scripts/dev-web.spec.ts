@@ -3,7 +3,45 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, it } from 'vitest'
 import type { TsdownBundle } from 'tsdown'
-import { discoverPluginDirs, watchClientPlugins } from './dev-web.ts'
+import { writeClientBuildRecord } from './client-build-environment.ts'
+import {
+  devWebBuildEnvironment,
+  discoverLibraryDirs,
+  discoverPluginDirs,
+  watchClientPlugins,
+} from './dev-web.ts'
+
+it('samples one local environment at startup without validating watcher outputs', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-dev-web-environment-'))
+  try {
+    await mkdir(join(root, 'apps/web/dist'), { recursive: true })
+    await mkdir(join(root, 'packages/client/example/lib'), { recursive: true })
+    await writeFile(join(root, 'package.json'), JSON.stringify({ version: '1.2.3' }))
+    await writeFile(join(root, 'apps/web/dist/index.html'), '<main></main>')
+    await writeFile(join(root, 'packages/client/example/lib/client.js'), 'module.exports = {}\n')
+    writeClientBuildRecord(root, {
+      DSH_CLIENT_BUILD_PROFILE: 'official',
+      DSH_CLIENT_COMMIT_HASH: 'fffffff',
+      DSH_CLIENT_TITLE: 'DeepSeek Harness',
+      DSH_CLIENT_VERSION: '1.2.2',
+    })
+    await writeFile(join(root, 'packages/client/example/lib/client.js'), 'module.exports = { changed: true }\n')
+
+    expect(devWebBuildEnvironment(root, {
+      PATH: '/bin',
+      DSH_BUILD_CLIENT_PROFILE: 'official',
+      DSH_CLIENT_COMMIT_HASH: 'abc1234',
+      DSH_CLIENT_EXTRA: 'launch-value',
+    })).toEqual({
+      PATH: '/bin',
+      DSH_CLIENT_COMMIT_HASH: 'abc1234',
+      DSH_CLIENT_EXTRA: 'launch-value',
+      DSH_CLIENT_VERSION: '1.2.3',
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
 
 it('discovers dsh.client packages with sibling roles', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-dev-web-discovery-'))
@@ -19,6 +57,31 @@ it('discovers dsh.client packages with sibling roles', async () => {
     }))
 
     expect(discoverPluginDirs(root)).toEqual(['packages/client/current'])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+it('discovers client-preset packages the shell links, excluding loader-delivered and test infrastructure', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-dev-web-library-'))
+  try {
+    const write = async (dir: string, manifest: unknown, config: string): Promise<void> => {
+      await mkdir(join(root, dir), { recursive: true })
+      await writeFile(join(root, dir, 'package.json'), JSON.stringify(manifest))
+      await writeFile(join(root, dir, 'tsdown.config.ts'), config)
+    }
+    const clientPreset = "import { clientLibrary } from '../tsdown.client.ts'\nexport default clientLibrary('x', [])\n"
+
+    // Linked by the compile shell: client preset, no loader-delivered half.
+    await write('packages/client/linked', {}, clientPreset)
+    // Loader-delivered: discoverPluginDirs owns it, so it must not appear twice.
+    await write('packages/client/delivered', { dsh: { client: { platform: 'web' } } }, clientPreset)
+    // Test infrastructure builds through the preset but never enters the shell graph.
+    await write('packages/test-support/harness', {}, clientPreset)
+    // Host package with its own config: not a client-face build at all.
+    await write('packages/host/server', {}, "import { defineConfig } from 'tsdown'\nexport default defineConfig({})\n")
+
+    expect(discoverLibraryDirs(root)).toEqual(['packages/client/linked'])
   } finally {
     await rm(root, { recursive: true, force: true })
   }

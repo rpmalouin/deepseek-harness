@@ -1,21 +1,20 @@
 /**
- * The model-facing `read_image` tool: reads a PNG/JPEG/WebP/GIF file, durably
- * commits its bytes through the attachment service (the same lifecycle as a
- * user-uploaded image), and returns an image block so the image enters model
- * context from the next request onward.
+ * The model-facing `read_image` tool commits a PNG/JPEG/WebP/GIF file. A path
+ * without a file extension is identified from its file signature, while the
+ * attachment service's full decode stays authoritative. The mounted `ctx.fs`
+ * backend owns path resolution and read access; names only declare media type.
  *
- * The route gate is deliberately stricter than the host upload preflight: a
- * tool result enters durable session history, so emitting an image on a route
- * that cannot carry it would break that route's continuation. Unknown
- * capability therefore refuses instead of relying on the adapter guard.
+ * The route gate is deliberately stricter than the host upload preflight. An
+ * image-reading tool is useful only when the exact calling route can inspect
+ * its result, so unknown capability refuses instead of relying on an adapter
+ * failure after filesystem and attachment work.
  * @module @deepseek-ai/dsh-tool-fs/src/read-image
  */
 
 import { basename, extname } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { AttachmentError, AttachmentId } from '@deepseek-ai/dsh-attachment'
-import type { ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { AttachmentStore, ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView, ToolExecution } from '@deepseek-ai/dsh-tools'
@@ -31,7 +30,58 @@ const IMAGE_EXTENSIONS: Readonly<Record<string, ImageMediaType>> = {
   '.gif': 'image/gif',
 }
 
-/** The canonical outcome declared by the `read_image` output schema. */
+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] as const
+const JPEG_SIGNATURE = [0xff, 0xd8, 0xff] as const
+
+function matchesBytes(data: Uint8Array, offset: number, expected: readonly number[]): boolean {
+  if (data.byteLength < offset + expected.length) return false
+  return expected.every((byte, index) => data[offset + index] === byte)
+}
+
+function matchesAscii(data: Uint8Array, offset: number, value: string): boolean {
+  if (data.byteLength < offset + value.length) return false
+  for (let index = 0; index < value.length; index += 1) {
+    if (data[offset + index] !== value.charCodeAt(index)) return false
+  }
+  return true
+}
+
+/**
+ * Identify the media type declared by a supported image file signature.
+ * @param data - file bytes read through the current filesystem backend.
+ * @returns the detected supported media type, or undefined for other bytes.
+ */
+export function sniffImageMediaType(data: Uint8Array): ImageMediaType | undefined {
+  if (matchesBytes(data, 0, PNG_SIGNATURE)) return 'image/png'
+  if (matchesBytes(data, 0, JPEG_SIGNATURE)) return 'image/jpeg'
+  if (matchesAscii(data, 0, 'GIF87a') || matchesAscii(data, 0, 'GIF89a')) return 'image/gif'
+  if (matchesAscii(data, 0, 'RIFF') && matchesAscii(data, 8, 'WEBP')) return 'image/webp'
+  return undefined
+}
+
+const IMAGE_VALUE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: true,
+  properties: {
+    attachmentId: { type: 'string', required: true },
+    mediaType: { type: 'string', enum: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'], required: true },
+    bytes: { type: 'integer', required: true },
+    width: { type: 'integer', required: true },
+    height: { type: 'integer', required: true },
+    name: { type: 'string' },
+    originalDimensions: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        width: { type: 'integer', required: true },
+        height: { type: 'integer', required: true },
+      },
+    },
+  },
+} as const
+
+/** The structured outcome declared by the `read_image` output schema. */
 export interface ImageReadValue {
   path: string
   image: {
@@ -41,6 +91,11 @@ export interface ImageReadValue {
     width: number
     height: number
     name?: string
+    /** Orientation-applied file dimensions before normalization; present only when storage reduced it. */
+    originalDimensions?: {
+      width: number
+      height: number
+    }
   }
 }
 
@@ -75,10 +130,17 @@ export async function assertImageCapableRoute(ctx: Context, exec: ToolExecution,
   }
 }
 
+/** Refuse a media type outside the deployment's accepted set, naming the offending path. */
+function assertDeploymentAccepts(attachments: AttachmentStore, mediaType: ImageMediaType, displayPath: string): void {
+  if (!attachments.imageLimits.mediaTypes.includes(mediaType)) {
+    throw new Error(`cannot read "${displayPath}": ${mediaType} images are not accepted by this deployment`)
+  }
+}
+
 /**
- * Re-brand a canonical image outcome into the durable attachment reference an
+ * Re-brand a structured image outcome into the durable attachment reference an
  * `ImageBlock` carries.
- * @param image - the canonical image metadata from the output schema.
+ * @param image - the image metadata from the output schema.
  * @returns the branded attachment reference.
  */
 export function imageRefFromValue(image: ImageReadValue['image']): ImageAttachmentRef {
@@ -89,26 +151,42 @@ export function imageRefFromValue(image: ImageReadValue['image']): ImageAttachme
     width: image.width,
     height: image.height,
     ...image.name === undefined ? {} : { name: image.name },
+    ...image.originalDimensions === undefined ? {} : {
+      originalDimensions: { ...image.originalDimensions },
+    },
   }
 }
 
 /**
  * Format an image read as the model-facing envelope beside its image block.
+ * A downscaled read names the on-disk dimensions and the multiplier that maps
+ * coordinates measured on the attached image back onto the original file.
  * @param displayPath - the backend-resolved path rendered in the envelope's `<path>` element.
- * @param image - the canonical image metadata to summarize.
+ * @param image - the image metadata to summarize.
  * @returns the model-facing envelope; the image itself rides the adjacent image block.
  */
 export function formatImageReadOutput(displayPath: string, image: ImageReadValue['image']): string {
+  let scaled = ''
+  if (image.originalDimensions !== undefined) {
+    // Integer rounding can give the two axes slightly different ratios, so the
+    // advice names one multiplier only when both round to the same value.
+    const x = (image.originalDimensions.width / image.width).toFixed(2)
+    const y = (image.originalDimensions.height / image.height).toFixed(2)
+    const advice = x === y
+      ? `multiply coordinates by ${x}`
+      : `multiply x coordinates by ${x} and y coordinates by ${y}`
+    scaled = ` (downscaled from ${image.originalDimensions.width}x${image.originalDimensions.height} px; ${advice} to locate features in the original file)`
+  }
   return `<path>${displayPath}</path>
 <type>image</type>
 <content>
-${image.mediaType} image, ${image.width}x${image.height} px, ${image.bytes} bytes
+${image.mediaType} image, ${image.width}x${image.height} px, ${image.bytes} bytes${scaled}
 </content>`
 }
 
 /**
- * Project one canonical image read into its model-facing envelope and image.
- * @param value - the canonical image-read outcome.
+ * Project one structured image read into its model-facing envelope and image.
+ * @param value - the image-read outcome.
  * @returns the two content blocks used by native and nested dispatches.
  */
 function imageReadContent(value: ImageReadValue): ContentBlock[] {
@@ -130,7 +208,10 @@ function imageReadContent(value: ImageReadValue): ContentBlock[] {
 export function applyReadImageTool(ctx: Context): void {
   ctx.tools.register(defineTool({
     name: 'read_image',
-    description: 'Read a PNG/JPEG/WebP/GIF file and return the image itself. Requires the current model to accept image input.',
+    description: 'Read a PNG/JPEG/WebP/GIF file and return the image itself. '
+      + 'A path without a file extension is accepted; the format is detected from the file content, so normalized attachment paths can be passed directly without copying or renaming. '
+      + 'Harness validates and downscales large supported images before the next model request, so use this tool directly instead of installing image libraries or creating thumbnails merely to inspect an image. '
+      + 'Independent files may be read concurrently in small batches. Requires the current model to accept image input.',
     parameters: {
       file_path: { type: 'string', required: true, description: 'Path to the image file, resolved by the filesystem backend.' },
     },
@@ -140,19 +221,7 @@ export function applyReadImageTool(ctx: Context): void {
         additionalProperties: false,
         properties: {
           path: { type: 'string', required: true },
-          image: {
-            type: 'object',
-            additionalProperties: false,
-            required: true,
-            properties: {
-              attachmentId: { type: 'string', required: true },
-              mediaType: { type: 'string', enum: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'], required: true },
-              bytes: { type: 'integer', required: true },
-              width: { type: 'integer', required: true },
-              height: { type: 'integer', required: true },
-              name: { type: 'string' },
-            },
-          },
+          image: IMAGE_VALUE_SCHEMA,
         },
       },
       render: (_args, value) => imageReadContent(value),
@@ -163,19 +232,20 @@ export function applyReadImageTool(ctx: Context): void {
     async execute(args, exec) {
       if (args.file_path.trim().length === 0) throw new Error('file_path must be a non-empty string')
 
-      // Every gate runs before any filesystem I/O so a refusal never leaks
-      // partial reads or attachment writes.
-      const mediaType = imageMediaTypeForPath(args.file_path)
-      if (mediaType === undefined) {
-        throw new Error(`cannot read "${args.file_path}": read_image only accepts PNG/JPEG/WebP/GIF paths`)
+      // Every pre-read gate runs before any filesystem I/O so a refusal never
+      // leaks partial reads or attachment writes. An extension-less path
+      // declares no format, so only its format and deployment media-type
+      // checks wait for the bytes.
+      const extension = extname(args.file_path).toLowerCase()
+      const declared = imageMediaTypeForPath(args.file_path)
+      if (declared === undefined && extension !== '') {
+        throw new Error(`cannot read "${args.file_path}": the ${extension} extension does not declare a supported image format; read_image accepts PNG/JPEG/WebP/GIF files, including extension-less files in those formats`)
       }
       const attachments = ctx.get('attachments')
       if (attachments === undefined) {
         throw new Error(`cannot read "${args.file_path}" as an image: no attachment service is mounted`)
       }
-      if (!attachments.imageLimits.mediaTypes.includes(mediaType)) {
-        throw new Error(`cannot read "${args.file_path}": ${mediaType} images are not accepted by this deployment`)
-      }
+      if (declared !== undefined) assertDeploymentAccepts(attachments, declared, args.file_path)
       await assertImageCapableRoute(ctx, exec, args.file_path)
 
       const { target, info } = await resolveRegularReadTarget(ctx, exec, args.file_path)
@@ -184,14 +254,58 @@ export function applyReadImageTool(ctx: Context): void {
       // aggregate bound applies beside the per-image bound.
       const byteCap = Math.min(attachments.imageLimits.maxImageBytes, attachments.imageLimits.maxMessageImageBytes)
       const data = await ctx.fs.readBytes(target, exec.signal, byteCap)
+      const mediaType = declared ?? sniffImageMediaType(data)
+      if (mediaType === undefined) {
+        throw new Error(`cannot read "${target.displayPath}": the file content is not a supported image format; read_image accepts PNG/JPEG/WebP/GIF`)
+      }
+      if (declared === undefined) assertDeploymentAccepts(attachments, mediaType, target.displayPath)
       // Persist before returning: the image block must reference a durably
       // committed object by the time the tool/result event is appended.
       let ref: ImageAttachmentRef
       try {
         ref = await attachments.saveImage({ data, mediaType, name: basename(target.displayPath) })
       } catch (error: unknown) {
-        if (!(error instanceof AttachmentError) || error.code !== 'IMAGE_TYPE_MISMATCH') throw error
-        const extension = extname(target.displayPath).toLowerCase()
+        if (!(error instanceof AttachmentError)) throw error
+        // Dimension refusals stay recoverable tool errors: an oversized image
+        // must never enter durable history, where it would ride every later
+        // model request past provider-side dimension rejections.
+        if (error.code === 'IMAGE_DIMENSION_TOO_LARGE') {
+          throw new Error(
+            `cannot read "${target.displayPath}": at least one image side exceeds the ${attachments.imageLimits.maxImageDimension}px limit; downscale the image and read the smaller copy`,
+            { cause: error },
+          )
+        }
+        if (error.code === 'IMAGE_TOO_MANY_PIXELS') {
+          throw new Error(
+            `cannot read "${target.displayPath}": the image exceeds the ${attachments.imageLimits.maxImagePixels}-pixel decoded-size limit; downscale the image and read the smaller copy`,
+            { cause: error },
+          )
+        }
+        if (error.code === 'IMAGE_TOO_LARGE') {
+          throw new Error(
+            `cannot read "${target.displayPath}": the image cannot be stored within the deployment's byte limits; downscale the image and read the smaller copy`,
+            { cause: error },
+          )
+        }
+        if (error.code === 'ATTACHMENT_WRITE_FAILED' && /16-bit PNG/iu.test(error.message)) {
+          throw new Error(
+            `cannot read "${target.displayPath}": the 16-bit PNG could not be converted to the normalized 8-bit sRGB form; convert it to an 8-bit PNG/JPEG/WebP and retry`,
+            { cause: error },
+          )
+        }
+        if (error.code === 'INVALID_IMAGE' && declared === undefined) {
+          throw new Error(
+            `cannot read "${target.displayPath}": the bytes do not decode as a supported PNG/JPEG/WebP/GIF image; the file may be truncated or corrupt`,
+            { cause: error },
+          )
+        }
+        if (error.code !== 'IMAGE_TYPE_MISMATCH') throw error
+        if (declared === undefined) {
+          throw new Error(
+            `cannot read "${target.displayPath}": the file signature claims ${mediaType}, but the bytes decode as a different image format; the file may be corrupt`,
+            { cause: error },
+          )
+        }
         throw new Error(
           `cannot read "${target.displayPath}": the ${extension} extension declares ${mediaType}, but the bytes use a different image format; rename the file to match its actual format if it is PNG/JPEG/WebP/GIF, or convert it to one of those formats`,
           { cause: error },
@@ -207,13 +321,10 @@ export function applyReadImageTool(ctx: Context): void {
           width: ref.width,
           height: ref.height,
           ...ref.name === undefined ? {} : { name: ref.name },
+          ...ref.originalDimensions === undefined ? {} : {
+            originalDimensions: { ...ref.originalDimensions },
+          },
         },
-      }
-      if (exec.parent !== undefined) {
-        exec.deferContext(createUserMessage({
-          content: imageReadContent(value),
-          source: { kind: 'plugin', plugin: 'tool-fs' },
-        }))
       }
       return value
     },

@@ -1,21 +1,22 @@
 // @vitest-environment jsdom
-/**
- * ClientModuleSystem behavior: lazy CJS arrival (bundle execution only
- * registers the factory), materialization on first import/require with
- * memoization and recursive self-sequencing, the resolution branch order,
- * shared in-flight arrival, invalidate-refetch (HMR), style claiming, the
- * default transport hook, and the loud failure modes (duplicate
- * registration, cycles, table misses, double boot).
- */
+import { Context } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
-  ClientModuleSystem,
-  type BootModuleRow, type ClientModuleLoader, type ClientPluginHandoff, type DshWindow,
+  apply, createClientModuleSystem, parseBootManifest,
+  type BootModuleRow, type ClientBundleRegistration, type ClientModuleCreateOptions,
+  type ClientModuleLoader, type ClientModuleLoaderTarget, type DshWindow,
 } from '../src/client/index.ts'
 
-const win = globalThis as DshWindow
+const MODULES_ID = '@deepseek-ai/dsh-client-modules'
 
-type Factory = ClientPluginHandoff['factory']
+const comboUrl = (ids: readonly string[], rev: string): string =>
+  `/plugins/??${ids.map(id => `${id}/client.js`).join(',')}&rev=${rev}`
+const BOOTSTRAP_URL = comboUrl([MODULES_ID], 'bootstrap')
+const APPLICATION_URL = comboUrl(['a', 'b'], 'application')
+const win = globalThis as DshWindow
+const bootstrapExports = { apply, createClientModuleSystem }
+
+type Factory = ClientBundleRegistration['factory']
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -23,12 +24,37 @@ afterEach(() => {
   for (const el of document.querySelectorAll('style, script')) el.remove()
 })
 
-const row = (id: string): BootModuleRow => ({ id, url: `/plugins/${id}/client.js?rev=0`, rev: '0' })
+const row = (id: string, fields: Partial<BootModuleRow> = {}): BootModuleRow =>
+  ({
+    id,
+    url: comboUrl([id], '0'),
+    initialUrl: id === MODULES_ID ? BOOTSTRAP_URL : APPLICATION_URL,
+    rev: '0',
+    inject: [],
+    external: [],
+    ...fields,
+  })
 
 interface Bench {
   loader: ClientModuleLoader
+  target: ClientModuleLoaderTarget
   fetched: string[]
   gates: Map<string, () => void>
+}
+
+/** Build the page-global facade shape consumed by the module system. */
+function registrationTarget(pending: ClientBundleRegistration[] = []): ClientModuleLoaderTarget {
+  const pendingQueue = [...pending]
+  const target: ClientModuleLoaderTarget = {
+    mode: 'queue',
+    pendingQueue,
+    load: (registration) => { pendingQueue.push(registration) },
+    create: options => createClientModuleSystem(target, {
+      id: MODULES_ID,
+      exports: bootstrapExports,
+    }, options),
+  }
+  return target
 }
 
 /**
@@ -39,35 +65,89 @@ interface Bench {
 function bench(
   entries: BootModuleRow[],
   bundles: Record<string, Factory | null> = {},
-  opts: { seed?: Record<string, unknown>; gated?: string[] } = {},
+  opts: {
+    seed?: Record<string, unknown>
+    gated?: string[]
+    pending?: ClientBundleRegistration[]
+    defaultTransport?: boolean
+  } = {},
 ): Bench {
   const fetched: string[] = []
   const gates = new Map<string, () => void>()
-  const loader = new ClientModuleSystem({
-    modules: entries,
-    staticModules: opts.seed ?? {},
-    loadBundle: async (url) => {
-      fetched.push(url)
-      if (opts.gated?.includes(url) === true) {
-        await new Promise<void>((resolve) => { gates.set(url, resolve) })
-      }
-      const id = /\/plugins\/(.+)\/client\.js/.exec(url)?.[1]
-      const factory = id === undefined ? undefined : bundles[id]
-      if (factory == null || id === undefined) return
-      win.__ModuleLoader__?.load({ id, factory })
+  const target = registrationTarget(opts.pending)
+  win.__ModuleLoader__ = target
+  const loadBundle = async (url: string): Promise<void> => {
+    fetched.push(url)
+    if (opts.gated?.includes(url) === true) {
+      await new Promise<void>((resolve) => { gates.set(url, resolve) })
+    }
+    const batchIds = url === BOOTSTRAP_URL
+      ? entries.filter(entry => entry.initialUrl === BOOTSTRAP_URL).map(entry => entry.id)
+      : url === APPLICATION_URL
+        ? entries.filter(entry => entry.initialUrl === APPLICATION_URL).map(entry => entry.id)
+        : undefined
+    const parsed = new URL(url, 'http://dsh.invalid')
+    const combo = parsed.search.startsWith('??') ? parsed.search.slice(2).split('&', 1)[0] : undefined
+    const singleId = combo?.split(',').length === 1 && combo.endsWith('/client.js')
+      ? combo.slice(0, -'/client.js'.length)
+      : undefined
+    for (const id of batchIds ?? (singleId === undefined ? [] : [singleId])) {
+      const factory = bundles[id]
+      if (factory != null) win.__ModuleLoader__?.load({ id, factory })
+    }
+  }
+  const bootstrapEntries = entries.filter(entry => entry.initialUrl === BOOTSTRAP_URL).map(entry => entry.id)
+  const applicationEntries = entries.filter(entry => entry.initialUrl === APPLICATION_URL).map(entry => entry.id)
+  const batches = [
+    ...(bootstrapEntries.length === 0 ? [] : [{
+      phase: 'bootstrap' as const, url: BOOTSTRAP_URL, rev: 'bootstrap', entries: bootstrapEntries,
+    }]),
+    ...(applicationEntries.length === 0 ? [] : [{
+      phase: 'application' as const, url: APPLICATION_URL, rev: 'application', entries: applicationEntries,
+    }]),
+  ]
+  const loader = target.create({
+    boot: {
+      rev: 'graph',
+      entries: entries.map(({ initialUrl: _initialUrl, inject, external, ...entry }) => ({
+        ...entry,
+        ...(inject.length === 0 ? {} : { inject }),
+        ...(external.length === 0 ? {} : { external }),
+      })),
+      batches,
     },
+    staticModules: opts.seed ?? {},
+    ...(opts.defaultTransport === true ? {} : { loadBundle }),
   })
-  return { loader, fetched, gates }
+  return { loader, target, fetched, gates }
 }
 
+describe('Cordis plugin face', () => {
+  it('rejects activation before the HTML facade creates the module system', () => {
+    expect(() => { apply(new Context()) }).toThrow('createClientModuleSystem must run before plugin boot')
+  })
+})
+
 describe('lazy CJS arrival', () => {
+  it('drains registrations queued by parser-blocking preload scripts into the same live facade', async () => {
+    const b = bench([row('runtime')], {}, {
+      pending: [{ id: 'runtime', factory: () => ({ marker: 'preloaded' }) }],
+    })
+    const exports = await b.loader.import('runtime', '', {})
+    expect((exports as { marker: string }).marker).toBe('preloaded')
+    expect(b.target.pendingQueue).toEqual([])
+    expect(b.fetched).toEqual([])
+    expect(win.__ModuleLoader__).toBe(b.target)
+    expect(b.target.mode).toBe('live')
+  })
+
   it('prefetch loads and registers but does not run the factory', async () => {
     const ran: string[] = []
     const b = bench([row('a')], { a: () => { ran.push('a'); return {} } })
     await b.loader.prefetch('a')
-    expect(b.fetched).toEqual(['/plugins/a/client.js?rev=0'])
+    expect(b.fetched).toEqual([APPLICATION_URL])
     expect(ran).toEqual([])
-    expect(b.loader.loadCache.size).toBe(0)
+    expect(b.loader.loadCache.has('a')).toBe(false)
   })
 
   it('import materializes once and memoizes the exports', async () => {
@@ -88,9 +168,39 @@ describe('lazy CJS arrival', () => {
     expect(b.fetched).toHaveLength(1)
   })
 
+  it('registers declared dynamic requests before materializing their consumer', async () => {
+    const b = bench([
+      row('consumer', { external: ['provider/client', 'react'] }),
+      row('provider'),
+    ], {
+      consumer: req => ({ provider: req('provider/client'), react: req('react') }),
+      provider: () => ({ marker: 'provider' }),
+    }, { seed: { react: { marker: 'react' } } })
+    const exports = await b.loader.import('consumer', '', {}) as {
+      provider: { marker: string }
+      react: { marker: string }
+    }
+    expect(b.fetched).toEqual([APPLICATION_URL])
+    expect(exports.provider.marker).toBe('provider')
+    expect(exports.react.marker).toBe('react')
+  })
+
+  it('registers injected package factories before materializing a consumer', async () => {
+    const b = bench([
+      row('consumer', { inject: ['provider'] }),
+      row('provider', { inject: ['consumer'] }),
+    ], {
+      consumer: req => ({ provider: req('provider/client') }),
+      provider: () => ({ marker: 'provider' }),
+    })
+    const exports = await b.loader.import('consumer', '', {}) as { provider: { marker: string } }
+    expect(b.fetched).toEqual([APPLICATION_URL])
+    expect(exports.provider.marker).toBe('provider')
+  })
+
   it('concurrent callers share one in-flight arrival and materialize once', async () => {
     const ran: string[] = []
-    const url = '/plugins/a/client.js?rev=0'
+    const url = APPLICATION_URL
     const b = bench([row('a')], { a: () => { ran.push('a'); return { marker: 'a' } } }, { gated: [url] })
     const first = b.loader.import('a', '', {})
     const second = b.loader.import('a', '', {})
@@ -168,24 +278,32 @@ describe('require resolution', () => {
   })
 })
 
-describe('static registry', () => {
-  it('serves shell-own modules to import and require without any fetch', async () => {
-    const shell = { marker: 'app-shell' }
-    const b = bench([row('a')], {
-      a: req => ({ dep: req('app-shell') }),
+describe('bootstrap module', () => {
+  it('caches the materialized modules exports under the package id and /client alias', async () => {
+    const b = bench([
+      row('consumer', { external: [`${MODULES_ID}/client`] }),
+      row(MODULES_ID),
+    ], {
+      consumer: req => ({ dep: req(`${MODULES_ID}/client`) }),
     })
-    b.loader.registerStatic('app-shell', shell)
-    await b.loader.prefetch('app-shell')
-    expect(await b.loader.import('app-shell', '', {})).toBe(shell)
-    expect(b.loader.loadCache.get('app-shell')?.styles).toEqual([])
-    expect((await b.loader.import('a', '', {}) as { dep: unknown }).dep).toBe(shell)
-    expect(b.fetched).toEqual(['/plugins/a/client.js?rev=0'])
+    await b.loader.prefetch(MODULES_ID)
+    const exports = await b.loader.import('consumer', '', {}) as { dep: unknown }
+    expect(exports.dep).toBe(bootstrapExports)
+    expect(await b.loader.import(`${MODULES_ID}/client`, '', {})).toBe(bootstrapExports)
+    expect(b.fetched).toEqual([APPLICATION_URL])
   })
 
-  it('duplicate static registration is loud', () => {
+  it('publishes the same closed-over system when the modules Cordis plugin activates', () => {
     const b = bench([])
-    b.loader.registerStatic('app-shell', {})
-    expect(() => { b.loader.registerStatic('app-shell', {}) }).toThrow('registered twice')
+    const ctx = new Context()
+    apply(ctx)
+    expect(ctx.modules).toBe(b.loader)
+  })
+
+  it('rejects a second queued registration for the bootstrap id', () => {
+    expect(() => bench([], {}, {
+      pending: [{ id: `${MODULES_ID}/client`, factory: () => ({}) }],
+    })).toThrow(`duplicate factory registration for "${MODULES_ID}/client"`)
   })
 })
 
@@ -216,10 +334,124 @@ describe('failure modes', () => {
     expect(() => bench([row('a'), row('a')])).toThrow('duplicate graph entry "a"')
   })
 
+  it('a module arrival cycle is loud even if a malformed host graph reaches the browser', async () => {
+    const b = bench([
+      row('a', { external: ['b'] }),
+      row('b', { external: ['a'] }),
+    ])
+    await expect(b.loader.prefetch('a')).rejects.toThrow('module arrival cycle a -> b -> a')
+  })
+
   it('double boot is loud', () => {
-    bench([])
-    expect(() => new ClientModuleSystem({ modules: [], staticModules: {} }))
-      .toThrow('already installed (double boot?)')
+    const b = bench([])
+    const options: ClientModuleCreateOptions = {
+      boot: { rev: 'graph', entries: [], batches: [] },
+      staticModules: {},
+    }
+    expect(() => b.target.create(options)).toThrow('create called after module-system boot')
+  })
+})
+
+describe('boot manifest wire', () => {
+  it('normalizes absent shared-module fields and carries the declared ones', () => {
+    const manifest = parseBootManifest({
+      rev: 'graph',
+      entries: [
+        { id: 'a', url: '/plugins/a/client.js', rev: '1', inject: ['b'] },
+        { id: 'b', url: '/plugins/b/client.js', rev: '2', external: ['react'] },
+      ],
+      batches: [{ phase: 'application', url: '/batch.js', rev: 'batch', entries: ['a', 'b'] }],
+    })
+    expect(manifest.modules).toEqual([
+      { id: 'a', url: '/plugins/a/client.js', initialUrl: '/batch.js', rev: '1', inject: ['b'], external: [] },
+      { id: 'b', url: '/plugins/b/client.js', initialUrl: '/batch.js', rev: '2', inject: [], external: ['react'] },
+    ])
+  })
+
+  it('rejects a non-array external', () => {
+    expect(() => parseBootManifest({
+      rev: 'graph',
+      entries: [{ id: 'a', url: '/a', rev: '1', external: 'react' }],
+      batches: [{ phase: 'application', url: '/batch.js', rev: 'batch', entries: ['a'] }],
+    })).toThrow('client-modules: boot manifest entry "a" external must be a string array')
+  })
+
+  it('requires the batch table', () => {
+    expect(() => parseBootManifest({ rev: 'graph', entries: [] }))
+      .toThrow('client-modules: boot manifest batches must be an array')
+  })
+
+  it('rejects malformed batch phases', () => {
+    const entry = { id: 'a', url: '/a.js', rev: '1' }
+    expect(() => parseBootManifest({ rev: 'graph', entries: [entry], batches: [null] }))
+      .toThrow('client-modules: boot manifest batch is not an object')
+    expect(() => parseBootManifest({
+      rev: 'graph', entries: [entry], batches: [{ phase: 'idle', url: '/b.js', rev: 'b', entries: ['a'] }],
+    })).toThrow('boot manifest batch phase must be "bootstrap" or "application"')
+  })
+
+  it('rejects duplicate batch URLs', () => {
+    expect(() => parseBootManifest({
+      rev: 'graph',
+      entries: [
+        { id: 'a', url: '/a.js', rev: '1' },
+        { id: 'b', url: '/b.js', rev: '2' },
+      ],
+      batches: [
+        { phase: 'application', url: '/combo.js', rev: '1', entries: ['a'] },
+        { phase: 'application', url: '/combo.js', rev: '2', entries: ['b'] },
+      ],
+    })).toThrow('boot manifest carries duplicate batch URL "/combo.js"')
+  })
+
+  it('allows several batches in one scheduling phase', () => {
+    const manifest = parseBootManifest({
+      rev: 'graph',
+      entries: [
+        { id: 'a', url: '/a.js', rev: '1' },
+        { id: 'b', url: '/b.js', rev: '2' },
+      ],
+      batches: [
+        { phase: 'application', url: '/b.js', rev: '1', entries: ['a'] },
+        { phase: 'application', url: '/c.js', rev: '2', entries: ['b'] },
+      ],
+    })
+    expect(manifest.modules.map(row => row.initialUrl)).toEqual(['/b.js', '/c.js'])
+  })
+
+  it('requires complete batch fields and non-empty entries', () => {
+    const entry = { id: 'a', url: '/a.js', rev: '1' }
+    expect(() => parseBootManifest({
+      rev: 'graph', entries: [entry], batches: [{ phase: 'application', entries: ['a'] }],
+    })).toThrow('boot manifest application batch must carry string url/rev')
+    expect(() => parseBootManifest({
+      rev: 'graph', entries: [entry], batches: [{ phase: 'application', url: '/b.js', rev: 'b', entries: [] }],
+    })).toThrow('boot manifest application batch entries must be a non-empty string array')
+  })
+
+  it('requires a one-to-one batch assignment over graph entries', () => {
+    const entries = [
+      { id: 'a', url: '/a.js', rev: '1' },
+      { id: 'b', url: '/b.js', rev: '2' },
+    ]
+    expect(() => parseBootManifest({
+      rev: 'graph',
+      entries,
+      batches: [{ phase: 'application', url: '/batch.js', rev: 'b', entries: ['ghost'] }],
+    })).toThrow('boot manifest application batch names unknown entry "ghost"')
+    expect(() => parseBootManifest({
+      rev: 'graph',
+      entries,
+      batches: [
+        { phase: 'bootstrap', url: '/boot.js', rev: 'boot', entries: ['a'] },
+        { phase: 'application', url: '/batch.js', rev: 'app', entries: ['a', 'b'] },
+      ],
+    })).toThrow('boot manifest entry "a" belongs to more than one batch')
+    expect(() => parseBootManifest({
+      rev: 'graph',
+      entries,
+      batches: [{ phase: 'application', url: '/batch.js', rev: 'b', entries: ['a'] }],
+    })).toThrow('boot manifest entry "b" belongs to no initial-load batch')
   })
 })
 
@@ -228,13 +460,41 @@ describe('HMR reset', () => {
     let generation = 0
     const b = bench([row('a')], { a: () => ({ generation: ++generation }) })
     const first = await b.loader.import('a', '', {})
-    b.loader.invalidate('a')
+    b.loader.invalidate('a', '1')
     expect(b.loader.loadCache.has('a')).toBe(false)
     await b.loader.prefetch('a')
     const second = await b.loader.import('a', '', {})
-    expect(b.fetched).toHaveLength(2)
+    expect(b.fetched).toEqual([APPLICATION_URL, comboUrl(['a'], '1')])
     expect((first as { generation: number }).generation).toBe(1)
     expect((second as { generation: number }).generation).toBe(2)
+  })
+
+  it('preserves an absolute combo endpoint when applying the rebuilt revision', async () => {
+    const b = bench([
+      row('a', { url: 'https://plugins.example.test/plugins/??a/client.js&rev=0' }),
+    ], { a: () => ({}) })
+    await b.loader.import('a', '', {})
+    b.loader.invalidate('a', 'next')
+    await b.loader.prefetch('a')
+    expect(b.fetched.at(-1)).toBe('https://plugins.example.test/plugins/??a/client.js&rev=next')
+  })
+
+  it('preserves a protocol-relative combo endpoint when applying the rebuilt revision', async () => {
+    const b = bench([
+      row('a', { url: '//plugins.example.test/plugins/??a/client.js&rev=0' }),
+    ], { a: () => ({}) })
+    await b.loader.import('a', '', {})
+    b.loader.invalidate('a', 'next')
+    await b.loader.prefetch('a')
+    expect(b.fetched.at(-1)).toBe('//plugins.example.test/plugins/??a/client.js&rev=next')
+  })
+
+  it('uses the current plugin revision when a graph-row invalidation omits an override', async () => {
+    const b = bench([row('a')], { a: () => ({}) })
+    await b.loader.import('a', '', {})
+    b.loader.invalidate('a')
+    await b.loader.prefetch('a')
+    expect(b.fetched).toEqual([APPLICATION_URL, comboUrl(['a'], '0')])
   })
 })
 
@@ -277,14 +537,14 @@ describe('default transport seam', () => {
       const script = nodes[0]
       if (!(script instanceof HTMLScriptElement)) throw new Error('expected script node')
       expect(script.async).toBe(true)
-      expect(script.getAttribute('src')).toBe('/plugins/dee/client.js?rev=0')
+      expect(script.getAttribute('src')).toBe(APPLICATION_URL)
       queueMicrotask(() => {
         win.__ModuleLoader__?.load({ id: 'dee', factory: () => ({ marker: 'via-script' }) })
         script.dispatchEvent(new Event('load'))
       })
     })
-    const loader: ClientModuleLoader = new ClientModuleSystem({ modules: [row('dee')], staticModules: {} })
-    const exports = await loader.import('dee', '', {})
+    const b = bench([row('dee')], {}, { defaultTransport: true })
+    const exports = await b.loader.import('dee', '', {})
     expect((exports as { marker: string }).marker).toBe('via-script')
     expect(append).toHaveBeenCalledOnce()
     expect([...document.querySelectorAll('script')]).toEqual([])
@@ -296,9 +556,9 @@ describe('default transport seam', () => {
       if (!(script instanceof HTMLScriptElement)) throw new Error('expected script node')
       queueMicrotask(() => { script.dispatchEvent(new Event('error')) })
     })
-    const loader = new ClientModuleSystem({ modules: [row('dee')], staticModules: {} })
-    await expect(loader.prefetch('dee')).rejects.toThrow(
-      'bundle script /plugins/dee/client.js?rev=0 failed to load',
+    const b = bench([row('dee')], {}, { defaultTransport: true })
+    await expect(b.loader.prefetch('dee')).rejects.toThrow(
+      `bundle script ${APPLICATION_URL} failed to load`,
     )
     expect([...document.querySelectorAll('script')]).toEqual([])
   })

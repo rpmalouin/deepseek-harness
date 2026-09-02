@@ -4,6 +4,8 @@ Status: implemented
 
 English | [中文](2026-08-10-web-plugin-configuration.zh.md)
 
+> The three sections, the layering, and the staged-save form remain current. The Host allowlist and the unkeyed card list are superseded by the [plugin-owned settings surface](../architecture/2026-08-12-plugin-owned-settings-surface.md): every registered namespace is served, and cards are keyed on the namespace they edit.
+
 ## Problem
 
 Everything a plugin can be configured with lived in `cordis.yml`. A user who wanted a longer shell timeout, a different search endpoint, or fewer parallel tool calls had to find the composition file, know its shape, and restart — while the Models page had shown for months that a settings namespace can be edited from the browser and take effect immediately.
@@ -47,4 +49,4 @@ Two costs are real. Adding a fourth plugin still requires an entry in the apipro
 
 The bash and pwsh executors now expose `config` as a getter over a source thunk rather than a readonly field. Every read site was already per-call, so nothing else changed, but a subclass that captured `this.config` at construction would silently pin the composition entry.
 
-`verify-cordis-config` gained one check, paid for by this branch: merging master's rename of the client manifest field (`dshClient` → `dsh.client`) left this package declaring the old name, and the whole section vanished from the browser with no error anywhere — the row composed, the empty node half activated, and the browser roster scan simply never matched it. Nothing could catch that, because the composition file cannot tell a surface plugin from a Host plugin: the difference lives in the manifest. The gate now requires a `packages/client` package's `./client` export and its `dsh.client` declaration to agree in both directions. The check is scoped to that group because a Host package's `./client` export is the typed wire face its browser consumers import, not a plugin the roster serves.
+`verify-cordis-config` requires every `packages/client` package's `./client` export and `dsh.client` declaration to agree in both directions. Without that check, a stale manifest field can leave the composition row and empty node half active while the browser roster silently omits the package. The check is scoped to that group because a Host package's `./client` export is the typed wire face its browser consumers import, not a plugin the roster serves.

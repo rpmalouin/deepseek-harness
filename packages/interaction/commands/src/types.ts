@@ -7,12 +7,21 @@
  * @module @deepseek-ai/dsh-commands/types
  */
 
+import type { SessionSeq } from '@deepseek-ai/dsh-session/types'
 import type { CommandId } from './brand.ts'
 
 /** Immutable metadata for a command's optional unstructured input. */
 export interface CommandInputDescriptor {
   /** Placeholder shown before the user supplies free-form input. */
   readonly hint: string
+  /**
+   * Whether composer image attachments may accompany an invocation. Absent or
+   * false = the executor rejects an invocation carrying images and capable
+   * composers refuse the submission before dispatch. A declaring command's
+   * handler receives the admitted durable blocks and owns every further
+   * grammar decision, including rejecting sub-commands that cannot use them.
+   */
+  readonly images?: boolean
 }
 
 /** Expected command outcome rendered directly by the dispatching UI. */
@@ -21,7 +30,7 @@ export type CommandResult =
     readonly kind: 'success'
     readonly text?: string
     /** Earlier authoritative domain event that owns a richer presentation. */
-    readonly sourceEventSeq?: number
+    readonly sourceEventSeq?: SessionSeq
   }
   | { readonly kind: 'error'; readonly text: string }
 
@@ -51,7 +60,7 @@ export interface CommandDescriptor {
 /**
  * Producer record for one command invocation (the `command/run` event's
  * source slot). Merge-extensible sum type mirroring `MessageSourceMap`'s
- * shape; minimal today because every executor caller is a human-facing UI
+ * shape; minimal because every executor caller is a human-facing UI
  * surface dispatching a human-typed line, so the sole variant is `user`.
  */
 export interface CommandSourceMap {
@@ -96,7 +105,7 @@ declare module '@deepseek-ai/dsh-session/types' {
       commandId: CommandId
       kind: 'success' | 'error'
       text?: string
-      sourceEventSeq?: number
+      sourceEventSeq?: import('@deepseek-ai/dsh-session/types').SessionSeq
     }
   }
 }

@@ -7,16 +7,19 @@
  * Feature-owned rows and sections stay with their features.
  * Export discipline: packages/client/AGENTS.md.
  */
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
-import type { ConnectionHandle } from '@deepseek-ai/dsh-api-remotes/client'
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
+// Type-only: pulls the ctx.remote merge and its fixed Host facts.
+import type {} from '@deepseek-ai/dsh-api-remotes/client'
+import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client'
 import { resolveSlotLabel } from '@deepseek-ai/dsh-client-ui-slots'
-import { bindSnapshotSelector } from '@deepseek-ai/dsh-client-web-react'
 // Type-only: the settings slot declarations plus the ctx.settingsScope Context
 // merge. Cross-plugin collaboration goes through the service, never a value
 // import (client bundle purity gate).
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 // Type-only: pulls ctx.locale into this program.
 import type {} from '@deepseek-ai/dsh-client-locale/client'
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type {} from '@deepseek-ai/dsh-client-ui-session/client'
 import type {
   SettingsOnboardingStep, SettingsRootInjected, SettingsSectionRow,
 } from './shell-contract.ts'
@@ -25,7 +28,7 @@ import { CloseLabel, HeaderContent, TriggerContent } from './chrome.tsx'
 import { GeneralSection } from './GeneralSection.tsx'
 import { SettingsDocumentAction } from './SettingsDocumentAction.tsx'
 import type { SettingsDocumentActionInjected } from './SettingsDocumentAction.tsx'
-import { refreshDocumentIfLoaded, SettingsDocumentStore } from './settings-document-store.ts'
+import { SettingsDocumentStore } from './settings-document-store.ts'
 import { en, zh, type SettingsKey } from './locales.ts'
 
 export type {
@@ -54,7 +57,7 @@ const NS = 'settings'
  * ui-settings' apply, whose activation order relative to this one is NOT
  * constrained; registrations depend on their slots through `slots.inject()`.
  */
-export const inject = ['slots', 'locale', 'connection']
+export const inject = ['slots', 'locale', 'connection', 'remote', 'remote.settings', 'settingsScope']
 
 /**
  * Register the `settings` dictionaries, the chrome content, and the General
@@ -63,24 +66,23 @@ export const inject = ['slots', 'locale', 'connection']
  */
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'ui-settings-general: dictionaries')
+  const connection = ctx.get('connection') as ConnectionHandle
 
   // Copy freshness is framework-owned: components read the standard `t`
   // seat, and the nav label is a thunk the owner resolves per render — no
   // locale/change re-registration wiring.
   const t = ctx.locale.bind(NS)
-  const connection = ctx.get('connection') as ConnectionHandle
-  const documentController = connection.isLoopback
-    ? new SettingsDocumentStore(connection.api)
+  // The shared SettingsScope mirror updates after document commits and reconnects.
+  const documentController = ctx.remote.$host.isLoopback
+    ? new SettingsDocumentStore(ctx, ctx.settingsScope.describe())
     : undefined
   const documentInjected = documentController === undefined
     ? undefined
-    : (() => {
-      const useSnapshot = bindSnapshotSelector(documentController.store)
-      return (): SettingsDocumentActionInjected => ({ controller: documentController, useSnapshot })
-    })()
-  ctx.effect(() => ctx.on('connection/reset', () => {
-    refreshDocumentIfLoaded(documentController)
-  }), 'ui-settings-general: metadata invalidations')
+    : (): SettingsDocumentActionInjected => ({
+      controller: documentController,
+      hooks: { snapshot: documentController.store },
+    })
+  ctx.effect(() => () => { documentController?.dispose() }, 'ui-settings-general: document action directory')
   // The settings shell: this package occupies the sidebar-owned hole and
   // declares the settings slots. Ledger → nav-row projection as an observable
   // source (uSES contract: getSnapshot returns the cached rows until the
@@ -92,7 +94,9 @@ export function apply(ctx: ClientContext): void {
   let onboardingVersion = -1
   let onboardingSteps: readonly SettingsOnboardingStep[] = []
   const shellInjected = (): SettingsRootInjected => ({
+    reconnect: () => { connection.reconnect() },
     hooks: {
+      connectionState: connection.state,
       sections: {
         getSnapshot: () => {
           const version = ctx.slots.getVersion('settings.section')
@@ -141,6 +145,7 @@ export function apply(ctx: ClientContext): void {
   })
   ctx.slots.inject('sidebar.settings', () => ctx.slots.register({
     name: 'sidebar.settings',
+    locale: NS,
     children: {
       'settings.trigger': { kind: 'single', scope: 'root' },
       'settings.header': { kind: 'single', scope: 'root' },
