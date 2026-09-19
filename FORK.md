@@ -315,6 +315,40 @@ git merge upstream/master
 git push origin master
 ```
 
-Upstream tracking: this fork starts from upstream `master` at
-`47f943859bef` (2026-08-13). Add any new upstream work by merging forward from
-`deepseek-ai/deepseek-harness`.
+Upstream tracking: this fork started from the upstream `master` line that later
+shipped as the `dsh-v0.1.0-rc.7` tag (2026-08-13) and was last synced to the
+`dsh-v0.1.6-alpha.2` tag (2026-09-17) on 2026-09-19. Add new upstream work by
+merging forward from `deepseek-ai/deepseek-harness`.
+
+The checkout uses the conventional remote names the commands above assume:
+`upstream` = `deepseek-ai/deepseek-harness` and `origin` = the `rpmalouin` fork, so
+`git push origin master` publishes the sync to the fork rather than to upstream.
+
+### Sync notes (upstream gates apply to the fork's own additions)
+
+A merge of new upstream work is not only the three commands above; the fork's
+files are checked by upstream gates, and the pre-commit hooks run on the merge
+commit:
+
+1. Run `pnpm install` **before** committing the merge. The hooks execute from
+   `node_modules`, and a tree left over from the previous sync fails
+   `third-party notices (staged)` with `cannot resolve react/jsx-runtime`.
+2. `README.md` is a bilingual pair (`README.md`, `README.zh.md`,
+   `README.i18n.yaml`) under `verify-translation-pairing`. Editing the English
+   side alone goes red: bring the Chinese side along in one terminology-guided
+   pass, then re-record with
+   `pnpm run verify-translation-pairing --write README.md`.
+3. `verify-md-wrap` requires **one physical line per prose paragraph**, in the
+   fork's additions to `README.md` and `AGENTS.md` as much as anywhere else. A
+   paragraph or list item continued on its next source line is a violation.
+4. `verify-doc-budgets` caps `AGENTS.md` at 1950 words, so the fork's
+   code-review-graph section stays a compact pointer at the top of the file
+   rather than a tool catalog; the per-tool detail lives under `.agents/skills/`,
+   which is outside the gated corpora.
+5. `pnpm run doc-quick` is the build-free gate aggregate worth running after
+   resolving doc-level conflicts, and `pnpm run build` verifies the merged tree
+   after `pnpm install`.
+
+`.gitignore` is the only file with recurring conflict risk (upstream appends new
+entries; the fork appends its own at the end) — merge the hunk by keeping both
+sides rather than choosing one.
