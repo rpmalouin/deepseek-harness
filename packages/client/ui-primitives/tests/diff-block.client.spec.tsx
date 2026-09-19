@@ -1,15 +1,15 @@
 // @vitest-environment jsdom
-// DiffBlock: the per-file hunk rows (path header, removed block, added block),
-// the same-file second-hunk gap separator, the `+A -R · N file(s)` footer and
-// its singular/plural, the head/tail height cap and its expand control, the
-// empty-diffs null render, and the copy control writing the prefixed diff text
-// on both the accepted and the refused clipboard paths. writeClipboard's own
-// return contract is pinned in terminal-block.spec.tsx (the shared return contract), so
-// only its DOM consequence is asserted here.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { DEFAULT_DIFF_MAX_LINES, DiffBlock, type DiffHunk } from '../src/index.ts'
+import type { ComponentProps } from 'react'
+import { DEFAULT_DIFF_MAX_LINES, DiffBlock as LocalizedDiffBlock, type DiffHunk } from '../src/index.ts'
+import { diffBlockLabels } from './labels.client.ts'
+import { diffTotals } from '../src/DiffBlock.tsx'
+
+function DiffBlock(props: Omit<ComponentProps<typeof LocalizedDiffBlock>, 'labels'>) {
+  return <LocalizedDiffBlock {...props} labels={diffBlockLabels} />
+}
 
 afterEach(cleanup)
 
@@ -17,17 +17,14 @@ beforeEach(() => {
   vi.useRealTimers()
 })
 
-/** The rendered body rows, one string per visible line (CSS-module class prefix). */
 function bodyRows(container: HTMLElement): string[] {
   return [...container.querySelectorAll('[class*="_line_"]')].map(row => row.textContent ?? '')
 }
 
-/** Only the changed rows (add/del), excluding the path header and gap chrome. */
 function changeRows(container: HTMLElement): string[] {
   return [...container.querySelectorAll('[class*="_del_"], [class*="_add_"]')].map(row => row.textContent ?? '')
 }
 
-/** `count` numbered added lines as one hunk's newText. */
 function added(count: number): string {
   return Array.from({ length: count }, (_v, i) => `line ${i + 1}`).join('\n')
 }
@@ -95,6 +92,80 @@ describe('DiffBlock structure', () => {
   it('keeps a genuine interior blank line', () => {
     const { container } = render(<DiffBlock diffs={[{ path: 'a.ts', oldText: null, newText: 'x\n\ny' }]} />)
     expect(container.querySelectorAll('[class*="_add_"]').length).toBe(3)
+  })
+})
+
+describe('DiffBlock local changes', () => {
+  it.each([128, 129])('renders and copies %i replacements with bounded comparison', async (count) => {
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+    const oldLines = ['shared context', ...Array.from({ length: count }, (_, i) => `old ${i}`)]
+    const newLines = ['shared context', ...Array.from({ length: count }, (_, i) => `new ${i}`)]
+    const diffs = [{ path: 'large.txt', oldText: oldLines.join('\n'), newText: newLines.join('\n') }]
+    const total = count === 128 ? count : count + 1
+    render(<DiffBlock diffs={diffs} maxLines={1000} />)
+    expect(diffTotals(diffs)).toEqual({ added: total, removed: total })
+    expect(screen.getByText(`└ +${total} -${total} · 1 file`)).toBeTruthy()
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: '复制' })) })
+    expect(writeText).toHaveBeenCalledWith(count === 128
+      ? ['large.txt', '  shared context', ...oldLines.slice(1).map(line => `- ${line}`), ...newLines.slice(1).map(line => `+ ${line}`)].join('\n')
+      : ['large.txt', ...oldLines.map(line => `- ${line}`), ...newLines.map(line => `+ ${line}`)].join('\n'))
+  })
+
+  it('keeps a sparse edit exact in a ten-thousand-line fragment', () => {
+    const before = Array.from({ length: 10000 }, (_, i) => `line ${i}`)
+    const after = [...before]
+    after[5000] = 'changed'
+    const diffs = [{ path: 'sparse.txt', oldText: before.join('\n'), newText: after.join('\n') }]
+    const { container } = render(<DiffBlock diffs={diffs} />)
+    expect(diffTotals(diffs)).toEqual({ added: 1, removed: 1 })
+    expect(bodyRows(container)).toEqual([
+      'sparse.txt', 'line 4997', 'line 4998', 'line 4999', 'line 5000', 'changed',
+      'line 5001', 'line 5002', 'line 5003',
+    ])
+  })
+
+  it('copies shared context once and counts only a changed line', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+    const diffs = [{ path: 'settings.ts', oldText: 'start\nmode = 1\nend', newText: 'start\nmode = 2\nend' }]
+    render(<DiffBlock diffs={diffs} />)
+    expect(screen.getAllByText('start')).toHaveLength(1)
+    expect(screen.getAllByText('end')).toHaveLength(1)
+    expect(screen.getByText('└ +1 -1 · 1 file')).toBeTruthy()
+    expect(diffTotals(diffs)).toEqual({ added: 1, removed: 1 })
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: '复制' })) })
+    expect(writeText).toHaveBeenCalledWith('settings.ts\n  start\n- mode = 1\n+ mode = 2\n  end')
+  })
+
+  it('keeps three neutral context lines around distant changes and separates hunks', () => {
+    const before = Array.from({ length: 50 }, (_, i) => `item ${i}`)
+    const after = before.map((line, i) => i === 10 || i === 40 ? `changed ${i}` : line)
+    const { container } = render(<DiffBlock diffs={[{
+      path: 'items.txt', oldText: before.join('\n'), newText: after.join('\n'),
+    }]} maxLines={100} />)
+    expect(bodyRows(container)).toEqual([
+      'items.txt', 'item 7', 'item 8', 'item 9', 'item 10', 'changed 10',
+      'item 11', 'item 12', 'item 13', '⋯', 'item 37', 'item 38', 'item 39',
+      'item 40', 'changed 40', 'item 41', 'item 42', 'item 43',
+    ])
+    expect(changeRows(container)).toEqual(['item 10', 'changed 10', 'item 40', 'changed 40'])
+    expect(screen.getByText('└ +2 -2 · 1 file')).toBeTruthy()
+  })
+
+  it.each([
+    ['a\nx\na\ny\na', 'a\nx\na\nz\na', 1, 1],
+    ['a\nb', 'a\nx\nb', 1, 0],
+    ['a\nx\nb', 'a\nb', 0, 1],
+    ['same\n', 'same', 0, 0],
+    ['same', 'same', 0, 0],
+    ['', '', 0, 0],
+    ['a\n\nb', 'a\nb', 0, 1],
+  ])('counts ordered changes in %j → %j', (oldText, newText, added, removed) => {
+    const diffs = [{ path: 'a.txt', oldText, newText }]
+    render(<DiffBlock diffs={diffs} />)
+    expect(diffTotals(diffs)).toEqual({ added, removed })
+    expect(screen.getByText(`└ +${added} -${removed} · 1 file`)).toBeTruthy()
   })
 })
 

@@ -1,25 +1,12 @@
 ## Why This Fork Exists
 
-This fork tracks deepseek-ai/deepseek-harness upstream master and adds a set of workflow scaffolding that makes the harness far more effective as a delegated coding engine. Nothing in upstream behavior is changed — everything here is additive.
-The fork layers three integrations that work together when using this checkout as an embedded coding harness:
+This fork tracks `deepseek-ai/deepseek-harness` upstream `master` and adds workflow scaffolding that makes the harness more effective as a delegated coding engine. Nothing in upstream behavior changes — everything here is additive: three integrations that work together when this checkout is used as an embedded coding harness.
 
-1. Graph‑first code review & exploration
-A code-review-graph knowledge graph is wired into every coding agent surface. Agents explore and understand the codebase structurally — callers, dependents, cross‑module relationships — instead of relying on grep or linear scanning. This makes review cheaper, faster, and dramatically more accurate.
+1. **Graph-first code review and exploration** — a code-review-graph knowledge graph is wired into every coding agent surface, so agents explore and understand the codebase structurally (callers, dependents, cross-module relationships) instead of scanning files linearly. Review becomes cheaper, faster, and more accurate.
 
-2. LLM routing — native DeepSeek key first, OpenRouter only as a text fallback
-By default `dsh` runs on the DeepSeek‑native wire (`DEEPSEEK_API_KEY`), which is the
-working path for agentic, tool‑calling delegation — the agent actually executes bash /
-file writes / test runs and completes end‑to‑end (with `DSH_PERMISSION_MODE=danger‑full‑access`
-where bash is needed, since the `workspace‑write` preset has no bash sandbox here).
-The headless one‑shot profile can also be overlaid onto OpenRouter with
-`deepseek/deepseek-v4-flash-0731` by default, but that route is **text‑only**: the
-OpenRouter proxy passes DeepSeek v4's DSML tool‑call tags through as plain text, so a
-routed agent never executes its tools and the run hangs without completing. Use the
-native key for anything that must touch the filesystem; reserve OpenRouter for
-no‑tool text one‑shots.
+2. **LLM routing: native DeepSeek key first, OpenRouter only as a text fallback** — by default `dsh` runs on the DeepSeek-native wire (`DEEPSEEK_API_KEY`), the working path for agentic tool-calling delegation, where the agent actually executes bash, file writes, and test runs and completes end to end (with `DSH_PERMISSION_MODE=danger-full-access` where bash is needed, since the `workspace-write` preset has no bash sandbox here). The headless one-shot profile can also be overlaid onto OpenRouter, defaulting to `deepseek/deepseek-v4-flash-0731`, but that route is **text-only**: the proxy passes DeepSeek v4's DSML tool-call tags through as plain text, so a routed agent never executes its tools and the run hangs without completing. Use the native key for anything that must touch the filesystem and reserve OpenRouter for no-tool text one-shots.
 
-3. Hermes / agent delegation
-This checkout is designed to be driven as a local coding sub‑agent from Hermes (or any host that shells out to the dsh CLI). The harness becomes a deterministic execution engine inside a larger orchestration system, not just a standalone CLI.
+3. **Hermes and agent delegation** — this checkout is designed to be driven as a local coding sub-agent from Hermes, or any host that shells out to the `dsh` CLI, so the harness becomes a deterministic execution engine inside a larger orchestration system rather than only a standalone CLI.
 
 # DeepSeek Harness
 
@@ -27,11 +14,15 @@ English | [中文](README.zh.md)
 
 DeepSeek Harness (`dsh`) is an open-source agent harness developed by [DeepSeek AI](https://deepseek.com).
 
-It uses an architecture where **everything is a plugin**, and is powered by [Cordis](https://github.com/cordiverse/cordis), whose design is described in [_A Programming Paradigm for Spatiotemporal Composability_](https://github.com/cordiverse/paper).
+It is built on an **everything-is-a-plugin** architecture and powered by [Cordis](https://github.com/cordiverse/cordis), whose design is described in [_A Programming Paradigm for Spatiotemporal Composability_](https://arxiv.org/abs/2608.25512).
+
+Documentation: [https://deepseek-harness.github.io/deepseek-harness/](https://deepseek-harness.github.io/deepseek-harness/)
 
 ## Developer preview
 
-DeepSeek Harness is currently in _developer preview_ and is iterating rapidly. **THERE WILL BE COMPATIBILITY-BREAKING CHANGES.**
+DeepSeek Harness is in _developer preview_ and iterating rapidly. **THERE WILL BE COMPATIBILITY-BREAKING CHANGES.**
+
+Review the [safety notice](SAFETY.md) before running the project.
 
 ## Run
 
@@ -43,7 +34,7 @@ Install `Node.js`, then run:
 npx @deepseek-ai/dsh web
 ```
 
-The command starts the Web UI, served at `http://127.0.0.1:3080` by default. See [Web UI guide](docs/user/guide/index.md).
+The command starts the Web UI at `http://127.0.0.1:3080` by default and opens it in the default browser for a local launch. An SSH launch only prints the host URL because the SSH client or editor owns the local forwarded address. Pass `--no-open` to run the server without opening a browser. See [Web UI guide](docs/user/guide/index.md).
 
 ### Run from source
 
@@ -57,9 +48,11 @@ pnpm run build
 pnpm dsh web
 ```
 
+`pnpm run build` prepares the repository artifacts. `pnpm dsh web` uses those built artifacts without rebuilding.
+
 ## Community and support
 
-- Feel free to submit feedback or bug reports through [GitHub Discussions](https://github.com/deepseek-ai/deepseek-harness/discussions).
+- Submit feedback or bug reports through [GitHub Discussions](https://github.com/deepseek-ai/deepseek-harness/discussions).
 - Add the [`dsh-plugin`](https://github.com/topics/dsh-plugin) topic to your plugin repository for discoverability.
 - Join <a href="https://discord.gg/Ycq5dCaS4">DeepSeek Harness Discord community</a>.
 
@@ -72,6 +65,18 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 Start with the [development guide](docs/development.md) and [architecture documentation](docs/architecture.md).
 
 For agents, follow [AGENTS.md](AGENTS.md).
+
+## Citation
+
+```bibtex
+@misc{deepseek-harness2026,
+  title={DeepSeek Harness: Everything is a Plugin},
+  author={DeepSeek-AI},
+  year={2026},
+  publisher={GitHub},
+  howpublished={\url{https://github.com/deepseek-ai/deepseek-harness}},
+}
+```
 
 ## License
 

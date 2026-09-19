@@ -2,7 +2,8 @@
   "extends": "../../../tsconfig.base.client.json",
   "compilerOptions": {
     "rootDir": "src",
-    "outDir": "lib/types"
+    "outDir": "lib/types",
+    "types": ["client-build-environment", "node"]
   },
   "include": [
     "src"
@@ -12,19 +13,73 @@
       "path": "../../../vendor/cordis"
     },
     {
+      "path": "../../../vendor/loader"
+    },
+    {
+      "path": "../../../vendor/include"
+    },
+    {
+      "path": "../../api/gateway/tsconfig.client.json"
+    },
+    {
+      "path": "../../api/session-controller/tsconfig.client.json"
+    },
+    {
+      "path": "../../api/workspace-controller/tsconfig.client.json"
+    },
+    {
+      "path": "../../attachment/attachment"
+    },
+    {
+      "path": "../../core/session"
+    },
+    {
+      "path": "../../typert/protocol"
+    },
+    {
+      "path": "../../client/connection/tsconfig.client.json"
+    },
+    {
+      "path": "../../client/store"
+    },
+    {
+      "path": "../../client/ui-chat"
+    },
+    {
+      "path": "../../client/ui-conversation"
+    },
+    {
+      "path": "../../client/ui-layout"
+    },
+    {
       "path": "../../client/ui-slots"
     },
     {
-      "path": "../../client/web-react"
+      "path": "../../client/ui-renderer"
     },
     {
-      "path": "../../client/runtime"
+      "path": "../../client/ui-session"
     },
     {
-      "path": "../../runtime-diagnostics/invariants"
+      "path": "../../client/ui-settings"
     },
     {
-      "path": "../../host/apiproxy"
+      "path": "../../subagent/subagent"
+    },
+    {
+      "path": "../../api/remotes/tsconfig.client.json"
+    },
+    {
+      "path": "../../client/modules"
+    },
+    {
+      "path": "../../client/web"
+    },
+    {
+      "path": "../remote-mock"
+    },
+    {
+      "path": "../../client/hmr"
     }
   ]
 }

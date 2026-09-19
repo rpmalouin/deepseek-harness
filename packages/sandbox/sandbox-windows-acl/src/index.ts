@@ -42,9 +42,9 @@
 
 import { existsSync, statSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { Win32Error } from '@deepseek-ai/dsh-win32-process'
 
 import { grantWrite, revokeWrite } from './acl.ts'
-import { Win32Error } from './errors.ts'
 import { allocPtrSlot, decodePtr, isNullPtr, throwLastError, win32 } from './ffi.ts'
 import type { NativePtr, Win32Bindings } from './ffi.ts'
 import { assertPrivateTempDisjoint } from './path-boundary.ts'
@@ -52,12 +52,9 @@ import { drainPipe, spawnSandboxed, spawnSandboxedInherited, waitForExit } from 
 import { createRestrictedToken, findLogonSid, makeWellKnownSid, openCurrentProcessToken, setTokenDefaultDaclGrant } from './token.ts'
 import * as abi from './win32-abi.ts'
 
-export { quoteArg } from './spawn.ts'
 export { AclWriteGrant } from './grant.ts'
 export { assertTempRootOutsideWorkspace } from './path-boundary.ts'
 export { tempWriteSid, workspaceWriteSid } from './workspace-sid.ts'
-export { Win32Error } from './errors.ts'
-
 /** Construction options: the workspace/temp allowlists and their distinct SID identities. */
 export interface AclSandboxOptions {
   /** Directories the confined child may write into (must exist and be caller-owned). */
@@ -115,6 +112,8 @@ export interface AclSandboxSpawnOptions {
    * child dies with the caller; stdout/stderr in the result are empty.
    */
   stdio?: 'pipe' | 'inherit'
+  /** Control pipe forwarded to the same payload descriptor in inherited-stdio mode. */
+  controlFileDescriptor?: 7
 }
 
 /** A settled confined child: captured stdio and the exit code. */
@@ -352,11 +351,17 @@ export class AclSandbox {
     const api = this.api
     const token = this.token
     if (api === undefined || token === undefined) throw new Error('AclSandbox is not initialized: call init() first')
+    if (options.controlFileDescriptor !== undefined && options.stdio !== 'inherit') {
+      throw new Error('control pipe requires inherited stdio')
+    }
     const args = options.args ?? []
     const cwd = options.cwd ?? process.cwd()
 
     if (options.stdio === 'inherit') {
-      const native = spawnSandboxedInherited(api, token, { command: options.command, args, cwd })
+      const native = spawnSandboxedInherited(api, token, {
+        command: options.command, args, cwd,
+        ...options.controlFileDescriptor === undefined ? {} : { controlFileDescriptor: options.controlFileDescriptor },
+      })
       let exitCodePromise: Promise<number> | undefined
       return {
         pid: native.pid,

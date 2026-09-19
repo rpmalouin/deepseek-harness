@@ -2,10 +2,13 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSyn
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { describe, expect, it } from 'vitest'
+import desktopRuntimeLock from '../apps/desktop/scripts/primary-runtime-lock.json' with { type: 'json' }
 import {
   CLAUDE_AGENT_SDK_PACKAGE,
+  assertRuntimeLicenses,
   claudeDistributionFromManifest,
   collectPythonDependencies,
+  collectDesktopPythonDependencies,
   isOwnerAuthorizedRuntime,
   isPermissive,
   type Manifest,
@@ -24,9 +27,15 @@ describe('THIRD_PARTY_NOTICES.md', () => {
   // already runs in the test lane, so the check costs no extra CI process.
   // Pre-commit regenerates the file whenever a manifest is staged, so reaching
   // this assertion means the notices were committed without that hook.
-  it('matches what the generator produces from the current manifests', () => {
-    const generated = render()
+  // This case resolves all browser build graphs as well as installed license metadata.
+  it('matches what the generator produces from the current manifests', {
+    timeout: 120_000,
+  }, async () => {
+    const generated = await render()
     expect(generated).toContain('It depends on the third-party software listed below.')
+    expect(generated).toContain(`| [\`numpy\`](https://github.com/numpy/numpy) | ${desktopRuntimeLock.pythonPackages.numpy} | BSD-3-Clause |`)
+    expect(generated).toContain('## LibreOffice conversion kit')
+    expect(generated).toContain('Recipients must have access to those corresponding sources and notices.')
     expect(readFileSync(resolve(root, 'THIRD_PARTY_NOTICES.md'), 'utf8'), 'stale notices — run `pnpm run gen-third-party-notices`').toBe(generated)
   })
 })
@@ -42,6 +51,58 @@ function workspace(entries: Record<string, Manifest>): { manifests: Map<string, 
 }
 
 describe('tierExternalDeps', () => {
+  it('limits the LibreOffice exception to its reviewed package identity and MPL terms', () => {
+    for (const name of [
+      '@deepseek-ai/libreoffice-kit', '@deepseek-ai/libreoffice-kit-wasm',
+      '@deepseek-ai/libreoffice-kit-darwin-arm64', '@deepseek-ai/libreoffice-kit-darwin-x64',
+      '@deepseek-ai/libreoffice-kit-win32-arm64', '@deepseek-ai/libreoffice-kit-win32-x64',
+    ]) {
+      expect(() => { assertRuntimeLicenses([{ name, license: 'MPL-2.0' }]) }).not.toThrow()
+      expect(() => { assertRuntimeLicenses([{ name, license: 'GPL-3.0-only' }]) }).toThrow(name)
+    }
+    for (const dependency of [
+      { name: 'unrelated-library', license: 'MPL-2.0' },
+      { name: '@deepseek-ai/dsh-libreoffice-kit', license: 'MPL-2.0' },
+      { name: '@deepseek-ai/libreoffice-kit-unreviewed', license: 'MPL-2.0' },
+      { name: '@deepseek-ai/libreoffice-kit', license: 'GPL-3.0-only' },
+      { name: '@deepseek-ai/libreoffice-kit', license: 'UNKNOWN' },
+    ]) {
+      expect(() => { assertRuntimeLicenses([dependency]) }).toThrow(`${dependency.name} (${dependency.license})`)
+    }
+    expect(isPermissive('MPL-2.0')).toBe(false)
+  })
+
+  it('keeps license rejection active when a browser library is declared for development', () => {
+    const { manifests, names } = workspace({
+      'packages/client/ui/package.json': { devDependencies: { 'browser-lib': '^1', 'test-tool': '^1' } },
+    })
+    const tiers = tierExternalDeps(manifests, names, new Set(['browser-lib']))
+    const dependencies = [{ name: 'browser-lib', license: 'GPL-3.0-only' }, { name: 'test-tool', license: 'GPL-3.0-only' }]
+      .filter(dep => tiers.get(dep.name))
+    expect(dependencies.map(dep => dep.name)).toEqual(['browser-lib'])
+    expect(() => { assertRuntimeLicenses(dependencies) }).toThrow('browser-lib (GPL-3.0-only)')
+    expect(() => { assertRuntimeLicenses([{ name: 'browser-lib', license: 'MIT' }]) }).not.toThrow()
+    expect(() => { assertRuntimeLicenses([{ name: CLAUDE_AGENT_SDK_PACKAGE, license: 'SEE LICENSE IN README.md' }]) })
+      .not.toThrow()
+  })
+
+  it('keeps browser-bundled development dependencies in runtime disclosures', () => {
+    const { manifests, names } = workspace({
+      'packages/client/ui/package.json': {
+        name: '@fixture/ui', devDependencies: { react: '^18', 'browser-lib': '^1', 'type-only': '^1' },
+      },
+    })
+    expect(tierExternalDeps(manifests, names, new Set(['react', 'browser-lib']))).toEqual(new Map([
+      ['tsx', true], ['react', true], ['browser-lib', true], ['type-only', false],
+    ]))
+  })
+
+  it('rejects a browser library missing from the disclosed declarations', () => {
+    const { manifests, names } = workspace({})
+    expect(() => tierExternalDeps(manifests, names, new Set(['missing-lib'])))
+      .toThrow('browser package missing-lib has no workspace dependency declaration')
+  })
+
   it('tiers by declaring area, not by the declaring section name', () => {
     const { manifests, names } = workspace({
       // Root tooling and test infrastructure never ship, whichever section declares them.
@@ -109,6 +170,24 @@ describe('virtualManifest', () => {
       writeFileSync(join(manifestDir, 'package.json'), JSON.stringify({ name, version, license: 'Apache-2.0' }))
 
       expect(virtualManifest(store, name)).toMatchObject({ name, version, license: 'Apache-2.0' })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('selects the requested version when the store retains historical copies', () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-notices-version-'))
+    try {
+      const name = '@scope/pkg'
+      const store = join(root, 'store')
+      for (const version of ['1.0.0', '2.0.0']) {
+        const manifestDir = join(store, `${name.replace('/', '+')}@${version}`, 'node_modules', name)
+        mkdirSync(manifestDir, { recursive: true })
+        writeFileSync(join(manifestDir, 'package.json'), JSON.stringify({ name, version, license: 'MIT' }))
+      }
+
+      expect(virtualManifest(store, name, '2.0.0')).toMatchObject({ name, version: '2.0.0' })
+      expect(virtualManifest(store, name, '3.0.0')).toBeUndefined()
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
@@ -228,6 +307,11 @@ describe('parsePyprojectRequirements', () => {
 })
 
 describe('collectPythonDependencies', () => {
+  it('labels shared Python metadata in the Python-project context', () => {
+    const dependencies = collectPythonDependencies(['[project]\ndependencies = ["numpy", "pandas", "six", "tzdata"]\n'])
+    expect(dependencies.map(({ role }) => role)).toEqual(Array(4).fill('Python project dependency'))
+  })
+
   it('excludes normalized local project names without exempting a third-party prefix', () => {
     const pyprojects = [
       '[project]\nname = "deepseek-harness-runtime-bin"\ndependencies = ["pydantic"]\n',
@@ -236,6 +320,47 @@ describe('collectPythonDependencies', () => {
     expect(() => collectPythonDependencies(pyprojects)).toThrow(
       'python dependency deepseek-unrelated is missing from PYTHON_METADATA',
     )
+  })
+})
+
+describe('collectDesktopPythonDependencies', () => {
+  it('discloses the committed Desktop closure with its exact locked versions', () => {
+    const dependencies = collectDesktopPythonDependencies(desktopRuntimeLock.pythonPackages)
+    expect(dependencies).toHaveLength(Object.keys(desktopRuntimeLock.pythonPackages).length)
+    expect(dependencies).toContainEqual({
+      name: 'pillow', version: desktopRuntimeLock.pythonPackages.Pillow,
+      license: 'MIT-CMU', repo: 'https://github.com/python-pillow/Pillow',
+    })
+    expect(dependencies).toContainEqual({
+      name: 'typing-extensions', version: desktopRuntimeLock.pythonPackages.typing_extensions,
+      license: 'PSF-2.0', repo: 'https://github.com/python/typing_extensions',
+    })
+  })
+
+  it('normalizes names while preserving pinned version strings', () => {
+    expect(collectDesktopPythonDependencies({ 'typing_extensions': '4.16.0', 'Pillow': '12.3.0' }))
+      .toEqual([
+        { name: 'pillow', version: '12.3.0', license: 'MIT-CMU', repo: 'https://github.com/python-pillow/Pillow' },
+        { name: 'typing-extensions', version: '4.16.0', license: 'PSF-2.0', repo: 'https://github.com/python/typing_extensions' },
+      ])
+  })
+
+  it('rejects duplicate normalized distribution names with the same locked version', () => {
+    expect(() => collectDesktopPythonDependencies({ typing_extensions: '4.16.0', 'typing.extensions': '4.16.0' }))
+      .toThrow('duplicate normalized names')
+  })
+
+  it('rejects missing distribution metadata and conflicting normalized versions', () => {
+    expect(() => collectDesktopPythonDependencies({ missing: '1.0' })).toThrow('missing from PYTHON_METADATA')
+    expect(() => collectDesktopPythonDependencies({ Pillow: '12.3.0', pillow: '12.4.0' })).toThrow('conflicting locked versions')
+  })
+
+  it('applies the runtime license check to bundled Python distributions', () => {
+    expect(() => { assertRuntimeLicenses(collectDesktopPythonDependencies(desktopRuntimeLock.pythonPackages)) }).not.toThrow()
+    const dependencies = collectDesktopPythonDependencies({ 'copyleft-wheel': '1.0' }, {
+      'copyleft-wheel': { license: 'GPL-3.0-only', repo: 'https://example.com/project' },
+    })
+    expect(() => { assertRuntimeLicenses(dependencies) }).toThrow('copyleft-wheel (GPL-3.0-only)')
   })
 })
 
@@ -333,13 +458,12 @@ describe('official Claude distribution authorization', () => {
 
 describe('manifestPatterns', () => {
   it('derives globs from the declared members, so a new member area is read', () => {
-    expect(manifestPatterns(['packages/*/*', 'tools/*', 'native/landlock-run', 'native/landlock-run/packages/*'])).toEqual([
+    expect(manifestPatterns(['packages/*/*', 'tools/*', 'native/system', 'native/system/packages/*'])).toEqual([
       'package.json',
       'packages/*/*/package.json',
       'tools/*/package.json',
-      'native/landlock-run/package.json',
-      'native/landlock-run/packages/*/package.json',
-      'examples/*/package.json',
+      'native/system/package.json',
+      'native/system/packages/*/package.json',
     ])
   })
 })

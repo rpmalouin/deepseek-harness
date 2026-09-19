@@ -1,10 +1,3 @@
-// TerminalBlock: the terminal surface for a shell command and its output —
-// prompt line (run-state dot + shortened cwd + command), ANSI-colored output,
-// settled exit status, and a copy control for the raw output. Output never soft-wraps:
-// column-aligned output (ls, tables, box drawing) keeps its alignment and
-// scrolls horizontally instead of folding. Colors resolve through --dsw-*
-// tokens; ANSI parsing lives in ansi.ts.
-
 import { useCallback, useMemo, useState } from 'react'
 import clsx from 'clsx'
 import { parseAnsiLines, type AnsiLine } from './ansi.ts'
@@ -14,24 +7,20 @@ import { Pill } from './Pill.tsx'
 import { StateDot, type StateDotState } from './StateDot.tsx'
 import css from './TerminalBlock.module.css'
 
-/**
- * Output lines shown before the height cap collapses the middle. Matches the
- * TUI transcript's default tool-output budget so both front ends cut a long
- * command's output at the same place.
- */
+/** Output lines shown before the height cap collapses the middle. */
 export const DEFAULT_TERMINAL_MAX_LINES = 16
 
 /**
  * Display copy for the terminal surface; the owner passes localized labels
- * (this package is cordis-free, so copy arrives via props). Every field
- * defaults to the current built-in value, so existing consumers render
- * unchanged.
+ * (this package is cordis-free, so copy arrives via props).
  */
 export interface TerminalBlockLabels {
   /** Status pill text for a signal-terminated command. */
   signal: (signal: string) => string
   /** Status pill text for a non-zero exit code. */
   exitCode: (exitCode: number) => string
+  /** Status pill text for a command that ended without an exit code: killed by a signal the view does not know, or never started. */
+  noExitCode: string
   /** Run-state text while the command is still running. */
   running: string
   /** Run-state text for a signal or non-zero-exit settle. */
@@ -54,21 +43,6 @@ export interface TerminalBlockLabels {
   expand: (hidden: number) => string
 }
 
-const DEFAULT_LABELS: TerminalBlockLabels = {
-  signal: signal => `信号 ${signal}`,
-  exitCode: exitCode => `退出码 ${exitCode}`,
-  running: '运行中',
-  failed: '失败',
-  done: '已完成',
-  copy: '复制',
-  copied: '复制成功',
-  noOutput: '无输出',
-  collapseAria: '收起输出',
-  collapse: '收起',
-  expandAria: hidden => `展开其余 ${hidden} 行输出`,
-  expand: hidden => `… 其余 ${hidden} 行`,
-}
-
 export interface TerminalBlockProps {
   /** The command line, rendered verbatim after the prompt label. */
   command: string
@@ -78,18 +52,21 @@ export interface TerminalBlockProps {
   home?: string | undefined
   /** The command's output text; may contain ANSI escape sequences. */
   output?: string | undefined
-  /** Settled exit code; a non-zero value renders the status pill. */
-  exitCode?: number | undefined
+  /** Settled exit code; a non-zero value renders the status pill, and null (settled without one) the no-exit-code pill. */
+  exitCode?: number | null | undefined
   /** Settled terminating signal name; any value renders the status pill, taking precedence over the exit code. */
   signal?: string | undefined
-  /** The command is still running: the block shows the prompt line alone. */
+  /**
+   * The command is still running: the block shows the prompt line, and the
+   * output printed so far when there is any, with no copy control until it settles.
+   */
   running?: boolean | undefined
   /** Height cap in output lines before the middle collapses (default {@link DEFAULT_TERMINAL_MAX_LINES}); Infinity disables the cap. */
   maxLines?: number | undefined
   /** Extra class merged onto the wrapper (callers position; this component draws). */
   className?: string | undefined
-  /** Localized display copy; omitted fields keep the built-in defaults. */
-  labels?: Partial<TerminalBlockLabels> | undefined
+  /** Localized display copy supplied by the owning render site. */
+  labels: TerminalBlockLabels
 }
 
 /**
@@ -112,17 +89,18 @@ function promptLabel(cwd: string, home: string | undefined): string {
  * Status pill text for a settled command, or undefined when the command
  * settled cleanly (exit 0, no signal) and needs no pill — the same
  * distinction the bash tool's own exit-status markers draw.
- * @param exitCode - settled exit code, when known.
+ * @param exitCode - settled exit code, when known; null when the command settled without one.
  * @param signal - settled terminating signal name, when known.
  * @param labels - display copy for the pill text.
  * @returns the pill text, or undefined for a clean exit.
  */
 function statusText(
-  exitCode: number | undefined,
+  exitCode: number | null | undefined,
   signal: string | undefined,
   labels: TerminalBlockLabels,
 ): string | undefined {
   if (signal !== undefined) return labels.signal(signal)
+  if (exitCode === null) return labels.noExitCode
   if (exitCode !== undefined && exitCode !== 0) return labels.exitCode(exitCode)
   return undefined
 }
@@ -131,21 +109,21 @@ function statusText(
  * Run-state indicator for the command, shown at the head of the prompt line so
  * the card states whether the command is still running without the reader
  * having to infer it from the presence of output. Three of {@link StateDotState}'s
- * four states are reachable: the running chase (the same
+ * five states are reachable: the running chase (the same
  * indicator a running tool row's leading icon uses, so the row and its card
  * never disagree), green for a clean settle, red for a signal or a non-zero
  * exit — the same status distinction {@link statusText} draws for the pill. A
  * settled command whose exit status never reached the view counts as a clean
  * settle: the view says it finished and says nothing went wrong.
  * @param running - the command has not settled.
- * @param exitCode - settled exit code, when known.
+ * @param exitCode - settled exit code, when known; null when the command settled without one.
  * @param signal - settled terminating signal name, when known.
  * @param labels - display copy for the text label.
  * @returns the dot's state and its text label, since the dot is aria-hidden.
  */
 function runState(
   running: boolean,
-  exitCode: number | undefined,
+  exitCode: number | null | undefined,
   signal: string | undefined,
   labels: TerminalBlockLabels,
 ): { state: StateDotState; label: string } {
@@ -183,10 +161,7 @@ export function TerminalBlock({
   className,
   labels,
 }: TerminalBlockProps) {
-  const copy = useMemo<TerminalBlockLabels>(
-    () => (labels === undefined ? DEFAULT_LABELS : { ...DEFAULT_LABELS, ...labels }),
-    [labels],
-  )
+  const copy = labels
   const text = output ?? ''
   // A command's output ends with a newline; that terminator is not an extra
   // blank line to draw or to count against the height cap. The check runs on the
@@ -225,9 +200,17 @@ export function TerminalBlock({
   // for invisible bytes, and hide the placeholder that belongs there.
   const empty = lines.every(line => line.every(span => span.text.trim() === ''))
   const { hidden, capped, headLines, tailLines } = headTailCap(lines.length, maxLines, expanded)
+  // A running command with nothing printed yet is banner-only; once it has
+  // printed, the output streams in under the banner as it would in a terminal.
+  const body = !running || !empty
 
   return (
-    <div className={clsx(css.block, className)} data-terminal="" data-running={running ? '' : undefined}>
+    <div
+      className={clsx(css.block, className)}
+      data-terminal=""
+      data-running={running ? '' : undefined}
+      data-body={body ? '' : undefined}
+    >
       <div className={css.header}>
         <div className={css.prompt}>
           <span className={css.runStateLabel}>{state.label}</span>
@@ -258,7 +241,7 @@ export function TerminalBlock({
           </button>
         )}
       </div>
-      {!running && (empty
+      {body && (empty
         ? <div className={css.empty}>{copy.noOutput}</div>
         : (
           <div className={css.output}>

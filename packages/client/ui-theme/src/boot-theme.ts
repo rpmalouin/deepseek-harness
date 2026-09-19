@@ -1,40 +1,53 @@
 /**
- * Host-rendered theme bootstrap for the browser's pre-plugin interval. Each
- * index response embeds the current durable built-in preference; the browser
- * resolves only `system`, then writes the same DOM fields ui-layout's
- * ThemePresenter owns after the client plugin tree activates.
+ * Theme bootstrap row for the browser's pre-plugin interval. Each index
+ * render embeds the current durable built-in preference and content font size.
+ * Head CSS colors the document canvas before script execution; the body script
+ * installs the palette selector and font size that the client presenters adopt.
  */
 
-import { DEFAULT_PREFERENCE, type ThemePreference } from './theme-settings.ts'
+import type { IndexInjection } from '@deepseek-ai/dsh-host-webserver'
+import { DEFAULT_FONT_SIZE, DEFAULT_PREFERENCE, type ThemePreference } from './theme-settings.ts'
 
-/** Build the inline script for one schema-validated built-in preference. */
-function bootThemeScript(preference: ThemePreference): string {
-  return `<script>(() => {
+const LIGHT_BACKGROUND = '#fff'
+const DARK_BACKGROUND = '#151517'
+
+/** CSS that colors the document canvas before any script executes. */
+function bootThemeStyle(preference: ThemePreference): string {
+  const light = `:root{color-scheme:light}body{background-color:${LIGHT_BACKGROUND};--dsh-boot-bg:${LIGHT_BACKGROUND}}`
+  const dark = `:root{color-scheme:dark}body{background-color:${DARK_BACKGROUND};--dsh-boot-bg:${DARK_BACKGROUND}}`
+  if (preference === 'light') return light
+  if (preference === 'dark') return dark
+  return `${light}@media(prefers-color-scheme:dark){${dark}}`
+}
+
+/** Build the body script that installs the palette selector and content size. */
+function bootThemeBodyScript(preference: ThemePreference, fontSize: number): string {
+  return `(() => {
   const preference = ${JSON.stringify(preference)}
   const systemDark = preference === 'system'
     && typeof matchMedia !== 'undefined'
     && matchMedia('(prefers-color-scheme: dark)').matches
   const dark = preference === 'dark' || systemDark
-  document.documentElement.style.colorScheme = dark ? 'dark' : 'light'
+  document.documentElement.dataset.dsThemeSource = preference
   document.body.toggleAttribute('data-ds-dark-theme', dark)
-})()</script>`
+  document.body.style.setProperty('--dsh-content-font-size', ${JSON.stringify(`${fontSize}px`)})
+})()`
 }
 
 /**
- * Insert the theme bootstrap immediately after the opening body tag, before
- * the shell mount and module script. Body-less fragments receive it at the
- * end, where the HTML parser has already synthesized a body.
- * @param html - Raw application index HTML.
+ * Theme bootstrap rows: head CSS colors the document canvas before
+ * first paint, then the body script installs the palette selector and font
+ * size before the shell mount and module script.
  * @param preference - Current Host-backed built-in preference.
- * @returns HTML containing the theme bootstrap.
+ * @param fontSize - Current Host-backed content font size in px.
+ * @returns head and body script rows in execution order.
  */
-export function injectBootTheme(
-  html: string,
+export function bootThemeInjections(
   preference: ThemePreference = DEFAULT_PREFERENCE,
-): string {
-  const script = bootThemeScript(preference)
-  const body = /<body(?:\s[^>]*)?>/i.exec(html)
-  if (body === null) return `${html}${script}`
-  const at = body.index + body[0].length
-  return `${html.slice(0, at)}${script}${html.slice(at)}`
+  fontSize: number = DEFAULT_FONT_SIZE,
+): IndexInjection[] {
+  return [
+    { kind: 'style', text: bootThemeStyle(preference) },
+    { kind: 'script', placement: 'body', text: bootThemeBodyScript(preference, fontSize) },
+  ]
 }

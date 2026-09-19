@@ -1,6 +1,8 @@
-/** Persistent PTY session over the subprocess seam's terminal primitive. */
+/** Persistent PTY session with bounded output, readiness, and terminal-protocol replies. */
 
 import { Buffer } from 'node:buffer'
+import type { IDisposable, Terminal as HeadlessTerminalType } from '@xterm/headless'
+import { createLazyRequire } from '@deepseek-ai/dsh-lazy-require'
 import type {
   SubprocessOutcome,
   SubprocessTerminalForeground,
@@ -23,6 +25,8 @@ import type {
 import type { ResolvedConfig } from './config.ts'
 import { CONTROLLED_PROMPT, TerminalSanitizer } from './sanitize.ts'
 
+const requireHeadless = createLazyRequire<typeof import('@xterm/headless')>('@xterm/headless', import.meta.url)
+
 function utf8Tail(text: string, maxBytes: number): { text: string; truncated: boolean } {
   if (Buffer.byteLength(text) <= maxBytes) return { text, truncated: false }
   const chars = Array.from(text)
@@ -37,8 +41,22 @@ function utf8Tail(text: string, maxBytes: number): { text: string; truncated: bo
   return { text: chars.slice(start).join(''), truncated: true }
 }
 
+// Bound pending string fragments independently of deployment retention limits.
+const COALESCED_CHUNK_UNITS = 4096
+
+interface TextChunk {
+  text: string
+  start: number
+  next: TextChunk | undefined
+}
+
+/** Retention work is amortized over appended text; reads assemble the retained chunks. */
 class BoundedTextBuffer {
-  private value = ''
+  private head: TextChunk | undefined
+  private tail: TextChunk | undefined
+  private bytes = 0
+  private newlines = 0
+  private lastCodeUnit = 0
   private dropped = false
 
   constructor(
@@ -46,31 +64,94 @@ class BoundedTextBuffer {
     private readonly maxLines?: number,
   ) {}
 
+  get truncated(): boolean {
+    return this.dropped
+  }
+
+  get isEmpty(): boolean {
+    return this.head === undefined
+  }
+
   append(text: string): void {
     if (text.length === 0) return
-    this.value += text
-    if (this.maxLines !== undefined) {
-      const lines = this.value.split('\n')
-      if (lines.length > this.maxLines) {
-        this.value = lines.slice(lines.length - this.maxLines).join('\n')
-        this.dropped = true
-      }
+    // Sanitized text can be a slice retaining discarded controls; copy UTF-16 without replacing lone surrogates.
+    text = Buffer.from(text, 'utf16le').toString('utf16le')
+    this.bytes += Buffer.byteLength(text)
+    const tail = this.tail
+    if (tail !== undefined) {
+      const last = this.lastCodeUnit
+      const first = text.charCodeAt(0)
+      // Concatenation can turn two three-byte lone surrogates into one four-byte code point.
+      if (last >= 0xd800 && last <= 0xdbff && first >= 0xdc00 && first <= 0xdfff) this.bytes -= 2
     }
-    const tail = utf8Tail(this.value, this.maxBytes)
-    this.value = tail.text
-    this.dropped ||= tail.truncated
+    for (let index = text.indexOf('\n'); index !== -1; index = text.indexOf('\n', index + 1)) {
+      this.newlines += 1
+    }
+    this.lastCodeUnit = text.charCodeAt(text.length - 1)
+    // The head never grows, so eviction never rescans a growing string.
+    if (tail !== undefined && tail !== this.head && tail.text.length + text.length <= COALESCED_CHUNK_UNITS) {
+      tail.text += text
+    } else {
+      if (tail !== undefined && tail.text.length <= COALESCED_CHUNK_UNITS) {
+        // Copy coalesced fragments into one string; large tails already own their storage.
+        tail.text = Buffer.from(tail.text, 'utf16le').toString('utf16le')
+      }
+      const chunk: TextChunk = { text, start: 0, next: undefined }
+      if (tail === undefined) this.head = chunk
+      else tail.next = chunk
+      this.tail = chunk
+    }
+
+    while (this.head !== undefined
+      && (this.bytes > this.maxBytes || (this.maxLines !== undefined && this.newlines >= this.maxLines))) {
+      const head = this.head
+      const first = head.text.charCodeAt(head.start)
+      const second = head.start + 1 < head.text.length
+        ? head.text.charCodeAt(head.start + 1)
+        : head.next?.text.charCodeAt(0)
+      const paired = first >= 0xd800 && first <= 0xdbff
+        && second !== undefined && second >= 0xdc00 && second <= 0xdfff
+      this.bytes -= paired ? 4 : first < 0x80 ? 1 : first < 0x800 ? 2 : 3
+      if (first === 10) this.newlines -= 1
+      this.advance(paired ? 2 : 1)
+      this.dropped = true
+    }
+    const head = this.head
+    if (head !== undefined && head.start >= head.text.length / 2) {
+      // Copy UTF-16 verbatim so a small suffix cannot retain an oversized input's backing store.
+      // Copying only after discarding at least half keeps this work amortized over discarded text.
+      head.text = Buffer.from(head.text.slice(head.start), 'utf16le').toString('utf16le')
+      head.start = 0
+    }
+  }
+
+  private advance(units: number): void {
+    while (units > 0 && this.head !== undefined) {
+      const head = this.head
+      const count = Math.min(units, head.text.length - head.start)
+      head.start += count
+      units -= count
+      if (head.start === head.text.length) this.head = head.next
+    }
+    if (this.head === undefined) this.tail = undefined
   }
 
   consume(): TerminalSendRead {
-    const delta = this.value
-    const truncated = this.dropped
-    this.value = ''
+    const { text: delta, truncated } = this.snapshot()
+    this.head = undefined
+    this.tail = undefined
+    this.bytes = 0
+    this.newlines = 0
     this.dropped = false
     return { delta, truncated }
   }
 
   snapshot(): { text: string; truncated: boolean } {
-    return { text: this.value, truncated: this.dropped }
+    const chunks: string[] = []
+    for (let chunk = this.head; chunk !== undefined; chunk = chunk.next) {
+      chunks.push(chunk.text.slice(chunk.start))
+    }
+    return { text: chunks.join(''), truncated: this.dropped }
   }
 }
 
@@ -157,6 +238,9 @@ export class LocalPtySession implements TerminalBackendSession {
   motd = ''
   readonly pid: number
   private readonly decoder = new TextDecoder()
+  /** Protocol state only; the sanitizer and bounded buffers own returned text. */
+  private readonly emulator: HeadlessTerminalType
+  private readonly emulatorData: IDisposable
   private readonly sanitizer: TerminalSanitizer
   private readonly scrollback: BoundedTextBuffer
   private readonly outputEnded = Promise.withResolvers<void>()
@@ -164,9 +248,8 @@ export class LocalPtySession implements TerminalBackendSession {
   private statusValue: TerminalSessionStatus = { kind: 'running' }
   // TODO(pty-send-state-consolidation): Fold the per-send fields below
   // (active/activeTimer/activeDeadlineTimer/activeAbort/interrupting/
-  // activeWrite/pollingReady/polling) into one send-lifecycle owner; the
-  // cancellation/readiness interplay now has enough pinned tests to carry
-  // that refactor safely.
+  // activeWrite/pollingReady/polling and terminal-protocol work) into one send-lifecycle
+  // owner; the cancellation/readiness interplay has enough pinned tests to carry that refactor safely.
   private active: LocalSendOperation | undefined
   private activeTimer: NodeJS.Timeout | undefined
   private activeDeadlineTimer: NodeJS.Timeout | undefined
@@ -184,12 +267,32 @@ export class LocalPtySession implements TerminalBackendSession {
   private closing = false
   private closePromise: Promise<void> | undefined
   private transportFailure: Error | undefined
+  private emulatorWrites = Promise.resolve()
+  private emulatorWriteDone: (() => void) | undefined
+  private emulatorBuffer = ''
+  private emulatorWriting = false
+  private responseWrites = Promise.resolve()
+  private pendingResponseWrites = 0
+  private emulatorClosed = false
 
   constructor(
     private readonly terminal: SubprocessTerminalHandle,
     private readonly config: ResolvedConfig,
   ) {
     this.pid = terminal.pid
+    const { Terminal: HeadlessTerminal } = requireHeadless()
+    this.emulator = new HeadlessTerminal({ cols: config.cols, rows: config.rows, scrollback: 0 })
+    this.emulatorData = this.emulator.onData((data) => {
+      this.pendingResponseWrites += 1
+      const response = this.responseWrites.then(async () => { await this.terminal.write(data) })
+      this.responseWrites = response.then(
+        () => { this.finishResponseWrite() },
+        (error: unknown) => {
+          this.finishResponseWrite()
+          if (!this.emulatorClosed && !this.closing) this.onTransportFailure(error)
+        },
+      )
+    })
     this.sanitizer = new TerminalSanitizer(config.maxReadBytes)
     this.scrollback = new BoundedTextBuffer(config.scrollbackMaxBytes, config.scrollbackLines)
     terminal.output.on('data', this.onTerminalData)
@@ -250,7 +353,9 @@ export class LocalPtySession implements TerminalBackendSession {
     }
     this.activeDeadlineTimer = setTimeout(() => {
       if (this.active === operation) {
-        this.settleActive('timeout', this.activeWrite !== undefined || this.interrupting === operation)
+        this.settleActive('timeout', this.activeWrite !== undefined
+          || this.interrupting === operation
+          || this.protocolWorkPending())
       }
     }, this.config.timeoutMs)
     void this.beginSend(operation, request)
@@ -260,8 +365,15 @@ export class LocalPtySession implements TerminalBackendSession {
   private async beginSend(operation: LocalSendOperation, request: TerminalSendRequest): Promise<void> {
     let foreground: SubprocessTerminalForeground | undefined
     try {
+      if (this.protocolWorkPending()) await this.drainTerminalProtocol()
+      const emulatorWrites = this.emulatorWrites
+      const responseWrites = this.responseWrites
       foreground = await this.terminal.inspectForeground()
+      if (this.protocolStateChanged(emulatorWrites, responseWrites)) {
+        foreground = await this.inspectForegroundAfterProtocol()
+      }
     } catch (error: unknown) {
+      if (this.protocolWorkPending()) await this.drainTerminalProtocol()
       // A pre-write inspection failure while cancellation owns the slot must not
       // release it: interruptOnce's in-flight foreground signal could land on a
       // successor's foreground group. The interrupt path's post-signal tail
@@ -290,7 +402,7 @@ export class LocalPtySession implements TerminalBackendSession {
       // Cancellation owns post-write signalling and reservation release.
       if (operation.cancelRequested) return
       if (this.active === operation && operation.settled) {
-        this.clearActive()
+        this.releaseSettledActive()
         return
       }
       // Closing can race the awaited provider write even though static analysis sees only local assignments.
@@ -301,7 +413,7 @@ export class LocalPtySession implements TerminalBackendSession {
       }
     } catch (error: unknown) {
       if (this.active === operation && !this.closing) {
-        if (operation.settled) this.clearActive()
+        if (operation.settled) this.releaseSettledActive()
         else this.failActive(error)
       }
     }
@@ -363,16 +475,20 @@ export class LocalPtySession implements TerminalBackendSession {
 
   private readonly onTerminalData = (chunk: Buffer | Uint8Array | string): void => {
     const bytes = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk
-    this.onData(this.decoder.decode(bytes, { stream: true }))
+    const data = this.decoder.decode(bytes, { stream: true })
+    this.queueEmulatorData(data)
+    this.onData(data)
   }
 
   private readonly onTerminalEnd = (): void => {
     this.onData(this.decoder.decode())
     this.appendOutput(this.sanitizer.flush())
+    this.closeEmulator()
     this.outputEnded.resolve()
   }
 
   private readonly onTerminalError = (error: Error): void => {
+    this.closeEmulator()
     this.onTransportFailure(error)
     this.outputEnded.resolve()
   }
@@ -409,6 +525,7 @@ export class LocalPtySession implements TerminalBackendSession {
     const failure = error instanceof Error ? error : new Error(String(error))
     this.transportFailure ??= failure
     this.statusValue = { kind: 'exited', exitCode: null, signal: null }
+    this.closeEmulator()
     this.failActive(failure)
     void this.terminal.terminate().catch(() => {})
   }
@@ -437,7 +554,13 @@ export class LocalPtySession implements TerminalBackendSession {
         this.settleActive('session_exit')
         return
       }
-      const foreground = await this.terminal.inspectForeground()
+      if (this.protocolWorkPending()) await this.drainTerminalProtocol()
+      const emulatorWrites = this.emulatorWrites
+      const responseWrites = this.responseWrites
+      let foreground = await this.terminal.inspectForeground()
+      if (this.protocolStateChanged(emulatorWrites, responseWrites)) {
+        foreground = await this.inspectForegroundAfterProtocol()
+      }
       if (this.active !== operation || this.closing || this.interrupting === operation) return
       const idleFor = Date.now() - this.lastOutputAt
       if (this.promptSeen && foreground !== undefined && this.shellPgid === undefined) {
@@ -449,7 +572,7 @@ export class LocalPtySession implements TerminalBackendSession {
         return
       }
       const elapsed = Date.now() - operation.startedAt
-      const startupHasOutput = !this.initializing || this.scrollback.snapshot().text.length > 0
+      const startupHasOutput = !this.initializing || !this.scrollback.isEmpty
       const acceptsStdinWait = startupHasOutput && foreground !== undefined
         && operation.acceptsStdinWait(foreground.processGroupId, foreground.inputWaiting)
       if (elapsed >= this.config.exactProbeAfterMs && acceptsStdinWait) {
@@ -465,6 +588,7 @@ export class LocalPtySession implements TerminalBackendSession {
         this.settleActive('inferred_idle')
       }
     } catch (error: unknown) {
+      if (this.protocolWorkPending()) await this.drainTerminalProtocol()
       if (this.active === operation && !this.closing && this.interrupting !== operation) this.failActive(error)
     } finally {
       this.polling = false
@@ -475,10 +599,105 @@ export class LocalPtySession implements TerminalBackendSession {
     }
   }
 
+  /** Wait until generated replies reach the provider before another send can publish. */
+  private async drainTerminalProtocol(): Promise<void> {
+    for (;;) {
+      const emulatorWrites = this.emulatorWrites
+      await emulatorWrites
+      const responseWrites = this.responseWrites
+      await responseWrites
+      if (emulatorWrites === this.emulatorWrites && responseWrites === this.responseWrites
+        && !this.protocolWorkPending()) return
+    }
+  }
+
+  /** Sample foreground state only after protocol replies are quiet for the entire inspection. */
+  private async inspectForegroundAfterProtocol(): Promise<SubprocessTerminalForeground | undefined> {
+    for (;;) {
+      if (this.protocolWorkPending()) await this.drainTerminalProtocol()
+      const emulatorWrites = this.emulatorWrites
+      const responseWrites = this.responseWrites
+      const foreground = await this.terminal.inspectForeground()
+      if (!this.protocolStateChanged(emulatorWrites, responseWrites)) return foreground
+    }
+  }
+
+  private protocolStateChanged(emulatorWrites: Promise<void>, responseWrites: Promise<void>): boolean {
+    return emulatorWrites !== this.emulatorWrites || responseWrites !== this.responseWrites
+      || this.protocolWorkPending()
+  }
+
+  private protocolWorkPending(): boolean {
+    return this.emulatorWriteDone !== undefined || this.pendingResponseWrites > 0
+  }
+
+  private queueEmulatorData(data: string): void {
+    if (this.emulatorClosed) return
+    this.emulatorBuffer += data
+    if (this.emulatorWriteDone === undefined) {
+      const idle = Promise.withResolvers<undefined>()
+      this.emulatorWrites = idle.promise
+      this.emulatorWriteDone = () => { idle.resolve(undefined) }
+    }
+    this.pumpEmulator()
+  }
+
+  private pumpEmulator(): void {
+    if (this.emulatorWriting || this.emulatorClosed) return
+    if (this.emulatorBuffer.length === 0) {
+      const done = this.emulatorWriteDone
+      this.emulatorWriteDone = undefined
+      done?.()
+      this.releaseSettledActive()
+      return
+    }
+    const data = this.emulatorBuffer
+    this.emulatorBuffer = ''
+    this.emulatorWriting = true
+    try {
+      this.emulator.write(data, () => {
+        this.emulatorWriting = false
+        this.pumpEmulator()
+      })
+    } catch (error: unknown) {
+      this.emulatorWriting = false
+      this.emulatorBuffer = ''
+      const done = this.emulatorWriteDone
+      this.emulatorWriteDone = undefined
+      done?.()
+      this.releaseSettledActive()
+      if (!this.closing) this.onTransportFailure(error)
+    }
+  }
+
+  private finishResponseWrite(): void {
+    this.pendingResponseWrites -= 1
+    this.releaseSettledActive()
+  }
+
+  private releaseSettledActive(): void {
+    const operation = this.active
+    if (operation === undefined || !operation.settled || this.activeWrite !== undefined
+      || this.interrupting === operation || this.protocolWorkPending()) return
+    this.clearActive()
+  }
+
+  private closeEmulator(): void {
+    if (this.emulatorClosed) return
+    this.emulatorClosed = true
+    this.emulatorBuffer = ''
+    this.emulatorWriting = false
+    const done = this.emulatorWriteDone
+    this.emulatorWriteDone = undefined
+    done?.()
+    this.emulatorData.dispose()
+    this.emulator.dispose()
+  }
+
   private settleActive(waitReason: TerminalWaitReason, retainOwnership = false): void {
     const operation = this.active
     if (operation === undefined) return
-    const scrollbackTruncated = this.scrollback.snapshot().truncated
+    const scrollbackTruncated = this.scrollback.truncated
     if (retainOwnership) {
       this.stopPolling()
       this.activeAbort?.()
@@ -537,7 +756,7 @@ export class LocalPtySession implements TerminalBackendSession {
       if (this.interrupting === operation) this.interrupting = undefined
     }
     if (this.active === operation && operation.settled) {
-      this.clearActive()
+      this.releaseSettledActive()
     } else if (this.active === operation && !this.closing) {
       this.pollingReady = operation
       this.schedulePoll(operation, 0)
@@ -549,6 +768,7 @@ export class LocalPtySession implements TerminalBackendSession {
     // it as session_exit below, so an in-flight send is never mis-settled as
     // stdin_read/inferred_idle/timeout during the grace period.
     this.stopPolling()
+    this.closeEmulator()
     try {
       await this.terminal.terminate()
     } catch (error: unknown) {

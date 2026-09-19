@@ -1,14 +1,30 @@
+## 本 fork 的用途
+
+本 fork 跟踪 `deepseek-ai/deepseek-harness` 上游 `master`，并在此基础上增加了一套工作流脚手架，使 harness 作为被委派的编码引擎时更高效。上游行为没有任何改变，这里的一切都是增量叠加：当把本 checkout 作为嵌入式编码 harness 使用时，三项集成会协同发挥作用。
+
+1. **以图谱为先的代码审查与探索** —— code-review-graph 知识图谱被接入到每个编码 agent 界面，因此 agent 以结构化方式理解代码库（调用方、被调用方、跨模块关系），而不必线性扫描文件。审查因此更省、更快，也更准确。
+
+2. **LLM 路由：优先使用 DeepSeek 原生密钥，OpenRouter 仅作文本兜底** —— 默认情况下 `dsh` 走 DeepSeek 原生协议（`DEEPSEEK_API_KEY`），这是 agentic 工具调用委派的可用路径：agent 会真正执行 bash、写入文件和运行测试，并端到端完成（需要 bash 时设置 `DSH_PERMISSION_MODE=danger-full-access`，因为 `workspace-write` 预设在此环境下没有可用的 bash 沙箱）。headless 一次性 profile 也可以叠加到 OpenRouter 上，默认模型为 `deepseek/deepseek-v4-flash-0731`，但该路线是**纯文本**的：代理会把 DeepSeek v4 的 DSML 工具调用标签当作纯文本透传，因此经该路线的 agent 从不真正执行工具，运行会挂起而无法完成。凡是要触碰文件系统的任务都使用原生密钥，OpenRouter 只保留给不调用工具的文本一次性任务。
+
+3. **Hermes 与 agent 委派** —— 本 checkout 的设计目标之一，是可以从 Hermes（或任何通过 `dsh` CLI 调用外部命令的宿主）作为本地编码子 agent 被驱动，从而让 harness 成为更大编排系统中的确定性执行引擎，而不只是一个独立 CLI。
+
 # DeepSeek Harness
 
 [English](README.md) | 中文
 
 DeepSeek Harness（`dsh`）是由 [DeepSeek AI](https://deepseek.com) 开发的开源 agent harness（智能体框架）。
 
-它采用**一切皆插件**的架构，并由 [Cordis](https://github.com/cordiverse/cordis) 驱动，其设计参见论文 [_A Programming Paradigm for Spatiotemporal Composability_](https://github.com/cordiverse/paper)。
+它构建于**一切皆插件**的架构之上，由 [Cordis](https://github.com/cordiverse/cordis) 驱动，其设计参见论文 [_A Programming Paradigm for Spatiotemporal Composability_](https://arxiv.org/abs/2608.25512)。
+
+文档：[https://deepseek-harness.github.io/deepseek-harness/](https://deepseek-harness.github.io/deepseek-harness/)
 
 ## 开发者预览
 
-DeepSeek Harness 目前处于 _开发者预览_ 阶段，正在快速迭代。**未来将出现破坏兼容性的变更。**
+DeepSeek Harness 处于 _开发者预览_ 阶段，正在快速迭代。**未来将出现破坏兼容性的变更。**
+
+运行本项目前，请阅读[安全说明](SAFETY.zh.md)。
+
+<a id="run"></a>
 
 ## 运行
 
@@ -20,7 +36,9 @@ DeepSeek Harness 目前处于 _开发者预览_ 阶段，正在快速迭代。**
 npx @deepseek-ai/dsh web
 ```
 
-该命令会启动 Web UI，默认地址为 `http://127.0.0.1:3080`。详见 [Web UI 指南](docs/user/guide/index.md)。
+该命令默认会在 `http://127.0.0.1:3080` 启动 Web UI，本机启动时还会用默认浏览器打开页面。通过 SSH 启动时只打印宿主机 URL，因为本地转发地址由 SSH 客户端或编辑器持有。传入 `--no-open` 可仅运行服务器而不打开浏览器。详见 [Web UI 指南](docs/user/guide/index.zh.md)。
+
+<a id="run-from-source"></a>
 
 ### 从源码运行
 
@@ -34,9 +52,11 @@ pnpm run build
 pnpm dsh web
 ```
 
+`pnpm run build` 会准备仓库产物。`pnpm dsh web` 会直接使用这些已构建产物，不会重新构建。
+
 ## 社区与支持
 
-- 欢迎通过 [GitHub Discussions](https://github.com/deepseek-ai/deepseek-harness/discussions) 提交反馈或 bug 报告。
+- 通过 [GitHub Discussions](https://github.com/deepseek-ai/deepseek-harness/discussions) 提交反馈或 bug 报告。
 - 为你的插件仓库添加 [`dsh-plugin`](https://github.com/topics/dsh-plugin) 话题，便于被发现。
 - 欢迎加入 DeepSeek Harness 企微群：扫码添加企微小助手并填写入群问卷，完成后小助手会邀请你入群。
 
@@ -50,22 +70,34 @@ pnpm dsh web
   </thead>
   <tbody>
     <tr>
-      <td align="center"><img src="assets/community-wecom-assistant.png" alt="DeepSeek Harness 企微小助手二维码" width="180" height="180"></td>
-      <td align="center"><a href="https://trtgsjkv6r.feishu.cn/share/base/form/shrcnIt5twSVdLGD52KJBckGCgg"><img src="assets/community-wecom-survey.png" alt="DeepSeek Harness 入群问卷二维码" width="180" height="180"></a></td>
-      <td align="center"><img src="assets/community-wechat-official-account.png" alt="DeepSeek Harness 团队微信公众号二维码" width="180" height="180"></td>
+      <td align="center"><img src="https://cdn.deepseek.com/harness/readme/community-wecom-assistant.png" alt="DeepSeek Harness 企微小助手二维码" width="180" height="180"></td>
+      <td align="center"><a href="https://trtgsjkv6r.feishu.cn/share/base/form/shrcnIt5twSVdLGD52KJBckGCgg"><img src="https://cdn.deepseek.com/harness/readme/community-wecom-survey.png" alt="DeepSeek Harness 入群问卷二维码" width="180" height="180"></a></td>
+      <td align="center"><img src="https://cdn.deepseek.com/harness/readme/community-wechat-official-account.png" alt="DeepSeek Harness 团队微信公众号二维码" width="180" height="180"></td>
     </tr>
   </tbody>
 </table>
 
 ## 参与贡献
 
-参见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+参见 [CONTRIBUTING.md](CONTRIBUTING.zh.md)。
 
 ## 开发
 
-请先阅读[开发指南](docs/development.md)与[架构文档](docs/architecture.md)。
+请先阅读[开发指南](docs/development.zh.md)与[架构文档](docs/architecture.zh.md)。
 
 面向 agent：请遵循 [AGENTS.md](AGENTS.md)。
+
+## 引用
+
+```bibtex
+@misc{deepseek-harness2026,
+  title={DeepSeek Harness: Everything is a Plugin},
+  author={DeepSeek-AI},
+  year={2026},
+  publisher={GitHub},
+  howpublished={\url{https://github.com/deepseek-ai/deepseek-harness}},
+}
+```
 
 ## 许可证
 

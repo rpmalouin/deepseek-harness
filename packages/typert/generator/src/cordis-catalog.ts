@@ -124,6 +124,8 @@ export interface CordisCatalogPolicy {
   readonly inheritedEvents: readonly InheritedEntry[]
   /** Manually curated framework context members inherited by every plugin. */
   readonly inheritedServices: readonly InheritedEntry[]
+  /** Maximum rendered characters per runtime type declaration. */
+  readonly runtimeDeclarationMaxChars?: number
 }
 
 /** Complete model-level Cordis projection used by every text renderer. */
@@ -333,17 +335,19 @@ export class CordisCatalogProjector {
   ): { name: string; declaration: string }[] {
     const declarations = new Map<string, string>()
     const ambiguous = new Set<string>()
+    const maxDeclarationChars = this.policy.runtimeDeclarationMaxChars ?? DEFAULT_MAX_DECL_CHARS
     for (const declaration of this.sourceDeclarations) {
-      if (declaration.face !== this.face.face || declaration.kind === 'enum'
-        || !/^packages\/[^/]+\/[^/]+\/src\/.+\.tsx?$/.test(declaration.location.file)) continue
+      if (declaration.face !== this.face.face
+        || (!/^packages\/[^/]+\/[^/]+\/src\/.+\.tsx?$/.test(declaration.location.file)
+          && !(declaration.kind === 'enum' && /^vendor\/[^/]+\/src\/.+\.ts$/.test(declaration.location.file)))) continue
       if (declarations.has(declaration.name)) {
         ambiguous.add(declaration.name)
         continue
       }
       declarations.set(
         declaration.name,
-        declaration.text.length > MAX_DECL_CHARS
-          ? `${declaration.text.slice(0, MAX_DECL_CHARS)} /* …truncated — full shape in source */`
+        declaration.text.length > maxDeclarationChars
+          ? `${declaration.text.slice(0, maxDeclarationChars)} /* …truncated — full shape in source */`
           : declaration.text,
       )
     }
@@ -613,7 +617,7 @@ function signatureTypeNames(renderer: TypeGraphRenderer, signature: SignatureMod
 }
 
 /** Declarations longer than this render as a truncated stub. */
-const MAX_DECL_CHARS = 1500
+const DEFAULT_MAX_DECL_CHARS = 1_500
 
 /** Render one value as a single-quoted TypeScript literal. */
 function quote(value: string): string {
@@ -826,7 +830,7 @@ function renderRuntimeApi(
     '    const next: string[] = []',
     '    for (const entry of TYPE_API) {',
     '      if (included.has(entry.name)) continue',
-    '      const pattern = new RegExp(`\\b${entry.name}\\b`)',
+    '      const pattern = new RegExp(`\\\\b${entry.name}\\\\b`)',
     '      if (!frontier.some(text => pattern.test(text))) continue',
     '      included.add(entry.name)',
     '      next.push(entry.declaration)',
@@ -951,6 +955,12 @@ function anchorFor(headingText: string): string[] {
   return [`<a id="${githubSlug(headingText)}"></a>`, '']
 }
 
+/** Render a subsystem `file:line` source pointer as a file-only link. */
+function sourceLink(source: string): string {
+  const file = source.split(':')[0]
+  return `[\`${file}\`](../../${file})`
+}
+
 /** Render one harness event entry onto its owning page, nested under its scope heading. */
 function renderEvent(e: EventEntry, onPage: string, linkedTypePages: Readonly<Record<string, string>>): string[] {
   const out = [...anchorFor(`${e.name} — ${e.mode}`), `#### \`${e.name}\` — ${e.mode}`, '']
@@ -958,7 +968,7 @@ function renderEvent(e: EventEntry, onPage: string, linkedTypePages: Readonly<Re
   out.push('```' + FENCE, e.jsDoc, e.signature, '```', '')
   const links = typeLinks(e.signature, onPage, linkedTypePages)
   if (links) out.push(links, '')
-  out.push(`Source: [\`${e.source}\`](../../${e.source.split(':')[0]})`, '')
+  out.push(`Source: ${sourceLink(e.source)}`, '')
   return out
 }
 
@@ -978,7 +988,7 @@ function renderService(s: ServiceEntry, onPage: string, linkedTypePages: Readonl
     const links = typeLinks(methods.map(method => method.signature).join('\n'), onPage, linkedTypePages)
     if (links) out.push(links, '')
   }
-  out.push(`Source: [\`${s.source}\`](../../${s.source.split(':')[0]})`, '')
+  out.push(`Source: ${sourceLink(s.source)}`, '')
   return out
 }
 
@@ -1010,7 +1020,7 @@ export function renderPageRegion(page: string, services: ServiceEntry[], events:
     '',
     '## Cordis API',
     '',
-    'Generated from source by `scripts/gen-cordis-catalog.ts` (verified fresh by `pnpm run verify-cordis-catalog` in doc-sync; regenerate with `pnpm run gen-cordis-catalog`) — this section is byte-identical in both language sides of the page. Signature blocks use a `ts cordis-catalog` fence and keep the original source JSDoc; dispatch modes are defined in the [primer](../cordis-primer.md#dispatch-modes), and the framework-inherited `ctx` API lives in [cordis-api/inherited.md](../cordis-api/inherited.md).',
+    'Generated from source by `scripts/gen-cordis-catalog.ts` (verified fresh by `pnpm run verify-cordis-catalog` in doc-sync; regenerate with `pnpm run gen-cordis-catalog`) — the language sides differ only in locale-specific paired document paths. Signature blocks use a `ts cordis-catalog` fence and keep the original source JSDoc; dispatch modes are defined in the [primer](../cordis-primer.md#dispatch-modes), and the framework-inherited `ctx` API lives in [cordis-api/inherited.md](../cordis-api/inherited.md).',
     '',
   ]
   for (const s of services) lines.push(...renderService(s, page, policy.linkedTypePages))

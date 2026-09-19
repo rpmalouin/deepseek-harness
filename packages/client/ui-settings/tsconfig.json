@@ -15,19 +15,19 @@
       "path": "../ui-slots"
     },
     {
-      "path": "../runtime"
+      "path": "../store"
     },
     {
-      "path": "../schema-form"
+      "path": "../../../vendor/schemastery"
     },
     {
       "path": "../../api/remotes/tsconfig.client.json"
     },
     {
-      "path": "../../settings/settings"
+      "path": "../connection/tsconfig.client.json"
     },
     {
-      "path": "../../runtime-diagnostics/invariants"
+      "path": "../../settings/settings"
     }
   ]
 }

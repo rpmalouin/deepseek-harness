@@ -7,14 +7,34 @@
  * only the source roster. One controller per session scope; the service
  * disposes it with the scope fiber.
  */
-import type { ClientContext, SessionId, SnapshotStore } from '@deepseek-ai/dsh-client-runtime/client'
-import { createSnapshotStore } from '@deepseek-ai/dsh-client-runtime/client'
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
+import { createSnapshotStore, type SnapshotStore } from '@deepseek-ai/dsh-client-store'
+import type {
+  ArbitrateKey, ArbitrateOutcome, PickOutcome, ReferenceInsert,
+} from '@deepseek-ai/dsh-client-ui-conversation/client'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { detectTrigger } from '../core/detect.ts'
 import { MENU_CLOSED, menuReduce, seedGroups } from '../core/menu.ts'
 import type { MenuEvent, MenuState, TriggerHit } from '../core/contract.ts'
 import type {
-  ArbitrateKey, ArbitrateOutcome, ClientSessionContext, PickOutcome, InputTriggerSource, TriggerChar, TriggerGuard,
+  ClientSessionContext, InputTriggerCandidate, InputTriggerCrumb, InputTriggerSource, PickAction,
+  SubmitEnvelope, TriggerChar, TriggerGuard,
 } from '../types.ts'
+
+/** Token identity a dismissal sticks to: the same trigger, query, and span bounds. */
+interface DismissedHit {
+  readonly trigger: string
+  readonly query: string
+  readonly quoted: boolean
+  readonly start: number
+  readonly end: number
+}
+
+/** Whether a tracked hit is the one the user just dismissed (same token, same query). */
+function dismissedHit(dismissed: DismissedHit, hit: TriggerHit): boolean {
+  return dismissed.trigger === hit.trigger && dismissed.query === hit.query && dismissed.quoted === hit.quoted
+    && dismissed.start === hit.span.start && dismissed.end === hit.span.end
+}
 
 /** Roster access the controller borrows from the root service (registration order preserved). */
 export interface SourceRoster {
@@ -47,8 +67,16 @@ export class InputTriggerController {
    */
   readonly launcher: SnapshotStore<string | null> = createSnapshotStore<string | null>(null)
   /**
+   * Crumbs published by each header-bearing source for the open menu, keyed
+   * by source name. A snapshot store like {@link InputTriggerController.launcher}:
+   * the answer changes with every hit, and render-side consumers subscribe
+   * instead of re-polling sources during a render.
+   */
+  readonly headers: SnapshotStore<ReadonlyMap<string, readonly InputTriggerCrumb[]>> =
+    createSnapshotStore<ReadonlyMap<string, readonly InputTriggerCrumb[]>>(new Map())
+  /**
    * Aggregated hot reference lexicon, grouped by trigger (plain-text-reference decision;
-   * see .agents/notes/implemented/architecture/2026-07-25-web-input-machine-and-slash-pipeline.md):
+   * see .agents/notes/archived/architecture/2026-07-25-web-input-machine-and-slash-pipeline.md):
    * sources implementing the lexicon hook are polled with the session
    * projection; undefined answers (roll not hot yet) are skipped; multiple
    * sources on one trigger concatenate in registration order. A snapshot
@@ -61,6 +89,15 @@ export class InputTriggerController {
 
   /** The authoritative hit: single truth for span CAS material (menu snapshot never carries it alone). */
   private hit: TriggerHit | null = null
+  /**
+   * Identity of the hit whose menu the user dismissed. A dismissal means "not
+   * this one, not now": the same token with the same query keeps its menu
+   * closed, so restoring the caret after a dismissal cannot reopen it. Typing
+   * (a new query) or moving to another token clears it.
+   */
+  private dismissed: DismissedHit | null = null
+  /** Whether the open menu was reached by a drill pick; cleared with the menu. */
+  private drilled = false
   private fetch: AbortController | null = null
   private disposed = false
   /** Per-source lexicon unsubscribers (sources without the hook never enter). */
@@ -92,15 +129,36 @@ export class InputTriggerController {
     this.clearLauncher()
     const raw = detectTrigger(draft, caret, guard)
     if (raw === null) {
+      // A launcher-opened menu is opened by a gesture, not by a typed token:
+      // the focus it takes to drive it with the keyboard re-tracks an empty
+      // draft right away, and that track must not close what the gesture
+      // opened. The launcher flag is cleared here, so this holds for that one
+      // follow-up track only; typing or picking takes over from there.
+      if (launched) return
       this.hit = null
+      // A frozen-tier track is the submit gesture's own bookkeeping, not a new
+      // intent from the user: a command submitted after a dismissal must not
+      // re-arm the menu the dismissal closed.
+      if (guard.tier !== 'frozen') this.dismissed = null
       this.stopFetch()
       this.reduce({ type: 'close' })
       return
     }
     const hit: TriggerHit = { ...raw, span: { ...raw.span, draftRev } }
+    // A launcher-opened menu is a fresh intent: the dismissal that closed the
+    // same token earlier must not silence it.
+    if (launched) this.dismissed = null
+    if (this.dismissed !== null) {
+      if (!dismissedHit(this.dismissed, hit)) this.dismissed = null
+      else {
+        this.hit = hit
+        return
+      }
+    }
     const prev = this.menu.getSnapshot()
     const same = !launched && prev.open && prev.hit !== null
       && prev.hit.trigger === hit.trigger && prev.hit.query === hit.query
+      && prev.hit.quoted === hit.quoted
       && prev.hit.span.start === hit.span.start && prev.hit.span.end === hit.span.end
     this.hit = hit
     if (same) return
@@ -111,9 +169,10 @@ export class InputTriggerController {
       return
     }
     if (launched || !prev.open || prev.hit === null || prev.hit.trigger !== hit.trigger) {
-      this.menu.set(seedGroups(this.menu.getSnapshot(), roster.map(s => s.name)))
+      this.menu.set(seedGroups(this.menu.getSnapshot(), roster))
     }
     this.reduce({ type: 'hit', hit })
+    this.refreshHeaders(hit, roster)
     this.fetchCandidates(hit, roster)
   }
 
@@ -139,8 +198,9 @@ export class InputTriggerController {
     this.stopFetch()
     this.hit = hit
     this.launcher.set(source)
-    this.menu.set(seedGroups(this.menu.getSnapshot(), [source]))
+    this.menu.set(seedGroups(this.menu.getSnapshot(), [match]))
     this.reduce({ type: 'hit', hit })
+    this.refreshHeaders(hit, [match])
     this.fetchCandidates(hit, [match])
   }
 
@@ -149,8 +209,9 @@ export class InputTriggerController {
    * and execute claim/insert outcomes via the scoped input events.
    * @param source - source (group) name.
    * @param index - candidate index within the group.
+   * @param action - settling pick (default) or the candidate's drill action.
    */
-  pick(source: string, index: number): void {
+  pick(source: string, index: number, action: PickAction = 'pick'): void {
     const state = this.menu.getSnapshot()
     const hit = this.hit
     if (this.disposed || !state.open || hit === null) return
@@ -159,23 +220,47 @@ export class InputTriggerController {
     if (candidate === undefined) return
     const src = this.deps.roster.sources(hit.trigger).find(s => s.name === source)
     if (src === undefined) return
-    const outcome = src.onPick({
-      candidate,
-      session: this.project(),
-      position: hit.position,
-      via: 'menu',
-      span: hit.span,
-    })
-    this.stopFetch()
-    this.reduce({ type: 'close' })
-    this.execute(outcome, hit.span)
+    this.settle(src, candidate, hit, action)
+  }
+
+  /**
+   * Pointer pick on one crumb of a source's menu header: route it through the
+   * same drill path a folder row takes, so returning to a step and descending
+   * into one share one outcome.
+   * @param source - source (group) name.
+   * @param index - crumb index within that source's published header.
+   */
+  pickCrumb(source: string, index: number): void {
+    const hit = this.hit
+    if (this.disposed || !this.menu.getSnapshot().open || hit === null) return
+    const crumb = this.headers.getSnapshot().get(source)?.[index]
+    if (crumb === undefined || crumb.current === true) return
+    const src = this.deps.roster.sources(hit.trigger).find(s => s.name === source)
+    if (src === undefined) return
+    this.settle(src, { name: crumb.label, value: crumb.value }, hit, 'drill')
+  }
+
+  /**
+   * Pointer hover from MenuView: park the shared highlight on the hovered
+   * candidate (keyboard `move` and pointer hover drive one highlight —
+   * last input wins).
+   * @param source - source (group) name.
+   * @param index - candidate index within the group.
+   */
+  hover(source: string, index: number): void {
+    if (this.disposed) return
+    this.reduce({ type: 'hover', source, index })
   }
 
   /**
    * Keyboard arbitration while the menu is open.
    * @param key - intercepted key.
    * @param composing - inside IME composition: everything passes.
-   * @returns consumed / pick-highlighted / pass.
+   * @returns `pass` when the browser keeps the key (closed menu, no
+   * highlight, or a vanished candidate), `consumed` when the menu handled
+   * the key without a settling pick (move, close, drill descent, or a
+   * pending-refinement no-op), or `pick-highlighted` when the highlighted
+   * candidate settled and the menu closed.
    */
   arbitrate(key: ArbitrateKey, composing: boolean): ArbitrateOutcome {
     if (composing || this.disposed) return 'pass'
@@ -190,13 +275,37 @@ export class InputTriggerController {
         this.reduce({ type: 'move', dir: 1 })
         return 'consumed'
       }
-      case 'escape': {
+      case 'escape':
+      case 'tabBack': {
+        // Escape leaves, and Shift+Tab leaves with it: the exit gesture never
+        // settles a candidate, so it cannot consume or rewrite the draft.
+        this.rememberDismissed()
         this.stopFetch()
         this.reduce({ type: 'close' })
         return 'consumed'
       }
       case 'enter': {
         if (state.highlight === null) return 'pass'
+        // Refinement keeps the previous rows and highlight visible while the
+        // next fetch is pending; Enter then neither picks the stale row nor
+        // falls through to submit — an explicit no-op until the group is ready.
+        const group = state.groups.find(g => g.source === state.highlight?.source)
+        if (group === undefined || group.status !== 'ready') return 'consumed'
+        this.pick(state.highlight.source, state.highlight.index)
+        return 'pick-highlighted'
+      }
+      case 'tab': {
+        if (state.highlight === null) return 'pass'
+        const group = state.groups.find(g => g.source === state.highlight?.source)
+        // Pending refinement keeps the stale highlight visible: consume the
+        // gesture rather than pick a stale row or let Tab move focus away.
+        if (group === undefined || group.status !== 'ready') return 'consumed'
+        const item = group.items[state.highlight.index]
+        if (item === undefined) return 'pass'
+        if (item.drill === true) {
+          this.pick(state.highlight.source, state.highlight.index, 'drill')
+          return 'consumed'
+        }
         this.pick(state.highlight.source, state.highlight.index)
         return 'pick-highlighted'
       }
@@ -243,22 +352,45 @@ export class InputTriggerController {
   }
 
   /**
+   * Route a chip to its owner or an editable token to its current lexicon owner.
+   * @param source - chip source name; undefined for editable text.
+   * @param reference - source-owned id and optional chip glyph.
+   * @returns whether an owner accepted the preview, possibly awaiting its catalog.
+   */
+  openReference(source: string | undefined, reference: Pick<ReferenceInsert, 'ref' | 'appearance'>): boolean {
+    if (this.disposed) return false
+    const session = this.project()
+    for (const owner of this.deps.roster.all()) {
+      const matches = source === undefined
+        ? reference.ref.startsWith(owner.trigger) && owner.lexicon?.(session)?.includes(reference.ref.slice(1))
+        : owner.name === source
+      if (matches && owner.openReference?.(session, reference)) {
+        this.dismiss()
+        return true
+      }
+    }
+    return false
+  }
+
+  /**
    * Enter last adjudication: polls sources' matchEnter in registration
    * order, first non-undefined wins. The outcome returns to the caller (the
    * input machine applies it inside the same submit attempt — no event).
    * @param line - trimmed draft; the leading char selects the trigger roster.
    * @param signal - attempt-scoped abort from the input machine.
+   * @param envelope - non-text submission state accompanying the draft.
    * @returns the winning outcome or undefined (default sink). Rejects when a
-   * polled source's warmup fails — the caller must not silently downgrade.
+   * polled source's warmup fails or the winning source refuses the envelope —
+   * the caller must not silently downgrade.
    */
-  async adjudicate(line: string, signal: AbortSignal): Promise<PickOutcome> {
+  async adjudicate(line: string, signal: AbortSignal, envelope: SubmitEnvelope): Promise<PickOutcome> {
     const projection = this.project()
     for (const src of this.deps.roster.all()) {
       if (signal.aborted) {
         throw signal.reason instanceof Error ? signal.reason : new Error('slash adjudication aborted')
       }
       if (src.matchEnter === undefined || !line.startsWith(src.trigger)) continue
-      const outcome = await src.matchEnter(projection, line, signal)
+      const outcome = await src.matchEnter(projection, line, signal, envelope)
       if (outcome !== undefined) return outcome
     }
     return undefined
@@ -295,8 +427,19 @@ export class InputTriggerController {
   /** External dismiss (e.g. pointer outside the composer area). */
   dismiss(): void {
     if (this.disposed) return
+    this.rememberDismissed()
     this.stopFetch()
     this.reduce({ type: 'close' })
+  }
+
+  /** Re-fetch the currently open menu without changing its hit or visible rows. */
+  refreshOpenMenu(): void {
+    if (this.disposed || !this.menu.getSnapshot().open || this.hit === null) return
+    const launched = this.launcher.getSnapshot()
+    const roster = this.deps.roster.sources(this.hit.trigger)
+      .filter(source => launched === null || source.name === launched)
+    if (roster.length === 0) return
+    this.fetchCandidates(this.hit, roster)
   }
 
   /** Scope teardown: close and abort (the service deletes the map entry). */
@@ -322,7 +465,11 @@ export class InputTriggerController {
       return actx.bail(actx, 'slash/input-begin-command', { claim: outcome.claim, span }) === true
     }
     if ('text' in outcome) {
-      return actx.bail(actx, 'slash/input-insert-text', { text: outcome.text, span }) === true
+      return actx.bail(actx, 'slash/input-insert-text', {
+        text: outcome.text,
+        span,
+        ...outcome.continue === true ? { continue: true } : {},
+      }) === true
     }
     return actx.bail(actx, 'slash/input-insert-reference', { reference: outcome.insert, span }) === true
   }
@@ -353,7 +500,17 @@ export class InputTriggerController {
   /** Wire one source's lexicon invalidation channel into refresh (hookless or roll-less sources never notify). */
   private watchLexicon(source: InputTriggerSource, projection: ClientSessionContext): void {
     if (source.lexicon === undefined || source.subscribeLexicon === undefined) return
-    this.lexiconOffs.set(source, source.subscribeLexicon(projection, () => { this.refreshLexicon() }))
+    this.lexiconOffs.set(source, source.subscribeLexicon(projection, () => {
+      this.refreshLexicon()
+      const hit = this.hit
+      if (hit === null || !this.menu.getSnapshot().open || hit.trigger !== source.trigger) return
+      // Let every source process the same invalidation before rebuilding the
+      // open menu, so one source cannot contribute its previous catalog.
+      void Promise.resolve().then(() => {
+        if (this.disposed || this.hit !== hit || !this.menu.getSnapshot().open) return
+        this.fetchCandidates(hit, this.deps.roster.sources(hit.trigger))
+      })
+    }))
   }
 
   /** Launch the candidate fetch for one hit generation, superseding the previous one. */
@@ -365,7 +522,13 @@ export class InputTriggerController {
     const projection = this.project()
     for (const source of roster) {
       void source
-        .candidates(projection, { query: hit.query, position: hit.position, signal: controller.signal })
+        .candidates(projection, {
+          query: hit.query,
+          quoted: hit.quoted,
+          position: hit.position,
+          drilled: this.drilled,
+          signal: controller.signal,
+        })
         .then(
           (items) => {
             if (controller.signal.aborted) return
@@ -385,6 +548,85 @@ export class InputTriggerController {
     this.fetch = null
   }
 
+  /**
+   * Run one candidate (or crumb) through its source and apply the outcome.
+   *
+   * A drill is the one pick that leaves the menu open, so it is also the one
+   * that records how the next query was reached; every other pick closes the
+   * menu, which clears that record.
+   * @param src - the owning source.
+   * @param candidate - the picked candidate, or a crumb projected as one.
+   * @param hit - the authoritative hit supplying position and span CAS.
+   * @param action - settling pick or drill.
+   */
+  private settle(
+    src: InputTriggerSource,
+    candidate: InputTriggerCandidate,
+    hit: TriggerHit,
+    action: PickAction,
+  ): void {
+    const outcome = src.onPick({
+      candidate,
+      session: this.project(),
+      position: hit.position,
+      via: 'menu',
+      action,
+      span: hit.span,
+    })
+    this.stopFetch()
+    // A settling pick is the user's decision about this token: the menu stays
+    // closed for it until the text changes, so a settled command that opens a
+    // surface of its own does not bring the menu back when that surface closes
+    // and the caret returns.
+    if (action === 'pick') this.rememberDismissed()
+    this.reduce({ type: 'close' })
+    // Claimed before the edit, and after the close above so the reducer's own
+    // teardown cannot clear it: the input may apply the descent through a
+    // synchronous editor commit that re-enters track(), and the header and
+    // candidate requests raised there read this flag. A refused edit (stale
+    // draft revision, or an unmappable span) mutates nothing and so reaches
+    // no re-entry, which is why withdrawing the claim afterwards still keeps
+    // a header off a draft nobody descended into — one that would name a
+    // directory while hiding the locations its rows still need.
+    this.drilled = action === 'drill'
+    if (!this.execute(outcome, hit.span)) this.drilled = false
+  }
+
+  /** Re-poll every header-bearing source in the hit roster and publish their crumbs. */
+  private refreshHeaders(hit: TriggerHit, roster: readonly InputTriggerSource[]): void {
+    const projection = this.project()
+    const crumbs = new Map<string, readonly InputTriggerCrumb[]>()
+    for (const src of roster) {
+      if (src.header === undefined) continue
+      let published: readonly InputTriggerCrumb[] | undefined
+      try {
+        published = src.header(projection, { query: hit.query, quoted: hit.quoted, drilled: this.drilled })
+      } catch (error) {
+        // A faulty source drops silently with a console record (the
+        // candidate-fetch failure policy); a header is decoration and must
+        // not take down the menu that carries the candidates.
+        console.error(`[ui-input-trigger] source "${src.name}" header failed:`, error)
+        continue
+      }
+      if (published === undefined || published.length === 0) continue
+      crumbs.set(src.name, published)
+    }
+    this.setHeaders(crumbs)
+  }
+
+  private setHeaders(next: ReadonlyMap<string, readonly InputTriggerCrumb[]>): void {
+    if (this.headers.getSnapshot().size === 0 && next.size === 0) return
+    this.headers.set(next)
+  }
+
+  /** Record the open menu's identity as dismissed, so a bare re-track cannot revive it. */
+  private rememberDismissed(): void {
+    const hit = this.hit
+    this.dismissed = hit === null ? null : {
+      trigger: hit.trigger, query: hit.query, quoted: hit.quoted, start: hit.span.start, end: hit.span.end,
+    }
+  }
+
   private clearLauncher(): void {
     if (this.launcher.getSnapshot() !== null) this.launcher.set(null)
   }
@@ -393,6 +635,9 @@ export class InputTriggerController {
     const cur = this.menu.getSnapshot()
     const next = menuReduce(cur, ev)
     if (next !== cur) this.menu.set(next)
-    if (!next.open) this.clearLauncher()
+    if (next.open) return
+    this.clearLauncher()
+    this.drilled = false
+    this.setHeaders(new Map())
   }
 }

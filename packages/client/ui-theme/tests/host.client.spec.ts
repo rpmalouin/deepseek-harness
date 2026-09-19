@@ -1,7 +1,7 @@
 import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it } from 'vitest'
-import type { WebServer } from '@deepseek-ai/dsh-host-webserver'
-import { SettingsProvider, settingsNamespace, type SettingsNamespace } from '@deepseek-ai/dsh-settings'
+import type { IndexInjection } from '@deepseek-ai/dsh-host-webserver'
+import { SettingsProvider, type SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import {
   DEFAULT_PREFERENCE, THEME_SETTINGS_NAMESPACE, apply,
 } from '@deepseek-ai/dsh-client-ui-theme'
@@ -14,52 +14,72 @@ class MemorySettings extends SettingsProvider {
   }
 }
 
+/** Collect the injection table the way an index render or boot payload does. */
+function collect(ctx: Context): IndexInjection[] {
+  const table: IndexInjection[] = []
+  ctx.emit('webserver/index-inject', table)
+  return table
+}
+
+/** Narrow a theme style or script row and return its text. */
+function rowText(row: IndexInjection | undefined): string {
+  if (row?.kind !== 'script' && row?.kind !== 'style') throw new Error('expected a style or script row')
+  return row.text
+}
+
 describe('ui-theme host', () => {
   it('registers, validates, and disposes the durable theme namespace with its fiber', async () => {
     const ctx = new Context()
     await ctx.plugin(MemorySettings).await()
     const fiber = ctx.plugin({ apply })
     await fiber.await()
-    const ns = settingsNamespace(THEME_SETTINGS_NAMESPACE)
-    expect(ctx.settings.get(ns)).toEqual({ preference: DEFAULT_PREFERENCE })
-    await ctx.settings.update(ns, { preference: 'dark' })
-    expect(ctx.settings.get(ns)).toEqual({ preference: 'dark' })
+    const ns = THEME_SETTINGS_NAMESPACE
+    expect(ctx.settings.get(ns)).toEqual({ preference: DEFAULT_PREFERENCE, fontSize: 14 })
+    await ctx.settings.update(ns, { preference: 'dark', fontSize: 16 })
+    expect(ctx.settings.get(ns)).toEqual({ preference: 'dark', fontSize: 16 })
     await expect(ctx.settings.update(ns, { preference: 'sepia' })).rejects.toThrow()
+    await expect(ctx.settings.update(ns, { fontSize: 11 })).rejects.toThrow()
+    await expect(ctx.settings.update(ns, { fontSize: 18 })).rejects.toThrow()
     await fiber.dispose()
     expect(ctx.settings.describe().map(row => row.ns)).not.toContain(ns)
   })
 
-  it('renders the current durable preference and disposes the index transform', async () => {
+  it('answers each collection with the current durable preference until disposal', async () => {
     const ctx = new Context()
     await ctx.plugin(MemorySettings).await()
-    let transform: ((html: string) => string) | undefined
-    let disposed = false
-    ctx.provide('webServer', {
-      tapIndex: (next: (html: string) => string) => {
-        transform = next
-        return () => { disposed = true }
-      },
-    } as WebServer)
+    ctx.on('webserver/index-inject', (table) => {
+      table.push({ kind: 'script', placement: 'head', text: 'window.afterTheme=true' })
+    })
     const fiber = ctx.plugin({ apply })
     await fiber.await()
-    expect(transform?.('<body></body>')).toContain('const preference = "system"')
-    await ctx.settings.update(settingsNamespace(THEME_SETTINGS_NAMESPACE), { preference: 'dark' })
-    expect(transform?.('<body></body>')).toContain('const preference = "dark"')
+    const rows = collect(ctx)
+    expect(rows).toHaveLength(3)
+    expect(rows[0]).toMatchObject({ kind: 'style' })
+    expect(rows[1]).toMatchObject({ kind: 'script', placement: 'body' })
+    expect(rows[2]).toMatchObject({ kind: 'script', placement: 'head', text: 'window.afterTheme=true' })
+    expect(rowText(rows[0])).toContain('@media(prefers-color-scheme:dark)')
+    expect(rowText(rows[1])).toContain('const preference = "system"')
+    expect(rowText(rows[1])).toContain('"14px"')
+    await ctx.settings.update(THEME_SETTINGS_NAMESPACE, { preference: 'dark', fontSize: 17 })
+    expect(rowText(collect(ctx)[0])).toContain('color-scheme:dark')
+    expect(rowText(collect(ctx)[1])).toContain('const preference = "dark"')
+    expect(rowText(collect(ctx)[1])).toContain('"17px"')
     await fiber.dispose()
-    expect(disposed).toBe(true)
-    expect(transform?.('<body></body>')).toContain('const preference = "system"')
+    expect(collect(ctx)).toEqual([{ kind: 'script', placement: 'head', text: 'window.afterTheme=true' }])
   })
 
-  it('uses the system preference when only an HTTP server exists', async () => {
+  it('uses the system preference without a settings provider', async () => {
     const ctx = new Context()
-    let transform: ((html: string) => string) | undefined
-    ctx.provide('webServer', {
-      tapIndex: (next: (html: string) => string) => {
-        transform = next
-        return () => undefined
-      },
-    } as WebServer)
     await ctx.plugin({ apply }).await()
-    expect(transform?.('<body></body>')).toContain('const preference = "system"')
+    expect(rowText(collect(ctx)[1])).toContain('const preference = "system"')
+  })
+
+  it('falls back to the schema default while the theme namespace holds no section', async () => {
+    // A settings provider whose namespace read comes back empty (registration
+    // still pending or a provider without schema defaults).
+    const ctx = new Context()
+    ctx.provide('settings', { register: () => () => {}, get: () => undefined } as never)
+    await ctx.plugin({ apply }).await()
+    expect(rowText(collect(ctx)[1])).toContain('const preference = "system"')
   })
 })

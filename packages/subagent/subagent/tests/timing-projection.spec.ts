@@ -4,16 +4,16 @@ import SessionStore from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import SubagentRuntime from '../src/index.ts'
-import { subagentTimingProjectionDefinition } from '../src/projection.ts'
+import { subagentTimingProjectionDefinition, type TimingState } from '../src/projection.ts'
 
 function event(type: SessionEvent['type'], seq: number, time: number): SessionEvent {
   return { type, seq, time, data: {} } as SessionEvent
 }
 
 function fold(events: SessionEvent[]) {
-  let state = subagentTimingProjectionDefinition.init()
+  let state: TimingState = subagentTimingProjectionDefinition.init()
   for (const item of events) state = subagentTimingProjectionDefinition.apply(state, item)
-  return subagentTimingProjectionDefinition.view(state)
+  return subagentTimingProjectionDefinition.wire.view(state)
 }
 
 describe('subagent timing projection', () => {
@@ -53,7 +53,7 @@ describe('subagent timing projection', () => {
       event('subagent/descriptor', 1, 1_100),
       event('turn/end', 2, 900),
       event('turn/start', 3, 2_000),
-      event('assistant/chunk', 4, 2_500),
+      event('assistant/attempt', 4, 2_500),
     ])).toEqual({ settledMs: 0, active: { since: 2_000, through: 2_500 } })
   })
 
@@ -61,7 +61,7 @@ describe('subagent timing projection', () => {
     const initial = subagentTimingProjectionDefinition.init()
     expect(subagentTimingProjectionDefinition.apply(
       initial,
-      event('assistant/chunk', 0, 1),
+      event('assistant/attempt', 0, 1),
     )).toBe(initial)
     expect(subagentTimingProjectionDefinition.apply(
       initial,

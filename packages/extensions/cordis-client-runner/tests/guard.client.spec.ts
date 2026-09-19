@@ -16,7 +16,7 @@ import type {
   CordisDynamicPluginRunId,
   DynamicCordisPackage,
 } from '@deepseek-ai/dsh-api-remotes/client'
-import { SlotRegistry } from '@deepseek-ai/dsh-client-runtime/client'
+import { SlotRegistry } from '@deepseek-ai/dsh-client-ui-renderer/client'
 import { dynamicCordisContext } from '../src/client/guard.ts'
 import type { DynamicCordisSlotLedgerRow } from '../src/client/guard.ts'
 
@@ -169,6 +169,22 @@ describe('slots seat', () => {
     slots.register({ name: 'root', priority: 5 }, C)
     spec.mockRestore()
     expect(bench.ledger).toEqual([{ slot: 'root', priority: 5 }])
+  })
+
+  it('ledgers and claims Factory definitions without assigning Slot priority', async () => {
+    const bench = await boot(['slots'])
+    const slots = bench.facade.slots as {
+      registerFactory(options: object, component: unknown): () => void
+    }
+    slots.registerFactory({ name: 'guard.factory', scope: 'root' }, C)
+
+    expect(bench.ledger).toEqual([{ slot: 'factory:guard.factory', priority: undefined }])
+    expect(bench.claimed).toEqual([C])
+    expect(bench.slots.snapshot('factory:guard.factory')).toMatchObject([{
+      type: 'factory', name: 'guard.factory', scope: 'root',
+    }])
+    await bench.dispose()
+    expect(bench.slots.snapshot('factory:guard.factory')).toEqual([])
   })
 
   it('rejects a malformed register call before touching the registry', async () => {

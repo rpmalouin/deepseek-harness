@@ -3,7 +3,8 @@
 // the real provider, while replay keeps the same provider-authored behavior
 // keyless. Assertions read the exact durable header, runtime-context messages,
 // and tool calls, so assistant prose alone cannot satisfy the scenario.
-import { readFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Browser, Page } from 'playwright'
@@ -11,14 +12,16 @@ import { chromium } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
 import { canonicalPath } from '@deepseek-ai/dsh-sandbox'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
+import type { WebTerminalId } from '@deepseek-ai/dsh-api-terminal-controller/types'
+import type {} from '@deepseek-ai/dsh-api-terminal-controller'
 import {
-  assertFixtureInventory, fixtureUserPrompts, launchWebScaffold, recordFixture,
+  assertFinalWorkspaceSnapshot, assertFixtureInventory, fixtureUserPrompts, launchWebScaffold, recordFixture,
   watchConsole, webSnapshotMode, type WebScaffold,
 } from './scaffold.ts'
-import { connectFreshWorkspace, newEnglishPage, saveFailureShot } from './support.ts'
+import { connectFreshWorkspace, newEnglishPage, saveFailureShot, writeComposerDraft } from './support.ts'
 
-const SNAPSHOT_DIR = fileURLToPath(new URL('./snapshots/permission-policy-context', import.meta.url))
-const FIXTURE = fileURLToPath(new URL('./snapshots/permission-policy-context/session.jsonl', import.meta.url))
+const SNAPSHOT_DIR = fileURLToPath(new URL('../../../snapshots/web/permission-policy-context', import.meta.url))
+const FIXTURE = fileURLToPath(new URL('../../../snapshots/web/permission-policy-context/session.v3.jsonl', import.meta.url))
 const MODE = webSnapshotMode()
 
 const PROMPTS = [
@@ -30,10 +33,10 @@ const PROMPTS = [
 
 const PRESET_LABELS = ['Read Only', 'Full access', 'Workspace Write'] as const
 
-function requestSystems(events: readonly SessionEvent[]): string[] {
+function systemPrompts(events: readonly SessionEvent[]): string[] {
   return events.flatMap((event) => {
-    if (event.type !== 'request/header') return []
-    return typeof event.data.header.system === 'string' ? [event.data.header.system] : []
+    if (event.type !== 'system/message') return []
+    return [event.data.message.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('')]
   })
 }
 
@@ -65,10 +68,18 @@ describe('web e2e: current sandbox policy reaches the model before tools', () =>
   let tripwire: ReturnType<typeof watchConsole>
   let disposeApproval: (() => void) | undefined
   let sessionWorkspace: string | undefined
+  let outsideWorkspace: string | undefined
+  let terminalId: WebTerminalId | undefined
   const sessionEvents: SessionEvent[] = []
 
   beforeAll(async () => {
-    scaffold = await launchWebScaffold(MODE === 'record' ? {} : { replayFixture: FIXTURE })
+    scaffold = await launchWebScaffold({
+      ...MODE === 'record' ? {} : { replayFixture: FIXTURE, compareReplaySession: true },
+      ...process.platform === 'win32' ? {} : {
+        extraOverlayPath: fileURLToPath(new URL('./fixtures/sidebar-terminal.patch.yml', import.meta.url)),
+      },
+    })
+    outsideWorkspace = await mkdtemp(join(tmpdir(), 'dsh-user-terminal-'))
     disposeApproval = scaffold.ctx.on('approval/request', () => Promise.resolve('allowed-once'), { prepend: true })
     scaffold.ctx.on('session/event', (session, event: SessionEvent) => {
       sessionWorkspace = session.header.cwd
@@ -77,16 +88,53 @@ describe('web e2e: current sandbox policy reaches the model before tools', () =>
     browser = await chromium.launch()
     page = await newEnglishPage(browser)
     tripwire = watchConsole(page)
-    await page.goto(scaffold.baseUrl, { waitUntil: 'load' })
+    await page.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })
     await page.waitForSelector('[class*="frame"]', { timeout: 30_000 })
     await connectFreshWorkspace(page, scaffold.workspaceCwd)
   }, 120_000)
 
   afterAll(async () => {
-    await browser?.close()
-    disposeApproval?.()
-    await scaffold?.close()
+    try { await browser?.close() } finally {
+      disposeApproval?.()
+      try { await scaffold?.close() } finally {
+        if (outsideWorkspace !== undefined) await rm(outsideWorkspace, { recursive: true, force: true })
+      }
+    }
   })
+
+  async function verifyUserTerminal(preset: string): Promise<void> {
+    // The pinned interactive Bash profile is POSIX-only; Windows still replays every Agent policy assertion.
+    if (process.platform === 'win32') return
+    if (terminalId === undefined) {
+      const expand = page.locator('[data-sidebar-right-expand]')
+      if (await expand.isVisible()) await expand.click()
+      await page.locator('[data-sidebar-right-guide-entry="terminal"]').getByRole('button', { name: /^New terminal/u }).click()
+      await expect.poll(() => page.locator('.xterm-rows:visible').innerText()).toContain('bash-')
+    }
+    const agent = scaffold.ctx.agents.list()[0]
+    if (agent === undefined || sessionWorkspace === undefined || outsideWorkspace === undefined) throw new Error('Terminal test has no Session workspace')
+    const terminals = scaffold.ctx.terminalController.list(agent.id)
+    expect(terminals).toHaveLength(1)
+    terminalId ??= terminals[0]!.id
+    expect(terminals[0]).toMatchObject({ id: terminalId, state: 'running', cwd: sessionWorkspace })
+    const outsideFile = join(outsideWorkspace, 'terminal-access.txt')
+    const quotedOutside = `'${outsideFile.replaceAll("'", "'\\''")}'`
+    const beforeInput = sessionEvents.length
+    await page.locator('.xterm-helper-textarea:visible').click()
+    await page.keyboard.insertText(`printf '%s' '${preset}' > terminal-access.txt; printf '%s' '${preset}' > ${quotedOutside}`)
+    await page.keyboard.press('Enter')
+    await expect.poll(() => readFile(join(sessionWorkspace!, 'terminal-access.txt'), 'utf8')).toBe(preset)
+    await expect.poll(() => readFile(outsideFile, 'utf8')).toBe(preset)
+    expect(sessionEvents).toHaveLength(beforeInput)
+    await page.keyboard.insertText('rm terminal-access.txt')
+    await page.keyboard.press('Enter')
+    await expect.poll(async () => {
+      try { await readFile(join(sessionWorkspace!, 'terminal-access.txt')); return false } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+        return true
+      }
+    }).toBe(true)
+  }
 
   it('switches read-only, danger-full-access, and workspace-write through the real GUI command path', async () => {
     onTestFailed(() => saveFailureShot(page, 'web-e2e-permission-policy-context'))
@@ -94,35 +142,39 @@ describe('web e2e: current sandbox policy reaches the model before tools', () =>
       expect(fixtureUserPrompts(await readFile(FIXTURE, 'utf8'))).toEqual(PROMPTS)
     }
 
-    const input = page.locator('textarea').first()
+    const input = page.locator('[data-composer-input][contenteditable="true"]').first()
     let sessionId: Awaited<ReturnType<WebScaffold['whenTurnSettled']>> | undefined
     for (const [index, preset] of ['read-only', 'danger-full-access', 'workspace-write'].entries()) {
-      await input.fill(`/permission ${preset}`)
+      await writeComposerDraft(page, input, `/permission ${preset}`)
       await input.press('Enter')
       await page.getByRole('button', { name: `Access mode, current: ${PRESET_LABELS[index]}` })
         .waitFor({ timeout: 10_000 })
 
       const settled = scaffold.whenTurnSettled()
-      await input.fill(PROMPTS[index] as string)
+      await writeComposerDraft(page, input, PROMPTS[index] as string)
       await input.press('Enter')
       sessionId = await settled
-      await expect.poll(() => input.isEnabled(), { timeout: 10_000 }).toBe(true)
+      await input.waitFor({ timeout: 10_000 })
+      await verifyUserTerminal(preset)
     }
 
-    await input.fill('/permission read-only')
+    await writeComposerDraft(page, input, '/permission read-only')
     await input.press('Enter')
     await page.getByRole('button', { name: 'Access mode, current: Read Only' }).waitFor({ timeout: 10_000 })
+    await verifyUserTerminal('read-only')
     const settled = scaffold.whenTurnSettled()
-    await input.fill(PROMPTS[3])
+    await writeComposerDraft(page, input, PROMPTS[3])
     await input.press('Enter')
     sessionId = await settled
 
     if (sessionId === undefined) throw new Error('permission-policy scenario completed no model turn')
     if (MODE === 'record') await recordFixture(scaffold, sessionId, FIXTURE)
+    if (sessionWorkspace === undefined) throw new Error('permission-policy scenario observed no session workspace')
+    await assertFinalWorkspaceSnapshot(SNAPSHOT_DIR, sessionWorkspace)
   }, 240_000)
 
   it.skipIf(MODE === 'record')('records cache-safe current policy before the corresponding model behavior', async () => {
-    const systems = requestSystems(sessionEvents)
+    const systems = systemPrompts(sessionEvents)
     expect(systems).toHaveLength(1)
     expect(systems[0]).not.toContain('Current DSH file policy:')
     expect(systems[0]).not.toContain('Approval policy:')
@@ -166,6 +218,6 @@ describe('web e2e: current sandbox policy reaches the model before tools', () =>
   it.skipIf(MODE === 'record')('stays clean and keeps the fixture inventory closed', async () => {
     expect(tripwire.pageErrors).toEqual([])
     expect(tripwire.warnings).toEqual([])
-    await assertFixtureInventory(SNAPSHOT_DIR, ['session.jsonl'])
+    await assertFixtureInventory(SNAPSHOT_DIR, ['session.v3.jsonl', 'workspace.expected'])
   })
 })

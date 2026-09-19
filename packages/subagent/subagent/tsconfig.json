@@ -15,6 +15,12 @@
       "path": "../../../vendor/cordis"
     },
     {
+      "path": "../../../vendor/schemastery"
+    },
+    {
+      "path": "../../attachment/attachment"
+    },
+    {
       "path": "../../core/agent"
     },
     {
@@ -25,6 +31,9 @@
     },
     {
       "path": "../../core/scope"
+    },
+    {
+      "path": "../../core/system-prompt"
     },
     {
       "path": "../../interaction/user-approval"
@@ -48,10 +57,28 @@
       "path": "../../session/session-projection-cache"
     },
     {
+      "path": "../../session-query/session-query"
+    },
+    {
       "path": "../../jobs/jobs"
     },
     {
+      "path": "../../typert/protocol"
+    },
+    {
+      "path": "../../util/time"
+    },
+    {
       "path": "../../runtime-diagnostics/invariants"
+    },
+    {
+      "path": "../../interaction/permission-presets"
+    },
+    {
+      "path": "../../util/chunked-list"
+    },
+    {
+      "path": "../../settings/settings"
     }
   ]
 }

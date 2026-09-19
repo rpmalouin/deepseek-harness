@@ -42,7 +42,7 @@ const MAX_DECL_CHARS = 1200
 /**
  * Line budget for ONE slot's expanded report. The whole point of narrowing to a
  * single slot is to spend less context, so a report a model cannot finish
- * reading is a defect rather than a detail. Today's widest slot renders 60
+ * reading is a defect rather than a detail. The widest measured slot renders 60
  * lines, so this leaves room to document a slot properly while catching the two
  * ways a report runs away: an owner share that hands down a subsystem instead of
  * a share, and prose that grew into a manual.
@@ -208,7 +208,7 @@ export function validateSlotContracts(
     }
   }
   for (const registration of registrations) {
-    if (!byKey.has(registration.key)) {
+    if (registration.factory !== true && !byKey.has(registration.key)) {
       problems.push(`registration into '${registration.key}' (${registration.source}) targets a slot no SlotMap merge declares; either the scan has a blind spot or the registration is dead.`)
     }
     for (const child of registration.children) {
@@ -267,7 +267,8 @@ function entryOf(
   types: ReadonlyMap<string, TypeDeclaration>,
   kits: ReadonlyMap<string, readonly string[]>,
 ): SlotEntry {
-  const occupants = registrations.filter(registration => registration.key === declaration.key)
+  const occupants = registrations.filter(registration =>
+    registration.factory !== true && registration.key === declaration.key)
   const cellOccupied = occupants.some(occupant =>
     declaration.kind === 'single' || occupant.entryKey !== undefined)
   const doc = docProse(declaration.jsDoc)
@@ -287,7 +288,9 @@ function entryOf(
     slotInject: declaration.injectType ?? '',
     declaredBy: declaredBy === undefined
       ? 'the runtime itself (built in; always present)'
-      : `an entry in '${declaredBy.key}' (${shortPackage(declaredBy.package)}), so it exists while that entry is mounted`,
+      : declaredBy.factory === true
+        ? `factory '${declaredBy.key}' (${shortPackage(declaredBy.package)}), so it exists while that definition is registered`
+        : `an entry in '${declaredBy.key}' (${shortPackage(declaredBy.package)}), so it exists while that entry is mounted`,
     occupants: occupants.map(occupant => [
       shortPackage(occupant.package),
       occupant.component,
@@ -552,7 +555,6 @@ export function main(): void {
   console.log(`gen-client-catalog: wrote ${OUT}.`)
 }
 
-// Run only when invoked as a script, not when imported by a test.
 if (process.argv[1] && import.meta.filename === resolve(process.argv[1])) {
   main()
 }

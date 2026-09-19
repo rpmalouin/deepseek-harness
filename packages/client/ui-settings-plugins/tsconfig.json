@@ -15,13 +15,19 @@
       "path": "../../../vendor/cordis"
     },
     {
-      "path": "../runtime"
+      "path": "../store"
     },
     {
       "path": "../../test-support/client-runtime"
     },
     {
       "path": "../ui-primitives"
+    },
+    {
+      "path": "../ui-renderer"
+    },
+    {
+      "path": "../ui-plugin-manager"
     },
     {
       "path": "../ui-settings"
@@ -31,12 +37,6 @@
     },
     {
       "path": "../ui-slots"
-    },
-    {
-      "path": "../web-react"
-    },
-    {
-      "path": "../../runtime-diagnostics/invariants"
     }
   ]
 }

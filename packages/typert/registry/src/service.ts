@@ -9,12 +9,12 @@ import { Context, Service } from '@deepseek-ai/cordis'
 import { z } from 'zod'
 import type {
   InvocationDescriptor,
-  TypertClientContextBinder,
+  TypertClientContextAdapter,
   TypertContextMap,
   TypertContextRegistry,
   TypertContextWire,
   TypertDisposer,
-  TypertHostContextProvider,
+  TypertHostContextAdapter,
   TypertHostContextResolver,
   TypertLocalRegistry,
   TypertLookupHost,
@@ -35,6 +35,7 @@ import type {
   TypertFace,
   TypertPackageFilter,
   TypertPackageRecord,
+  TypertSchemaFactory,
   TypertSchemaFilter,
   TypertSchemaRecord,
 } from './types.ts'
@@ -334,9 +335,9 @@ function lookupDefinitionEquals(left: TypertLookupDefinition, right: TypertLooku
 }
 
 class ContextStore {
-  private readonly hosts = new Map<string, ProviderEntry<TypertHostContextProvider>>()
+  private readonly hosts = new Map<string, ProviderEntry<TypertHostContextAdapter>>()
   private readonly hostResolvers = new Map<string, ProviderEntry<HostContextResolverEntry>>()
-  private readonly clients = new Map<string, ProviderEntry<TypertClientContextBinder>>()
+  private readonly clients = new Map<string, ProviderEntry<TypertClientContextAdapter>>()
   private readonly changes: ChangeSource
 
   constructor(report: ReportObserverError) {
@@ -347,30 +348,30 @@ class ContextStore {
     return {
       registerHost: <K extends Extract<keyof TypertContextMap, string>>(
         key: K,
-        provider: TypertHostContextProvider<TypertContextWire<TypertContextMap[K]>>,
-      ) => this.registerHost(ctx, key, provider),
+        adapter: TypertHostContextAdapter<TypertContextWire<TypertContextMap[K]>>,
+      ) => this.registerHost(ctx, key, adapter),
       configureHost: <K extends Extract<keyof TypertContextMap, string>>(
         key: K,
         resolver: TypertHostContextResolver<TypertContextWire<TypertContextMap[K]>>,
       ) => this.configureHost(ctx, key, resolver),
       registerClient: <K extends Extract<keyof TypertContextMap, string>>(
         key: K,
-        binder: TypertClientContextBinder<TypertContextWire<TypertContextMap[K]>>,
-      ) => this.registerClient(ctx, key, binder),
+        adapter: TypertClientContextAdapter<TypertContextWire<TypertContextMap[K]>>,
+      ) => this.registerClient(ctx, key, adapter),
       getHost: key => this.getHost(key),
       getClient: key => this.clients.get(key)?.provider,
       subscribe: listener => this.changes.subscribe(ctx, listener),
     }
   }
 
-  private getHost(key: string): TypertHostContextProvider | undefined {
-    const provider = this.hosts.get(key)?.provider
-    if (provider === undefined) return undefined
+  private getHost(key: string): TypertHostContextAdapter | undefined {
+    const adapter = this.hosts.get(key)?.provider
+    if (adapter === undefined) return undefined
     const resolver = this.hostResolvers.get(key)?.provider
-    if (resolver === undefined) return provider
+    if (resolver === undefined) return adapter
     return {
-      wire: provider.wire,
-      wireTypeSymbol: provider.wireTypeSymbol,
+      wire: adapter.wire,
+      wireTypeSymbol: adapter.wireTypeSymbol,
       resolve: id => resolver.resolve(id),
     }
   }
@@ -399,16 +400,16 @@ class ContextStore {
     }, `typert.contexts.configureHost(${JSON.stringify(key)})`)
   }
 
-  private registerHost<Wire>(ctx: Context, key: string, provider: TypertHostContextProvider<Wire>): TypertDisposer {
+  private registerHost<Wire>(ctx: Context, key: string, adapter: TypertHostContextAdapter<Wire>): TypertDisposer {
     validateSegment('Context key', key)
-    validateWireName('Context wire field', provider.wire)
-    validateNonempty('Context wire type symbol', provider.wireTypeSymbol)
-    return this.registerProvider(ctx, this.hosts, 'host-context', key, provider)
+    validateWireName('Context wire field', adapter.wire)
+    validateNonempty('Context wire type symbol', adapter.wireTypeSymbol)
+    return this.registerProvider(ctx, this.hosts, 'host-context', key, adapter)
   }
 
-  private registerClient<Wire>(ctx: Context, key: string, binder: TypertClientContextBinder<Wire>): TypertDisposer {
+  private registerClient<Wire>(ctx: Context, key: string, adapter: TypertClientContextAdapter<Wire>): TypertDisposer {
     validateSegment('Context key', key)
-    return this.registerProvider(ctx, this.clients, 'client-context', key, binder)
+    return this.registerProvider(ctx, this.clients, 'client-context', key, adapter)
   }
 
   private registerProvider<Provider>(
@@ -444,7 +445,7 @@ interface HostContextResolverEntry {
  * @typert service typert
  */
 export class TypertRegistry extends Service implements TypertRegistryContract {
-  private readonly schemas = new Map<string, TypertSchemaRecord>()
+  private readonly schemas = new Map<string, TypertSchemaFactoryRecord>()
   private readonly packages = new Map<string, TypertPackageRecord>()
   private readonly localStore: DescriptorStore
   private readonly remoteStore: RemoteStore
@@ -484,7 +485,7 @@ export class TypertRegistry extends Service implements TypertRegistryContract {
     return this.lookupStore.view(this.ctx)
   }
 
-  /** Host Context providers and Client Context binders. */
+  /** Host and Client Context adapters. */
   get contexts(): TypertContextRegistry {
     return this.contextStore.view(this.ctx)
   }
@@ -522,21 +523,22 @@ export class TypertRegistry extends Service implements TypertRegistryContract {
   /**
    * Look up one schema by `<package>#<name>`.
    * @param key - global schema key.
-   * @returns the live schema record, or `undefined` when absent.
+   * @returns a record containing the cached schema, or `undefined` when absent.
    */
   get(key: string): TypertSchemaRecord | undefined {
-    return this.schemas.get(key)
+    const record = this.schemas.get(key)
+    return record === undefined ? undefined : materializeSchema(record)
   }
 
   /**
    * Resolve one required schema.
    * @param key - global schema key.
-   * @returns the live schema record.
+   * @returns a record containing the cached schema.
    * @throws when the key is malformed, the package face is absent, or the schema is not contributed.
    */
   resolve(key: string): TypertSchemaRecord {
     const record = this.schemas.get(key)
-    if (record !== undefined) return record
+    if (record !== undefined) return materializeSchema(record)
     const hash = key.indexOf('#')
     if (hash <= 0 || hash === key.length - 1) {
       throw new Error(`typert: invalid schema key "${key}" — expected "<package>#<name>"`)
@@ -553,10 +555,10 @@ export class TypertRegistry extends Service implements TypertRegistryContract {
   /**
    * Enumerate live schemas in registration order.
    * @param filter - optional package and face restriction.
-   * @returns matching schema records.
+   * @returns matching records containing the cached schemas.
    */
   list(filter: TypertSchemaFilter = {}): TypertSchemaRecord[] {
-    return [...this.schemas.values()].filter(record => matches(record, filter))
+    return [...this.schemas.values()].filter(record => matches(record, filter)).map(materializeSchema)
   }
 
   /**
@@ -606,11 +608,14 @@ export class TypertRegistry extends Service implements TypertRegistryContract {
     }
   }
 
-  private validateSchemas(contribution: TypertContribution): TypertSchemaRecord[] {
-    const records: TypertSchemaRecord[] = []
+  private validateSchemas(contribution: TypertContribution): TypertSchemaFactoryRecord[] {
+    const records: TypertSchemaFactoryRecord[] = []
     const batch = new Set<string>()
     for (const schema of contribution.schemas) {
       validateSegment('schema name', schema.name)
+      if (typeof schema.create !== 'function') {
+        throw new Error(`typert: schema "${schema.name}" has no create() factory`)
+      }
       const key = typertKey(contribution.package, schema.name)
       if (batch.has(key) || this.schemas.has(key)) {
         throw new Error(`typert: schema "${key}" is already registered`)
@@ -624,6 +629,24 @@ export class TypertRegistry extends Service implements TypertRegistryContract {
       })
     }
     return records
+  }
+}
+
+interface TypertSchemaFactoryRecord extends TypertSchemaFactory {
+  readonly package: string
+  readonly face: TypertFace
+  readonly key: string
+  value?: z.ZodType
+}
+
+function materializeSchema(record: TypertSchemaFactoryRecord): TypertSchemaRecord {
+  const schema = record.value ??= record.create()
+  return {
+    name: record.name,
+    schema,
+    package: record.package,
+    face: record.face,
+    key: record.key,
   }
 }
 
@@ -697,8 +720,8 @@ function validateInvocation(descriptor: InvocationDescriptor): void {
 function validateCodec(codec: InvocationDescriptor['result'], subject: string): void {
   if (codec.mode === 'src-json') return
   validateNonempty(`${subject} type symbol`, codec.typeSymbol)
-  if (typeof codec.schema.parse !== 'function') {
-    throw new Error(`typert: ${subject} strict codec has no parse() method`)
+  if (typeof codec.create !== 'function') {
+    throw new Error(`typert: ${subject} strict codec has no create() factory`)
   }
 }
 

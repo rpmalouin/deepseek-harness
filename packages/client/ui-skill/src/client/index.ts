@@ -1,16 +1,16 @@
 /**
  * Skill reference plugin, browser half: registers the '/' skill source —
- * candidates from the skill.list RPC addressed by the per-call session
+ * candidates from the `skills/list` Remote addressed by the per-call session
  * projection's sessionId (sessions are always agent-backed; the host
  * resolves cwd from the session header). A pick lands the literal `/name `
  * text and the prompt ships the same literal (plain-text-reference decision;
- * see .agents/notes/implemented/architecture/2026-07-25-web-input-machine-and-slash-pipeline.md);
+ * see .agents/notes/archived/architecture/2026-07-25-web-input-machine-and-slash-pipeline.md);
  * determinism
  * lives host-side — the pre-step boundary (`dsh-tool-skill`) recognizes a
  * leading `/name` naming a user-invocable skill and injects the rendered
  * body for every entry point, including `disable-model-invocation` skills the
  * model-side catalog never lists (issue #1470). The RPC rides the plugin's
- * root-context connection captured at registration — the source never reads
+ * root-context Remote captured at registration — the source never reads
  * services off a per-call argument. Draft chip visuals derive from
  * the lexicon scan; this source implements no reference codec.
  *
@@ -30,11 +30,18 @@
  * accent row derived only from each logged call/result slice.
  */
 // Type-only: the carrier types, the forwarded Host-event face and the ctx.remote merge.
-import type { ConnectionHandle, SessionId, SkillEntry } from '@deepseek-ai/dsh-api-remotes/client'
-import type { ClientContext, ISessions } from '@deepseek-ai/dsh-client-runtime/client'
+import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
+import type { SkillEntry } from '@deepseek-ai/dsh-api-remotes/client'
+import type {} from '@deepseek-ai/dsh-api-session-controller/client'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { InputTriggerServiceContract, InputTriggerSource } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
+import { fileAddressFor } from '@deepseek-ai/dsh-util-workspace-path'
+import { rankByName } from '@deepseek-ai/dsh-client-ui-primitives'
 // Type-only: pulls the locale plugin's Context merge (ctx.locale).
 import type {} from '@deepseek-ai/dsh-client-locale/client'
+// Type-only: pulls the SlotRegistry service merge (ctx.slots).
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import { SkillRow } from './SkillRow.tsx'
 import { en, NS, zh, type SkillKey } from './locales.ts'
 
@@ -54,7 +61,7 @@ interface CatalogFetch {
 }
 
 /** Required services: reference source faces plus the tool-row and locale registries. */
-export const inject = ['inputTriggers', 'connection', 'sessions', 'slots', 'locale', 'remote']
+export const inject = ['inputTriggers', 'sessions', 'slots', 'locale', 'remote', 'remote.skills', 'sidebarRight']
 
 /**
  * Client plugin body: register the '/' source, dictionaries, and keyed tool row.
@@ -67,8 +74,8 @@ export function apply(ctx: ClientContext): void {
     SkillRow,
   ))
 
-  const skills = (ctx.get('connection') as ConnectionHandle).api.skills
-  const sessions = ctx.get('sessions') as ISessions
+  const skills = ctx.remote.skills
+  const sessions = ctx.sessions
   // Session-keyed catalog cache; single-flight per key. Plugin-closure state:
   // the fiber effect below is its teardown boundary.
   const fetches = new Map<SessionId, CatalogFetch>()
@@ -88,14 +95,14 @@ export function apply(ctx: ClientContext): void {
     }
   }
 
-  const fetchCatalog = (sessionId: SessionId): Promise<readonly SkillEntry[]> => {
-    if (sessions.subagentAddress(sessionId) !== undefined) return Promise.resolve([])
+  const fetchCatalog = (sessionId: SessionId): CatalogFetch => {
     const existing = fetches.get(sessionId)
-    if (existing !== undefined) return existing.promise
+    if (existing !== undefined) return existing
     const abort = new AbortController()
     const promise = (async () => {
-      const { result } = await skills.list({ sessionId }, abort.signal)
-      if (!result.ok) throw new Error(`skill.list failed: ${result.error.code}: ${result.error.message}`)
+      const result = await skills.list({ sessionId }, abort.signal)
+      abort.signal.throwIfAborted()
+      if (!result.ok) throw new Error(`skills/list failed: ${result.error.code}: ${result.error.message}`)
       return result.value.skills
     })()
     const entry: CatalogFetch = { promise, abort }
@@ -111,7 +118,7 @@ export function apply(ctx: ClientContext): void {
         if (fetches.get(sessionId) === entry) fetches.delete(sessionId)
       },
     )
-    return promise
+    return entry
   }
 
   const invalidate = (key: SessionId): void => {
@@ -135,11 +142,13 @@ export function apply(ctx: ClientContext): void {
     name: 'skill',
     order: 2,
     async candidates(session, { query, signal }) {
-      const skills = await fetchCatalog(session.sessionId)
+      if (sessions.subagentAddress(session.sessionId) !== undefined) return []
+      const skills = await fetchCatalog(session.sessionId).promise
       // Superseded keystroke: the shared fetch stays warm, this caller yields.
       if (signal.aborted) return []
-      return skills
-        .filter(skill => skill.name.startsWith(query))
+      // The same ranking as the command group of this menu: case-insensitive
+      // ordered subsequence, prefix hits first.
+      return rankByName(skills, query)
         .map(skill => ({
           name: skill.name,
           // The user-only marker rides the description (the menu's only
@@ -150,7 +159,8 @@ export function apply(ctx: ClientContext): void {
     warm(session) {
       // Fire-and-forget scope-birth prewarm; the shared fetch reports
       // through candidates.
-      fetchCatalog(session.sessionId).catch(() => {})
+      if (sessions.subagentAddress(session.sessionId) !== undefined) return
+      fetchCatalog(session.sessionId).promise.catch(() => {})
     },
     lexicon(session) {
       return fetches.get(session.sessionId)?.settled?.map(skill => skill.name)
@@ -164,6 +174,25 @@ export function apply(ctx: ClientContext): void {
         listeners.delete(listener)
         if (listeners.size === 0) lexiconListeners.delete(key)
       }
+    },
+    openReference(session, { ref }) {
+      if (sessions.subagentAddress(session.sessionId) !== undefined) return false
+      const cwd = sessions.list.getSnapshot().byId[session.sessionId]?.cwd
+      const open = (catalog: readonly SkillEntry[]): boolean => {
+        const path = catalog.find(skill => `/${skill.name}` === ref)?.path
+        if (path === undefined) return false
+        ctx.sidebarRight.openResource(fileAddressFor(session.sessionId, cwd, path))
+        return true
+      }
+      const settled = fetches.get(session.sessionId)?.settled
+      if (settled !== undefined) return open(settled)
+      const entry = fetchCatalog(session.sessionId)
+      void entry.promise.then((catalog) => {
+        if (!entry.abort.signal.aborted) open(catalog)
+      }).catch((error: unknown) => {
+        if (!entry.abort.signal.aborted) console.error('[ui-skill] reference preview failed:', error)
+      })
+      return true
     },
     onPick({ candidate }) {
       // Plain-text-reference decision (web-input-machine note): the pick

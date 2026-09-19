@@ -13,7 +13,6 @@ if ((kind !== 'ordinary' && kind !== 'terminal')
 }
 
 const treeState = join(root, 'tree.json')
-const ready = join(root, 'ready')
 const proceed = join(root, 'proceed')
 const managedTree = fileURLToPath(new URL('./managed-tree.ts', import.meta.url))
 
@@ -28,10 +27,13 @@ async function waitForFile(path: string): Promise<void> {
   }
 }
 
-const listenersBefore = process.listenerCount('exit')
+const listenersBefore = new Set(process.listeners('exit'))
 const ctx = new Context()
 const fiber = await ctx.plugin(LocalSubprocessRuntime)
-const listenersAfterLoad = process.listenerCount('exit')
+const ownedListeners = process.listeners('exit').filter(listener => !listenersBefore.has(listener))
+// Independent process-lifetime listeners may be installed after this provider.
+const unrelatedListener = (): void => {}
+if (trigger === 'dispose') process.once('exit', unrelatedListener)
 if (kind === 'ordinary') {
   ctx.subprocess.spawn({
     argv: [process.execPath, managedTree, treeState],
@@ -49,6 +51,7 @@ if (kind === 'ordinary') {
     cwd: process.cwd(),
     rows: 24,
     cols: 80,
+    terminalType: 'dumb',
     graceMs: 30_000,
   })
 }
@@ -58,15 +61,14 @@ const published = JSON.parse(await readFile(treeState, 'utf8')) as { root?: unkn
 if (!Number.isSafeInteger(published.root) || !Number.isSafeInteger(published.descendant)) {
   throw new Error('managed tree published invalid process ids')
 }
-await writeFile(ready, 'ready')
 await waitForFile(proceed)
 
 if (trigger === 'dispose') {
   await fiber.dispose()
   await writeFile(join(root, 'dispose.json'), JSON.stringify({
-    listenersBefore,
-    listenersAfterLoad,
-    listenersAfterDispose: process.listenerCount('exit'),
+    ownedListenersAfterLoad: ownedListeners.length,
+    ownedListenersAfterDispose: ownedListeners.filter(listener => process.listeners('exit').includes(listener)).length,
+    unrelatedListenerPreserved: process.listeners('exit').includes(unrelatedListener),
   }))
 } else if (trigger === 'direct') {
   process.exit(23)

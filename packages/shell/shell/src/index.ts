@@ -6,7 +6,6 @@
  */
 
 import { Context, Service } from '@deepseek-ai/cordis'
-import { settingsNamespace } from '@deepseek-ai/dsh-settings'
 import type { SandboxMode } from '@deepseek-ai/dsh-sandbox'
 import type { ShellExecRequest, ShellExecSpec, ShellProcess, ShellRunResult } from './types.ts'
 
@@ -19,7 +18,7 @@ import type { ShellExecRequest, ShellExecSpec, ShellProcess, ShellRunResult } fr
  * registering it twice, and a settings document carried between platforms
  * keeps resolving on both.
  */
-export const SHELL_SETTINGS_NAMESPACE = settingsNamespace('shell')
+export const SHELL_SETTINGS_NAMESPACE = 'shell'
 
 export { DSH_ENV_PREFIX } from './types.ts'
 export type {
@@ -52,9 +51,10 @@ declare module '@deepseek-ai/cordis' {
  * Implementations must honor these semantics:
  * - {@link run} rejects only for infrastructure failures. Nonzero exits,
  *   timeout kills, and abort kills resolve with a {@link ShellRunResult}.
- * - {@link start} returns immediately; no timeout applies to background
- *   processes. `done` settles at process close and never rejects; spawn
- *   failures settle as `killed` with the error on stderr.
+ * - {@link start} resolves after launch preparation; cancellation or setup failure
+ *   rejects before publishing a handle. No timeout applies to background processes.
+ *   Once published, `done` settles at process close and never rejects; subprocess
+ *   provider failures settle as `killed` with the error on stderr.
  * - {@link ShellProcess.readOutput} is incremental: consecutive reads never
  *   repeat output. Lossy reads report truncation and available spill files.
  * - A still-running background process is stopped and awaited when its
@@ -85,19 +85,20 @@ export abstract class ShellExecutor extends Service {
   abstract resolve(request: ShellExecRequest): ShellExecSpec
 
   /**
-   * Run a command in the foreground; resolves when it finishes.
+   * Run preparation and the foreground command under the resolved timeout.
    * @param spec - a resolved spec from {@link resolve}, never a raw request.
    * @returns the outcome; nonzero exits, timeout kills, and abort kills
    *   resolve with a descriptive result rather than reject.
+   * @throws on preparation failure or caller cancellation before process publication.
    */
   abstract run(spec: ShellExecSpec): Promise<ShellRunResult>
 
   /**
-   * Start a background process and return its handle immediately.
+   * Prepare a background process asynchronously and publish its live handle.
    * @param spec - a resolved spec from {@link resolve}, never a raw request.
-   * @returns the live process handle (reads, kill, quiescence promise).
+   * @returns the live process handle after preparation; cancellation or setup failure rejects.
    */
-  abstract start(spec: ShellExecSpec): ShellProcess
+  abstract start(spec: ShellExecSpec): Promise<ShellProcess>
 }
 
 export default ShellExecutor

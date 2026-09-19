@@ -7,6 +7,9 @@
   "include": ["src"],
   "references": [
     {
+      "path": "../../boot/app-boot"
+    },
+    {
       "path": "../../../vendor/cosmokit"
     },
     {
@@ -19,6 +22,9 @@
       "path": "../../../vendor/include"
     },
     {
+      "path": "../../../vendor/loader"
+    },
+    {
       "path": "../../core/agent"
     },
     {
@@ -28,7 +34,16 @@
       "path": "../../core/session"
     },
     {
+      "path": "../../session/session-projection"
+    },
+    {
       "path": "../../core/system-prompt"
+    },
+    {
+      "path": "../../core/tools"
+    },
+    {
+      "path": "../../typert/protocol"
     },
     {
       "path": "../../settings/settings"

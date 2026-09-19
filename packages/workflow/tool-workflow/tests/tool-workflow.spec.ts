@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, onTestFinished, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
@@ -10,11 +10,13 @@ import type {
   WorkflowAgentEndInfo, WorkflowAgentInfo, WorkflowResult, WorkflowRun,
   WorkflowRunId as WorkflowRunIdType, WorkflowStartRequest,
 } from '@deepseek-ai/dsh-workflow'
-import { CallId } from '@deepseek-ai/dsh-llm'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import SubagentRuntime from '@deepseek-ai/dsh-subagent'
-import WorkerThreadWorkflowEngine from '@deepseek-ai/dsh-workflow-worker-thread'
+import PtcWorkflowEngine from '@deepseek-ai/dsh-workflow-ptc'
+import { mountWorkflowRuntime } from '../../workflow-ptc/tests/setup.ts'
 import * as toolWorkflow from '../src/index.ts'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 
 const testToolSignal = new AbortController().signal
 
@@ -96,7 +98,7 @@ function execute(ctx: Context, args: unknown, extra?: {
 }): Promise<ToolExecutionResult> {
   return ctx.tools.execute({
     signal: testToolSignal,
-    callId: CallId('call-1'),
+    callId: ToolCallId('call-1'),
     name: 'workflow',
     arguments: args,
     ...extra?.agent ? { agent: extra.agent } : {},
@@ -145,7 +147,7 @@ describe('dsh-tool-workflow', () => {
     engine.settleRun(runId, { value: 1, stopReason: 'completed', agentsStarted: 1 })
     expect((await pending).isError).toBe(false)
     expect(engine.disposed).toBe(1)
-    expect(session.events.map(event => [event.type, event.data])).toEqual([
+    expect(session.snapshotEvents().map(event => [event.type, event.data])).toEqual([
       ['tool-workflow/run-start', { runId: 'run-1', name: 'audit' }],
       ['tool-workflow/agent-start', {
         runId: 'run-1', seq: 1, label: '', phase: '', childId: 'child-1',
@@ -165,10 +167,10 @@ describe('dsh-tool-workflow', () => {
       value: null, stopReason: 'completed', agentsStarted: 0,
     })
     await vi.waitFor(() => { expect(engine.disposed).toBe(1) })
-    expect(session.events.map(event => event.type)).toEqual(['tool-workflow/run-start'])
+    expect(session.snapshotEvents().map(event => event.type)).toEqual(['tool-workflow/run-start'])
     barrier.resolve(undefined)
     expect((await pending).isError).toBe(false)
-    expect(session.events.map(event => event.type)).toEqual([
+    expect(session.snapshotEvents().map(event => event.type)).toEqual([
       'tool-workflow/run-start', 'tool-workflow/run-end',
     ])
   })
@@ -189,9 +191,9 @@ describe('dsh-tool-workflow', () => {
     engine.settleRun(secondId, { value: null, stopReason: 'error', error: 'child failed', agentsStarted: 1 })
     expect((await first).isError).toBe(false)
     expect((await second).isError).toBe(true)
-    expect(session.events.filter(event => event.type === 'tool-workflow/agent-start'))
+    expect(session.snapshotEvents().filter(event => event.type === 'tool-workflow/agent-start'))
       .toHaveLength(1)
-    expect(session.events.filter(event => event.type === 'tool-workflow/run-end').map(event => event.data))
+    expect(session.snapshotEvents().filter(event => event.type === 'tool-workflow/run-end').map(event => event.data))
       .toEqual([
         { runId: 'run-1', stopReason: 'completed' },
         { runId: 'run-2', stopReason: 'error' },
@@ -207,7 +209,7 @@ describe('dsh-tool-workflow', () => {
     await vi.waitFor(() => { expect(engine.requests).toHaveLength(1) })
     engine.settleRun(WorkflowRunId('run-1'), { value: null, stopReason: 'completed', agentsStarted: 0 })
     expect((await pending).isError).toBe(false)
-    expect(session.events).toEqual([])
+    expect(session.snapshotEvents()).toEqual([])
   })
 
   it.each([
@@ -239,7 +241,7 @@ describe('dsh-tool-workflow', () => {
     expect(engine.disposed).toBe(1)
     expect(warnings).toHaveLength(1)
     expect(warnings[0]).toContain(failedType)
-    const types = session.events.map(event => event.type)
+    const types = session.snapshotEvents().map(event => event.type)
     const expectedPrefixes = {
       'tool-workflow/run-start': [],
       'tool-workflow/agent-start': ['tool-workflow/run-start'],
@@ -379,6 +381,10 @@ describe('dsh-tool-workflow', () => {
     const section = sections.find(s => s.name === 'tool:orchestrate')
     expect(section?.text).toContain('orchestrate')
     expect(sections.some(s => s.name === 'tool:workflow')).toBe(false)
+    ctx.systemPrompt.section({ name: 'tool:cordis-order-probe', order: 115.5, text: 'Cordis' })
+    expect((await ctx.systemPrompt.assemble()).sections
+      .filter(s => s.name === 'tool:cordis-order-probe' || s.name === 'tool:orchestrate')
+      .map(s => s.name)).toEqual(['tool:cordis-order-probe', 'tool:orchestrate'])
     await fiber.dispose()
     expect(ctx.tools.get('orchestrate')).toBeUndefined()
     // …and gone with the fiber — a reload must not leak a stale section.
@@ -413,31 +419,33 @@ describe('dsh-tool-workflow', () => {
     expect(typeof unwrapped.apply).toBe('function')
   })
 
-  describe('composition with the REAL worker-thread engine (the mock above must stay honest)', () => {
+  describe('composition with the sandboxed PTC workflow engine', () => {
     it('an abort releases the tool even when the script parks on a promise no hook owns', async () => {
-      // The tool and loop await run.result before cleanup, so cancellation must settle a script
-      // parked on an unowned promise. Exercise that guarantee through the real registry and worker.
       const ctx = new Context()
+      onTestFinished(async () => { await ctx.fiber.dispose() })
       await ctx.plugin(SystemPrompt)
       await ctx.plugin(ToolRuntime)
+      await ctx.plugin(SessionProjectionRegistry)
       await ctx.plugin(SubagentRuntime)
       ctx.subagents.registerProvider({
         name: 'spawn',
-        capabilities: { outputSchema: true, depthLimit: true, toolFilter: true, persona: true },
+        capabilities: { agentOptions: true, outputSchema: true, depthLimit: true, toolFilter: true, persona: true },
         inheritsParentContext: false,
         start: () => Promise.reject(new Error('the parked-script fixture must not start a child')),
       })
-      await ctx.plugin(WorkerThreadWorkflowEngine, { disposeGraceMs: 30 })
+      await mountWorkflowRuntime(ctx)
+      await ctx.plugin(PtcWorkflowEngine, {})
       await ctx.plugin(toolWorkflow, {})
       const session = Session.create(SessionId('caller'))
       const parent = { id: session.id, options: {}, session } as unknown as Agent
       const controller = new AbortController()
+      const ready = Promise.withResolvers<undefined>()
+      ctx.on('workflow/log', () => { ready.resolve(undefined) })
       const pending = execute(ctx, {
-        script: 'await new Promise(() => {})\nreturn 1',
+        script: 'log("ready"); await new Promise(() => {})\nreturn 1',
         meta: { name: 'stuck', description: 'parks forever' },
       }, { agent: parent, signal: controller.signal })
-      // Give the run a beat to start (past its synchronous slice), then abort.
-      await new Promise(resolve => setTimeout(resolve, 20))
+      await ready.promise
       controller.abort('user abort')
       const result = await pending
       expect(result.isError).toBe(true)

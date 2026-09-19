@@ -1,41 +1,56 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, onTestFinished } from 'vitest'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
-import { createUserMessage, CallId  } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, ToolCallId  } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import SubagentRuntime from '@deepseek-ai/dsh-subagent'
 import { STRUCTURED_OUTPUT_TOOL } from '@deepseek-ai/dsh-subagent-in-process-driver'
 import * as spawn from '@deepseek-ai/dsh-subagent-spawn-in-process'
-import WorkerThreadWorkflowEngine from '@deepseek-ai/dsh-workflow-worker-thread'
+import PtcWorkflowEngine from '@deepseek-ai/dsh-workflow-ptc'
 import { MockAdapter, maxTokensResponse, textResponse, toolCallResponse } from '../../../core/agent-loop/tests/mock-adapter.ts'
 import * as toolRalph from '../src/index.ts'
+import { mountWorkflowRuntime } from '../../workflow-ptc/tests/setup.ts'
 
 type MockScript = ConstructorParameters<typeof MockAdapter>[0]
 const testToolSignal = new AbortController().signal
+
+async function mountExecution(ctx: Context): Promise<string> {
+  const cwd = await mkdtemp(join(tmpdir(), 'dsh-ralph-'))
+  onTestFinished(async () => {
+    await ctx.fiber.dispose()
+    await rm(cwd, { recursive: true, force: true })
+  })
+  await mountWorkflowRuntime(ctx, { cwd })
+  return cwd
+}
 
 /** Mount the shipped Ralph execution stack around one keyless model script. */
 async function mountRalph(script: MockScript, config: toolRalph.Config) {
   const ctx = new Context()
   const adapter = new MockAdapter(script)
   await mountAgentLoopTestDependencies(ctx)
+  const cwd = await mountExecution(ctx)
   await ctx.plugin(AgentLoop, { agents: [] })
   await ctx.plugin(SubagentRuntime)
   await ctx.plugin(spawn, { providerName: 'spawn' })
-  await ctx.plugin(WorkerThreadWorkflowEngine, {})
+  await ctx.plugin(PtcWorkflowEngine, {})
   await ctx.plugin(toolRalph, config)
   ctx.llm.registerAdapter(['mock'], adapter)
   const parentHandle = await ctx.agents.create({
     sessionId: SessionId('ralph-parent'),
-    meta: { cwd: '/tmp/ralph-shared-workspace' },
+    meta: { cwd },
     agentOptions: { provider: 'mock', model: 'mock' },
   })
   return { ctx, adapter, parentHandle, parent: parentHandle.agent }
 }
 
-describe('dsh-tool-ralph over the real spawn and worker-thread stack', () => {
-  it('uses distinct empty-seed children, shared cwd, and only the prior bounded handoff', async () => {
+describe('dsh-tool-ralph over the real spawn and sandboxed PTC stack', () => {
+  it('uses distinct empty-seed children, shared cwd, and only the prior bounded handoff', { timeout: 90_000 }, async () => {
     const firstReport = {
       status: 'continue',
       summary: 'ROUND_ONE_HANDOFF',
@@ -57,16 +72,17 @@ describe('dsh-tool-ralph over the real spawn and worker-thread stack', () => {
       toolCallResponse('round-2', STRUCTURED_OUTPUT_TOOL, finalReport),
     ])
     await mountAgentLoopTestDependencies(ctx)
+    const cwd = await mountExecution(ctx)
     await ctx.plugin(AgentLoop, { agents: [] })
     await ctx.plugin(SubagentRuntime)
     await ctx.plugin(spawn, { providerName: 'spawn' })
-    await ctx.plugin(WorkerThreadWorkflowEngine, {})
+    await ctx.plugin(PtcWorkflowEngine, {})
     await ctx.plugin(toolRalph, { maxRounds: 2 })
     ctx.llm.registerAdapter(['mock'], adapter)
 
     const parentHandle = await ctx.agents.create({
       sessionId: SessionId('ralph-parent'),
-      meta: { cwd: '/tmp/ralph-shared-workspace' },
+      meta: { cwd },
       agentOptions: { provider: 'mock', model: 'mock' },
     })
     const parent = parentHandle.agent
@@ -83,7 +99,7 @@ describe('dsh-tool-ralph over the real spawn and worker-thread stack', () => {
     })
     const result = await ctx.tools.execute({
       signal: testToolSignal,
-      callId: CallId('ralph-integration'),
+      callId: ToolCallId('ralph-integration'),
       name: 'ralph',
       arguments: { objective: 'Complete both migration slices.', maxRounds: 2 },
       agent: parent,
@@ -96,9 +112,10 @@ describe('dsh-tool-ralph over the real spawn and worker-thread stack', () => {
     expect(children).toHaveLength(2)
     expect(new Set(children.map(child => child.id)).size).toBe(2)
     for (const child of children) {
-      expect(child.session.header.cwd).toBe('/tmp/ralph-shared-workspace')
+      expect(child.session.header.cwd).toBe(cwd)
       expect(child.session.header.parentSession).toBe(parent.session.header.id)
-      expect(child.session.header.seedLength).toBeUndefined()
+      expect(child.session.header.isSeeded).toBe(false)
+      expect(child.session.inheritedEventCount).toBe(0)
       expect(ctx.agents.get(child.id)).toBeUndefined()
     }
 
@@ -115,7 +132,7 @@ describe('dsh-tool-ralph over the real spawn and worker-thread stack', () => {
     await parentHandle.dispose()
   })
 
-  it('reports the failed round and last good handoff when a child fails', async () => {
+  it('reports the failed round and last good handoff when a child fails', { timeout: 90_000 }, async () => {
     const firstReport = {
       status: 'continue',
       summary: 'ROUND_ONE_HANDOFF',
@@ -135,7 +152,7 @@ describe('dsh-tool-ralph over the real spawn and worker-thread stack', () => {
 
     const result = await ctx.tools.execute({
       signal: testToolSignal,
-      callId: CallId('ralph-child-failure'),
+      callId: ToolCallId('ralph-child-failure'),
       name: 'ralph',
       arguments: { objective: 'Complete both migration slices.', maxRounds: 2 },
       agent: parent,
@@ -224,7 +241,7 @@ describe('dsh-tool-ralph over the real spawn and worker-thread stack', () => {
 
     const result = await ctx.tools.execute({
       signal: testToolSignal,
-      callId: CallId('ralph-script-enforcement'),
+      callId: ToolCallId('ralph-script-enforcement'),
       name: 'ralph',
       arguments: { objective: 'Complete the scoped work.', maxRounds: config.maxRounds },
       agent: parent,
@@ -235,7 +252,7 @@ describe('dsh-tool-ralph over the real spawn and worker-thread stack', () => {
     await parentHandle.dispose()
   })
 
-  it('cancels the real worker and fresh child to quiescence', { timeout: 20_000 }, async () => {
+  it('cancels the sandboxed process and fresh child to quiescence', { timeout: 90_000 }, async () => {
     const { ctx, parent, parentHandle } = await mountRalph(['hang'], { maxRounds: 2 })
     const children: Agent[] = []
     const outcomes: string[] = []
@@ -251,7 +268,7 @@ describe('dsh-tool-ralph over the real spawn and worker-thread stack', () => {
     ctx.on('workflow/agent-end', (_run, child) => { outcomes.push(child.outcome) })
     const controller = new AbortController()
     const pending = ctx.tools.execute({
-      callId: CallId('ralph-real-cancel'),
+      callId: ToolCallId('ralph-real-cancel'),
       name: 'ralph',
       arguments: { objective: 'Keep working until cancelled.', maxRounds: 2 },
       agent: parent,

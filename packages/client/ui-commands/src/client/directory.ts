@@ -6,7 +6,8 @@
  * is the only extra dimension.
  */
 import type { CommandDescriptor } from '@deepseek-ai/dsh-commands/types'
-import type { SessionId } from '@deepseek-ai/dsh-client-runtime/client'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import { resolveCommand } from './resolution.ts'
 
 export type { CommandDescriptor } from '@deepseek-ai/dsh-commands/types'
 
@@ -46,20 +47,32 @@ export class CommandDirectory {
   }
 
   /**
-   * Synchronous exact-name lookup over one session's hot snapshot.
+   * Synchronous command lookup over one Session's ready catalog; exact names precede localized aliases.
    * @param sessionId - session key.
-   * @param name - command name without the leading slash.
+   * @param name - typed command spelling without the leading slash.
    * @returns the descriptor, or undefined when absent or the entry is not ready.
    */
   resolve(sessionId: SessionId, name: string): CommandDescriptor | undefined {
     const entry = this.entries.get(sessionId)
     if (entry === undefined || entry.state !== 'ready') return undefined
-    return entry.commands.find(c => c.name === name)
+    return resolveCommand(name, entry.commands)
   }
 
   /** Soft invalidation (commands-changed): background repull on every touched key; ready snapshots keep serving. */
   invalidateAll(): void {
     for (const key of this.entries.keys()) void this.refresh(key)
+  }
+
+  /**
+   * Drop one Session's obsolete composition-specific snapshot and prewarm its replacement.
+   * @param sessionId - Session whose effective command composition changed.
+   */
+  resetSession(sessionId: SessionId): void {
+    const entry = this.entry(sessionId)
+    entry.state = 'cold'
+    entry.commands = []
+    entry.lastError = undefined
+    void this.refresh(sessionId)
   }
 
   /**

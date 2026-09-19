@@ -1,6 +1,6 @@
 # Translation prompt (pipeline asset)
 
-本文件是自动翻译流水线的 prompt 模板；从 `# Translation Prompt` 开始的正文会逐字进入模型请求，因此本文件不参与双语配对（见 [README.md](README.md) 排除清单）。模板正文与内嵌 few-shot 正误例由 jingtingxiang 基于对存量译文的质量评审撰写，是流水线行为的拍板基线。渲染时把 [terminology.md](terminology.md) 整表填入 `{{terminology}}`；除此之外不注入任何其他仓库文件（translation-rules.md 约束人和 agent 的翻译工作，不注入本模板）。[style-samples.md](style-samples.md) 定义文体，模板中的 Examples 只用于说明典型问题，两者冲突时以文体样例为准。本模板遵循 [提示词 v4 约定 Agent Note](../../.agents/notes/implemented/process/2026-07-23-translation-prompt-v4-contract.md) 记录的兼容协议。修改本文件会改变翻译行为，需正常经过 PR 评审。
+本文件是自动翻译流水线的 prompt 模板；从 `# Translation Prompt` 开始的正文会逐字进入模型请求，因此本文件不参与双语配对（见 [README.md](README.md) 排除清单）。模板正文与内嵌 few-shot 正误例由 jingtingxiang 基于对存量译文的质量评审撰写，是流水线行为的拍板基线。渲染时把 [terminology.md](terminology.md) 整表填入 `{{terminology}}`；除此之外不注入任何其他仓库文件（translation-rules.md 约束人和 agent 的翻译工作，不注入本模板）。[style-samples.md](style-samples.md) 定义文体，模板中的 Examples 只用于说明典型问题，两者冲突时以文体样例为准。本模板遵循 [提示词 v4 约定 Agent Note](../../.agents/notes/archived/process/2026-07-23-translation-prompt-v4-contract.md) 记录的兼容协议。修改本文件会改变翻译行为，需正常经过 PR 评审。
 
 ## 占位符约定
 
@@ -51,12 +51,12 @@ A lower-priority rule may refine but never override a higher-priority requiremen
 ## Quality Requirements
 
 ### Structure and Format Preservation
-- Output a complete translated document that maintains the same document frame as the source: heading hierarchy and order, list kinds and item counts, ordered-list starts, table rows and columns, link targets, and code blocks.
+- Output a complete translated document that maintains the same document frame as the source: heading hierarchy and order, list kinds and item counts, ordered-list starts, table rows and columns, link order and semantic targets, and code blocks.
 - Paragraph boundaries may change within the same structural unit when the target language needs different semantic grouping. Do not merge or move content across headings, list items, table cells, or other independent structural units.
 - Keep each prose paragraph on one physical line. Use paragraph breaks, not hard-wrapped lines inside a paragraph.
 - Fenced code blocks must be byte-identical to the source, including info strings, whitespace, and ALL comments inside them. Do NOT translate or reformat any content inside code blocks. This is a hard rule with no exceptions.
 - Inline code spans must be kept verbatim. This includes commands, flags, paths, identifiers, API and event names, config keys, protocol values, version numbers, and other machine-readable tokens. Never translate or reformat them.
-- Every relative link must point to the same target as in the source. Translate link text; do not change link targets.
+- Every repository-relative document link must keep the source link's semantic target and exact query/fragment suffix. When the target belongs to the active bilingual corpus, English output uses its `.md` path and Chinese output uses its `.zh.md` path; a missing counterpart in that corpus is an error, while targets outside it keep the original path. External URLs, images, and pure in-page fragments stay unchanged. Translate link text.
 - Language switcher line: when an English source contains `English | [中文](source-filename.zh.md)`, write `[English](source-filename.md) | 中文`. When a Chinese source contains `[English](source-filename.md) | 中文`, write `English | [中文](source-filename.zh.md)`. Do NOT copy the source switcher unchanged. If the source has no switcher, do not invent a filename or switcher; the pipeline inserts the canonical target switcher after parsing `<final>`.
 - Preserve emphasis marker types and the semantic spans they cover. Do not add, remove, move, or change bold and italic markers.
 
@@ -159,7 +159,7 @@ After writing `<translation>`, verify it in two directions. First re-read it in 
 - Are ALL comments and info strings inside code blocks left untranslated and byte-identical to the source?
 - Are inline code spans and machine-readable tokens verbatim?
 - Is an existing language switcher correctly flipped, and is no switcher or filename invented when the source lacks one?
-- Are link targets and emphasis spans preserved?
+- Do links preserve their semantic targets and exact query/fragment suffixes while using target-locale paths, and are emphasis spans preserved?
 - Does spacing across emphasis boundaries follow the same Chinese/Latin/numeral rule as ordinary prose?
 - Are wrapper-tag lines inside section bodies escaped with one additional backslash?
 

@@ -1,15 +1,18 @@
 /**
- * Per-message feedback controls: a Like/Dislike pair plus an optional note.
- * Rendered inside the assistant message's IconActions row, so the buttons
- * reuse that row's chrome and sit between copy and branch.
+ * Per-message feedback controls: the Like/Dislike pair inside the assistant
+ * message's IconActions row, between copy and branch. Either rating opens the
+ * Session's feedback dialog, whose submission records that judgment with its
+ * category and text. Clicking the recorded rating retracts it. A recorded rating
+ * shows the filled glyph so the signal survives a pointer leaving the row.
  * @module @deepseek-ai/dsh-client-ui-message-feedback/client/MessageFeedbackActions
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  IconDislikeOutline16, IconLikeOutline16, Tooltip,
+  IconDislikeFill16, IconDislikeOutline16, IconLikeFill16, IconLikeOutline16, Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { MessageFeedbackRating } from '@deepseek-ai/dsh-message-feedback/types'
+import type { MessageFeedbackActionFailure } from './controller.ts'
 import type { MessageFeedbackActionProps } from './slots.ts'
 import css from './MessageFeedbackActions.module.css'
 
@@ -17,15 +20,16 @@ import css from './MessageFeedbackActions.module.css'
  * One message's feedback controls.
  * @param props - the owner's message identity, the injected verbs, and the
  * shared feedback hook.
- * @returns the rating buttons, plus the note editor while it is open.
+ * @returns the rating buttons with any failure notice beside them.
  */
-export function MessageFeedbackActions({ messageId, ensure, rate, toggle, clearNote, useFeedback, t }: MessageFeedbackActionProps) {
+export function MessageFeedbackActions({
+  messageId, ensure, current, retract, openDialog, useFeedback, t,
+}: MessageFeedbackActionProps) {
   const item = useFeedback(view => view.items.get(messageId))
   const loadFailed = useFeedback(view => view.status === 'error')
   const rating = item?.rating
-  const [noteOpen, setNoteOpen] = useState(false)
-  const [draft, setDraft] = useState('')
   const [pending, setPending] = useState(false)
+  // A rating or load failure surfaces beside the rating buttons.
   const [failure, setFailure] = useState<string | null>(null)
   // The controls mount for every settled message in the transcript, so the
   // Session's feedback is read once on first hover/focus rather than on mount.
@@ -39,47 +43,33 @@ export function MessageFeedbackActions({ messageId, ensure, rate, toggle, clearN
   const alive = useRef(true)
   useEffect(() => () => { alive.current = false }, [])
 
-  const settle = useCallback((result: { ok: boolean; error?: { code: string } }) => {
-    if (!alive.current) return
-    setPending(false)
-    if (result.ok) {
-      setFailure(null)
-      return
-    }
-    setFailure(result.error?.code === 'version-conflict' ? t('error.conflict') : t('error.generic'))
+  const errorCopy = useCallback((result: MessageFeedbackActionFailure) => {
+    return result.error.code === 'version-conflict' ? t('error.conflict') : t('error.generic')
   }, [t])
 
-  const onRate = useCallback((next: MessageFeedbackRating) => {
+  // A recorded rating retracts on click; either unrecorded rating opens the
+  // dialog and records only after submission. The decision waits for the
+  // seeding read, so a click on a cold row still sees the stored judgment.
+  const choose = useCallback((nextRating: MessageFeedbackRating) => {
     setPending(true)
     setFailure(null)
-    // The controller decides retract-vs-replace from the committed item, so a
-    // click that lands before the first list read still toggles the stored
-    // value instead of this render's empty view.
-    setNoteOpen(false)
-    void toggle(messageId, next).then(settle)
-  }, [messageId, settle, toggle])
-
-  // The rating is a parameter because only the note editor's render site can
-  // prove one is recorded; that removes an unreachable undefined guard here.
-  const onSaveNote = useCallback((current: MessageFeedbackRating) => {
-    const trimmed = draft.trim()
-    setPending(true)
-    setFailure(null)
-    // An emptied editor removes the note explicitly; `rate` alone preserves a
-    // stored note, so it cannot express deletion.
-    const settled = trimmed.length === 0
-      ? clearNote(messageId)
-      : rate(messageId, current, trimmed)
-    void settled.then((result) => {
-      settle(result)
-      if (result.ok && alive.current) setNoteOpen(false)
+    void ensure().then((loaded) => {
+      if (!alive.current) return
+      if (!loaded.ok || current(messageId)?.rating !== nextRating) {
+        setPending(false)
+        openDialog(messageId, nextRating)
+        return
+      }
+      void retract(messageId, nextRating).then((result) => {
+        if (!alive.current) return
+        setPending(false)
+        if (!result.ok) setFailure(errorCopy(result))
+      })
     })
-  }, [clearNote, draft, messageId, rate, settle])
+  }, [current, ensure, errorCopy, messageId, openDialog, retract])
 
-  const openNote = useCallback(() => {
-    setDraft(item?.note ?? '')
-    setNoteOpen(true)
-  }, [item?.note])
+  const onLike = useCallback(() => { choose('positive') }, [choose])
+  const onDislike = useCallback(() => { choose('negative') }, [choose])
 
   const likeLabel = rating === 'positive' ? t('action.likeActive') : t('action.like')
   const dislikeLabel = rating === 'negative' ? t('action.dislikeActive') : t('action.dislike')
@@ -96,9 +86,9 @@ export function MessageFeedbackActions({ messageId, ensure, rate, toggle, clearN
           disabled={pending}
           onFocus={seed}
           onPointerEnter={seed}
-          onClick={() => { onRate('positive') }}
+          onClick={onLike}
         >
-          <IconLikeOutline16 />
+          {rating === 'positive' ? <IconLikeFill16 /> : <IconLikeOutline16 />}
         </button>
       </Tooltip>
       <Tooltip label={dislikeLabel} side="bottom">
@@ -111,39 +101,11 @@ export function MessageFeedbackActions({ messageId, ensure, rate, toggle, clearN
           disabled={pending}
           onFocus={seed}
           onPointerEnter={seed}
-          onClick={() => { onRate('negative') }}
+          onClick={onDislike}
         >
-          <IconDislikeOutline16 />
+          {rating === 'negative' ? <IconDislikeFill16 /> : <IconDislikeOutline16 />}
         </button>
       </Tooltip>
-      {rating !== undefined && !noteOpen && (
-        <button type="button" className={css.noteOpen} onClick={openNote}>
-          {item?.note === undefined ? t('note.open') : item.note}
-        </button>
-      )}
-      {rating !== undefined && noteOpen && (
-        <span className={css.noteEditor}>
-          <textarea
-            className={css.noteInput}
-            aria-label={t('note.aria')}
-            placeholder={t('note.placeholder')}
-            value={draft}
-            rows={2}
-            onChange={(event) => { setDraft(event.target.value) }}
-          />
-          <button
-            type="button"
-            className={css.noteSave}
-            disabled={pending}
-            onClick={() => { onSaveNote(rating) }}
-          >
-            {t('note.save')}
-          </button>
-          <button type="button" className={css.noteCancel} onClick={() => { setNoteOpen(false) }}>
-            {t('note.cancel')}
-          </button>
-        </span>
-      )}
       {failure === null && loadFailed && (
         <span className={css.failure} role="status">{t('error.load')}</span>
       )}

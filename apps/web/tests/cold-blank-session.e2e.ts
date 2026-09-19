@@ -1,24 +1,21 @@
-/** Cold Session list visibility through the shipped compressed JSONL backend. */
+/** Pending Inbox recovery from detached persistence through the shipped Web profile. */
 
-import { mkdir, stat } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
-import { join } from 'node:path'
-import type { Browser, Page } from 'playwright'
-import { chromium } from 'playwright'
+import { chromium, type Browser, type Page } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { SESSION_FORMAT_VERSION, SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
 import {
-  captureStableAria, compareOrRefreshGolden, launchWebScaffold, seedBlankSession,
+  captureStableAria, compareOrRefreshGolden, launchWebScaffold,
   watchConsole, webSnapshotMode, type WebScaffold,
 } from './scaffold.ts'
 import { newEnglishPage, saveFailureShot } from './support.ts'
 
-const SNAPSHOT_DIR = fileURLToPath(new URL('./snapshots/cold-blank-session', import.meta.url))
-const SIDEBAR_EXPECTED = join(SNAPSHOT_DIR, 'sidebar.expected.md')
-const MODE = webSnapshotMode()
-const SESSION_ID = 'cold-blank-session-web-e2e'
-const WORKSPACE_NAME = 'cold-blank-workspace'
+const SESSION_ID = SessionId('cold-inbox-web-e2e')
+const PENDING_TEXT = 'Accepted before the Host restarted'
+const EXPECTED = fileURLToPath(new URL('./expected/cold-blank-session/queue.expected.md', import.meta.url))
 
-describe('web e2e: cold blank Session visibility', () => {
+describe('web e2e: cold Inbox recovery', () => {
   let scaffold: WebScaffold
   let browser: Browser
   let page: Page
@@ -26,20 +23,27 @@ describe('web e2e: cold blank Session visibility', () => {
 
   beforeAll(async () => {
     scaffold = await launchWebScaffold({})
-    const cwd = join(scaffold.workspaceCwd, WORKSPACE_NAME)
-    await mkdir(cwd, { recursive: true })
-    await seedBlankSession(scaffold, SESSION_ID, cwd)
-    const header = (await scaffold.ctx.sessionPersistence.list())
-      .find(candidate => candidate.id === SESSION_ID)
-    if (header === undefined) throw new Error('blank Session fixture did not materialize')
-    const location = scaffold.ctx.sessionPersistence.locate(header)
-    if (location === undefined) throw new Error('JSONL fixture has no physical artifact')
-    expect((await stat(location.path)).size).toBeLessThanOrEqual(1024)
-
+    const createdAt = Date.now() - 60_000
+    const handle = await scaffold.ctx.sessionPersistence.create({
+      version: SESSION_FORMAT_VERSION, id: SESSION_ID, createdAt,
+      cwd: scaffold.workspaceCwd, isSeeded: false, delegationDepth: 0,
+    })
+    try {
+      await handle.append([{
+        type: 'agent/inbox/spliced', seq: SessionSeq(0), time: createdAt,
+        data: { target: 'next-turn', start: 0, inserted: [createUserMessage({
+          content: [{ type: 'text', text: PENDING_TEXT }], source: { kind: 'user' },
+        })] },
+      }])
+    } finally {
+      await handle.close()
+    }
+    expect(scaffold.ctx.agents.get(SESSION_ID)).toBeUndefined()
+    expect(scaffold.ctx.sessions.get(SESSION_ID)).toBeUndefined()
     browser = await chromium.launch()
     page = await newEnglishPage(browser)
     tripwire = watchConsole(page)
-    await page.goto(scaffold.baseUrl, { waitUntil: 'load' })
+    await page.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })
     await page.waitForSelector('[class*="frame"]', { timeout: 30_000 })
   }, 120_000)
 
@@ -48,13 +52,24 @@ describe('web e2e: cold blank Session visibility', () => {
     await scaffold?.close()
   })
 
-  it('keeps the verified cold blank Session out of the sidebar', async () => {
-    onTestFailed(() => saveFailureShot(page, 'web-e2e-cold-blank-session'))
-    const tree = page.getByRole('tree', { name: 'Sessions' })
-    await tree.waitFor({ timeout: 30_000 })
-    expect(await tree.getByText(WORKSPACE_NAME, { exact: true }).count()).toBe(0)
-    const sidebar = await captureStableAria(page, '[role="tree"][aria-label="Sessions"]', scaffold.workspaceCwd)
-    await compareOrRefreshGolden(SIDEBAR_EXPECTED, sidebar, MODE)
+  it('restores a pending row on opening and reload, then edits and removes it', async () => {
+    onTestFailed(() => saveFailureShot(page, 'web-e2e-cold-inbox'))
+    const group = page.locator('[role="treeitem"]').first()
+    await group.waitFor({ timeout: 15_000 })
+    await group.click()
+    await page.locator('[role="treeitem"]').nth(1).click()
+    const dock = page.locator('[data-queue-dock]')
+    await dock.getByText(PENDING_TEXT, { exact: true }).waitFor({ timeout: 15_000 })
+    await compareOrRefreshGolden(EXPECTED,
+      await captureStableAria(page, '[data-queue-dock]', scaffold.workspaceCwd), webSnapshotMode())
+    await page.reload({ waitUntil: 'load' })
+    await dock.getByText(PENDING_TEXT, { exact: true }).waitFor({ timeout: 15_000 })
+    await dock.getByRole('button', { name: 'Edit queued message', exact: true }).click()
+    await dock.getByRole('textbox').fill('Edited after recovery')
+    await dock.getByRole('button', { name: 'Save queued message', exact: true }).click()
+    await dock.getByText('Edited after recovery', { exact: true }).waitFor()
+    await dock.getByRole('button', { name: 'Remove queued message', exact: true }).click()
+    await dock.waitFor({ state: 'detached' })
     expect(tripwire.pageErrors).toEqual([])
   })
 })

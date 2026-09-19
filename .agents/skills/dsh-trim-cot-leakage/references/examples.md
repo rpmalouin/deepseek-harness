@@ -8,7 +8,7 @@ Distilled from the 2026-08 repo-wide purge and its review rounds. Use them to id
 
 **Leaked:** "Slash input resolves against the visible catalog (decision 21)."
 
-**Fixed:** "Slash input resolves against the visible catalog — the plain-text-reference decision, owned by [the web input-machine note](../../../notes/implemented/architecture/2026-07-25-web-input-machine-and-slash-pipeline.md)."
+**Fixed:** "Slash input resolves against the visible catalog — the plain-text-reference decision, owned by [the web input-machine note](../../../notes/archived/architecture/2026-07-25-web-input-machine-and-slash-pipeline.md)."
 
 The ordinal resolves nowhere at HEAD; the decision's name and owning note path do. Name the owning note's path at least once per file — as a link where the surface supports one — and later mentions may use the searchable name alone.
 
@@ -174,7 +174,23 @@ Replace the hedge with the actual bound and the failure behavior when it is exce
 
 **Fixed:** "The renderer runs on the client side; spacing follows the Figma frame `widget-badges`."
 
-Working-language fragments and session separators are transcription residue. The Figma frame name stays: external provenance that resolves outside the repo by design.
+Working-language fragments and session separators are transcription residue. The Figma frame name stays: an external source that resolves outside the repo by design.
+
+### Authoring-language slip inside a paired fence
+
+**Leaked in both files:** `// 更新这里 before returning` inside a verbatim code block.
+
+**Fixed in both files:** `// Update this before returning.`
+
+Correct the block once and copy that byte-exact fence into both language files. Translating the code comment differently in the Chinese counterpart breaks the pairing contract even when both comments are individually fluent.
+
+## Behavior-visible candidates
+
+**Suspect:** An exported JSDoc sentence says "available for now," and a generator copies that sentence into a model-visible catalog.
+
+**Wrong:** Rewrite only the source sentence during a prose-only purge, or hand-edit only the generated catalog.
+
+**Right:** Trace the source's generated fan-out, update the owner, regenerate every derivative, and update the owning runnable snapshot. For a GUI string, include the repository-required behavior evidence. If the authorized scope has no owning scenario, leave the wording unchanged and report the deferral.
 
 ## Keeps
 
@@ -200,13 +216,19 @@ The justification clause is required prose. When the stated reason is false (the
 
 **Keep:** "Depth cap (measured: 512 nests ≈ 0.15s synchronous; 4096 blocks the loop)."
 
-The measurement pins the constant against uninformed retuning, and "measured" is the provenance that distinguishes data from a guess.
+The measurement pins the constant against uninformed retuning, and "measured" identifies data rather than a guess.
 
 ### Runtime old/new is not change history
 
 **Keep:** "The old connection drains before the new one accepts."
 
 "Old" and "new" here name two live runtime objects during handover, not repository states. The change-narration ban is about repo history, not lifecycle vocabulary.
+
+### Runtime natural time is not a version stamp
+
+**Keep:** "What is today's date?"
+
+The prompt asks about the runtime clock; "today" does not contrast repository states. Because the text reaches a model, any rewrite still requires its owning behavior evidence.
 
 ## Overcorrection traps
 
@@ -242,7 +264,7 @@ Deleting the future-marker alone turns a design illustration into a claim that t
 
 Half the sentence was narration; the other half was a load-bearing coupling. Delete clauses, not sentences, when propositions share a line.
 
-### Dropping provenance while keeping the number
+### Dropping the measurement source while keeping the number
 
 **Original:** "The 4 MiB ceiling is measured: the largest generated `py-types` module is 3.1 MiB."
 

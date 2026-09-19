@@ -15,7 +15,6 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView, ToolDefinition, ToolExecution } from '@deepseek-ai/dsh-tools'
 import { JobId } from '@deepseek-ai/dsh-jobs'
 import type { JobSnapshot } from '@deepseek-ai/dsh-jobs'
-import type {} from '@deepseek-ai/dsh-system-prompt'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 
 export const name = 'tool-jobs'
@@ -64,7 +63,7 @@ export interface PublicJobSnapshot {
 }
 
 /** Shared schema for job-control outputs. */
-const PUBLIC_TASK_SCHEMA = {
+const PUBLIC_JOB_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   properties: {
@@ -198,7 +197,7 @@ function validateJobId(value: string): JobId {
 }
 
 /** Pending presentation shared by the three generic job controls. */
-function presentTaskCall(title: string, kind: 'read' | 'execute', rawInput?: string): GenericCallView {
+function presentJobCall(title: string, kind: 'read' | 'execute', rawInput?: string): GenericCallView {
   return { card: 'generic', title, kind, ...rawInput !== undefined ? { rawInput } : {} }
 }
 
@@ -235,7 +234,7 @@ export function apply(ctx: Context, config: Config): void {
     if (maxBytes !== undefined) outputLimits.set(exec, maxBytes)
     return next()
   }, { prepend: true })
-  const finalizeTaskContent: NonNullable<ToolDefinition['finalizeContent']> = (exec, result) => {
+  const finalizeJobContent: NonNullable<ToolDefinition['finalizeContent']> = (exec, result) => {
     const maxBytes = outputLimits.get(exec) ?? visibleOutputLimit(ctx, exec)
     outputLimits.delete(exec)
     if (maxBytes === undefined) return undefined
@@ -259,10 +258,10 @@ export function apply(ctx: Context, config: Config): void {
   // Producers may start work only while a controller is attached.
   ctx.jobs.attachController('tool-jobs')
 
-  // Cross-call guidance follows the bash section and precedes product sections.
+  // Cross-call guidance follows the filesystem sections and precedes product sections.
   ctx.systemPrompt.section({
     name: 'tool:jobs',
-    order: 106,
+    order: ctx.systemPrompt.getSectionOrder('TOOL_JOBS'),
     text: 'Track every background job id you start. You are notified in-session when a job finishes — do not busy-poll or sleep on one; keep working on independent steps and do not duplicate a running job\'s work. Before giving a final answer, collect every still-relevant job with job_output (set wait: true only when you are genuinely blocked on it), and job_kill jobs that stopped mattering.',
   })
 
@@ -311,14 +310,14 @@ export function apply(ctx: Context, config: Config): void {
       wait: { type: 'boolean', description: 'Block until the job reaches a terminal status or the timeout expires. A timed-out wait returns [status: running] and leaves the job alive.' },
       timeout_ms: { type: 'number', description: 'Max wait in milliseconds (only meaningful with wait: true). Defaults to the configured wait timeout; capped by the configured maximum.' },
     },
-    finalizeContent: finalizeTaskContent,
+    finalizeContent: finalizeJobContent,
     output: {
       schema: {
         type: 'object',
         additionalProperties: false,
         properties: {
           text: { type: 'string', required: true },
-          job: { ...PUBLIC_TASK_SCHEMA, required: true },
+          job: { ...PUBLIC_JOB_SCHEMA, required: true },
         },
       },
       render: (_args, value) => {
@@ -336,7 +335,7 @@ export function apply(ctx: Context, config: Config): void {
       const read = ctx.jobs.read(id, exec.agent)
       return { text: read.text, job: publicJob(read.snapshot) }
     },
-    presentCall: args => presentTaskCall(`Read output from background job ${args.job_id}`, 'read', args.job_id),
+    presentCall: args => presentJobCall(`Read output from background job ${args.job_id}`, 'read', args.job_id),
   }))
 
   ctx.tools.register(defineTool({
@@ -344,7 +343,7 @@ export function apply(ctx: Context, config: Config): void {
     description: 'List your background jobs (running and finished) with their ids, kinds, and statuses.',
     parameters: {},
     output: {
-      schema: { type: 'array', items: PUBLIC_TASK_SCHEMA },
+      schema: { type: 'array', items: PUBLIC_JOB_SCHEMA },
       render: (_args, jobs) => [{
         type: 'text',
         text: jobs.length === 0
@@ -356,7 +355,7 @@ export function apply(ctx: Context, config: Config): void {
       const jobs = ctx.jobs.list(exec.agent)
       return Promise.resolve(jobs.map(publicJob))
     },
-    presentCall: () => presentTaskCall('List background jobs', 'read'),
+    presentCall: () => presentJobCall('List background jobs', 'read'),
   }))
 
   ctx.tools.register(defineTool({
@@ -366,7 +365,7 @@ export function apply(ctx: Context, config: Config): void {
       job_id: { type: 'string', required: true, description: 'Job id returned by the tool that started the background work.' },
       reason: { type: 'string', description: 'Optional short reason, recorded in the log and forwarded to the job.' },
     },
-    finalizeContent: finalizeTaskContent,
+    finalizeContent: finalizeJobContent,
     output: {
       schema: {
         type: 'object',
@@ -377,7 +376,7 @@ export function apply(ctx: Context, config: Config): void {
             required: true,
             enum: ['cancellation-requested', 'already-finished'],
           },
-          job: { ...PUBLIC_TASK_SCHEMA, required: true },
+          job: { ...PUBLIC_JOB_SCHEMA, required: true },
         },
       },
       render: (_args, value) => [{
@@ -397,6 +396,6 @@ export function apply(ctx: Context, config: Config): void {
         job: snapshot,
       })
     },
-    presentCall: args => presentTaskCall(`Kill background job ${args.job_id}`, 'execute', args.job_id),
+    presentCall: args => presentJobCall(`Kill background job ${args.job_id}`, 'execute', args.job_id),
   }))
 }

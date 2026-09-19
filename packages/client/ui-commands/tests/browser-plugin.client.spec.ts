@@ -7,9 +7,10 @@
  * (HMR safety), and the service satisfies the frozen CommandUiContract.
  */
 import { Context } from '@deepseek-ai/cordis'
-import { describe, expect, it } from 'vitest'
-import { createScope, scopeOf, SlotRegistry } from '@deepseek-ai/dsh-client-runtime/client'
-import type { SessionId } from '@deepseek-ai/dsh-client-runtime/client'
+import { describe, expect, it, onTestFinished } from 'vitest'
+import { createScope, scopeOf } from '@deepseek-ai/dsh-api-session-controller/client'
+import { SlotRegistry } from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { InputTriggerSource } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
 import type { CommandUiContract } from '../src/client/contract.ts'
 import type { PopupSelectInjected } from '../src/client/PopupSelectView.tsx'
@@ -28,11 +29,21 @@ async function bench() {
     },
   })
   const scopes = new Map<SessionId, Context>()
+  const bindings = new Map<SessionId, {
+    readonly sessionId: SessionId
+    readonly session: { readonly sessionId: SessionId }
+    readonly ctx: Context
+  }>()
   ctx.provide('sessions', {
     scope: (id: SessionId) => scopes.get(id),
     scopeOf: (c: Context) => scopeOf(c),
+    sessionOf: (c: Context) => bindings.get(scopeOf(c)!)?.session,
+    binding: (id: SessionId) => bindings.get(id),
+    subagentAddress: (id: SessionId) => id === sid('child')
+      ? { parentSessionId: sid('parent'), childSessionId: id, mode: 'continuable' as const }
+      : undefined,
   })
-  const commandsRemote = { list: () => Promise.resolve([]) }
+  const commandsRemote = { list: () => Promise.resolve({ ok: true as const, value: [] }) }
   // The service subscribes its cache-invalidation events on construction, so
   // the Remote face needs `$on` even where this spec dispatches none.
   ctx.provide('remote', { commands: commandsRemote, $on: () => () => {} })
@@ -45,8 +56,10 @@ async function bench() {
   const fiber = ctx.plugin({ inject: [...inject], apply })
   await fiber.await()
   const mint = (key: string) => {
-    const handle = createScope(ctx, sid(key))
-    scopes.set(sid(key), handle.ctx)
+    const id = sid(key)
+    const handle = createScope(ctx, id)
+    scopes.set(id, handle.ctx)
+    bindings.set(id, { sessionId: id, session: { sessionId: id }, ctx: handle.ctx })
     return handle
   }
   return { ctx, fiber, sources, slots: ctx.slots, mint }
@@ -70,6 +83,15 @@ describe('apply', () => {
     await fiber.dispose()
     expect(sources.size).toBe(0)
     expect(slots.entries('conversation.input.overlay')).toHaveLength(0)
+  })
+
+  it('provides no File action without its composer owner', async () => {
+    const { fiber, sources } = await bench()
+    onTestFinished(() => fiber.dispose())
+    const source = sources.get('/ command')!
+    const req = { query: '', position: 'leading' as const, drilled: false, signal: new AbortController().signal }
+    expect(await source.candidates({ sessionId: sid('s1') }, req)).toEqual([])
+    expect(await source.candidates({ sessionId: sid('child') }, req)).toEqual([])
   })
 
   it('the overlay inject resolves the per-session popup controller by sessionId and fails loud on an unknown id', async () => {

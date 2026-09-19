@@ -33,9 +33,6 @@
       "path": "../../packages/bundle/web-app"
     },
     {
-      "path": "../../packages/host/apiproxy"
-    },
-    {
       "path": "../../packages/host/webserver"
     },
     {
@@ -66,10 +63,19 @@
       "path": "../../packages/session-query/session-query-sqlite"
     },
     {
+      "path": "../../packages/session-query/session-query"
+    },
+    {
       "path": "../../packages/shell/shell-env"
     },
     {
       "path": "../../packages/shell/tool-bash"
+    },
+    {
+      "path": "../../packages/boot/plugin-manager"
+    },
+    {
+      "path": "../../packages/util/atomic-write"
     }
   ]
 }

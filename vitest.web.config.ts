@@ -26,8 +26,10 @@ export default defineConfig({
     include: [
       'apps/web/tests/**/*.e2e.ts',
       'apps/web/tests/**/*.snapshot.ts',
+      'packages/experimental/inspector/tests/client-browser.e2e.ts',
     ],
-    // Browser boot + real-model turns are slow; files share one browser, run serial.
+    // Local and record runs stay serial. CI runs workspace-mutating HMR and
+    // dynamic Cordis lifecycle coverage before parallelizing the remaining files.
     testTimeout: 180_000,
     hookTimeout: 120_000,
     fileParallelism: false,

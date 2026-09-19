@@ -8,12 +8,12 @@
  * result without an `isError`.
  */
 
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, onTestFinished, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
-import { createUserMessage, CallId } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import { SessionId } from '@deepseek-ai/dsh-session'
+import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
@@ -21,7 +21,29 @@ import type { PostToolDecision, ToolExecution, ToolExecutionToken } from '@deeps
 import { SpillLocator, SpillStore } from '@deepseek-ai/dsh-spill'
 import type { SaveTextSpill, SpillRef } from '@deepseek-ai/dsh-spill'
 import * as SpillPolicy from '@deepseek-ai/dsh-spill-policy'
-import { WorkerThreadCodeRuntime } from '@deepseek-ai/dsh-code-runtime-worker-thread'
+import NodeRuntime, { type Config as NodeRuntimeConfig } from '@deepseek-ai/dsh-ptc-runtime-node'
+import FileSystem from '@deepseek-ai/dsh-fs-local'
+import Subprocess from '@deepseek-ai/dsh-subprocess-local'
+import Sandbox from '@deepseek-ai/dsh-sandbox-local'
+import SandboxPolicy from '@deepseek-ai/dsh-sandbox-policy'
+import SessionProjections from '@deepseek-ai/dsh-session-projection'
+
+async function mountRuntime(ctx: Context, config: NodeRuntimeConfig = {}): Promise<void> {
+  onTestFinished(async () => { await ctx.fiber.dispose() })
+  if (!ctx.get('sessions')) await ctx.plugin(SessionStore)
+  if (!ctx.get('fs')) await ctx.plugin(FileSystem)
+  if (!ctx.get('subprocess')) await ctx.plugin(Subprocess)
+  if (!ctx.get('sandbox')) await ctx.plugin(Sandbox, {})
+  if (!ctx.get('sessionProjections')) await ctx.plugin(SessionProjections)
+  if (!ctx.get('sandboxPolicy')) await ctx.plugin(SandboxPolicy, { mode: 'danger-full-access' })
+  await ctx.plugin(NodeRuntime, config)
+}
+
+function observedAgent(ctx: Context, id: string, observe: (type: string, data: unknown) => void) {
+  const session = ctx.sessions.create(SessionId(id), { meta: { cwd: process.cwd() } })
+  ctx.on('session/event', (owner, event) => { if (owner === session) observe(event.type, event.data) })
+  return { session }
+}
 
 const testToolSignal = new AbortController().signal
 
@@ -58,7 +80,7 @@ function textTool(name: string, text: string) {
 function exec(name: string, session = 's1'): ToolExecution {
   // Only agent.session.header.id is read by the policy; a structural stub suffices.
   const agent = { session: { header: { id: SessionId(session) } } }
-  return { callId: CallId(`call-${name}`), name, arguments: {}, agent, signal: testToolSignal } as unknown as ToolExecution
+  return { callId: ToolCallId(`call-${name}`), name, arguments: {}, agent, signal: testToolSignal } as unknown as ToolExecution
 }
 
 /**
@@ -134,7 +156,7 @@ describe('oversized plain-text replacement', () => {
     expect(result.isError).toBe(false)
     expect(spill?.saves).toHaveLength(1)
     expect(spill?.saves[0]?.content).toBe(body)
-    expect(spill?.saves[0]?.source.toolName).toBe('big')
+    expect(spill?.saves[0]?.source).toMatchObject({ toolName: 'big' })
     expect(spill?.saves[0]?.suggestedName).toBe('big.txt')
     expect(spill?.saves[0]?.owner.sessionId).toBe('s1')
 
@@ -186,25 +208,20 @@ describe('oversized plain-text replacement', () => {
   })
 })
 
-describe('outer Code Mode failure capture', () => {
+describe('outer PTC mode failure capture', () => {
   it('spills the bounded output-limit diagnostic through the ordinary outer-result policy', async () => {
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
-    await ctx.plugin(ToolRuntime, { mode: 'code' })
+    await ctx.plugin(ToolRuntime, { mode: 'ptc' })
     await ctx.plugin(StubStore)
     await ctx.plugin(SpillPolicy, { maxInlineBytes: 200 })
-    await ctx.plugin(WorkerThreadCodeRuntime, { maxOutputBytes: 500 })
+    await mountRuntime(ctx, { maxOutputBytes: 500 })
     const events: unknown[] = []
-    const agent = {
-      session: {
-        header: { id: SessionId('code-spill'), cwd: '/workspace' },
-        append: (_type: string, data: unknown) => { events.push(data) },
-      },
-    }
+    const agent = observedAgent(ctx, 'code-spill', (_type: string, data: unknown) => { events.push(data) })
 
     const result = await ctx.tools.execute({
       signal: testToolSignal,
-      callId: CallId('code-output-limit'),
+      callId: ToolCallId('code-output-limit'),
       name: 'run_code',
       arguments: {
         code: 'console.log("HEAD-" + "x".repeat(300)); console.log("TAIL-" + "y".repeat(300)); return "unreachable";',
@@ -216,7 +233,7 @@ describe('outer Code Mode failure capture', () => {
     expect(result.isError).toBe(true)
     const saved = (ctx.spillStore as StubStore).saves
     expect(saved).toHaveLength(1)
-    expect(saved[0]?.source.toolName).toBe('run_code')
+    expect(saved[0]?.source).toMatchObject({ toolName: 'run_code' })
     expect(saved[0]?.content).toContain('code run failed (output-limit)')
     expect(saved[0]?.content).toContain('HEAD-')
     expect(textOf(result.content)).toContain('Full formatted result stored at: /spill/run_code.txt')
@@ -235,27 +252,22 @@ describe('read skip', () => {
 })
 
 describe('the durable dispatch-log arm', () => {
-  /** Boot code mode + the policy + the worker runtime; run one program via the real bridge. */
+  /** Boot code mode + the policy + the Node runtime; run one program via the real bridge. */
   async function runCodeWith(program: string, maxInlineBytes: number, extraTools: ToolDefinition[] = []) {
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
-    await ctx.plugin(ToolRuntime, { mode: 'code' })
+    await ctx.plugin(ToolRuntime, { mode: 'ptc' })
     await ctx.plugin(StubStore)
     await ctx.plugin(SpillPolicy, { maxInlineBytes })
-    await ctx.plugin(WorkerThreadCodeRuntime, {})
+    await mountRuntime(ctx, {})
     const events: { type: string; data: unknown }[] = []
-    const agent = {
-      session: {
-        header: { id: SessionId('dispatch-spill'), cwd: '/workspace' },
-        append: (type: string, data: unknown) => { events.push({ type, data }) },
-      },
-    }
+    const agent = observedAgent(ctx, 'dispatch-spill', (type: string, data: unknown) => { events.push({ type, data }) })
     ctx.tools.register(textTool('huge_read', 'H'.repeat(2_000)))
     ctx.tools.register(textTool('small_read', 'tiny'))
     for (const tool of extraTools) ctx.tools.register(tool)
     const result = await ctx.tools.execute({
       signal: testToolSignal,
-      callId: CallId('parent-1'),
+      callId: ToolCallId('parent-1'),
       name: 'run_code',
       arguments: { code: program, description: 'Drive dispatch-log spilling' },
       agent: agent as never,
@@ -263,7 +275,7 @@ describe('the durable dispatch-log arm', () => {
     return { ctx, result, events, spill: ctx.spillStore as StubStore }
   }
 
-  it('bounds the tool/code-dispatch copy of an oversized sub-result while the program value stays whole', async () => {
+  it('bounds the tool/ptc-dispatch copy of an oversized sub-result while the program value stays whole', async () => {
     const { result, events, spill } = await runCodeWith(
       'const blocks = await tools.huge_read({});\nreturn blocks[0].text.length', 200)
     expect(result.isError).toBe(false)
@@ -271,7 +283,7 @@ describe('the durable dispatch-log arm', () => {
     // The program received the COMPLETE text (length 2000), untouched by spill.
     expect(result.value).toMatchObject({ result: 2_000 })
     // The durable settle event carries the bounded projection + locator.
-    const settle = events.find(event => event.type === 'tool/code-dispatch')
+    const settle = events.find(event => event.type === 'tool/ptc-dispatch')
     expect(settle).toBeDefined()
     const logged = (settle!.data as { content: { type: string; text: string }[] }).content
     expect(logged).toHaveLength(1)
@@ -281,7 +293,7 @@ describe('the durable dispatch-log arm', () => {
     // The artifact holds the full text under the dispatch label and sub-call id.
     const save = spill.saves.find(entry => entry.source.label === 'dispatch')
     expect(save).toMatchObject({
-      source: { toolName: 'huge_read', callId: 'parent-1:code:1', label: 'dispatch' },
+      source: { kind: 'tool', toolName: 'huge_read', callId: 'parent-1:ptc:1', label: 'dispatch' },
     })
     expect(save?.content).toBe('H'.repeat(2_000))
   })
@@ -296,7 +308,7 @@ describe('the durable dispatch-log arm', () => {
           return [{ type: 'text', text: 'x'.repeat(100) }, { type: 'reasoning', text: 'why' }]
         },
       })])
-    const settle = events.find(event => event.type === 'tool/code-dispatch')
+    const settle = events.find(event => event.type === 'tool/ptc-dispatch')
     expect((settle!.data as { content: unknown[] }).content).toHaveLength(2)
     expect(spill.saves.filter(entry => entry.source.label === 'dispatch')).toHaveLength(0)
   })
@@ -304,7 +316,7 @@ describe('the durable dispatch-log arm', () => {
   it('leaves a within-cap sub-result log untouched and saves nothing for it', async () => {
     const { events, spill } = await runCodeWith(
       'return await tools.small_read({})', 200)
-    const settle = events.find(event => event.type === 'tool/code-dispatch')
+    const settle = events.find(event => event.type === 'tool/ptc-dispatch')
     expect((settle!.data as { content: { type: string; text: string }[] }).content)
       .toEqual([{ type: 'text', text: 'tiny' }])
     expect(spill.saves.filter(entry => entry.source.label === 'dispatch')).toHaveLength(0)
@@ -313,10 +325,10 @@ describe('the durable dispatch-log arm', () => {
   it('a slow spill backend never delays the program value or a later dispatch slot', async () => {
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
-    await ctx.plugin(ToolRuntime, { mode: 'code' })
+    await ctx.plugin(ToolRuntime, { mode: 'ptc' })
     await ctx.plugin(StubStore)
     await ctx.plugin(SpillPolicy, { maxInlineBytes: 100 })
-    await ctx.plugin(WorkerThreadCodeRuntime, {})
+    await mountRuntime(ctx, {})
     // A spill backend that hangs until released.
     let releaseSave!: () => void
     const gate = new Promise<void>((resolve) => { releaseSave = resolve })
@@ -327,18 +339,13 @@ describe('the durable dispatch-log arm', () => {
       return realSave(input)
     }
     const events: { type: string; data: unknown }[] = []
-    const agent = {
-      session: {
-        header: { id: SessionId('dispatch-slow-spill'), cwd: '/workspace' },
-        append: (type: string, data: unknown) => { events.push({ type, data }) },
-      },
-    }
+    const agent = observedAgent(ctx, 'dispatch-slow-spill', (type: string, data: unknown) => { events.push({ type, data }) })
     ctx.tools.register(textTool('huge_read', 'H'.repeat(2_000)))
     ctx.tools.register(textTool('small_read', 'tiny'))
     let smallAfterHuge = false
     const runPromise = ctx.tools.execute({
       signal: testToolSignal,
-      callId: CallId('parent-3'),
+      callId: ToolCallId('parent-3'),
       name: 'run_code',
       arguments: {
         // The program takes BOTH values while the spill backend hangs: the
@@ -356,7 +363,7 @@ describe('the durable dispatch-log arm', () => {
     // the backend and observe the settle events land inside the turn.
     await vi.waitFor(() => {
       // The second dispatch STARTED while the first one's spill hung.
-      smallAfterHuge = events.some(event => event.type === 'tool/code-dispatch-start'
+      smallAfterHuge = events.some(event => event.type === 'tool/ptc-dispatch-start'
         && (event.data as { name: string }).name === 'small_read')
       if (!smallAfterHuge) throw new Error('small_read not started yet')
     })
@@ -365,7 +372,7 @@ describe('the durable dispatch-log arm', () => {
     expect(result.isError).toBe(false)
     if (result.isError) throw new Error('expected success')
     expect(result.value).toMatchObject({ result: 2_004 })
-    const settles = events.filter(event => event.type === 'tool/code-dispatch')
+    const settles = events.filter(event => event.type === 'tool/ptc-dispatch')
     expect(settles).toHaveLength(2)
     expect(smallAfterHuge).toBe(true)
   })
@@ -377,26 +384,21 @@ describe('the durable dispatch-log arm', () => {
     // lane holds inside the second commit, so the THIRD dispatch cannot start
     // until a pending save drains — the bound is observable as its missing
     // start event.
-    await ctx.plugin(ToolRuntime, { mode: 'code', maxParallelSubCalls: 1 })
+    await ctx.plugin(ToolRuntime, { mode: 'ptc', maxParallelSubCalls: 1 })
     await ctx.plugin(StubStore)
     await ctx.plugin(SpillPolicy, { maxInlineBytes: 100 })
-    await ctx.plugin(WorkerThreadCodeRuntime, {})
+    await mountRuntime(ctx, {})
     const store = ctx.spillStore as StubStore
     const releases: (() => void)[] = []
     store.gate = () => new Promise<void>((resolve) => { releases.push(resolve) })
     const events: { type: string; data: unknown }[] = []
-    const agent = {
-      session: {
-        header: { id: SessionId('dispatch-spill-bound'), cwd: '/workspace' },
-        append: (type: string, data: unknown) => { events.push({ type, data }) },
-      },
-    }
+    const agent = observedAgent(ctx, 'dispatch-spill-bound', (type: string, data: unknown) => { events.push({ type, data }) })
     ctx.tools.register(textTool('huge_read', 'H'.repeat(2_000)))
-    const started = (n: number): boolean => events.some(event => event.type === 'tool/code-dispatch-start'
-      && (event.data as { subCallId: string }).subCallId.endsWith(`:code:${n}`))
+    const started = (n: number): boolean => events.some(event => event.type === 'tool/ptc-dispatch-start'
+      && (event.data as { subCallId: string }).subCallId.endsWith(`:ptc:${n}`))
     const runPromise = ctx.tools.execute({
       signal: testToolSignal,
-      callId: CallId('parent-bound'),
+      callId: ToolCallId('parent-bound'),
       name: 'run_code',
       arguments: {
         code: 'await tools.huge_read({}); await tools.huge_read({}); await tools.huge_read({}); return "done"',
@@ -421,7 +423,7 @@ describe('the durable dispatch-log arm', () => {
     expect(result.isError).toBe(false)
     await vi.waitFor(() => {
       if (releases.length > 0) { while (releases.length > 0) releases.shift()!() }
-      if (events.filter(event => event.type === 'tool/code-dispatch').length !== 3) {
+      if (events.filter(event => event.type === 'tool/ptc-dispatch').length !== 3) {
         throw new Error('settle events still pending')
       }
     })
@@ -430,29 +432,24 @@ describe('the durable dispatch-log arm', () => {
   it('a saveText failure keeps the complete content in the durable log (best-effort)', async () => {
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
-    await ctx.plugin(ToolRuntime, { mode: 'code' })
+    await ctx.plugin(ToolRuntime, { mode: 'ptc' })
     await ctx.plugin(StubStore)
     await ctx.plugin(SpillPolicy, { maxInlineBytes: 100 })
-    await ctx.plugin(WorkerThreadCodeRuntime, {})
+    await mountRuntime(ctx, {})
     ;(ctx.spillStore as StubStore).fail = true
     const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => {})
     const events: { type: string; data: unknown }[] = []
-    const agent = {
-      session: {
-        header: { id: SessionId('dispatch-spill-fail'), cwd: '/workspace' },
-        append: (type: string, data: unknown) => { events.push({ type, data }) },
-      },
-    }
+    const agent = observedAgent(ctx, 'dispatch-spill-fail', (type: string, data: unknown) => { events.push({ type, data }) })
     ctx.tools.register(textTool('huge_read', 'H'.repeat(2_000)))
     const result = await ctx.tools.execute({
       signal: testToolSignal,
-      callId: CallId('parent-2'),
+      callId: ToolCallId('parent-2'),
       name: 'run_code',
       arguments: { code: 'return (await tools.huge_read({}))[0].text.length', description: 'Fail the spill backend' },
       agent: agent as never,
     })
     expect(result.isError).toBe(false)
-    const settle = events.find(event => event.type === 'tool/code-dispatch')
+    const settle = events.find(event => event.type === 'tool/ptc-dispatch')
     expect((settle!.data as { content: { text: string }[] }).content[0]!.text).toBe('H'.repeat(2_000))
     expect(warn).toHaveBeenCalled()
   })
@@ -498,7 +495,7 @@ describe('best-effort fallback', () => {
     const { ctx, spill } = await setup({ maxInlineBytes: 10 })
     const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => {})
     ctx.tools.register(textTool('big', 'x'.repeat(1000)))
-    const result = await ctx.tools.execute({ signal: testToolSignal, callId: CallId('c'), name: 'big', arguments: {} })
+    const result = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('c'), name: 'big', arguments: {} })
     expect(textOf(result.content)).toBe('x'.repeat(1000))
     expect(spill?.saves).toHaveLength(0)
     expect(warn).toHaveBeenCalled()

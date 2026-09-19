@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { Button, ConnectionBanner, Input, Menu, Modal, Pill } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, ConnectionIndicator, Input, Menu, Modal, Pill } from '@deepseek-ai/dsh-client-ui-primitives'
 import { POINTER_GRACE_MS } from '../src/pointer-grace.ts'
 
 afterEach(cleanup)
@@ -97,6 +97,27 @@ describe('Menu', () => {
     expect(onClose).not.toHaveBeenCalled()
   })
 
+  it('window blur closes only when focus moved into an iframe', () => {
+    const onClose = vi.fn()
+    render(
+      <Menu open anchor={<span>trigger</span>} items={items} onSelect={() => {}} onClose={onClose} />)
+    // An app or tab switch blurs the window without focusing an iframe: stays open.
+    fireEvent.blur(window)
+    expect(onClose).not.toHaveBeenCalled()
+    // A pointerdown inside a cross-origin iframe never reaches this document;
+    // the focus move it causes is the one signal left, and it closes.
+    const iframe = document.createElement('iframe')
+    document.body.appendChild(iframe)
+    try {
+      iframe.focus()
+      expect(document.activeElement).toBe(iframe)
+      fireEvent.blur(window)
+      expect(onClose).toHaveBeenCalledTimes(1)
+    } finally {
+      iframe.remove()
+    }
+  })
+
   it('selected item shows the trailing check; align=end, side=top, and className apply', () => {
     const { container } = render(
       <Menu
@@ -120,6 +141,24 @@ describe('Menu', () => {
     fireEvent.keyDown(document, { key: 'a' })
   })
 
+  it('fill selection holds the row fill instead of a trailing check', () => {
+    render(
+      <Menu
+        open
+        selection="fill"
+        anchor={<span>trigger</span>}
+        items={items}
+        selectedId="a"
+        onSelect={() => {}}
+        onClose={() => {}}
+      />)
+    const selected = screen.getByRole('menuitem', { name: 'Alpha' })
+    expect(selected.querySelector('svg')).toBeNull()
+    expect(selected.className).toMatch(/selectedFill/)
+    const other = screen.getByRole('menuitem', { name: 'Beta' })
+    expect(other.className).not.toMatch(/selectedFill/)
+  })
+
   it('renders a leading icon and a separator between groups', () => {
     render(
       <Menu
@@ -136,6 +175,85 @@ describe('Menu', () => {
       />)
     expect(screen.getByTestId('ic')).toBeDefined()
     expect(screen.getByRole('separator')).toBeDefined()
+  })
+
+  it('Tab settles the focused row; Shift+Tab closes back to the anchor', () => {
+    const onSelect = vi.fn()
+    const onClose = vi.fn()
+    render(
+      <Menu open autoFocus anchor={<button type="button">trigger</button>} items={items} onSelect={onSelect} onClose={onClose} />)
+    // autoFocus parks the keyboard on the first row; Tab settles it like Enter.
+    const alpha = screen.getByRole('menuitem', { name: 'Alpha' })
+    expect(document.activeElement).toBe(alpha)
+    expect(fireEvent.keyDown(alpha, { key: 'Tab' })).toBe(false)
+    expect(onSelect).toHaveBeenCalledExactlyOnceWith('a')
+
+    // Shift+Tab leaves like Escape: closed, with the trigger taking the keyboard.
+    fireEvent.keyDown(alpha, { key: 'Tab', shiftKey: true })
+    expect(onClose).toHaveBeenCalledTimes(1)
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'trigger' }))
+  })
+
+  it('Tab from the trigger enters the open list, and elsewhere on the page stays native', () => {
+    render(
+      <Menu open anchor={<button type="button">trigger</button>} items={items} onSelect={() => {}} onClose={() => {}} />)
+    const trigger = screen.getByRole('button', { name: 'trigger' })
+    trigger.focus()
+    expect(fireEvent.keyDown(trigger, { key: 'Tab' })).toBe(false)
+    expect(document.activeElement).toBe(screen.getByRole('menuitem', { name: 'Alpha' }))
+
+    // A keyboard outside both the anchor and the list keeps the traversal.
+    const outside = document.createElement('button')
+    document.body.append(outside)
+    outside.focus()
+    expect(fireEvent.keyDown(outside, { key: 'Tab' })).toBe(true)
+    outside.remove()
+  })
+
+  it('walks the list with the arrows without autoFocus, wrapping at both ends', () => {
+    const onClose = vi.fn()
+    const rows = [
+      { id: 'a', label: 'Alpha' },
+      { id: 'b', label: 'Beta' },
+      { id: 'c', label: 'Gamma' },
+    ]
+    render(
+      <Menu open anchor={<button type="button">trigger</button>} items={rows} onSelect={() => {}} onClose={onClose} />)
+    const trigger = screen.getByRole('button', { name: 'trigger' })
+    const alpha = screen.getByRole('menuitem', { name: 'Alpha' })
+    const beta = screen.getByRole('menuitem', { name: 'Beta' })
+    const gamma = screen.getByRole('menuitem', { name: 'Gamma' })
+    trigger.focus()
+    // autoFocus is off: the menu opens with the keyboard on the anchor, and the
+    // first step enters at the near end.
+    expect(document.activeElement).toBe(trigger)
+    expect(fireEvent.keyDown(trigger, { key: 'ArrowDown' })).toBe(false)
+    expect(document.activeElement).toBe(alpha)
+    fireEvent.keyDown(alpha, { key: 'ArrowDown' })
+    fireEvent.keyDown(beta, { key: 'ArrowDown' })
+    expect(document.activeElement).toBe(gamma)
+    fireEvent.keyDown(gamma, { key: 'ArrowDown' }) // wraps forwards
+    expect(document.activeElement).toBe(alpha)
+    fireEvent.keyDown(alpha, { key: 'ArrowUp' }) // wraps backwards
+    expect(document.activeElement).toBe(gamma)
+    fireEvent.keyDown(gamma, { key: 'Home' })
+    expect(document.activeElement).toBe(alpha)
+    fireEvent.keyDown(alpha, { key: 'End' })
+    expect(document.activeElement).toBe(gamma)
+    // Escape closes and hands the keyboard back to the anchor.
+    fireEvent.keyDown(gamma, { key: 'Escape' })
+    expect(onClose).toHaveBeenCalledTimes(1)
+    expect(document.activeElement).toBe(trigger)
+  })
+
+  it('enters at the last enabled row on ↑ and steps over a disabled one', () => {
+    render(
+      <Menu open anchor={<button type="button">trigger</button>} items={items} onSelect={() => {}} onClose={() => {}} />)
+    const trigger = screen.getByRole('button', { name: 'trigger' })
+    trigger.focus()
+    // Beta is disabled: it is not a step target, so Alpha is the only row.
+    expect(fireEvent.keyDown(trigger, { key: 'ArrowUp' })).toBe(false)
+    expect(document.activeElement).toBe(screen.getByRole('menuitem', { name: 'Alpha' }))
   })
 
   it('renders a non-interactive heading label and a danger row', () => {
@@ -383,7 +501,7 @@ describe('Modal', () => {
   it('is absent while closed; Escape and mask click call onClose', () => {
     const onClose = vi.fn()
     const { rerender } = render(
-      <Modal open={false} onClose={onClose} title="Create new workspace">body</Modal>)
+      <Modal open={false} onClose={onClose} title="Create new workspace" closeLabel="Close">body</Modal>)
     expect(screen.queryByRole('dialog')).toBeNull()
     rerender(
       <Modal open onClose={onClose} title="Create new workspace" closeLabel="Configure later" description="Name it." contentClassName="scrolling-content" footer={<button type="button">Create</button>}>
@@ -406,13 +524,71 @@ describe('Modal', () => {
     fireEvent.click(mask)
     expect(onClose).toHaveBeenCalledTimes(2)
   })
+
+  it('renders headless content without the default close chrome', () => {
+    render(
+      <Modal open onClose={() => {}} title="Custom surface" headless>
+        <span>Custom body</span>
+      </Modal>,
+    )
+    expect(screen.getByRole('dialog', { name: 'Custom surface' })).toBeDefined()
+    expect(screen.getByText('Custom body')).toBeDefined()
+    expect(screen.queryByRole('button')).toBeNull()
+  })
 })
 
-describe('ConnectionBanner', () => {
-  it('renders only while reconnecting', () => {
-    const { container, rerender } = render(<ConnectionBanner reconnecting={false} />)
+describe('ConnectionIndicator', () => {
+  it('renders outage, attempt progress, and recovered states without a native tooltip', () => {
+    const reconnect = vi.fn()
+    const labels = {
+      disconnectedLabel: 'Disconnected, retry',
+      connectingLabel: 'Connecting',
+      recoveredLabel: 'Connected',
+      reconnectActionLabel: 'Disconnected, reconnect now',
+      restartActionLabel: 'Connecting, restart now',
+      onReconnect: reconnect,
+    }
+    const { container, rerender } = render(
+      <ConnectionIndicator state={undefined} {...labels} />,
+    )
     expect(container.firstChild).toBeNull()
-    rerender(<ConnectionBanner reconnecting />)
-    expect(container.textContent).toContain('重连')
+    rerender(<ConnectionIndicator state="disconnected" {...labels} />)
+    const indicator = screen.getByRole('button', { name: 'Disconnected, reconnect now' })
+    expect(indicator.textContent).toContain('Disconnected, retry')
+    expect(indicator.hasAttribute('title')).toBe(false)
+    expect(indicator.querySelector('svg')).toBeTruthy()
+    fireEvent.click(indicator)
+    expect(reconnect).toHaveBeenCalledOnce()
+
+    rerender(<ConnectionIndicator state="connecting" {...labels} />)
+    expect(screen.getByRole('button', { name: 'Connecting, restart now' }).textContent)
+      .toContain('Connecting...')
+
+    rerender(<ConnectionIndicator state="recovered" {...labels} />)
+    expect(screen.queryByRole('button')).toBeNull()
+    expect(screen.getByRole('status', { name: 'Connected' })).toBeTruthy()
+  })
+
+  it('fades out for the exit duration before unmounting', () => {
+    vi.useFakeTimers()
+    try {
+      const labels = {
+        disconnectedLabel: 'Disconnected, retry',
+        connectingLabel: 'Connecting',
+        recoveredLabel: 'Connected',
+        reconnectActionLabel: 'Disconnected, reconnect now',
+        restartActionLabel: 'Connecting, restart now',
+        onReconnect: vi.fn(),
+      }
+      const { container, rerender } = render(
+        <ConnectionIndicator state="disconnected" {...labels} />,
+      )
+      rerender(<ConnectionIndicator state={undefined} {...labels} />)
+      expect(screen.getByRole('button', { name: 'Disconnected, reconnect now' })).toBeTruthy()
+      act(() => { vi.advanceTimersByTime(150) })
+      expect(container.firstChild).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

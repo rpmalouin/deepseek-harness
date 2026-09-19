@@ -1,6 +1,6 @@
 /**
  * The `sessionStats` projection unit: a pure fold of step boundaries, stream
- * chunks, tool pairs, and assembled assistant messages into whole-log counts
+ * embedded streams, tool pairs, and assembled assistant messages into whole-log counts
  * and wall times.
  *
  * `step/end` — not `assistant/message` — is the counted step event because it
@@ -24,8 +24,9 @@
  */
 
 import { z } from 'zod'
-import { isTokenDelta } from '@deepseek-ai/dsh-llm/message'
+import { assistantStreamFirstTokenTime } from '@deepseek-ai/dsh-llm'
 import type { ProjectionDefinition } from '@deepseek-ai/dsh-session-projection'
+
 
 /** Accumulated whole-log figures (the view is exactly these totals). */
 interface SessionStatsTotals {
@@ -62,6 +63,12 @@ interface SessionStatsState extends SessionStatsTotals {
   pendingCalls: Record<string, number>
 }
 
+declare module '@deepseek-ai/dsh-session-projection/types' {
+  interface SessionProjectionStateMap {
+    sessionStats: SessionStatsState
+  }
+}
+
 const sessionStatsSchema = z.object({
   turns: z.number().int().nonnegative(),
   steps: z.number().int().nonnegative(),
@@ -72,6 +79,23 @@ const sessionStatsSchema = z.object({
   decodeMs: z.number().nonnegative(),
   decodeTokens: z.number().nonnegative(),
 }).strict()
+
+/**
+ * The fold state's shape (totals plus in-flight boundaries), validated on
+ * persisted-cache rows after their `ver` gate — the unit's input boundary.
+ * The view is a strict subset of the state, so this schema extends
+ * `sessionStatsSchema` (the wire output boundary) with the boundary fields.
+ */
+const sessionStatsStateSchema = sessionStatsSchema.extend({
+  lastTurn: z.number().int().nonnegative().nullable(),
+  openStep: z.object({
+    turn: z.number().int().nonnegative(),
+    step: z.number().int().nonnegative(),
+    startTime: z.number().nonnegative(),
+    firstTokenTime: z.number().nonnegative().nullable(),
+  }).nullable(),
+  pendingCalls: z.record(z.string(), z.number().nonnegative()),
+})
 
 /**
  * Provider-reported completion tokens, guarded the way the window fold guards
@@ -86,9 +110,10 @@ function usageOutputTokens(usage: unknown): number | null {
 }
 
 /** The `sessionStats` unit registered on `ctx.sessionProjections` (exported for the unit spec). */
-export const sessionStatsProjectionDefinition: ProjectionDefinition<'sessionStats', SessionStatsState> = {
+export const sessionStatsProjectionDefinition = {
   key: 'sessionStats',
-  schema: sessionStatsSchema,
+  stateVersion: 1,
+  stateSchema: sessionStatsStateSchema,
   init: () => ({
     turns: 0,
     steps: 0,
@@ -110,15 +135,17 @@ export const sessionStatsProjectionDefinition: ProjectionDefinition<'sessionStat
           ...state,
           openStep: { turn: event.data.turn, step: event.data.step, startTime: event.time, firstTokenTime: null },
         }
-      case 'assistant/chunk': {
+      case 'assistant/attempt': {
         const open = state.openStep
         if (open === null || open.turn !== event.data.turn || open.step !== event.data.step) return state
-        if (open.firstTokenTime !== null || !isTokenDelta(event.data.chunk)) return state
-        return { ...state, openStep: { ...open, firstTokenTime: event.time } }
+        const first = assistantStreamFirstTokenTime(event.data.stream) ?? null
+        if (open.firstTokenTime !== null || first === null) return state
+        return { ...state, openStep: { ...open, firstTokenTime: first } }
       }
       case 'assistant/message': {
         const open = state.openStep
         if (open === null || open.turn !== event.data.turn || open.step !== event.data.step) return state
+        const firstToken = open.firstTokenTime ?? assistantStreamFirstTokenTime(event.data.stream) ?? null
         // One assembled message per step: closing the boundary means a
         // defensive duplicate cannot accrue twice.
         const next: SessionStatsState = {
@@ -126,12 +153,12 @@ export const sessionStatsProjectionDefinition: ProjectionDefinition<'sessionStat
           llmMs: state.llmMs + Math.max(0, event.time - open.startTime),
           openStep: null,
         }
-        if (open.firstTokenTime !== null) {
-          next.ttftMs += Math.max(0, open.firstTokenTime - open.startTime)
+        if (firstToken !== null) {
+          next.ttftMs += Math.max(0, firstToken - open.startTime)
           next.ttftSteps += 1
           const outputTokens = usageOutputTokens(event.data.usage)
           if (outputTokens !== null) {
-            next.decodeMs += Math.max(0, event.time - open.firstTokenTime)
+            next.decodeMs += Math.max(0, event.time - firstToken)
             next.decodeTokens += outputTokens
           }
         }
@@ -169,15 +196,17 @@ export const sessionStatsProjectionDefinition: ProjectionDefinition<'sessionStat
         return state
     }
   },
-  view: state => ({
-    turns: state.turns,
-    steps: state.steps,
-    llmMs: state.llmMs,
-    toolMs: state.toolMs,
-    ttftMs: state.ttftMs,
-    ttftSteps: state.ttftSteps,
-    decodeMs: state.decodeMs,
-    decodeTokens: state.decodeTokens,
-  }),
-  stateVersion: 1,
-}
+  wire: {
+    viewSchema: sessionStatsSchema,
+    view: state => ({
+      turns: state.turns,
+      steps: state.steps,
+      llmMs: state.llmMs,
+      toolMs: state.toolMs,
+      ttftMs: state.ttftMs,
+      ttftSteps: state.ttftSteps,
+      decodeMs: state.decodeMs,
+      decodeTokens: state.decodeTokens,
+    }),
+  },
+} satisfies ProjectionDefinition<'sessionStats', SessionStatsState>

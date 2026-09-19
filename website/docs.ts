@@ -131,11 +131,43 @@ const homeAndGuide = pairedPages([
     order: 2,
   },
   {
+    source: 'docs/user/guide/network-proxy.md',
+    route: 'guide/network-proxy.md',
+    label: { root: '网络代理', en: 'Network proxy' },
+    sidebar: { root: 'zh-guide', en: 'en-guide' },
+    section: { root: '入门', en: 'Guide' },
+    order: 3,
+  },
+  {
     source: 'docs/user/guide/python-sdk.md',
     route: 'guide/python-sdk.md',
     label: { root: 'Python', en: 'Python' },
     sidebar: { root: 'zh-guide', en: 'en-guide' },
     section: { root: 'SDK', en: 'SDK' },
+    order: 1,
+  },
+  {
+    source: 'docs/user/guide/github-review.md',
+    route: 'guide/github-review.md',
+    label: { root: 'GitHub 评审会话', en: 'GitHub review sessions' },
+    sidebar: { root: 'zh-guide', en: 'en-guide' },
+    section: { root: '自动化', en: 'Automation' },
+    order: 1,
+  },
+  {
+    source: 'docs/user/guide/schedule.md',
+    route: 'guide/schedule.md',
+    label: { root: '会话内提醒', en: 'Session reminders' },
+    sidebar: { root: 'zh-guide', en: 'en-guide' },
+    section: { root: '自动化', en: 'Automation' },
+    order: 2,
+  },
+  {
+    source: 'docs/user/guide/mcp-memory.md',
+    route: 'guide/mcp-memory.md',
+    label: { root: '记忆 MCP', en: 'Memory MCP' },
+    sidebar: { root: 'zh-guide', en: 'en-guide' },
+    section: { root: '集成', en: 'Integrations' },
     order: 1,
   },
 ])
@@ -216,6 +248,14 @@ const develop = pairedPages([
     section: { root: '实战', en: 'Practice' },
     order: 2,
   },
+  {
+    source: 'docs/user/develop/practice/dynamic-cordis.md',
+    route: 'develop/practice/dynamic-cordis.md',
+    label: { root: '持久化 Harness 插件', en: 'Persistent Harness plugins' },
+    sidebar: { root: 'zh-develop', en: 'en-develop' },
+    section: { root: '实战', en: 'Practice' },
+    order: 3,
+  },
 ])
 
 const cordisTutorial = pairedPages(([
@@ -286,7 +326,7 @@ const subsystemGroups = [
     ['jobs.md', '后台任务', 'Background jobs'],
     ['filesystem.md', '文件系统', 'Filesystem'],
     ['lsp.md', 'LSP 导航', 'LSP navigation'],
-    ['code-runtime.md', '代码运行时', 'Code runtime'],
+    ['ptc-runtime.md', 'PTC 运行时', 'PTC runtime'],
     ['web.md', 'Web 访问', 'Web access'],
     ['skills.md', '技能', 'Skills'],
     ['workflow.md', '工作流', 'Workflows'],
@@ -304,8 +344,13 @@ const subsystemGroups = [
   ]],
   ['平台与接入', 'Platform and access', [
     ['web-server.md', 'HTTP 服务器', 'HTTP server'],
-    ['typert.md', 'Typert', 'Typert'],
+    ['web-client.md', 'Web Client 架构', 'Web Client architecture'],
     ['client-modules.md', '客户端模块', 'Client modules'],
+    ['slots.md', '客户端 Slots', 'Client slots'],
+    ['client-resources.md', '客户端资源', 'Client resources'],
+    ['sidebar-right.md', '右侧 Sidebar', 'Right Sidebar'],
+    ['conversation.md', 'Conversation 组装', 'Conversation assembly'],
+    ['typert.md', 'Typert', 'Typert'],
     ['storage.md', '存储', 'Storage'],
     ['workspace.md', '工作区', 'Workspaces'],
     ['settings.md', '用户设置', 'User settings'],
@@ -328,6 +373,8 @@ const subsystemsReference = subsystemGroups.flatMap(([rootSection, enSection, fi
 ))
 
 const reference = [
+  // `docs/deepseek-llm-api-wire-extensions.md` is a repository-only provider protocol reference.
+  // Projected links intentionally resolve to its GitHub source instead of a public site route.
   ...pairedPages(([
     ['docs/architecture.md', 'reference/index.md', '架构', 'Architecture', 0],
   ] as const).map(([source, route, rootLabel, enLabel, order]): PairedPage => ({
@@ -342,6 +389,7 @@ const reference = [
     ['docs/capability-seams.md', 'reference/capability-seams.md', '能力服务', 'Capability services', 2],
     ['docs/agent-lifecycle.md', 'reference/agent-lifecycle.md', 'Agent 生命周期', 'Agent lifecycle', 3],
     ['docs/tool-execution-pipeline.md', 'reference/tool-execution-pipeline.md', 'Tool 执行', 'Tool execution', 4],
+    ['docs/api-gateway.md', 'reference/api-gateway.md', 'API Gateway', 'API Gateway', 5],
   ] as const).map(([source, route, rootLabel, enLabel, order]): PairedPage => ({
     source,
     route,
@@ -392,6 +440,7 @@ const reference = [
     ['adding-a-package.md', '新增 Package', 'Adding a package'],
     ['adding-a-tool.md', '新增 Tool', 'Adding a tool'],
     ['adding-an-llm-adapter.md', '新增 LLM Adapter', 'Adding an LLM adapter'],
+    ['adding-a-settings-card.md', '新增设置卡片', 'Adding a settings card'],
     ['extension-cookbook.md', '扩展模式', 'Extension patterns'],
   ] as const).map(([file, rootLabel, enLabel], order): PairedPage => ({
     source: `docs/cookbook/${file}`,
@@ -401,15 +450,17 @@ const reference = [
     section: { root: '开发手册', en: 'Cookbook' },
     order,
   }))),
-  ...pairedPages([{
-    source: 'docs/cookbook/adding-a-conversation-node.md',
-    route: 'reference/cookbook/adding-a-conversation-node.md',
-    label: { root: '新增 Conversation Node', en: 'Adding a Conversation Node' },
-    sidebar: { root: 'zh-reference', en: 'en-reference' },
-    section: { root: '开发手册', en: 'Cookbook' },
-    order: 4,
-  }]),
 ]
+
+/**
+ * Sidebar collections of each locale, in the order the site's navigation
+ * presents them. The navigation bar and the llms.txt index both read this
+ * sequence, so a new collection lands in both surfaces together.
+ */
+export const localeCollections = {
+  root: ['zh-guide', 'zh-develop', 'zh-reference'],
+  en: ['en-guide', 'en-develop', 'en-reference'],
+} as const satisfies Record<DocsLocale, readonly DocsSidebar[]>
 
 /** A sidebar group, matched to pages by `label`. */
 export interface DocsSection {
@@ -427,7 +478,7 @@ export interface DocsSection {
  */
 const sections: Record<DocsLocale, readonly DocsSection[]> = {
   root: [
-    { label: '入门' }, { label: 'SDK' },
+    { label: '入门' }, { label: 'SDK' }, { label: '自动化' }, { label: '集成' },
     { label: '基础' }, { label: '框架能力' }, { label: '实战' }, { label: 'Cordis 框架教程' },
     { label: '概念' }, { label: '生成参考' }, { label: 'Cordis API' }, { label: '开发手册' },
     { label: '总览' },
@@ -439,7 +490,7 @@ const sections: Record<DocsLocale, readonly DocsSection[]> = {
     { label: '平台与接入', collapsed: true },
   ],
   en: [
-    { label: 'Guide' }, { label: 'SDK' },
+    { label: 'Guide' }, { label: 'SDK' }, { label: 'Automation' }, { label: 'Integrations' },
     { label: 'Basics' }, { label: 'Framework' }, { label: 'Practice' }, { label: 'Cordis framework tutorial' },
     { label: 'Concepts' }, { label: 'Generated reference' }, { label: 'Cordis Core API' }, { label: 'Cookbook' },
     { label: 'Overview' },

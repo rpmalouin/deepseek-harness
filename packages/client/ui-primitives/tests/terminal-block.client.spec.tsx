@@ -1,16 +1,15 @@
 // @vitest-environment jsdom
-// TerminalBlock: the prompt label's cwd shortening, the running/empty/settled
-// arms, the prompt line's run-state dot, the exit-status pill, the head/tail height cap and its expand control,
-// and the copy control writing the raw output on both the accepted and the
-// refused clipboard paths. writeClipboard's own return contract is pinned here
-// too, since it is the return contract both copy controls in this package share; the
-// resolution of ANSI runs into styles is pinned in ansi.spec.ts, so only its
-// DOM consequence (which runs get a span wrapper) is asserted here.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { DEFAULT_TERMINAL_MAX_LINES, TerminalBlock } from '../src/index.ts'
+import type { ComponentProps } from 'react'
+import { DEFAULT_TERMINAL_MAX_LINES, TerminalBlock as LocalizedTerminalBlock } from '../src/index.ts'
 import { writeClipboard } from '../src/clipboard.ts'
+import { terminalBlockLabels } from './labels.client.ts'
+
+function TerminalBlock(props: Omit<ComponentProps<typeof LocalizedTerminalBlock>, 'labels'>) {
+  return <LocalizedTerminalBlock {...props} labels={terminalBlockLabels} />
+}
 
 const ESC = '\u001b'
 
@@ -20,12 +19,10 @@ beforeEach(() => {
   vi.useRealTimers()
 })
 
-/** The rendered output rows, one string per visible line (CSS-module class prefix). */
 function outputLines(container: HTMLElement): string[] {
   return [...container.querySelectorAll('[class^="_line_"]')].map(row => row.textContent ?? '')
 }
 
-/** The prompt line's run-state dot: its StateDot state plus the hidden text label beside it. */
 function runStateOf(container: HTMLElement): { state: string | null; label: string | undefined } {
   const dot = container.querySelector('[class*="_runState_"][data-state]')
   return {
@@ -34,12 +31,10 @@ function runStateOf(container: HTMLElement): { state: string | null; label: stri
   }
 }
 
-/** The prompt rows as `<label><command>`, one per command line (the visual gap is CSS). */
 function promptRows(container: HTMLElement): string[] {
   return [...container.querySelectorAll('[class^="_promptLine_"]')].map(row => (row.textContent ?? '').trim())
 }
 
-/** `count` numbered output lines, without the terminating newline. */
 function body(count: number): string {
   return Array.from({ length: count }, (_value, index) => `line ${index + 1}`).join('\n')
 }
@@ -94,13 +89,21 @@ describe('TerminalBlock prompt label', () => {
 })
 
 describe('TerminalBlock states', () => {
-  it('running shows the command line only: no output, no placeholder, no copy', () => {
-    const view = render(<TerminalBlock command="sleep 5" running output="partial" />)
+  it('running with nothing printed yet shows the command line only: no placeholder, no copy, no body', () => {
+    const view = render(<TerminalBlock command="sleep 5" running />)
     expect(view.getByText('sleep 5')).toBeTruthy()
-    expect(view.queryByText('partial')).toBeNull()
     expect(view.queryByText('无输出')).toBeNull()
     expect(view.queryByRole('button')).toBeNull()
     expect(view.container.firstElementChild?.getAttribute('data-running')).toBe('')
+    expect(view.container.firstElementChild?.hasAttribute('data-body')).toBe(false)
+  })
+
+  it('running shows the output printed so far under the banner, still without a copy control', () => {
+    const view = render(<TerminalBlock command="pnpm add x" running output={'Progress: resolved 1\n'} />)
+    expect(outputLines(view.container)).toEqual(['Progress: resolved 1'])
+    expect(view.queryByRole('button')).toBeNull()
+    expect(view.container.firstElementChild?.getAttribute('data-running')).toBe('')
+    expect(view.container.firstElementChild?.getAttribute('data-body')).toBe('')
   })
 
   it('running still shows a settled-looking status pill when one is supplied', () => {
@@ -189,6 +192,12 @@ describe('TerminalBlock status pill', () => {
   it('renders the exit-code pill for a non-zero exit', () => {
     render(<TerminalBlock command="false" output="a" exitCode={1} />)
     expect(screen.getByText('退出码 1')).toBeTruthy()
+  })
+
+  it('renders the no-exit-code pill and the error dot for a command that settled without one', () => {
+    const view = render(<TerminalBlock command="pnpm add x" output="spawn pnpm ENOENT" exitCode={null} />)
+    expect(view.getByText('未正常退出')).toBeTruthy()
+    expect(runStateOf(view.container)).toEqual({ state: 'error', label: '失败' })
   })
 
   it('renders the signal pill, which outranks the exit code', () => {

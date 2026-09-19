@@ -15,6 +15,7 @@ import type { Context } from '@deepseek-ai/cordis'
 // Empty type imports carry the `loader` and `webServer` Context merges for the reads below.
 import type {} from '@deepseek-ai/cordis-plugin-loader'
 import type {} from '@deepseek-ai/dsh-host-webserver'
+import { launchedThroughSsh, launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
 import { canExecute, hasLinuxChooserBinary } from './probe.ts'
 import type { DirectoryPickerBackendKind } from './resolve.ts'
 import { resolveDirectoryPickerBackend } from './resolve.ts'
@@ -43,9 +44,8 @@ export const BACKEND_PACKAGES: Record<DirectoryPickerBackendKind, string> = {
  * Client surface package per resolved kind, mounted with its backend so one
  * resolved interaction still composes both faces. Declared as dependencies by
  * every composing app for the same reason as {@link BACKEND_PACKAGES}. Only the
- * specifier is referenced here — the packages belong to the Client program, so
- * no import of them exists on this side and knip needs them ignored for this
- * workspace.
+ * specifier is referenced here because the packages belong to the Client
+ * program, so no import of them exists on this side.
  */
 export const SURFACE_PACKAGES: Record<DirectoryPickerBackendKind, string> = {
   native: '@deepseek-ai/dsh-client-ui-directory-picker-native',
@@ -63,6 +63,7 @@ export async function apply(ctx: Context): Promise<void> {
   const backend = resolveDirectoryPickerBackend({
     bindHost: ctx.webServer.host,
     platform: process.platform,
+    ssh: launchedThroughSsh(launchEnvironmentOf(ctx)),
     env: process.env,
     linuxChooser: hasLinuxChooserBinary(process.env.PATH, canExecute),
   })
@@ -76,15 +77,20 @@ export async function apply(ctx: Context): Promise<void> {
       for (const id of [...ids].reverse()) {
         // Tree teardown (group.stop) can have removed the entry already;
         // nothing is left to unmount or await then.
-        if (ctx.loader.store[id] === undefined) continue
-        // remove() disposes the entry transactionally, so the chooser's unload
-        // signals completion only after that face quiesced.
-        await ctx.loader.remove(id)
+        const entry = ctx.loader.store[id]
+        if (entry === undefined) continue
+        const disposal = entry.fiber?.dispose()
+        ctx.loader.remove(id)
+        await disposal
       }
     }
     try {
       for (const name of [BACKEND_PACKAGES[backend], SURFACE_PACKAGES[backend]]) {
-        ids.push(await ctx.loader.create({ name }))
+        const id = await ctx.loader.create({ name })
+        ids.push(id)
+        const entry = ctx.loader.resolve(id)
+        if (entry.fiber === undefined) throw new Error(`directory-picker-auto: failed to load ${name}`)
+        await entry.fiber.await()
       }
     } catch (cause) {
       // Setup owns the entries it created until it returns the disposer: leaving

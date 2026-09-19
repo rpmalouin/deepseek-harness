@@ -21,25 +21,25 @@
       "path": "../../api/remotes/tsconfig.client.json"
     },
     {
-      "path": "../../client/runtime"
+      "path": "../../core/session"
     },
     {
       "path": "../../client/ui-sidebar"
     },
     {
-      "path": "../../client/ui-input-trigger"
+      "path": "../../client/ui-primitives"
     },
     {
-      "path": "../../client/ui-primitives"
+      "path": "../../client/ui-renderer"
+    },
+    {
+      "path": "../../client/ui-session"
     },
     {
       "path": "../../client/ui-slots"
     },
     {
       "path": "../../client/ui-tool"
-    },
-    {
-      "path": "../../runtime-diagnostics/invariants"
     }
   ]
 }

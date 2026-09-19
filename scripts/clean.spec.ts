@@ -38,6 +38,7 @@ describe('RepositoryCleaner', () => {
     write(join(root, 'products/shell/lib/types/index.js'))
     write(join(root, 'products/shell/lib/index.js'))
     write(join(root, '.typecheck/legacy.tsbuildinfo'))
+    write(join(root, '.dsh-build/client-build-environment.json'))
     write(join(root, 'root.tsbuildinfo'))
     write(join(root, 'packages/removed/ghost/node_modules/.bin/tool'))
 
@@ -46,6 +47,7 @@ describe('RepositoryCleaner', () => {
     expect(existsSync(join(root, 'products/shell/lib'))).toBe(false)
     expect(existsSync(join(root, 'products/shell/src/index.ts'))).toBe(true)
     expect(existsSync(join(root, '.typecheck'))).toBe(false)
+    expect(existsSync(join(root, '.dsh-build'))).toBe(false)
     expect(existsSync(join(root, 'root.tsbuildinfo'))).toBe(false)
     expect(existsSync(join(root, 'packages/removed/ghost'))).toBe(false)
   })
@@ -62,16 +64,16 @@ describe('RepositoryCleaner', () => {
 
   it('removes the native Landlock entry output and solution build info', async () => {
     const root = fixture()
-    const entry = 'native/landlock-run/packages/entry'
+    const entry = 'native/system/packages/entry'
     addProject(root, entry, 'lib')
     write(join(root, entry, 'lib/index.js'))
-    write(join(root, 'native/landlock-run/tsconfig.tsbuildinfo'))
+    write(join(root, 'native/system/tsconfig.tsbuildinfo'))
 
     await new RepositoryCleaner(root).clean()
 
     expect(existsSync(join(root, entry, 'lib'))).toBe(false)
     expect(existsSync(join(root, entry, 'src/index.ts'))).toBe(true)
-    expect(existsSync(join(root, 'native/landlock-run/tsconfig.tsbuildinfo'))).toBe(false)
+    expect(existsSync(join(root, 'native/system/tsconfig.tsbuildinfo'))).toBe(false)
   })
 
   it('refuses project outputs reached through a symlink outside the repository', async () => {

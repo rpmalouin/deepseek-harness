@@ -1,110 +1,103 @@
 // @vitest-environment jsdom
-/**
- * Exercises selection persistence through the real SlotRegistry store axis;
- * component stubs cannot prove per-session identity or disposal.
- */
-import { beforeEach, describe, expect, it } from 'vitest'
-import type { SessionId } from '@deepseek-ai/dsh-client-runtime/client'
+/** Exercises Conversation persistence through the real SlotRegistry store axis. */
+import { beforeEach, describe, expect, it, onTestFinished } from 'vitest'
 import { SlotTestRuntime } from '@deepseek-ai/dsh-client-test-runtime'
-import { createChatStore } from '../src/client/stores.ts'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import type { PropsRenderSlots } from '@deepseek-ai/dsh-client-ui-slots'
+import { createConversationStore } from '../src/client/stores.ts'
 
-const sid = (s: string): SessionId => s as SessionId
+const sid = (value: string): SessionId => value as SessionId
 
-type ChatInstance = ReturnType<ReturnType<typeof createChatStore>['create']>
+type ConversationInstance = ReturnType<ReturnType<typeof createConversationStore>['create']>
 
-async function bench() {
+async function createBench() {
   const runtime = await SlotTestRuntime.create()
-  const chat = createChatStore()
-  // The apply.ts shape: one shared handle across the strict Session header,
-  // body, and details registrations; the session-maybe 'conversation' shell
-  // carries no store by design. The slots must first exist in the ledger.
+  onTestFinished(() => runtime.dispose())
+  const conversation = createConversationStore()
   await runtime.root.declare({
-    'conversation': { kind: 'single', scope: 'session-maybe' },
     'conversation.session': { kind: 'single', scope: 'session' },
     'conversation.session.header': { kind: 'single', scope: 'session' },
-    'details': { kind: 'single', scope: 'session' },
-  }, (_p: { renderSlot?: unknown }) => null)
-  runtime.slots.register({ name: 'conversation.session', store: chat }, () => null)
-  runtime.slots.register({ name: 'conversation.session.header', store: chat }, () => null)
-  runtime.slots.register({ name: 'details', store: chat }, () => null)
-  runtime.renderRoot() // materializes the host face storeOf resolves through
-  return { runtime, chat }
+  }, (_props: PropsRenderSlots<'conversation.session' | 'conversation.session.header'>) => null)
+  runtime.slots.register({ name: 'conversation.session', store: conversation }, () => null)
+  runtime.slots.register({ name: 'conversation.session.header', store: conversation }, () => null)
+  runtime.renderRoot()
+  return { runtime }
 }
 
-/** Resolve the store instance the renderer would hand a slot's component for a session. */
-function storeFor(b: Awaited<ReturnType<typeof bench>>, slot: 'conversation.session' | 'details', sessionId: SessionId) {
-  return b.runtime.storeOf(slot, sessionId) as ChatInstance
+function storeFor(
+  current: Awaited<ReturnType<typeof createBench>>,
+  slot: 'conversation.session' | 'conversation.session.header',
+  reference: ReturnType<typeof current.runtime.sessions.retain>,
+): ConversationInstance {
+  return current.runtime.storeOf(slot, reference) as ConversationInstance
 }
 
 beforeEach(() => {
   localStorage.clear()
 })
 
-describe('selection survives on the store seat', () => {
-  it('one session, two slots: conversation writes, details reads the SAME instance', async () => {
-    const b = await bench()
-
-    const conv = storeFor(b, 'conversation.session', sid('s1'))
-    const details = storeFor(b, 'details', sid('s1'))
-    conv.actions.select({ turnSeq: 3, callId: 'c1' })
-    expect(details.store.getSnapshot().selection).toEqual({ turnSeq: 3, callId: 'c1' })
-    // Identity, not just value: the shared handle resolves one instance per scope key.
-    expect(details).toBe(conv)
-    await b.runtime.dispose()
-  })
-
-  it('sessions are isolated: s2 selection never bleeds into s1', async () => {
-    const b = await bench()
-
-    const one = storeFor(b, 'conversation.session', sid('s1'))
-    const two = storeFor(b, 'conversation.session', sid('s2'))
-    expect(two).not.toBe(one)
-    one.actions.select({ turnSeq: 1, callId: 'a' })
-    two.actions.select({ turnSeq: 9, callId: 'z' })
-    expect(one.store.getSnapshot().selection).toEqual({ turnSeq: 1, callId: 'a' })
-    expect(two.store.getSnapshot().selection).toEqual({ turnSeq: 9, callId: 'z' })
-    await b.runtime.dispose()
-  })
-
-  it('a list-projection update keeps instance identity and the selection value', async () => {
-    const b = await bench()
-    const id = sid('s1')
-
-    const store = storeFor(b, 'conversation.session', id)
-    store.actions.select({ turnSeq: 3, callId: 'c1' })
-    store.actions.setDraft('half-typed')
-
-    // A projection churn elsewhere (list rows re-projected) must not touch
-    // store identity: drive the runtime's own list observable.
-    await b.runtime.sessions.add({ id, summary: { displayTitle: 'proj-a' } })
-    expect(b.runtime.sessions.list.getSnapshot().byId[id]?.displayTitle).toBe('proj-a')
-
-    const after = storeFor(b, 'conversation.session', id)
-    expect(after).toBe(store)
-    expect(after.store.getSnapshot().selection).toEqual({ turnSeq: 3, callId: 'c1' })
-    expect(after.store.getSnapshot().draft).toBe('half-typed')
-    await b.runtime.dispose()
-  })
-
-  it('session death buries the instance and its persisted draft', async () => {
-    const b = await bench()
+describe('Conversation state survives on its store seat', () => {
+  it('shares one instance between the Session body and header', async () => {
+    const b = await createBench()
     await b.runtime.sessions.add({ id: 's1' })
+    using reference = b.runtime.sessions.retain(sid('s1'))
+    await reference.ready
+    expect(reference.sessionId).toBe(sid('s1'))
+    const body = storeFor(b, 'conversation.session', reference)
+    const header = storeFor(b, 'conversation.session.header', reference)
 
-    const doomed = storeFor(b, 'conversation.session', sid('s1'))
+    body.actions.setDraft('half-typed')
+    header.actions.setView('trajectory')
+
+    expect(header).toBe(body)
+    expect(body.store.getSnapshot()).toMatchObject({ draft: 'half-typed', view: 'trajectory' })
+    await b.runtime.dispose()
+  })
+
+  it('isolates Session instances and preserves identity across list projection updates', async () => {
+    const b = await createBench()
+    const oneId = sid('s1')
+    await b.runtime.sessions.add({ id: 's1' })
+    using retained = b.runtime.sessions.retain(oneId)
+    await retained.ready
+    await b.runtime.sessions.add({ id: 's2' })
+    using second = b.runtime.sessions.retain(sid('s2'))
+    await second.ready
+    const one = storeFor(b, 'conversation.session', retained)
+    const two = storeFor(b, 'conversation.session', second)
+    one.actions.setDraft('only one')
+    two.actions.setDraft('only two')
+
+    await b.runtime.sessions.updateSummary(oneId, { displayTitle: 'projected' })
+
+    expect(storeFor(b, 'conversation.session', retained)).toBe(one)
+    expect(one.store.getSnapshot().draft).toBe('only one')
+    expect(two.store.getSnapshot().draft).toBe('only two')
+    await b.runtime.dispose()
+  })
+
+  it('recreates the instance and restores persisted state after the Session scope ends', async () => {
+    const b = await createBench()
+    await b.runtime.sessions.add({ id: 's1' })
+    using reference = b.runtime.sessions.retain(sid('s1'))
+    await reference.ready
+    const doomed = storeFor(b, 'conversation.session', reference)
     doomed.actions.setDraft('to be buried')
-    doomed.actions.select({ turnSeq: 1 })
-    expect(localStorage.getItem('dsh.conversation.chat.s1')).not.toBeNull()
+    doomed.actions.setView('chat')
+    expect(localStorage.getItem('dsh.conversation.s1')).not.toBeNull()
 
-    // TestSessions.remove drives the same public slot lifecycle contract the
-    // production SessionRuntime calls when the scope dies (pruneStoreScope).
+    reference.release()
+    await b.runtime.flush()
     await b.runtime.sessions.remove('s1')
 
-    // Persisted residue is gone with the session...
-    expect(localStorage.getItem('dsh.conversation.chat.s1')).toBeNull()
-    // ...and a re-created same-id session starts from a FRESH instance.
-    const reborn = storeFor(b, 'conversation.session', sid('s1'))
+    expect(localStorage.getItem('dsh.conversation.s1')).not.toBeNull()
+    await b.runtime.sessions.add({ id: 's1' })
+    using replacement = b.runtime.sessions.retain(sid('s1'))
+    await replacement.ready
+    expect(replacement.binding).toBe(b.runtime.sessions.binding(sid('s1')))
+    const reborn = storeFor(b, 'conversation.session', replacement)
     expect(reborn).not.toBe(doomed)
-    expect(reborn.store.getSnapshot()).toEqual({ selection: null, draft: '', view: null, inspect: null })
+    expect(reborn.store.getSnapshot()).toEqual({ draft: 'to be buried', view: 'chat', viewRequest: null })
     await b.runtime.dispose()
   })
 })

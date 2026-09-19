@@ -1,10 +1,17 @@
 import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { describe, expect, it, vi } from 'vitest'
-import type { RpcResponse, SettingsNamespaceView } from '@deepseek-ai/dsh-api-remotes/client'
-import { TestRemote } from '@deepseek-ai/dsh-client-test-runtime'
-import type { SettingsScope } from '@deepseek-ai/dsh-client-runtime/client'
+import type {
+  SettingsNamespaceView, SettingsPathOpView,
+} from '@deepseek-ai/dsh-api-remotes/client'
+import { RemoteError, TestRemote } from '@deepseek-ai/dsh-client-test-runtime'
+import type { JsonValue } from '@deepseek-ai/dsh-util-values'
+import type { SettingsScope } from '@deepseek-ai/dsh-client-ui-settings/client'
+import { SettingsSchemaService } from '../src/client/schema.ts'
 import { SettingsScopeController, SettingsScopeBinder } from '../src/client/settings-scope.ts'
+import { SettingsDescribeMirror } from '../src/client/settings-mirror.ts'
+
+const settingsSchema = new SettingsSchemaService(new Context())
 
 interface UiTestSettings {
   preference: 'light' | 'dark' | 'system'
@@ -14,26 +21,30 @@ const ENVELOPE = z.object({
   preference: z.union(['light', 'dark', 'system']).default('system'),
 }).toJSON()
 
-let rpc = 0
+/** What a Remote call answers with: no carrier envelope, and a typed failure. */
+type Answer<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: RemoteError }
 
-function ok<T>(value: T): RpcResponse<T> {
-  return { rpcId: `scope-${rpc++}` as never, result: { ok: true, value } }
+function ok<T>(value: T): Answer<T> {
+  return { ok: true, value }
 }
 
-function rejected<T>(): RpcResponse<T> {
-  return {
-    rpcId: `scope-${rpc++}` as never,
-    result: {
-      ok: false,
-      error: { code: 'settings-rejected', message: 'conflict', details: { ns: 'ui-test' } },
-    },
-  }
+function rejected<T>(): Answer<T> {
+  return { ok: false, error: new RemoteError('settings/rejected', 'conflict', { ns: 'ui-test' }) }
 }
 
-function view(value: unknown, revision = 0): SettingsNamespaceView {
+/** The providing plugin's context, scripted down to the settings namespace. */
+function ctxWith(settings: object) {
+  return { remote: { settings } } as never
+}
+
+function view(value: JsonValue, revision = 0): SettingsNamespaceView {
   return {
     ns: 'ui-test',
-    schema: ENVELOPE,
+    // `toJSON()` already produced the wire envelope; its declared type is the
+    // schema builder's, so one cast names what the Host actually sends.
+    schema: ENVELOPE as unknown as JsonValue,
     value,
     applies: 'live',
     secrets: [],
@@ -41,7 +52,7 @@ function view(value: unknown, revision = 0): SettingsNamespaceView {
   }
 }
 
-function described(value: unknown, revision = 0) {
+function described(value: JsonValue, revision = 0) {
   return ok({ writable: true, hasDocument: true, namespaces: [view(value, revision)] })
 }
 
@@ -50,6 +61,17 @@ function deferred<T>() {
   let reject!: (reason: unknown) => void
   const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej })
   return { promise, resolve, reject }
+}
+
+/** A host-mode mirror plus a controller derived from it, over one scripted context. */
+function derivedScope(
+  api: { describe?: ReturnType<typeof vi.fn>; mutate?: ReturnType<typeof vi.fn> },
+  spec: { namespace: string; decode?: (section: unknown) => UiTestSettings | undefined } = { namespace: 'ui-test' },
+) {
+  const ctx = ctxWith(api)
+  const mirror = new SettingsDescribeMirror(ctx)
+  const scope = new SettingsScopeController<UiTestSettings>(ctx, spec, mirror, 'host', settingsSchema)
+  return { mirror, scope }
 }
 
 /** Record each distinct published section, starting from the current one. */
@@ -63,16 +85,13 @@ function trackValues(scope: SettingsScope<UiTestSettings>): Array<UiTestSettings
 }
 
 describe('SettingsScopeController', () => {
-  it('starts loading and publishes a schema-valid section with revision and writability', async () => {
+  it('starts loading and derives a schema-valid section with revision and writability', async () => {
     const describeCall = vi.fn().mockResolvedValueOnce(described({ preference: 'dark' }, 3))
-    const scope = new SettingsScopeController<UiTestSettings>(
-      { settings: { describe: describeCall } } as never,
-      { namespace: 'ui-test' },
-    )
+    const { mirror, scope } = derivedScope({ describe: describeCall })
     expect(scope.getSnapshot()).toEqual({
       status: 'loading', value: undefined, revision: undefined, writable: false, mode: 'host',
     })
-    await scope.load()
+    await mirror.load()
     expect(scope.getSnapshot()).toEqual({
       status: 'ready', value: { preference: 'dark' }, revision: 3, writable: true, mode: 'host',
     })
@@ -87,12 +106,9 @@ describe('SettingsScopeController', () => {
       .mockResolvedValueOnce(described(['queue'], 7))
       .mockResolvedValueOnce(rejected())
       .mockRejectedValueOnce(new Error('offline'))
-    const scope = new SettingsScopeController<UiTestSettings>(
-      { settings: { describe: describeCall } } as never,
-      { namespace: 'ui-test' },
-    )
+    const { mirror, scope } = derivedScope({ describe: describeCall })
     const good = trackValues(scope)
-    for (let i = 0; i < 7; i++) await scope.load()
+    for (let i = 0; i < 7; i++) await mirror.load()
     expect(scope.getSnapshot()).toMatchObject({
       status: 'ready', value: { preference: 'dark' }, revision: 7,
     })
@@ -103,29 +119,9 @@ describe('SettingsScopeController', () => {
     const broken = { ...view({ preference: 'dark' }, 2), schema: null }
     const describeCall = vi.fn()
       .mockResolvedValueOnce(ok({ writable: true, hasDocument: true, namespaces: [broken] }))
-    const scope = new SettingsScopeController<UiTestSettings>(
-      { settings: { describe: describeCall } } as never,
-      { namespace: 'ui-test' },
-    )
-    await scope.load()
+    const { mirror, scope } = derivedScope({ describe: describeCall })
+    await mirror.load()
     expect(scope.getSnapshot()).toMatchObject({ status: 'loading', value: undefined, revision: 2 })
-  })
-
-  it('suppresses a superseded read of an unexposed namespace', async () => {
-    const describeCall = vi.fn()
-      .mockResolvedValueOnce(ok({ writable: true, hasDocument: true, namespaces: [] }))
-      .mockResolvedValueOnce(described({ preference: 'dark' }, 1))
-    const scope = new SettingsScopeController<UiTestSettings>(
-      { settings: { describe: describeCall } } as never,
-      { namespace: 'ui-test' },
-    )
-    const statuses: string[] = []
-    scope.subscribe(() => { statuses.push(scope.getSnapshot().status) })
-    const stale = scope.load()
-    const fresh = scope.load()
-    await Promise.all([stale, fresh])
-    expect(statuses).not.toContain('unavailable')
-    expect(scope.getSnapshot()).toMatchObject({ status: 'ready', value: { preference: 'dark' } })
   })
 
   it('reports an unexposed namespace as unavailable and recovers when it reappears', async () => {
@@ -133,15 +129,12 @@ describe('SettingsScopeController', () => {
       .mockResolvedValueOnce(described({ preference: 'light' }, 1))
       .mockResolvedValueOnce(ok({ writable: true, hasDocument: true, namespaces: [] }))
       .mockResolvedValueOnce(described({ preference: 'system' }, 2))
-    const scope = new SettingsScopeController<UiTestSettings>(
-      { settings: { describe: describeCall } } as never,
-      { namespace: 'ui-test' },
-    )
-    await scope.load()
+    const { mirror, scope } = derivedScope({ describe: describeCall })
+    await mirror.load()
     expect(scope.getSnapshot().status).toBe('ready')
-    await scope.load()
+    await mirror.load()
     expect(scope.getSnapshot()).toMatchObject({ status: 'unavailable', value: { preference: 'light' } })
-    await scope.load()
+    await mirror.load()
     expect(scope.getSnapshot()).toMatchObject({ status: 'ready', value: { preference: 'system' }, revision: 2 })
   })
 
@@ -149,33 +142,27 @@ describe('SettingsScopeController', () => {
     const describeCall = vi.fn()
       .mockResolvedValueOnce(described({ preference: 'light' }, 1))
       .mockResolvedValueOnce(described({ preference: 'dark' }, 2))
-    const scope = new SettingsScopeController<UiTestSettings>(
-      { settings: { describe: describeCall } } as never,
-      {
-        namespace: 'ui-test',
-        decode: section => (section as UiTestSettings).preference === 'dark'
-          ? section as UiTestSettings
-          : undefined,
-      },
-    )
-    await scope.load()
+    const { mirror, scope } = derivedScope({ describe: describeCall }, {
+      namespace: 'ui-test',
+      decode: section => (section as UiTestSettings).preference === 'dark'
+        ? section as UiTestSettings
+        : undefined,
+    })
+    await mirror.load()
     expect(scope.getSnapshot()).toMatchObject({ status: 'loading', value: undefined, revision: 1 })
-    await scope.load()
+    await mirror.load()
     expect(scope.getSnapshot()).toMatchObject({ status: 'ready', value: { preference: 'dark' }, revision: 2 })
   })
 
   it('serializes rapid set writes, carries revisions, and publishes only the latest settlement', async () => {
-    const first = deferred<RpcResponse<SettingsNamespaceView>>()
+    const first = deferred<Answer<SettingsNamespaceView>>()
     const describeCall = vi.fn().mockResolvedValue(described({ preference: 'system' }, 4))
     const mutate = vi.fn()
       .mockReturnValueOnce(first.promise)
       .mockResolvedValueOnce(ok(view({ preference: 'light' }, 6)))
-    const scope = new SettingsScopeController<UiTestSettings>(
-      { settings: { describe: describeCall, mutate } } as never,
-      { namespace: 'ui-test' },
-    )
+    const { mirror, scope } = derivedScope({ describe: describeCall, mutate })
     const published = trackValues(scope)
-    await scope.load()
+    await mirror.load()
     const dark = scope.set('preference', 'dark')
     const light = scope.set('preference', 'light')
     await vi.waitFor(() => { expect(mutate).toHaveBeenCalledOnce() })
@@ -183,82 +170,212 @@ describe('SettingsScopeController', () => {
     await Promise.all([dark, light])
     expect(published.map(section => section?.preference)).toEqual([undefined, 'system', 'light'])
     expect(scope.getSnapshot()).toMatchObject({ value: { preference: 'light' }, revision: 6 })
-    expect(mutate).toHaveBeenNthCalledWith(1, {
-      ns: 'ui-test',
-      ops: [{ op: 'set', path: ['preference'], value: 'dark' }],
-      expectedRevision: 4,
-    })
-    expect(mutate).toHaveBeenNthCalledWith(2, {
-      ns: 'ui-test',
-      ops: [{ op: 'set', path: ['preference'], value: 'light' }],
-      expectedRevision: 5,
-    })
+    expect(mutate).toHaveBeenNthCalledWith(1,
+      'ui-test',
+      [{ op: 'set', path: ['preference'], value: 'dark' }],
+      4,
+    )
+    expect(mutate).toHaveBeenNthCalledWith(2,
+      'ui-test',
+      [{ op: 'set', path: ['preference'], value: 'light' }],
+      5,
+    )
   })
 
-  it('recovers the latest rejected or thrown write from Host state', async () => {
+  it('sends one copied multi-field mutation behind one revision fence', async () => {
+    const describeCall = vi.fn().mockResolvedValueOnce(described({ preference: 'system' }, 7))
+    const mutate = vi.fn().mockResolvedValueOnce(ok(view({ preference: 'dark' }, 8)))
+    const { mirror, scope } = derivedScope({ describe: describeCall, mutate })
+    await mirror.load()
+    const ops: SettingsPathOpView[] = [
+      { op: 'set', path: ['enabled'], value: true },
+      { op: 'set', path: ['allowedModels'], value: [{ provider: 'alpha', model: 'fast' }] },
+    ]
+
+    const write = scope.mutate(ops)
+    ops[0] = { op: 'unset', path: ['enabled'] }
+    ;(ops[1] as unknown as { value: Array<{ model: string }> }).value[0]!.model = 'changed'
+    await write
+
+    expect(mutate).toHaveBeenCalledWith(
+      'ui-test',
+      [
+        { op: 'set', path: ['enabled'], value: true },
+        { op: 'set', path: ['allowedModels'], value: [{ provider: 'alpha', model: 'fast' }] },
+      ],
+      7,
+    )
+  })
+
+  it('preserves an editor-owned revision fence behind earlier queued writes', async () => {
+    const first = deferred<Answer<SettingsNamespaceView>>()
+    const describeCall = vi.fn()
+      .mockResolvedValueOnce(described({ preference: 'system' }, 7))
+      .mockResolvedValueOnce(described({ preference: 'dark' }, 8))
+    const mutate = vi.fn()
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValueOnce(rejected())
+    const { mirror, scope } = derivedScope({ describe: describeCall, mutate })
+    await mirror.load()
+
+    const earlier = scope.set('preference', 'dark')
+    const fenced = scope.mutate([{ op: 'set', path: ['preference'], value: 'light' }], 7)
+    first.resolve(ok(view({ preference: 'dark' }, 8)))
+    await Promise.all([earlier, fenced])
+
+    expect(mutate).toHaveBeenNthCalledWith(
+      2,
+      'ui-test',
+      [{ op: 'set', path: ['preference'], value: 'light' }],
+      7,
+    )
+    expect(scope.getSnapshot()).toMatchObject({ value: { preference: 'dark' }, revision: 8 })
+  })
+
+  it('folds the latest write answer into the mirror so a sibling scope sees it', async () => {
+    const describeCall = vi.fn().mockResolvedValueOnce(described({ preference: 'system' }, 4))
+    const mutate = vi.fn().mockResolvedValueOnce(ok(view({ preference: 'dark' }, 5)))
+    const ctx = ctxWith({ describe: describeCall, mutate })
+    const mirror = new SettingsDescribeMirror(ctx)
+    const writer = new SettingsScopeController<UiTestSettings>(ctx, { namespace: 'ui-test' }, mirror, 'host', settingsSchema)
+    const sibling = new SettingsScopeController<UiTestSettings>(ctx, { namespace: 'ui-test' }, mirror, 'host', settingsSchema)
+    await mirror.load()
+    await writer.set('preference', 'dark')
+    expect(describeCall).toHaveBeenCalledTimes(1)
+    expect(sibling.getSnapshot()).toMatchObject({ value: { preference: 'dark' }, revision: 5 })
+  })
+
+  it('re-reads after a revisionless first write lands during the initial read', async () => {
+    const initial = deferred<ReturnType<typeof described>>()
+    const describeCall = vi.fn()
+      .mockReturnValueOnce(initial.promise)
+      .mockResolvedValueOnce(described({ preference: 'dark' }, 2))
+    const mutate = vi.fn().mockResolvedValueOnce(ok(view({ preference: 'dark' }, 2)))
+    const { mirror, scope } = derivedScope({ describe: describeCall, mutate })
+    const loading = mirror.load()
+    await Promise.resolve()
+
+    await scope.set('preference', 'dark')
+    initial.resolve(described({ preference: 'system' }, 1))
+    await loading
+
+    expect(mutate).toHaveBeenCalledWith(
+      'ui-test',
+      [{ op: 'set', path: ['preference'], value: 'dark' }],
+      undefined,
+    )
+    expect(describeCall).toHaveBeenCalledTimes(2)
+    expect(scope.getSnapshot()).toMatchObject({ value: { preference: 'dark' }, revision: 2 })
+  })
+
+  it('recovers the latest refused write from Host state', async () => {
     const describeCall = vi.fn()
       .mockResolvedValueOnce(described({ preference: 'system' }, 2))
       .mockResolvedValueOnce(described({ preference: 'light' }, 3))
     const mutate = vi.fn()
       .mockResolvedValueOnce(rejected())
-      .mockRejectedValueOnce(new Error('offline'))
-    const scope = new SettingsScopeController<UiTestSettings>(
-      { settings: { describe: describeCall, mutate } } as never,
-      { namespace: 'ui-test' },
-    )
+      .mockResolvedValueOnce(rejected())
+    const { mirror, scope } = derivedScope({ describe: describeCall, mutate })
     const published = trackValues(scope)
+    await mirror.load()
     await scope.set('preference', 'dark')
     await scope.set('preference', 'system')
     expect(published.map(section => section?.preference)).toEqual([undefined, 'system', 'light'])
   })
 
-  it('does not recover superseded rejected or thrown writes', async () => {
-    const describeCall = vi.fn()
+  it('does not recover superseded refused writes', async () => {
+    const describeCall = vi.fn().mockResolvedValueOnce(described({ preference: 'system' }, 2))
     const mutate = vi.fn()
       .mockResolvedValueOnce(rejected())
-      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce(rejected())
       .mockResolvedValueOnce(ok(view({ preference: 'light' }, 3)))
-    const scope = new SettingsScopeController<UiTestSettings>(
-      { settings: { describe: describeCall, mutate } } as never,
-      { namespace: 'ui-test' },
-    )
+    const { mirror, scope } = derivedScope({ describe: describeCall, mutate })
     const published = trackValues(scope)
+    await mirror.load()
     await Promise.all([
       scope.set('preference', 'dark'),
       scope.set('preference', 'system'),
       scope.set('preference', 'light'),
     ])
-    expect(describeCall).not.toHaveBeenCalled()
-    expect(published.map(section => section?.preference)).toEqual([undefined, 'light'])
+    expect(describeCall).toHaveBeenCalledTimes(1)
+    expect(published.map(section => section?.preference)).toEqual([undefined, 'system', 'light'])
   })
 
   it('keeps the write queue usable when a subscriber throws', async () => {
+    const report = vi.spyOn(console, 'error').mockImplementation(() => {})
     const describeCall = vi.fn()
       .mockResolvedValueOnce(described({ preference: 'dark' }, 1))
       .mockResolvedValueOnce(described({ preference: 'light' }, 2))
-    const scope = new SettingsScopeController<UiTestSettings>(
-      { settings: { describe: describeCall } } as never,
-      { namespace: 'ui-test' },
-    )
+    const { mirror, scope } = derivedScope({ describe: describeCall })
     let thrown = false
     scope.subscribe(() => {
       if (thrown) return
       thrown = true
       throw new Error('subscriber failed')
     })
-    await expect(scope.load()).rejects.toThrow('subscriber failed')
-    await expect(scope.load()).resolves.toBeUndefined()
+    await expect(mirror.load()).resolves.toBeUndefined()
+    await expect(mirror.load()).resolves.toBeUndefined()
     expect(scope.getSnapshot()).toMatchObject({ value: { preference: 'light' }, revision: 2 })
+    expect(report).toHaveBeenCalledWith('[client-store] subscriber failed:', expect.objectContaining({
+      message: 'subscriber failed',
+    }))
+    report.mockRestore()
+  })
+
+  it('keeps the write queue usable when a write publication listener throws', async () => {
+    const report = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const describeCall = vi.fn().mockResolvedValueOnce(described({ preference: 'system' }, 1))
+    const mutate = vi.fn()
+      .mockResolvedValueOnce(ok(view({ preference: 'dark' }, 2)))
+      .mockResolvedValueOnce(ok(view({ preference: 'light' }, 3)))
+    const { mirror, scope } = derivedScope({ describe: describeCall, mutate })
+    await mirror.load()
+    let shouldThrow = true
+    mirror.subscribe(() => {
+      if (!shouldThrow) return
+      shouldThrow = false
+      throw new Error('write subscriber failed')
+    })
+
+    await expect(scope.set('preference', 'dark')).resolves.toBeUndefined()
+    await expect(scope.set('preference', 'light')).resolves.toBeUndefined()
+
+    expect(mutate).toHaveBeenCalledTimes(2)
+    expect(scope.getSnapshot()).toMatchObject({ value: { preference: 'light' }, revision: 3 })
+    expect(report).toHaveBeenCalledWith('[client-store] subscriber failed:', expect.objectContaining({
+      message: 'write subscriber failed',
+    }))
+    report.mockRestore()
+  })
+
+  it('keeps the write queue usable after a failed mirror fold', async () => {
+    const describeCall = vi.fn().mockResolvedValueOnce(described({ preference: 'system' }, 1))
+    const mutate = vi.fn()
+      .mockResolvedValueOnce(ok(view({ preference: 'dark' }, 2)))
+      .mockResolvedValueOnce(ok(view({ preference: 'light' }, 3)))
+    const { mirror, scope } = derivedScope({ describe: describeCall, mutate })
+    await mirror.load()
+    vi.spyOn(mirror, 'acceptView').mockImplementationOnce(() => {
+      throw new Error('mirror fold failed')
+    })
+
+    await expect(scope.set('preference', 'dark')).rejects.toThrow('mirror fold failed')
+    await expect(scope.set('preference', 'light')).resolves.toBeUndefined()
+
+    expect(mutate).toHaveBeenCalledTimes(2)
+    expect(mutate).toHaveBeenNthCalledWith(2,
+      'ui-test',
+      [{ op: 'set', path: ['preference'], value: 'light' }],
+      1,
+    )
+    expect(scope.getSnapshot()).toMatchObject({ value: { preference: 'light' }, revision: 3 })
   })
 
   it('cancels queued and post-dispose writes while draining the in-flight mutation', async () => {
-    const first = deferred<RpcResponse<SettingsNamespaceView>>()
+    const first = deferred<Answer<SettingsNamespaceView>>()
     const mutate = vi.fn().mockReturnValue(first.promise)
     const describeCall = vi.fn()
-    const scope = new SettingsScopeController<UiTestSettings>(
-      { settings: { describe: describeCall, mutate } } as never,
-      { namespace: 'ui-test' },
-    )
+    const { scope } = derivedScope({ describe: describeCall, mutate })
     const published = trackValues(scope)
     const dark = scope.set('preference', 'dark')
     await vi.waitFor(() => { expect(mutate).toHaveBeenCalledOnce() })
@@ -270,24 +387,65 @@ describe('SettingsScopeController', () => {
     first.resolve(ok(view({ preference: 'dark' }, 1)))
     await Promise.all([dark, light, stop])
     await scope.set('preference', 'system')
-    await scope.load()
     expect(mutate).toHaveBeenCalledOnce()
     expect(describeCall).not.toHaveBeenCalled()
     expect(published).toEqual([undefined])
   })
 
+  it('stops deriving from the mirror after dispose', async () => {
+    const describeCall = vi.fn()
+      .mockResolvedValueOnce(described({ preference: 'dark' }, 1))
+      .mockResolvedValueOnce(described({ preference: 'light' }, 2))
+    const { mirror, scope } = derivedScope({ describe: describeCall })
+    await mirror.load()
+    expect(scope.getSnapshot()).toMatchObject({ value: { preference: 'dark' } })
+    await scope.dispose()
+    await mirror.load()
+    expect(scope.getSnapshot()).toMatchObject({ value: { preference: 'dark' }, revision: 1 })
+  })
+
+  it('ignores a mirror notification already queued when disposal starts', async () => {
+    let notify = (): void => {}
+    let snapshot = {
+      status: 'ready' as const,
+      view: {
+        writable: true, hasDocument: true,
+        namespaces: [view({ preference: 'dark' }, 1)],
+      },
+      error: null,
+    }
+    const mirror = {
+      getSnapshot: () => snapshot,
+      subscribe: (listener: () => void) => {
+        notify = listener
+        return () => {}
+      },
+    } as never
+    const scope = new SettingsScopeController<UiTestSettings>(
+      ctxWith({}), { namespace: 'ui-test' }, mirror, 'host', settingsSchema)
+    expect(scope.getSnapshot()).toMatchObject({ value: { preference: 'dark' }, revision: 1 })
+
+    await scope.dispose()
+    snapshot = {
+      ...snapshot,
+      view: { ...snapshot.view, namespaces: [view({ preference: 'light' }, 2)] },
+    }
+    notify()
+
+    expect(scope.getSnapshot()).toMatchObject({ value: { preference: 'dark' }, revision: 1 })
+  })
+
   it('keeps a remote browser in memory mode without Host calls', async () => {
     const describeCall = vi.fn()
     const mutate = vi.fn()
+    const ctx = ctxWith({ describe: describeCall, mutate })
+    const mirror = new SettingsDescribeMirror(ctx, 'memory')
     const scope = new SettingsScopeController<UiTestSettings>(
-      { settings: { describe: describeCall, mutate } } as never,
-      { namespace: 'ui-test' },
-      'memory',
-    )
+      ctx, { namespace: 'ui-test' }, mirror, 'memory', settingsSchema)
     expect(scope.getSnapshot()).toEqual({
       status: 'unavailable', value: undefined, revision: undefined, writable: false, mode: 'memory',
     })
-    await scope.load()
+    await mirror.load()
     await scope.set('preference', 'dark')
     await scope.dispose()
     expect(describeCall).not.toHaveBeenCalled()
@@ -302,12 +460,9 @@ describe('SettingsScopeController', () => {
     }
     const describeCall = vi.fn()
       .mockResolvedValueOnce(ok({ writable: true, hasDocument: true, namespaces: [layered] }))
-    const scope = new SettingsScopeController<UiTestSettings>(
-      { settings: { describe: describeCall } } as never,
-      { namespace: 'ui-test' },
-    )
+    const { mirror, scope } = derivedScope({ describe: describeCall })
 
-    await scope.load()
+    await mirror.load()
 
     expect(scope.getSnapshot()).toMatchObject({
       value: { preference: 'dark' },
@@ -320,12 +475,9 @@ describe('SettingsScopeController', () => {
     const inherited: SettingsNamespaceView = { ...view({ preference: 'system' }, 1), base: { preference: 'system' } }
     const describeCall = vi.fn()
       .mockResolvedValueOnce(ok({ writable: true, hasDocument: true, namespaces: [inherited] }))
-    const scope = new SettingsScopeController<UiTestSettings>(
-      { settings: { describe: describeCall } } as never,
-      { namespace: 'ui-test' },
-    )
+    const { mirror, scope } = derivedScope({ describe: describeCall })
 
-    await scope.load()
+    await mirror.load()
 
     expect(scope.getSnapshot().user).toBeUndefined()
   })
@@ -333,19 +485,16 @@ describe('SettingsScopeController', () => {
   it('clears one field through an unset op fenced by the held revision', async () => {
     const mutate = vi.fn().mockResolvedValueOnce(ok(view({ preference: 'system' }, 4)))
     const describeCall = vi.fn().mockResolvedValueOnce(described({ preference: 'dark' }, 3))
-    const scope = new SettingsScopeController<UiTestSettings>(
-      { settings: { describe: describeCall, mutate } } as never,
-      { namespace: 'ui-test' },
-    )
-    await scope.load()
+    const { mirror, scope } = derivedScope({ describe: describeCall, mutate })
+    await mirror.load()
 
     await scope.unset('preference')
 
-    expect(mutate).toHaveBeenCalledWith({
-      ns: 'ui-test',
-      ops: [{ op: 'unset', path: ['preference'] }],
-      expectedRevision: 3,
-    })
+    expect(mutate).toHaveBeenCalledWith(
+      'ui-test',
+      [{ op: 'unset', path: ['preference'] }],
+      3,
+    )
     expect(scope.getSnapshot()).toMatchObject({ value: { preference: 'system' }, revision: 4 })
   })
 
@@ -354,66 +503,52 @@ describe('SettingsScopeController', () => {
     const describeCall = vi.fn()
       .mockResolvedValueOnce(described({ preference: 'dark' }, 3))
       .mockResolvedValueOnce(described({ preference: 'light' }, 5))
-    const scope = new SettingsScopeController<UiTestSettings>(
-      { settings: { describe: describeCall, mutate } } as never,
-      { namespace: 'ui-test' },
-    )
-    await scope.load()
+    const { mirror, scope } = derivedScope({ describe: describeCall, mutate })
+    await mirror.load()
 
     await scope.unset('preference')
 
     expect(scope.getSnapshot()).toMatchObject({ value: { preference: 'light' }, revision: 5 })
   })
 })
+
 describe('SettingsScopeBinder.bind', () => {
-  it('subscribes before the initial read and converges to the latest queued invalidation', async () => {
-    const initial = deferred<ReturnType<typeof described>>()
-    const describeCall = vi.fn()
-      .mockReturnValueOnce(initial.promise)
-      .mockResolvedValueOnce(described({ preference: 'light' }, 2))
-      .mockResolvedValueOnce(described({ preference: 'system' }, 3))
+  it('shares one mirror read across bound scopes and disposes each with its fiber', async () => {
+    const describeCall = vi.fn().mockResolvedValue(described({ preference: 'dark' }, 1))
+    const mirror = new SettingsDescribeMirror(ctxWith({ describe: describeCall }))
     const ctx = new Context()
-    ctx.provide('connection', {
-      api: { settings: { describe: describeCall } },
-      isLoopback: true,
-    } as never)
-    let scope!: SettingsScope<UiTestSettings>
-    new TestRemote(ctx)
-    await ctx.plugin(SettingsScopeBinder).await()
+    let theme!: SettingsScope<UiTestSettings>
+    let locale!: SettingsScope<UiTestSettings>
+    new TestRemote(ctx, { settings: { describe: describeCall } })
+    await ctx.plugin(SettingsScopeBinder, { mirror, schema: settingsSchema, persistence: 'host' }).await()
+    expect(ctx.settingsScope.describe()).toBe(mirror)
     const fiber = ctx.plugin({
-      inject: ['connection', 'remote', 'settingsScope'],
+      inject: ['remote', 'settingsScope'],
       apply: (plugin: Context) => {
-        scope = plugin.settingsScope.bind<UiTestSettings>({ namespace: 'ui-test' })
+        theme = plugin.settingsScope.bind<UiTestSettings>({ namespace: 'ui-test' })
+        locale = plugin.settingsScope.bind<UiTestSettings>({ namespace: 'ui-test' })
       },
     })
     await fiber.await()
-    await vi.waitFor(() => { expect(describeCall).toHaveBeenCalledOnce() })
-    ctx.remote.$dispatch('settings/document-updated', ['unrelated', 0])
-    ctx.remote.$dispatch('settings/document-updated', ['ui-test', 0])
-    ctx.emit('connection/reset')
-    initial.resolve(described({ preference: 'dark' }, 1))
-    await vi.waitFor(() => { expect(describeCall).toHaveBeenCalledTimes(3) })
     await vi.waitFor(() => {
-      expect(scope.getSnapshot()).toMatchObject({ value: { preference: 'system' }, revision: 3 })
+      expect(theme.getSnapshot()).toMatchObject({ status: 'ready', value: { preference: 'dark' } })
+      expect(locale.getSnapshot()).toMatchObject({ status: 'ready', value: { preference: 'dark' } })
     })
+    expect(describeCall).toHaveBeenCalledTimes(1)
     await fiber.dispose()
-    ctx.remote.$dispatch('settings/document-updated', ['ui-test', 0])
-    await Promise.resolve()
-    expect(describeCall).toHaveBeenCalledTimes(3)
+    await mirror.load()
+    expect(theme.getSnapshot()).toMatchObject({ revision: 1 })
   })
 
   it('binds a remote browser in memory mode without starting a settings read', async () => {
     const describeCall = vi.fn()
+    const mirror = new SettingsDescribeMirror(ctxWith({ describe: describeCall }), 'memory')
     const ctx = new Context()
-    ctx.provide('connection', {
-      api: { settings: { describe: describeCall } },
-      isLoopback: false,
-    } as never)
     let scope!: SettingsScope<UiTestSettings>
-    new TestRemote(ctx)
-    await ctx.plugin(SettingsScopeBinder).await()
+    new TestRemote(ctx, { settings: { describe: describeCall } })
+    await ctx.plugin(SettingsScopeBinder, { mirror, schema: settingsSchema, persistence: 'memory' }).await()
     const fiber = ctx.plugin({
-      inject: ['connection', 'remote', 'settingsScope'],
+      inject: ['remote', 'settingsScope'],
       apply: (plugin: Context) => {
         scope = plugin.settingsScope.bind<UiTestSettings>({ namespace: 'ui-test' })
       },

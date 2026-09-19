@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { z } from 'zod'
 import TypertRegistry, {
@@ -22,6 +22,7 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
 
   interface TypertContextMap {
     registryFixture: TypertContext<string>
+    registryFixtureOther: TypertContext<string>
   }
 }
 
@@ -35,7 +36,7 @@ function toolsContribution(schema: z.ZodType = z.object({ name: z.string() })): 
   return {
     package: '@deepseek-ai/dsh-tools',
     face: 'host',
-    schemas: [{ name: 'ToolInput', schema }],
+    schemas: [{ name: 'ToolInput', create: () => schema }],
     invocations: [],
     model: {
       services: [{
@@ -110,7 +111,7 @@ describe('TypertRegistry', () => {
       face: 'host',
       name: 'ToolInput',
     })
-    expect(ctx.typert.get('@deepseek-ai/dsh-tools#ToolInput')?.schema).toBe(contribution.schemas[0]?.schema)
+    expect(ctx.typert.get('@deepseek-ai/dsh-tools#ToolInput')?.schema).toBe(contribution.schemas[0]?.create())
     expect(ctx.typert.getPackage('@deepseek-ai/dsh-tools', 'host')).toMatchObject({
       key: '@deepseek-ai/dsh-tools#host',
       model: { services: [{ key: 'tools' }] },
@@ -152,14 +153,14 @@ describe('TypertRegistry', () => {
     ctx.typert.register(original)
 
     expect(() => ctx.typert.register(toolsContribution(z.never()))).toThrow('package face')
-    expect(ctx.typert.get('@deepseek-ai/dsh-tools#ToolInput')?.schema).toBe(original.schemas[0]?.schema)
+    expect(ctx.typert.get('@deepseek-ai/dsh-tools#ToolInput')?.schema).toBe(original.schemas[0]?.create())
 
     const duplicateBatch: TypertContribution = {
       ...toolsContribution(),
       package: '@fixture/duplicate',
       schemas: [
-        { name: 'Same', schema: z.string() },
-        { name: 'Same', schema: z.number() },
+        { name: 'Same', create: () => z.string() },
+        { name: 'Same', create: () => z.number() },
       ],
     }
     expect(() => ctx.typert.register(duplicateBatch)).toThrow('schema "@fixture/duplicate#Same" is already registered')
@@ -179,7 +180,7 @@ describe('TypertRegistry', () => {
     expect(() => ctx.typert.register({
       ...toolsContribution(),
       package: '@fixture/schema-name',
-      schemas: [{ name: 'bad#name', schema: z.string() }],
+      schemas: [{ name: 'bad#name', create: () => z.string() }],
     })).toThrow('invalid schema name')
 
     expect(ctx.typert.list({ package: '@fixture/absent' })).toEqual([])
@@ -190,9 +191,15 @@ describe('TypertRegistry', () => {
 
   it('resolves required schemas and projects fresh JSON Schema documents', async () => {
     const ctx = await makeCtx()
-    ctx.typert.register(toolsContribution())
+    const schema = z.object({ name: z.string() })
+    const create = vi.fn(() => schema)
+    ctx.typert.register({ ...toolsContribution(), schemas: [{ name: 'ToolInput', create }] })
+    expect(create).not.toHaveBeenCalled()
 
     expect(ctx.typert.resolve('@deepseek-ai/dsh-tools#ToolInput').name).toBe('ToolInput')
+    expect(create).toHaveBeenCalledOnce()
+    expect(ctx.typert.resolve('@deepseek-ai/dsh-tools#ToolInput').schema).toBe(schema)
+    expect(create).toHaveBeenCalledOnce()
     expect(() => ctx.typert.resolve('@deepseek-ai/dsh-tools#Missing')).toThrow('contributes no schema named "Missing"')
     expect(() => ctx.typert.resolve('@fixture/absent#Value')).toThrow('has no registered contribution')
     expect(() => ctx.typert.resolve('invalid')).toThrow('expected "<package>#<name>"')
@@ -335,6 +342,7 @@ describe('TypertRegistry', () => {
     })
     const disposeClient = ctx.typert.contexts.registerClient('registryFixture', {
       identity: candidate => candidate === scoped ? object.id : undefined,
+      resolve: id => id === object.id ? scoped : undefined,
     })
 
     expect(ctx.typert.lookups.get('fixture')?.resolve('agent-1')).toBe(object)
@@ -347,6 +355,7 @@ describe('TypertRegistry', () => {
     }])
     expect(ctx.typert.contexts.getHost('registryFixture')?.resolve('agent-1')).toBe(scoped)
     expect(ctx.typert.contexts.getClient('registryFixture')?.identity(scoped)).toBe('agent-1')
+    expect(ctx.typert.contexts.getClient('registryFixture')?.resolve('agent-1')).toBe(scoped)
 
     await Promise.all([disposeClient(), disposeHost(), disposeLookup()])
     expect(ctx.typert.lookups.keys()).toEqual([])
@@ -440,7 +449,10 @@ describe('TypertRegistry', () => {
       wireTypeSymbol: '@fixture#AgentId',
       resolve: () => undefined,
     }
-    const client = { identity: () => undefined }
+    const client = {
+      identity: (_candidate: Context) => undefined,
+      resolve: () => undefined,
+    }
     const disposeLookup = ctx.typert.lookups.register('fixture', lookup)
     const disposeHost = ctx.typert.contexts.registerHost('registryFixture', host)
     const disposeClient = ctx.typert.contexts.registerClient('registryFixture', client)
@@ -477,7 +489,7 @@ describe('TypertRegistry', () => {
     const strict = {
       mode: 'strict' as const,
       typeSymbol: '@fixture#Value',
-      schema: z.string(),
+      create: () => z.string(),
     }
     const strictInvocation: InvocationDescriptor = {
       ...invocation('@fixture/remote#strict'),
@@ -533,12 +545,12 @@ describe('TypertRegistry', () => {
       }, 'repeats wire field'],
       [{
         ...invocation(),
-        result: { mode: 'strict', typeSymbol: '', schema: z.string() },
+        result: { mode: 'strict', typeSymbol: '', create: () => z.string() },
       }, 'type symbol'],
       [{
         ...invocation(),
-        result: { mode: 'strict', typeSymbol: '@fixture#Broken', schema: {} as z.ZodType },
-      }, 'has no parse'],
+        result: { mode: 'strict', typeSymbol: '@fixture#Broken', create: {} as () => z.ZodType },
+      }, 'has no create'],
     ]
     for (const [index, [descriptor, message]] of malformed.entries()) {
       expect(() => ctx.typert.remotes.register({

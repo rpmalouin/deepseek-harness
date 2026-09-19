@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import { CallId } from '@deepseek-ai/dsh-llm'
-import { Session, SessionId } from '@deepseek-ai/dsh-session'
-import AgentRegistry, { Inbox } from '@deepseek-ai/dsh-agent'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import { SESSION_FORMAT_VERSION, Session, SessionId } from '@deepseek-ai/dsh-session'
+import AgentRegistry from '@deepseek-ai/dsh-agent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import TerminalSessionService from '@deepseek-ai/dsh-terminal'
 import type {
@@ -18,6 +18,7 @@ import type {
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import * as ToolBashPersistent from '@deepseek-ai/dsh-tool-bash-persistent'
+import { unsupportedInbox } from '@deepseek-ai/dsh-agent-loop-testkit'
 
 const contexts: Context[] = []
 let callNumber = 0
@@ -26,20 +27,21 @@ afterEach(async () => {
   for (const ctx of contexts.splice(0)) await ctx.fiber.dispose()
 })
 
-function agent(ctx: Context, cwd: string | undefined): Agent {
+async function agent(ctx: Context, cwd: string | undefined): Promise<Agent> {
   const id = SessionId(`persistent-bash-owner-${callNumber}`)
   const scope = ctx.plugin(() => {})
   const session = Session.create(id, [], {
-    version: 0,
+    version: SESSION_FORMAT_VERSION,
     id,
     createdAt: 0,
+    isSeeded: false,
     ...cwd === undefined ? {} : { cwd },
   })
   const value: Agent = {
     id,
     options: {},
     session,
-    inbox: new Inbox(session, { inserted: () => {}, discarded: () => {}, claimed: () => {} }),
+    inbox: unsupportedInbox(),
     status: 'idle',
     ctx: scope.ctx,
     send: () => {},
@@ -50,7 +52,7 @@ function agent(ctx: Context, cwd: string | undefined): Agent {
     runMaintenance: task => task(new AbortController().signal),
     whenIdle: () => Promise.resolve(),
   }
-  ctx.agents.register(value)
+  await ctx.agents.register(value)
   return value
 }
 
@@ -66,7 +68,7 @@ function call(
 ) {
   return ctx.tools.execute({
     signal,
-    callId: CallId(`persistent-bash-${++callNumber}`),
+    callId: ToolCallId(`persistent-bash-${++callNumber}`),
     name: 'bash',
     arguments: { command },
     ...owner === undefined ? {} : { agent: owner },
@@ -98,9 +100,10 @@ type StubMode =
   | 'incremental-fallback'
   | 'empty-page-after-latest'
   | 'paged-scrollback'
+  | 'exit-after-send'
 
 class StubPtySession implements TerminalBackendSession {
-  readonly motd = '__DSH_PERSISTENT_BASH_PROMPT__ '
+  readonly motd = 'stub> '
   readonly pid = 123
   statusValue: TerminalSessionStatus = { kind: 'running' }
   scrollback = this.motd
@@ -109,6 +112,7 @@ class StubPtySession implements TerminalBackendSession {
   sends = 0
   pendingText = ''
   historyTruncated = false
+  throwOnSend = false
 
   constructor(mode: StubMode) {
     this.mode = mode
@@ -127,6 +131,7 @@ class StubPtySession implements TerminalBackendSession {
       return this.operation(Promise.resolve(this.result(this.motd, 'stdin_read')))
     }
     if (this.mode === 'send-error') throw new Error('stub send failed')
+    if (this.throwOnSend) throw new Error('PTY session has exited')
     if (this.mode === 'wait-for-abort' || this.mode === 'end-on-abort') {
       const done = new Promise<ReturnType<StubPtySession['result']>>((resolve) => {
         request.signal?.addEventListener('abort', () => {
@@ -170,6 +175,18 @@ class StubPtySession implements TerminalBackendSession {
     if (this.mode === 'incremental-fallback') {
       const incremental = `${start ?? ''}\nincrement\n${this.motd}`
       return this.operation(Promise.resolve(this.result(this.motd, 'stdin_read')), incremental)
+    }
+    if (this.mode === 'exit-after-send') {
+      // A fast `exit` settles the send while the exit event is still in
+      // flight; the shell flips to exited before the tool's next poll,
+      // exactly like the real backend. The tool must re-observe status
+      // instead of sending.
+      const output = `${start ?? ''}\n`
+      this.scrollback += output
+      const settled = this.result(output, 'inferred_idle')
+      this.statusValue = { kind: 'exited', exitCode: 9, signal: null }
+      this.throwOnSend = true
+      return this.operation(Promise.resolve(settled))
     }
     if (this.mode === 'torn-status') {
       const output = `${start ?? ''}\nhello from stub\n${end ?? ''}`
@@ -292,7 +309,7 @@ async function setup(
   const stub = stubBackend(initialMode)
   ctx.terminals.registerBackend(stub.backend)
   const fiber = await ctx.plugin(ToolBashPersistent, config)
-  return { ctx, stub, fiber, owner: agent(ctx, '/workspace') }
+  return { ctx, stub, fiber, owner: await agent(ctx, '/workspace') }
 }
 
 describe('tool-bash-persistent', () => {
@@ -311,13 +328,13 @@ describe('tool-bash-persistent', () => {
     expect(ctx.tools.get('bash')?.presentCall?.({ command: 'pwd' }))
       .toEqual({ card: 'terminal', title: 'pwd' })
 
-    expect(text(await call(ctx, owner, 'echo one'))).toBe('hello from stub')
-    expect(text(await call(ctx, owner, 'echo two'))).toBe('hello from stub')
+    expect(text(await call(ctx, owner, 'echo one'))).toBe('hello from stub\n[Command finished with exit code 0]')
+    expect(text(await call(ctx, owner, 'echo two'))).toBe('hello from stub\n[Command finished with exit code 0]')
     expect(stub.sessions).toHaveLength(1)
     expect(stub.sessions[0]?.sends).toBe(3)
 
-    const ownerWithoutCwd = agent(ctx, undefined)
-    expect(text(await call(ctx, ownerWithoutCwd, 'pwd'))).toBe('hello from stub')
+    const ownerWithoutCwd = await agent(ctx, undefined)
+    expect(text(await call(ctx, ownerWithoutCwd, 'pwd'))).toBe('hello from stub\n[Command finished with exit code 0]')
     expect(stub.sessions).toHaveLength(2)
 
     await fiber.dispose()
@@ -325,7 +342,7 @@ describe('tool-bash-persistent', () => {
     expect(ctx.tools.get('bash')).toBeUndefined()
   })
 
-  it('handles inferred idle, prompt fallback, shell exit, clipping, and cleanup', async () => {
+  it('handles inferred idle, stdin_read fallback, shell exit, clipping, and cleanup', async () => {
     const { ctx, owner, stub, fiber } = await setup({
       backendType: 'stub',
       maxOutputChars: 10,
@@ -338,18 +355,16 @@ describe('tool-bash-persistent', () => {
 
     session.mode = 'incremental-fallback'
     session.scrollback = ''
-    expect(text(await call(ctx, owner, 'incremental fallback'))).toBe('increment')
+    expect(text(await call(ctx, owner, 'incremental fallback'))).toContain('increment')
 
     session.mode = 'prompt-only'
     const promptFallback = text(await call(ctx, owner, 'bad {'))
     expect(promptFallback).toContain('bash: synt')
-    expect(promptFallback).not.toContain('DSH_PERSISTENT_BASH_PROMPT')
 
     session.mode = 'prompt-crlf'
     session.scrollback = ''
     const crlfPromptFallback = text(await call(ctx, owner, 'bad {'))
     expect(crlfPromptFallback).toContain('bash: synt')
-    expect(crlfPromptFallback).not.toContain('DSH_PERSISTENT_BASH_PROMPT')
 
     session.mode = 'end-only'
     session.scrollback = ''
@@ -362,13 +377,13 @@ describe('tool-bash-persistent', () => {
     expect(text(await call(ctx, owner, 'large'))).toContain('<response clipped>')
 
     session.mode = 'nonzero'
-    expect(text(await call(ctx, owner, 'false'))).toBe('[exit code: 7]')
+    expect(text(await call(ctx, owner, 'false'))).toBe('[Command finished with exit code 7]')
 
     session.mode = 'exit'
     const exited = text(await call(ctx, owner, 'exit'))
     expect(exited).toContain('hello from')
     expect(exited).toContain('[shell exited: code 9]')
-    expect(exited).not.toContain('[exit code: 9]')
+    expect(exited).not.toContain('[Command finished with exit code 9]')
     expect(exited).toContain('next bash call starts from the workspace')
     expect(session.closed).toContain('persistent bash shell exited')
 
@@ -394,7 +409,22 @@ describe('tool-bash-persistent', () => {
     stub.sessions[0]!.mode = 'torn-status'
     stub.sessions[0]!.scrollback = ''
 
-    expect(text(await call(ctx, owner, 'torn status'))).toBe('hello from stub\n[exit code: 7]')
+    expect(text(await call(ctx, owner, 'torn status'))).toBe('hello from stub\n[Command finished with exit code 7]')
+  })
+
+  it('reports the exit path when the shell exits between send settlement and the next poll', async () => {
+    const { ctx, owner, stub } = await setup({ backendType: 'stub' })
+    await call(ctx, owner, 'warm up')
+    const session = stub.sessions[0]!
+    session.mode = 'exit-after-send'
+
+    const result = text(await call(ctx, owner, 'exit'))
+    expect(result).toContain('[shell exited: code 9]')
+    expect(result).toContain('next bash call starts from the workspace')
+    expect(session.closed).toContain('persistent bash shell exited')
+
+    expect(text(await call(ctx, owner, 'echo "$PWD"'))).toBe('hello from stub\n[Command finished with exit code 0]')
+    expect(stub.sessions).toHaveLength(2)
   })
 
   it('reports a shell exit when the backend has no code or signal', async () => {
@@ -432,10 +462,10 @@ describe('tool-bash-persistent', () => {
     session.mode = 'paged-scrollback'
     session.scrollback = 'older one\nolder two\nolder three\nolder four\n'
 
-    expect(text(await call(ctx, owner, 'paged output'))).toBe('hello from stub')
+    expect(text(await call(ctx, owner, 'paged output'))).toBe('hello from stub\n[Command finished with exit code 0]')
   })
 
-  it('sanitizes a prompt fallback reached after multiple polling rounds', async () => {
+  it('returns a stdin_read fallback reached after multiple polling rounds', async () => {
     const { ctx, owner, stub } = await setup({ backendType: 'stub', maxOutputChars: 1_000 })
     await call(ctx, owner, 'warm up')
     const session = stub.sessions[0]!
@@ -444,7 +474,8 @@ describe('tool-bash-persistent', () => {
     const result = text(await call(ctx, owner, 'bad {'))
     expect(result).toContain('partial syntax output')
     expect(result).toContain('bash: syntax error')
-    expect(result).not.toContain('DSH_PERSISTENT_BASH_PROMPT')
+    // The backend owns the prompt text, so the fallback retains it verbatim.
+    expect(result.endsWith('stub> ')).toBe(true)
     expect(result).not.toContain('DSH_PERSISTENT_BASH_START')
   })
 
@@ -453,7 +484,7 @@ describe('tool-bash-persistent', () => {
     await call(ctx, owner, 'warm up')
     stub.sessions[0]!.historyTruncated = true
     const result = text(await call(ctx, owner, 'short command'))
-    expect(result).toBe('hello from stub')
+    expect(result).toBe('hello from stub\n[Command finished with exit code 0]')
     expect(result).not.toContain('<response clipped>')
     expect(result).not.toContain('beginning of this command output was dropped')
   })
@@ -465,6 +496,7 @@ describe('tool-bash-persistent', () => {
     const result = await call(ctx, owner, 'hang')
     expect(text(result)).toContain('timed out after 0 seconds or experienced an OOM error')
     expect(text(result)).toContain('partial output')
+    expect(text(result)).toContain('[Command timed out or OOM]')
     expect(text(result)).toContain('next bash call starts from the workspace')
     expect(stub.sessions[0]?.closed).toContain('persistent bash command timed out')
   })
@@ -483,7 +515,7 @@ describe('tool-bash-persistent', () => {
       }, 5)
 
       expect((await cancelled).isError).toBe(true)
-      expect(text(await queued)).toBe('hello from stub')
+      expect(text(await queued)).toBe('hello from stub\n[Command finished with exit code 0]')
       expect(stub.sessions[0]?.closed).toContain('persistent bash command aborted')
       expect(stub.sessions).toHaveLength(2)
     },
@@ -510,7 +542,7 @@ describe('tool-bash-persistent', () => {
     stub.sessions[0]!.mode = 'send-error'
     expect((await call(ctx, owner, 'fails')).isError).toBe(true)
     expect(stub.sessions[0]?.closed).toContain('persistent bash send failed')
-    expect(text(await call(ctx, owner, 'recovers'))).toBe('hello from stub')
+    expect(text(await call(ctx, owner, 'recovers'))).toBe('hello from stub\n[Command finished with exit code 0]')
     expect(stub.sessions).toHaveLength(2)
   })
 
@@ -537,7 +569,7 @@ describe('tool-bash-persistent', () => {
       }),
     })
     const fiber = await ctx.plugin(ToolBashPersistent, { backendType: 'slow' })
-    const owner = agent(ctx, '/workspace')
+    const owner = await agent(ctx, '/workspace')
     const running = call(ctx, owner, 'pwd')
     await spawnStarted.promise
     await fiber.dispose()

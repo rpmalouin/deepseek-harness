@@ -1,7 +1,9 @@
 /** Shared trajectory record data and formatting contracts. */
 
 import type { HTMLAttributes } from 'react'
-import type { ConversationPromptSnapshot } from '@deepseek-ai/dsh-client-runtime/client'
+import type { FileAttachmentRef, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
+import type { ConversationPromptSnapshot } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import type { TrajectoryTranslate } from './locales.ts'
 
 /** Closed set of trajectory record kinds. */
 export type TrajectoryCellKind =
@@ -27,8 +29,9 @@ export interface AssistantMetricDetail {
 export interface TrajectorySourceBlock {
   type: string
   content: string
-  imageSrc?: string
-  imageAlt?: string
+  attachment?: ImageAttachmentRef
+  /** Ordinary file metadata; never passed to the image loader. */
+  file?: FileAttachmentRef
   callId?: string
   toolName?: string
 }
@@ -57,6 +60,8 @@ export interface TrajectoryCellProps extends HTMLAttributes<HTMLDivElement> {
   inputDetail?: string
   /** Complete system-prompt/tool-catalog state introduced by a SYSTEM record. */
   promptDetail?: ConversationPromptSnapshot
+  /** Known prompt text without a loaded request config or tool catalog. */
+  systemPromptDetail?: string
   /** System-prompt/tool-catalog state replaced by a SYSTEM update. */
   previousPromptDetail?: ConversationPromptSnapshot
   /** Full assistant/tool result content for the details panel. */
@@ -77,6 +82,8 @@ export interface TrajectoryCellProps extends HTMLAttributes<HTMLDivElement> {
   resultPreviewMarkdown?: string
   /** Tool call id used to link message source blocks to tool records. */
   callId?: string
+  /** Recorded tool name; independent of the display summary. */
+  toolName?: string
   /** Tool-only result failure state. */
   isError?: boolean
   /** Own duration in seconds, or `null` when no duration is known. */
@@ -112,19 +119,29 @@ export function trajectoryRecordId(cell: TrajectoryCellProps): string {
 /**
  * Format a duration in milliseconds with thousands separators.
  * @param milliseconds - Duration in milliseconds, or `null` when absent.
+ * @param t - Trajectory locale translator.
  * @returns `—` when unknown, otherwise an integer-millisecond label.
  */
-export function formatDurationMillis(milliseconds: number | null): string {
+export function formatDurationMillis(
+  milliseconds: number | null,
+  t: TrajectoryTranslate,
+): string {
   if (milliseconds === null || !Number.isFinite(milliseconds)) return '—'
   const integer = String(Math.round(milliseconds))
-  return `${integer.replace(/\B(?=(\d{3})+(?!\d))/g, ',')} ms`
+  return t('unit.milliseconds', {
+    value: integer.replace(/\B(?=(\d{3})+(?!\d))/g, ','),
+  })
 }
 
 /**
  * Format an elapsed duration given in seconds as a millisecond label.
  * @param seconds - Duration seconds, or `null` when absent.
+ * @param t - Trajectory locale translator.
  * @returns `—` when unknown, otherwise an integer-millisecond label.
  */
-export function formatElapsedSeconds(seconds: number | null): string {
-  return formatDurationMillis(seconds === null ? null : seconds * 1000)
+export function formatElapsedSeconds(
+  seconds: number | null,
+  t: TrajectoryTranslate,
+): string {
+  return formatDurationMillis(seconds === null ? null : seconds * 1000, t)
 }

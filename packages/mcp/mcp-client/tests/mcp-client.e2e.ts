@@ -3,7 +3,7 @@
  * 1. A self-written fixture server over stdio (controlled edge cases)
  * 2. @modelcontextprotocol/server-everything (official integration test server)
  * 3. @modelcontextprotocol/server-filesystem (real filesystem operations)
- * 4. An in-process StreamableHTTPServerTransport server over Streamable HTTP
+ * 4. An in-process NodeStreamableHTTPServerTransport server over Streamable HTTP
  *
  * No API key needed — all servers are local/keyless.
  */
@@ -15,13 +15,14 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
+import { createMcpHandler, McpServer, type CallToolResult } from '@modelcontextprotocol/server'
+import { toNodeHandler, type NodeIncomingMessageLike } from '@modelcontextprotocol/node'
 import { z } from 'zod'
-import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
+import LocalAttachmentStore from '@deepseek-ai/dsh-attachment-local'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
-import { CallId } from '@deepseek-ai/dsh-llm'
+import { ToolCallId, LlmAdapter, LlmRuntime } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { apply } from '@deepseek-ai/dsh-mcp-client/src/index.ts'
 import { publicToolName } from '@deepseek-ai/dsh-mcp-client/src/tools.ts'
 import type { Config } from '@deepseek-ai/dsh-mcp-client'
@@ -43,6 +44,33 @@ async function mountRegistry(): Promise<Context> {
   return ctx
 }
 
+/** Exact-route adapter used to prove real MCP image admission without an API key. */
+class ImageAdapter extends LlmAdapter {
+  override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    return Promise.resolve({ provider, id: model, name: model, inputModalities: ['text', 'image'] })
+  }
+
+  stream(_options: GenerateOptions): AsyncIterable<StreamChunk> {
+    throw new Error('MCP image e2e never streams')
+  }
+}
+
+async function mountImageRegistry(dshHome: string): Promise<Context> {
+  const ctx = await mountRegistry()
+  await ctx.plugin(LocalAttachmentStore, { dshHome })
+  await ctx.plugin(LlmRuntime)
+  ctx.llm.registerAdapter(['visual'], new ImageAdapter())
+  return ctx
+}
+
+/** Calling-agent stand-in pinned to the keyless image-capable route. */
+function imageAgent(): object {
+  return {
+    options: { provider: 'visual', model: 'vision' },
+    session: { requestHeader: () => undefined },
+  }
+}
+
 function sleep(ms: number): Promise<void> {
   const gate: PromiseWithResolvers<void> = Promise.withResolvers()
   setTimeout(gate.resolve, ms)
@@ -58,14 +86,15 @@ function textOf(block: unknown): string {
 }
 
 let callSeq = 0
-function nextCallId(): CallId {
-  return CallId(`e2e-${++callSeq}`)
+function nextCallId(): ToolCallId {
+  return ToolCallId(`e2e-${++callSeq}`)
 }
 
 // ---- Fixture server tests ----
 
 describe('fixture server — controlled scenarios', () => {
   let ctx: Context
+  let home: string
 
   const fixtureConfig: Config = {
     transport: 'stdio',
@@ -79,13 +108,15 @@ describe('fixture server — controlled scenarios', () => {
   }
 
   beforeAll(async () => {
-    ctx = await mountRegistry()
+    home = await mkdtemp(join(tmpdir(), 'mcp-image-e2e-'))
+    ctx = await mountImageRegistry(home)
     await apply(ctx, fixtureConfig)
   }, 30_000)
 
   afterAll(async () => {
     if (ctx) await ctx.fiber.dispose()
     await sleep(200)
+    await rm(home, { recursive: true, force: true })
   })
 
   it('discovers all fixture tools under the server namespace', () => {
@@ -141,16 +172,23 @@ describe('fixture server — controlled scenarios', () => {
     expect(result.content[0]).toMatchObject({ type: 'text' })
   })
 
-  it('executes image() → image placeholder', async () => {
+  it('executes image() → ordered durable image content', async () => {
     const result = await ctx.tools.execute({
-      signal: testToolSignal,
+      signal: testToolSignal, agent: imageAgent() as never,
       callId: nextCallId(), name: 'mcp__fixture__image', arguments: {},
     })
     expect(result.isError).toBe(false)
-    const text = textOf(result.content[0])
-    expect(text).toContain('Here is an image:')
-    expect(text).toContain('[image: image/png, content discarded]')
-    expect(text).toContain('End of image.')
+    expect(result.content).toHaveLength(3)
+    expect(result.content[0]).toEqual({ type: 'text', text: 'Here is an image:' })
+    expect(result.content[2]).toEqual({ type: 'text', text: 'End of image.' })
+    const image = result.content[1]
+    if (image?.type !== 'image') throw new Error(`expected an image block, got ${JSON.stringify(image)}`)
+    expect(image.attachment).toMatchObject({ mediaType: 'image/png', width: 1, height: 1 })
+    const stored = await ctx.attachments.readImage(image.attachment)
+    expect(stored.data.byteLength).toBe(image.attachment.bytes)
+    if (result.isError) throw new Error('expected MCP image success')
+    expect(JSON.stringify(result.value)).toContain('iVBORw0KGgo')
+    expect(JSON.stringify(result.content)).not.toContain('iVBORw0KGgo')
   })
 })
 
@@ -334,13 +372,14 @@ describe('server-everything — official test server', () => {
     expect(textOf(result.content[0])).toContain('10')
   })
 
-  it('executes get-tiny-image → image placeholder', async () => {
+  it('executes get-tiny-image → explicit refusal without a durable route', async () => {
     const result = await ctx.tools.execute({
       signal: testToolSignal,
       callId: nextCallId(), name: 'mcp__everything__get-tiny-image', arguments: {},
     })
     expect(result.isError).toBe(false)
-    expect(textOf(result.content[0])).toContain('[image: image/png, content discarded]')
+    expect(result.content.map(block => block.type === 'text' ? block.text : '').join('\n'))
+      .toContain('[image unavailable: image/png; no attachment store is mounted;')
   })
 })
 
@@ -423,40 +462,33 @@ describe('streamable-http — in-process MCP server', () => {
   let baseUrl: string
   /** Authorization header values observed by the HTTP server, in arrival order. */
   const seenAuth: Array<string | undefined> = []
+  const seenMessageHeaders: Array<string | string[] | undefined> = []
 
-  /**
-   * Stateless Streamable HTTP endpoint: a fresh McpServer + server transport
-   * per request (the SDK's documented stateless pattern — no session id, no
-   * SSE stream to keep). The tool set mirrors a minimal fixture server.
-   */
-  async function handleMcpRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    seenAuth.push(req.headers.authorization)
+  const handler = createMcpHandler(() => {
     const server = new McpServer(
       { name: 'http-fixture', version: '1.0.0' },
       { capabilities: { tools: {} } },
     )
     server.registerTool('ping', {
       description: 'Replies pong.',
-      inputSchema: {},
-    }, async () => ({
+      inputSchema: z.object({}),
+    }, async (): Promise<CallToolResult> => ({
       content: [{ type: 'text', text: 'pong' }],
     }))
     server.registerTool('shout', {
       description: 'Upper-cases a message.',
-      inputSchema: { message: z.string().describe('Message to upper-case') },
+      inputSchema: z.object({ message: z.string().describe('Message to upper-case').meta({ 'x-mcp-header': 'message' }) }),
     }, async args => ({
       content: [{ type: 'text', text: args.message.toUpperCase() }],
     }))
-    // Stateless mode: sessionIdGenerator ABSENT (the runtime treats absent and
-    // explicit-undefined identically; exactOptionalPropertyTypes forbids the
-    // SDK-documented explicit `sessionIdGenerator: undefined` spelling).
-    const transport = new StreamableHTTPServerTransport({})
-    res.on('close', () => { void transport.close(); void server.close() })
-    // Same exactOptionalPropertyTypes mismatch the client transport factory
-    // documents (src/transport.ts): the SDK types optional callbacks without
-    // `| undefined`. The SDK constructed the object; the cast is safe.
-    await server.connect(transport as Transport)
-    await transport.handleRequest(req, res)
+    return server
+  })
+  const handle = toNodeHandler(handler)
+  async function handleMcpRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    seenAuth.push(req.headers.authorization)
+    seenMessageHeaders.push(req.headers['mcp-param-message'])
+    // The adapter excludes explicit undefined on Node's optional HTTP fields.
+    await handle(req as NodeIncomingMessageLike, res)
   }
 
   beforeAll(async () => {
@@ -486,7 +518,7 @@ describe('streamable-http — in-process MCP server', () => {
 
   afterAll(async () => {
     if (ctx) await ctx.fiber.dispose()
-    await sleep(200)
+    await handler.close()
     const closed: PromiseWithResolvers<void> = Promise.withResolvers()
     httpServer.close(() => { closed.resolve() })
     await closed.promise
@@ -514,6 +546,7 @@ describe('streamable-http — in-process MCP server', () => {
     })
     expect(result.isError).toBe(false)
     expect(result.content[0]).toEqual({ type: 'text', text: 'QUIET' })
+    expect(seenMessageHeaders).toContain('quiet')
   })
 
   it('sends configured headers on every HTTP request', () => {

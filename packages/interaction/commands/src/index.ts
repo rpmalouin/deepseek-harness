@@ -4,25 +4,38 @@
  */
 
 import { Context } from '@deepseek-ai/cordis'
+import { randomUUID } from '@deepseek-ai/dsh-util-crypto'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import { AttachmentError, admitEncodedImages } from '@deepseek-ai/dsh-attachment'
+import type { EncodedImageAttachment, FileAttachmentRef, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment/types'
+import type { FileBlock, ImageBlock } from '@deepseek-ai/dsh-llm'
 import { NamedEntries, ScopedLayers } from '@deepseek-ai/dsh-scope'
 import type { ScopeKey, ScopeLayer } from '@deepseek-ai/dsh-scope'
+import { SessionSeq } from '@deepseek-ai/dsh-session'
 import type { Session, SessionEvent, SessionEventMap } from '@deepseek-ai/dsh-session'
 import { TypertRemoteService, Remote } from '@deepseek-ai/dsh-typert-protocol'
 import { CommandId } from './brand.ts'
+import type { CommandDefinitionId } from './brand.ts'
 import type {
   CommandDescriptor,
   CommandExecution,
   CommandInputDescriptor,
   CommandResult,
+  CommandSubmitAttachment,
 } from './types.ts'
 
-export { CommandId } from './brand.ts'
+export { CommandDefinitionId, CommandId } from './brand.ts'
 export type * from './types.ts'
 
 export const name = 'commands'
 
 const COMMAND_NAME = /^[a-z][a-z0-9_-]*$/u
+
+/** Shared frozen attachments value for attachment-free invocations. */
+const NO_ATTACHMENTS: readonly (ImageBlock | FileBlock)[] = Object.freeze([])
+
+/** Host resolver for Session-scoped staged file-upload receipts. */
+export type CommandFileReceiptResolver = (agent: Agent, receiptId: string) => FileAttachmentRef | undefined
 
 /** Invocation passed to one registered command handler. */
 export interface CommandInvocation {
@@ -32,12 +45,22 @@ export interface CommandInvocation {
   readonly agent: Agent
   /** Exact text following the registered command name, including separator whitespace. */
   readonly rawInput: string
+  /**
+   * Durably admitted image and file blocks accompanying this invocation, in submission
+   * order; empty unless the definition declares `input.attachments`. The handler
+   * owns their model-visible use — the registry never schedules them itself —
+   * and a handler whose grammar cannot use them in this invocation returns an
+   * error so the dispatching composer retains the originals.
+   */
+  readonly attachments: readonly (ImageBlock | FileBlock)[]
   /** Cancellation signal owned by the dispatching UI request. */
   readonly signal: AbortSignal
 }
 
 /** Plugin-owned command registration. */
 export interface CommandDefinition {
+  /** Stable plugin-owned identity; absent for definitions without identity-based client behavior. */
+  readonly definitionId?: CommandDefinitionId
   /** Lowercase command name without the leading slash. */
   readonly name: string
   /** Human-readable summary used in discovery UI. */
@@ -114,6 +137,11 @@ function abortError(signal: AbortSignal): Error {
   return new Error(typeof signal.reason === 'string' ? signal.reason : 'command aborted')
 }
 
+/** The signal's normalized abort error when it is already aborted. */
+function cancellationOf(signal: AbortSignal): Error | undefined {
+  return signal.aborted ? abortError(signal) : undefined
+}
+
 /** Render arbitrary thrown values without trusting their string coercion. */
 function renderThrown(value: unknown): string {
   try {
@@ -171,9 +199,16 @@ function normalizeDefinition(definition: CommandDefinition): RegisteredCommand {
     if (rawInput.hint.trim().length === 0) {
       throw new TypeError(`command "${definition.name}" input hint must not be empty`)
     }
-    input = Object.freeze({ hint: rawInput.hint })
+    if ('attachments' in rawInput && rawInput.attachments !== undefined && typeof rawInput.attachments !== 'boolean') {
+      throw new TypeError(`command "${definition.name}" input attachments flag must be a boolean`)
+    }
+    input = Object.freeze({
+      hint: rawInput.hint,
+      ...('attachments' in rawInput && rawInput.attachments === true) ? { attachments: true } : {},
+    })
   }
   const normalized = Object.freeze({
+    ...definition.definitionId === undefined ? {} : { definitionId: definition.definitionId },
     name: definition.name,
     description: definition.description,
     ...input === undefined ? {} : { input },
@@ -181,6 +216,7 @@ function normalizeDefinition(definition: CommandDefinition): RegisteredCommand {
     handler: definition.handler,
   })
   const descriptor = Object.freeze({
+    ...normalized.definitionId === undefined ? {} : { definitionId: normalized.definitionId },
     name: normalized.name,
     description: normalized.description,
     ...normalized.input === undefined ? {} : { input: normalized.input },
@@ -199,13 +235,15 @@ function normalizeResult(command: string, value: unknown): CommandResult {
       throw new TypeError(`command "${command}" success text must be a string when supplied`)
     }
     if (result.sourceEventSeq !== undefined
-      && (!Number.isSafeInteger(result.sourceEventSeq) || (result.sourceEventSeq as number) < 0)) {
+      && (!Number.isSafeInteger(result.sourceEventSeq)
+        || (result.sourceEventSeq as number) < 0
+        || Object.is(result.sourceEventSeq, -0))) {
       throw new TypeError(`command "${command}" success sourceEventSeq must be a non-negative safe integer when supplied`)
     }
     return Object.freeze({
       kind: 'success',
       ...result.text === undefined ? {} : { text: result.text },
-      ...result.sourceEventSeq === undefined ? {} : { sourceEventSeq: result.sourceEventSeq as number },
+      ...result.sourceEventSeq === undefined ? {} : { sourceEventSeq: SessionSeq(result.sourceEventSeq as number) },
     })
   }
   if (result.kind === 'error') {
@@ -231,7 +269,9 @@ export class CommandRuntime extends TypertRemoteService {
   /** Monotonic per-instance counter behind {@link mintCommandId}. */
   private commandSeq = 0
   /** Instance token keeping minted ids unique across process restarts over one resumed log. */
-  private readonly instanceToken = crypto.randomUUID().slice(0, 8)
+  private readonly instanceToken = randomUUID().slice(0, 8)
+  /** Optional provider installed by the Session upload owner. */
+  private readonly fileReceipts: { resolver: CommandFileReceiptResolver | undefined } = { resolver: undefined }
 
   constructor(ctx: Context) {
     super(ctx, 'commands')
@@ -249,6 +289,21 @@ export class CommandRuntime extends TypertRemoteService {
       layer => layer.commands.insert(registered.definition.name, registered),
       { label: 'commands.register()' },
     )
+  }
+
+  /**
+   * Register the sole authority that resolves staged file receipts for command submissions.
+   * @param resolver - Session-aware receipt resolver.
+   * @returns disposer that removes this exact resolver.
+   */
+  registerFileReceiptResolver(resolver: CommandFileReceiptResolver): () => void {
+    if (this.fileReceipts.resolver !== undefined) {
+      throw new Error('commands: a file receipt resolver is already registered')
+    }
+    this.fileReceipts.resolver = resolver
+    return () => {
+      if (this.fileReceipts.resolver === resolver) this.fileReceipts.resolver = undefined
+    }
   }
 
   /**
@@ -287,8 +342,17 @@ export class CommandRuntime extends TypertRemoteService {
    * handler-failure path is contained so the handler's own error stays the
    * reported failure.
    *
+   * Attachment admission is enforced here, not in the composer: attachments sent to a
+   * command that does not declare `input.attachments`, an absent attachment store,
+   * and an exceeded image limit each settle as an error result before
+   * the handler runs. Validation rejection starts no attachment writes;
+   * a storage failure can leave only unreachable content-addressed objects
+   * for deferred collection.
+   *
    * @param agent - exact receiving agent.
    * @param line - complete slash-command line.
+   * @param submittedAttachments - encoded images and staged file receipts accompanying the line,
+   *   in submission order; empty for a plain invocation.
    * @param signal - cancellation signal owned by the UI request.
    * @returns the settled execution (result + lifecycle pairing id), or
    *   `undefined` when syntax or name does not resolve.
@@ -297,6 +361,7 @@ export class CommandRuntime extends TypertRemoteService {
   async execute(
     agent: Agent,
     line: string,
+    submittedAttachments: readonly CommandSubmitAttachment[],
     signal: AbortSignal,
   ): Promise<CommandExecution | undefined> {
     const parsed = parseCommand(line)
@@ -311,30 +376,70 @@ export class CommandRuntime extends TypertRemoteService {
       ...command.definition.recordInput === false ? {} : { args: parsed.rawInput },
       source: { kind: 'user' },
     })
-    const invocation = Object.freeze({ commandId, agent, rawInput: parsed.rawInput, signal })
+    const settle = (result: CommandResult): CommandExecution => {
+      this.appendLifecycle(agent.session, 'command/done', {
+        commandId, kind: result.kind,
+        ...result.text === undefined ? {} : { text: result.text },
+        ...result.kind === 'success' && result.sourceEventSeq !== undefined
+          ? { sourceEventSeq: result.sourceEventSeq }
+          : {},
+      })
+      return Object.freeze({ commandId, result: Object.freeze(result) })
+    }
+    let attachments: readonly (ImageBlock | FileBlock)[] = NO_ATTACHMENTS
+    if (submittedAttachments.length > 0) {
+      if (command.definition.input?.attachments !== true) {
+        return settle({ kind: 'error', text: `/${parsed.name} does not accept attachments` })
+      }
+      const store = this.ctx.get('attachments')
+      if (store === undefined) {
+        return settle({ kind: 'error', text: `/${parsed.name}: attachments are unavailable because no attachment store is composed` })
+      }
+      try {
+        attachments = await admitCommandAttachments(
+          store,
+          submittedAttachments,
+          receiptId => this.fileReceipts.resolver?.(agent, receiptId),
+        )
+      } catch (error: unknown) {
+        if (error instanceof AttachmentError) {
+          return settle({ kind: 'error', text: error.message })
+        }
+        this.settleThrown(agent.session, parsed.name, commandId, error)
+        throw error
+      }
+      // Cancellation must be honored BEFORE the handler runs: admission may
+      // await slow storage, and a handler entered after the caller cancelled
+      // would mutate state the retrying caller then duplicates. (The committed
+      // image objects stay unreferenced and are deferred-GC territory.)
+      const cancelledDuringAdmission = cancellationOf(signal)
+      if (cancelledDuringAdmission !== undefined) {
+        this.settleThrown(agent.session, parsed.name, commandId, cancelledDuringAdmission)
+        throw cancelledDuringAdmission
+      }
+    }
+    const invocation = Object.freeze({ commandId, agent, rawInput: parsed.rawInput, attachments, signal })
     let result: CommandResult
     try {
       const output = command.definition.handler(invocation)
       result = normalizeResult(parsed.name, await withAbort(Promise.resolve(output), signal))
     } catch (error: unknown) {
-      try {
-        this.appendLifecycle(agent.session, 'command/done', {
-          commandId, kind: 'error',
-          text: error instanceof Error ? error.message : renderThrown(error),
-        })
-      } catch (appendError: unknown) {
-        this.ctx.logger.warn(`command "${parsed.name}": command/done append failed: ${renderThrown(appendError)}`)
-      }
+      this.settleThrown(agent.session, parsed.name, commandId, error)
       throw error
     }
-    this.appendLifecycle(agent.session, 'command/done', {
-      commandId, kind: result.kind,
-      ...result.text === undefined ? {} : { text: result.text },
-      ...result.kind === 'success' && result.sourceEventSeq !== undefined
-        ? { sourceEventSeq: result.sourceEventSeq }
-        : {},
-    })
-    return Object.freeze({ commandId, result })
+    return settle(result)
+  }
+
+  /** Contained `command/done` error append for a thrown handler or admission failure. */
+  private settleThrown(session: Session, command: string, commandId: CommandId, error: unknown): void {
+    try {
+      this.appendLifecycle(session, 'command/done', {
+        commandId, kind: 'error',
+        text: error instanceof Error ? error.message : renderThrown(error),
+      })
+    } catch (appendError: unknown) {
+      this.ctx.logger.warn(`command "${command}": command/done append failed: ${renderThrown(appendError)}`)
+    }
   }
 
   /** Mint the next pairing id (monotonic; instance-token-prefixed so a resumed log never repeats one). */
@@ -382,6 +487,47 @@ export class CommandRuntime extends TypertRemoteService {
       }
     }
   }
+}
+
+/** Admit a mixed command batch and restore its original image/file order. */
+async function admitCommandAttachments(
+  store: Parameters<typeof admitEncodedImages>[0],
+  attachments: readonly CommandSubmitAttachment[],
+  resolveFileReceipt: (receiptId: string) => FileAttachmentRef | undefined,
+): Promise<readonly (ImageBlock | FileBlock)[]> {
+  const files = new Map<string, FileAttachmentRef>()
+  for (const attachment of attachments) {
+    if (attachment.type !== 'file' || files.has(attachment.receiptId)) continue
+    const file = resolveFileReceipt(attachment.receiptId)
+    if (file === undefined) {
+      throw new AttachmentError('File upload receipt is unknown for this session.', 'ATTACHMENT_NOT_FOUND')
+    }
+    files.set(attachment.receiptId, file)
+  }
+  const images: EncodedImageAttachment[] = []
+  for (const attachment of attachments) {
+    if (attachment.type !== 'image') continue
+    images.push({
+      mediaType: attachment.mediaType,
+      data: attachment.data,
+      ...(attachment.name === undefined ? {} : { name: attachment.name }),
+    })
+  }
+  const imageRefs = images.length === 0 ? [] : await admitEncodedImages(store, images)
+  let imageIndex = 0
+  const blocks: Array<ImageBlock | FileBlock> = []
+  for (const attachment of attachments) {
+    if (attachment.type === 'image') {
+      const ref = imageRefs[imageIndex] as ImageAttachmentRef
+      imageIndex += 1
+      blocks.push(Object.freeze({ type: 'image', attachment: ref }))
+      continue
+    }
+    blocks.push(Object.freeze({
+      type: 'file', attachment: files.get(attachment.receiptId) as FileAttachmentRef,
+    }))
+  }
+  return Object.freeze(blocks)
 }
 
 export default CommandRuntime

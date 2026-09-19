@@ -1,9 +1,8 @@
-/**
- * Wire-safe question and answer types, free of cordis/service imports so browser
- * type chains (apiproxy api → client) can consume them without loading this
- * package's Context augmentation.
- * @module @deepseek-ai/dsh-user-questions/types
- */
+/** Client-safe question, answer, and event types. @module @deepseek-ai/dsh-user-questions/types */
+
+import type { Scoped } from '@deepseek-ai/dsh-scope'
+import type { Agent } from '@deepseek-ai/dsh-agent/types'
+import type { ToolCallId } from '@deepseek-ai/dsh-llm/brand'
 
 /** One selectable answer offered to the user. */
 export interface AskUserQuestionOption {
@@ -29,6 +28,8 @@ export type AskUserQuestionIntent = {
    * An `approve` naming no option of its own question is rejected at `ask()`.
    */
   approve: string
+  /** Logged tool invocation whose arguments contain the reviewed plan. */
+  callId?: ToolCallId
 }
 
 /** One question in a user-questions request. */
@@ -63,4 +64,31 @@ export interface AskUserQuestionAnswerItem {
 export interface AskUserQuestionAnswer {
   /** Structured answers keyed by question id. */
   answers: AskUserQuestionAnswerItem[]
+}
+
+/** Client-safe payload declared for the user-question answerer waterfall. */
+export interface AskUserQuestionRequestEvent {
+  /** Questions to display. */
+  questions: AskUserQuestionItem[]
+  /** Agent identity projected to the corresponding Client Context in transit. */
+  agent?: Agent
+  /** Cancellation lifetime of the pending request. */
+  signal?: AbortSignal
+}
+
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    /**
+     * Ask composed answerers for structured user input. Return an answer to
+     * claim the request or call `next()` to delegate. Scope-filtered dispatch
+     * (`@deepseek-ai/dsh-scope`): agent-scoped listeners receive only that agent.
+     * @param request - pending user-question request.
+     * @mode waterfall
+     */
+    'user-questions/request'(
+      this: Scoped<Agent>,
+      request: AskUserQuestionRequestEvent,
+      next: () => Promise<AskUserQuestionAnswer>,
+    ): Promise<AskUserQuestionAnswer>
+  }
 }

@@ -1,25 +1,38 @@
 /**
  * InputHub: the SessionInputResolver implementation (`ctx.conversation.input`) — one
- * SessionInputShell per session, created inside the sessions provide
+ * SessionInputShell per session, created inside the uiSession provide
  * materialization (the 'input' standard-kit entry IS the
  * creation trigger) and torn down by the scope disposer (instance-and-scope
- * share one lifecycle). The hub registers the three scoped input-mutation
- * listeners on each session's actx (the sole consumer side of the ui-input-trigger
- * bail events) and owns the default-sink choreography: every session is a
+ * share one lifecycle). The hub registers the scoped input-mutation
+ * listeners on each Session context and owns the default-sink choreography: every session is a
  * real host entity, so the sink is one unconditional prompt path.
  */
-import type { ClientContext, ISessions, SessionBinding, SessionFace, SessionId } from '@deepseek-ai/dsh-client-runtime/client'
-import type { InputTriggerController } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
+import type { Context } from '@deepseek-ai/cordis'
+import type {
+  ISessions, SessionBinding, SessionFace,
+} from '@deepseek-ai/dsh-api-session-controller/client'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { TranslateNS } from '@deepseek-ai/dsh-client-locale/client'
-import { queueReadFaceOf } from '../queue/store.ts'
-import type { ComposerKeyboard, DraftAttachmentId, SessionInputResolver, SessionInput } from './contract.ts'
+import type { InboxState } from '@deepseek-ai/dsh-agent/types'
+import type { ObservableSnapshot } from '@deepseek-ai/dsh-client-store'
+import type {
+  DraftAttachmentId, DraftAttachmentSerializationResult, InputTriggerController,
+  SessionInputResolver, SessionInput, SubmitOutcome,
+} from '../contract/input.ts'
+import type { ComposerKeyboard } from '../contract/draft-editor.ts'
 import type { InputSubmitMode } from '../contract/composer-submission.ts'
 import type { PopupDismissFace } from './facade.ts'
 import { SessionInputShell } from './facade.ts'
 
 /** Structural command face for per-session popup resolution. */
 interface CommandFace {
-  popupFor(actx: ClientContext): PopupDismissFace
+  popupFor(actx: Context): PopupDismissFace
+}
+
+/** Optional input-trigger service resolved without importing its implementation. */
+interface InputTriggerServiceFace {
+  /** @param actx - Session scope. @returns that Session's trigger provider. */
+  sessionOf(actx: Context): InputTriggerController
 }
 
 /** Attachment-send face resolved lazily to keep hub/service construction acyclic. */
@@ -27,22 +40,24 @@ interface ConversationAttachmentFace {
   sendSession(
     session: SessionFace,
     text: string,
-    imageIds: readonly DraftAttachmentId[],
+    attachmentIds: readonly DraftAttachmentId[],
     mode: InputSubmitMode,
-  ): Promise<void>
-  releaseDraftImage(id: DraftAttachmentId): void
+    signal?: AbortSignal,
+  ): Promise<SubmitOutcome>
+  serializeDraftAttachments(attachmentIds: readonly DraftAttachmentId[]): Promise<DraftAttachmentSerializationResult>
+  releaseDraftAttachment(id: DraftAttachmentId): void
 }
 
 /** Session-addressed input facade registry (SessionInputResolver face + composer-layer extras). */
 export class InputHub implements SessionInputResolver {
-  private readonly shells = new Map<SessionId, SessionInputShell>()
+  private readonly shells = new WeakMap<SessionBinding, SessionInputShell>()
 
   /**
    * @param ctx - client root context (services resolved lazily per call — boot order stays free).
    * @param t - conversation-namespace translate thunk (reads the active locale at call time).
    */
   constructor(
-    private readonly rootCtx: ClientContext,
+    private readonly rootCtx: Context,
     private readonly t: TranslateNS<'conversation'>,
   ) {}
 
@@ -51,11 +66,14 @@ export class InputHub implements SessionInputResolver {
    * @param actx - session-scope context.
    * @returns the resident per-session facade.
    */
-  for(actx: ClientContext): SessionInput {
+  for(actx: Context): SessionInput {
     const sessions = this.sessions()
-    const id = sessions.scopeOf(actx)
-    if (id === undefined) throw new Error('conversation.input.for requires a session scope')
-    return this.shell(id)
+    const session = sessions.sessionOf(actx)
+    const binding = session === undefined ? undefined : sessions.binding(session.sessionId)
+    if (binding === undefined || binding.session !== session) {
+      throw new Error('conversation.input.for requires a retained Session scope')
+    }
+    return this.shellFor(binding)
   }
 
   /**
@@ -67,18 +85,35 @@ export class InputHub implements SessionInputResolver {
    * @returns the shell.
    */
   shellFor(binding: SessionBinding): SessionInputShell {
-    const existing = this.shells.get(binding.sessionId)
+    const existing = this.shells.get(binding)
     if (existing !== undefined) return existing
-    const { sessionId: id, session, ctx: actx } = binding
+    const { session, ctx: actx } = binding
     const shell = new SessionInputShell({
       actx,
       inputTriggers: () => this.controller(actx),
       popup: () => this.popup(actx),
-      queue: queueReadFaceOf(session),
-      defaultSink: (text, imageIds, mode) => { this.sink(session, text, imageIds, mode) },
+      inbox: session.projections.faceOf('inbox') as ObservableSnapshot<InboxState | undefined>,
+      defaultSink: (text, attachmentIds, mode, signal) => this.sink(session, text, attachmentIds, mode, signal),
       steerQueue: () => { void this.steerQueue(session, shell) },
+      commandAttachments: {
+        serialize: async (ids) => {
+          const result = await this.conversation().serializeDraftAttachments(ids)
+          return result.attachments
+        },
+        // Asymmetric with serialize on purpose: release settles AFTER the
+        // submit RPC, where session teardown may already have unloaded the
+        // conversation service (the same tolerance as the scope disposer
+        // above); leaked preview URLs then die with the document.
+        release: (ids) => {
+          const conversation = this.rootCtx.get('conversation') as ConversationAttachmentFace | undefined
+          for (const attachmentId of ids) conversation?.releaseDraftAttachment(attachmentId)
+        },
+        unsupportedNotice: token => this.t('command.attachmentsUnsupported', {
+          command: token.trim().replace(/^\//u, ''),
+        }),
+      },
     })
-    this.shells.set(id, shell)
+    this.shells.set(binding, shell)
     // The one teardown axis: listeners, shell, and map entries all ride the
     // scope fiber (nothing here outlives the scope).
     actx.effect(() => {
@@ -90,15 +125,14 @@ export class InputHub implements SessionInputResolver {
         actx.on('slash/input-consume-token', req =>
           shell.consumeToken(req.guard) ? true : undefined),
         actx.on('slash/input-insert-text', req =>
-          shell.insertText(req.text, req.span) ? true : undefined),
+          shell.insertText(req.text, req.span, req.continue === true) ? true : undefined),
       ]
       return () => {
         for (const off of offs) off()
-        const drafts = shell.snapshot.imageIds
-        shell.dispose()
-        this.shells.delete(id)
+        const drafts = shell.dispose()
+        this.shells.delete(binding)
         const conversation = this.rootCtx.get('conversation') as ConversationAttachmentFace | undefined
-        for (const imageId of drafts) conversation?.releaseDraftImage(imageId)
+        for (const attachmentId of drafts) conversation?.releaseDraftAttachment(attachmentId)
       }
     }, 'conversation.input: session shell')
     return shell
@@ -111,8 +145,6 @@ export class InputHub implements SessionInputResolver {
    * @returns the shell.
    */
   shell(id: SessionId): SessionInputShell {
-    const existing = this.shells.get(id)
-    if (existing !== undefined) return existing
     const binding = this.sessions().binding(id)
     if (binding === undefined) throw new Error(`conversation.input: session "${id}" resolved no binding`)
     return this.shellFor(binding)
@@ -130,73 +162,85 @@ export class InputHub implements SessionInputResolver {
   }
 
   /**
+   * Query file intake without creating a Session input.
+   * @param id - target Session.
+   * @returns whether its mounted composer currently accepts files.
+   */
+  canPickFiles(id: SessionId): boolean {
+    const binding = this.sessions().binding(id)
+    return binding !== undefined && this.shells.get(binding)?.canPickFiles() === true
+  }
+
+  /**
+   * Open the target composer's file dialog under its live intake policy.
+   * @param id - target Session.
+   */
+  pickFiles(id: SessionId): void {
+    const binding = this.sessions().binding(id)
+    if (binding !== undefined) this.shells.get(binding)?.pickFiles()
+  }
+
+  /**
    * Resolve the optional slash controller for composer chrome that launches
    * the shared candidate menu without typing a trigger.
    * @param id - session id.
-   * @returns the resident controller, or undefined when ui-input-trigger is absent.
+   * @returns the resident controller, or undefined when no trigger provider is installed.
    */
   inputTriggers(id: SessionId): InputTriggerController | undefined {
-    const actx = this.sessions().scope(id)
-    return actx === undefined ? undefined : this.controller(actx)
+    const binding = this.sessions().binding(id)
+    return binding === undefined ? undefined : this.controller(binding.ctx)
   }
 
   /**
    * Default sink: optimistic clear + prompt. The session is always a real
    * host entity (materialized when its workspace was picked), so there is
    * exactly one path; a failed first prompt is an ordinary prompt failure
-   * (error strip via promptError, draft restored only while untouched).
+   * (banner via promptError, draft restored only while untouched).
    */
   private sink(
     session: SessionFace,
     text: string,
-    imageIds: readonly DraftAttachmentId[],
+    attachmentIds: readonly DraftAttachmentId[],
     mode: InputSubmitMode,
-  ): void {
-    if (text === '' && imageIds.length === 0) return
-    const shell = this.shells.get(session.sessionId)
-    // Commit, not an editable clear: undo must not resurrect sent content.
-    shell?.commitSend(imageIds)
-    void this.conversation().sendSession(session, text, imageIds, mode).catch(() => {
-      if (this.shells.get(session.sessionId) === shell) {
-        shell?.restoreImages(imageIds)
-        if (shell?.snapshot.draft === '') shell.setDraft(text)
-        return
-      }
-      const conversation = this.rootCtx.get('conversation') as ConversationAttachmentFace | undefined
-      for (const id of imageIds) conversation?.releaseDraftImage(id)
-    })
+    signal: AbortSignal,
+  ): Promise<SubmitOutcome> {
+    if (text === '' && attachmentIds.length === 0) return Promise.resolve({ kind: 'success' })
+    return this.conversation().sendSession(session, text, attachmentIds, mode, signal)
   }
 
   /**
-   * Steer every still-pending queued message into the running turn, in FIFO
-   * order — the same strict-steer operation as the queue dock's per-row
-   * button. A turn closing mid-way (`steer-unavailable`) or a row already
-   * claimed by the agent (`queue-item-not-found`) converges silently, while a
+   * Submit every still-pending queued message through QueueDock Steer, in FIFO
+   * request order — the same operation as the queue dock's per-row button.
+   * An Agent stopping before a command (`session/steer-unavailable`) or a row already
+   * claimed by the agent (`session/queue-item-not-found`) converges silently, while a
    * genuine failure surfaces as one composer notice. Repeated triggers
-   * (e.g. two rapid empty-draft chords) rely on that `queue-item-not-found`
+   * (e.g. two rapid empty-draft chords) rely on that `session/queue-item-not-found`
    * convergence: the snapshot may still list a row the host already steered,
-   * and the duplicate strict steer is a silent no-op.
+   * and the duplicate Steer is a silent no-op.
    * @param session - the addressed host session.
    * @param shell - the resident shell (notice outlet).
    */
   private async steerQueue(session: SessionFace, shell: SessionInputShell): Promise<void> {
-    const queued = session.getSnapshot().queue.filter(item => item.placement === 'queued')
+    const inbox = session.projections.faceOf('inbox').getSnapshot() as InboxState | undefined
+    const queued = inbox?.['next-turn'] ?? []
     if (queued.length === 0) return
     for (const item of queued) {
       const result = await session.updateQueue(item.id, { kind: 'steer' })
       if (result.ok) continue
-      if (result.error.code === 'steer-unavailable' || result.error.code === 'queue-item-not-found') return
+      if (result.error.code === 'session/steer-unavailable' || result.error.code === 'session/queue-item-not-found') return
       shell.notify('error', this.t('queue.steerFailed'))
       return
     }
   }
 
-  private controller(actx: ClientContext): InputTriggerController | undefined {
-    const inputTriggers = this.rootCtx.get('inputTriggers')
+  private controller(actx: Context): InputTriggerController | undefined {
+    if (this.sessions().sessionOf(actx) === undefined) return undefined
+    const inputTriggers = this.rootCtx.get('inputTriggers') as InputTriggerServiceFace | undefined
     return inputTriggers?.sessionOf(actx)
   }
 
-  private popup(actx: ClientContext): PopupDismissFace | undefined {
+  private popup(actx: Context): PopupDismissFace | undefined {
+    if (this.sessions().sessionOf(actx) === undefined) return undefined
     const command = this.rootCtx.get('commandUi') as CommandFace | undefined
     return command?.popupFor(actx)
   }

@@ -2,9 +2,69 @@
 /** Trajectory ledger selection, details, status, and fold behavior. */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { TrajectoryTable } from '../src/client/TrajectoryTable.tsx'
-import type { TrajectoryTurnModel } from '../src/client/layout.ts'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { AttachmentId } from '@deepseek-ai/dsh-attachment'
+import type { ComponentProps } from 'react'
+import type { RenderMessageImages } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import { TrajectoryTable as LocalizedTrajectoryTable } from '../src/client/TrajectoryTable.tsx'
+import { deriveTrajectoryLayout, type TrajectoryTurnModel } from '../src/client/layout.ts'
+import { trajectoryRecordId } from '../src/client/trajectory-record.ts'
+import { t, tZh } from './locale.client.ts'
+
+const renderImagesStub: RenderMessageImages = ({ images }) => (
+  <div data-testid="record-images" data-count={images.length}>
+    {images.map((image, index) => (
+      <span
+        key={index}
+        data-attachment-id={'attachment' in image ? image.attachment.attachmentId : image.preview.url}
+      />
+    ))}
+  </div>
+)
+
+function TrajectoryTable(
+  props: Omit<ComponentProps<typeof LocalizedTrajectoryTable>, 't' | 'renderImages'>
+    & { renderImages?: RenderMessageImages },
+) {
+  const inferred: Array<NonNullable<typeof props.requestNumbers>[number] & { firstIndex: number }> = []
+  for (const turn of props.turns) {
+    for (const group of turn.groups) {
+      const step = /^Step (\d+)$/.exec(group.title)?.[1]
+      const compaction = /^Compaction (\d+)$/.exec(group.title)?.[1]
+      const firstIndex = group.cells[0]?.index ?? Number.MAX_SAFE_INTEGER
+      if (compaction !== undefined) {
+        inferred.push({
+          turn: turn.turn,
+          step: 0,
+          seq: Number(compaction),
+          group: group.title,
+          number: 0,
+          purpose: 'compaction',
+          firstIndex,
+        })
+      } else if (step !== undefined && turn.turn !== null) {
+        inferred.push({
+          turn: turn.turn,
+          step: Number(step),
+          group: group.title,
+          number: 0,
+          firstIndex,
+        })
+      }
+    }
+  }
+  const requestNumbers = props.requestNumbers ?? inferred
+    .sort((left, right) => left.firstIndex - right.firstIndex)
+    .map(({ firstIndex: _firstIndex, ...request }, index) => ({ ...request, number: index + 1 }))
+  return (
+    <LocalizedTrajectoryTable
+      renderImages={renderImagesStub}
+      {...props}
+      requestNumbers={requestNumbers}
+      t={t}
+    />
+  )
+}
 
 afterEach(() => {
   cleanup()
@@ -65,6 +125,20 @@ const FOLD_PROPS = {
 }
 
 describe('TrajectoryTable', () => {
+  it('shows known standalone prompt text without a fabricated tool catalog or request options', () => {
+    const turns = deriveTrajectoryLayout({
+      nodes: [], partial: null, runningCalls: [],
+      systemPrompts: [{ seq: 10, time: 10, turn: 2, step: 1, text: '# Known instructions', update: false }],
+    }, t)
+    expect(turns.flatMap(turn => turn.groups.flatMap(group => group.cells))).toMatchObject([
+      { kind: 'system', text: 'Initial System Prompt', systemPromptDetail: '# Known instructions' },
+    ])
+    render(<TrajectoryTable turns={turns} {...FOLD_PROPS} />)
+    fireEvent.click(screen.getByRole('row', { name: /SYSTEM/ }))
+    expect(screen.getByRole('heading', { name: 'Known instructions' })).toBeTruthy()
+    expect(screen.getAllByRole('tab').map(tab => tab.textContent)).toEqual(['System Prompt'])
+  })
+
   it('shows a muted placeholder for an assistant response containing only tool calls', () => {
     const turns: readonly TrajectoryTurnModel[] = [{
       turn: 1,
@@ -85,6 +159,23 @@ describe('TrajectoryTable', () => {
     render(<TrajectoryTable turns={turns} {...FOLD_PROPS} />)
 
     expect(screen.getByText('(tool call only)')).toBeTruthy()
+  })
+
+  it('localizes the summary for folded Assistant tool calls', () => {
+    const assistant = TURNS[0]!.groups[0]!.cells[0]!
+    render(
+      <LocalizedTrajectoryTable
+        t={tZh}
+        renderImages={renderImagesStub}
+        turns={TURNS}
+        collapsedTurns={new Set<number>()}
+        onToggleTurn={() => {}}
+        collapsedAssistants={new Set([trajectoryRecordId(assistant)])}
+        onToggleAssistant={() => {}}
+      />,
+    )
+
+    expect(screen.getByText('2 个工具调用 · bash')).toBeTruthy()
   })
 
   it('shows assistant timing facts after keyboard selection', () => {
@@ -141,7 +232,12 @@ describe('TrajectoryTable', () => {
     expect(panel.querySelector('[data-summary-scroll-region]')).toBeNull()
   })
 
-  it('keeps long thinking collapsed until the user asks to render it', () => {
+  it.each([
+    { outputDetail: undefined, toolCall: false },
+    { outputDetail: 'Visible answer', toolCall: false },
+    { outputDetail: undefined, toolCall: true },
+    { outputDetail: 'Visible answer', toolCall: true },
+  ])('opens thinking with output=$outputDetail and toolCall=$toolCall', ({ outputDetail, toolCall }) => {
     const thinking = 'private chain '.repeat(1_000)
     const turns: readonly TrajectoryTurnModel[] = [{
       turn: 1,
@@ -152,6 +248,10 @@ describe('TrajectoryTable', () => {
           kind: 'message',
           text: 'private chain…',
           thinkingDetail: thinking,
+          ...(outputDetail === undefined ? {} : { outputDetail }),
+          ...(toolCall ? { sourceBlocks: [{
+            type: 'tool-call', content: '{}', callId: 'call-1', toolName: 'read',
+          }] } : {}),
           timeSeconds: 1,
         }],
       }],
@@ -159,14 +259,69 @@ describe('TrajectoryTable', () => {
     render(<TrajectoryTable turns={turns} {...FOLD_PROPS} />)
 
     fireEvent.click(screen.getByRole('row', { name: /ASSISTANT/ }))
+    fireEvent.click(screen.getByRole('tab', { name: 'Preview' }))
     const toggle = screen.getByRole('button', { name: 'Thinking' })
-    expect(toggle.getAttribute('aria-expanded')).toBe('false')
-    expect(screen.queryByText(thinking)).toBeNull()
-
-    fireEvent.click(toggle)
-    expect(screen.getByRole('button', { name: 'Thinking' })).toBe(toggle)
     expect(toggle.getAttribute('aria-expanded')).toBe('true')
     expect(toggle.parentElement?.textContent?.length).toBeGreaterThan(thinking.length)
+
+    fireEvent.click(toggle)
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    expect(screen.queryByText(thinking)).toBeNull()
+    fireEvent.click(screen.getByRole('tab', { name: 'Summary' }))
+    expect(screen.getByRole('button', { name: 'Thinking' }).getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(screen.getByRole('tab', { name: 'Preview' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Thinking' }))
+    expect(screen.getByRole('button', { name: 'Thinking' }).getAttribute('aria-expanded')).toBe('true')
+  })
+
+  it('renders thinking as compact Markdown while keeping answer typography separate', () => {
+    const turns: readonly TrajectoryTurnModel[] = [{
+      turn: 1,
+      groups: [{
+        title: 'Step 1',
+        cells: [{
+          index: 1,
+          kind: 'message',
+          text: 'Answer',
+          outputDetail: '# Answer heading\n\nAnswer body.',
+          thinkingDetail: '# Thinking heading\n\nReasoning **emphasis**.',
+          timeSeconds: 1,
+        }],
+      }],
+    }]
+    render(<TrajectoryTable turns={turns} {...FOLD_PROPS} />)
+    fireEvent.click(screen.getByRole('row', { name: /ASSISTANT/ }))
+    fireEvent.click(screen.getByRole('tab', { name: 'Preview' }))
+
+    expect(screen.getByRole('heading', { name: 'Thinking heading' })
+      .closest('[data-markdown-variant="compact"]')).not.toBeNull()
+    expect(screen.getByText('emphasis').tagName).toBe('STRONG')
+    expect(screen.getByRole('heading', { name: 'Answer heading' })
+      .closest('[data-markdown-variant="compact"]')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Thinking' }))
+    expect(screen.queryByRole('heading', { name: 'Thinking heading' })).toBeNull()
+    expect(screen.getByRole('heading', { name: 'Answer heading' })).toBeTruthy()
+  })
+
+  it('opens thinking on another record after collapsing the selected record', () => {
+    const turns: readonly TrajectoryTurnModel[] = [{
+      turn: 1,
+      groups: [{
+        title: 'Step 1',
+        cells: [1, 2].map(index => ({
+          index, kind: 'message', text: `Answer ${index}`, outputDetail: `Answer ${index}`,
+          thinkingDetail: `Reasoning ${index}`, timeSeconds: 1,
+        })),
+      }],
+    }]
+    render(<TrajectoryTable turns={turns} {...FOLD_PROPS} />)
+    fireEvent.click(screen.getByRole('row', { name: /ASSISTANT, Answer 1/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Thinking' }))
+    expect(screen.getByRole('button', { name: 'Thinking' }).getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(screen.getByRole('row', { name: /ASSISTANT, Answer 2/ }))
+    expect(screen.getByRole('button', { name: 'Thinking' }).getAttribute('aria-expanded')).toBe('true')
+    expect(screen.getByText('Reasoning 2')).toBeTruthy()
   })
 
   it('keeps raw HTML tags in a Markdown-derived context preview', () => {
@@ -306,6 +461,41 @@ describe('TrajectoryTable', () => {
     expect(screen.getByRole('button', { name: 'Request #2' })
       .getAttribute('aria-pressed')).toBe('true')
     expect(screen.getByText('Request #2')).toBeTruthy()
+  })
+
+  it('keeps a selected request when its localized group label changes', () => {
+    const turn = (group: string): TrajectoryTurnModel => ({
+      turn: 1,
+      groups: [{
+        title: group,
+        cells: [{
+          index: 1,
+          kind: 'message',
+          sourceSeq: 10,
+          text: 'response',
+          timeSeconds: 1,
+        }],
+      }],
+    })
+    const request = (group: string) => [{
+      turn: 1,
+      step: 1,
+      seq: 10,
+      group,
+      number: 1,
+    }] as const
+    const view = render(
+      <TrajectoryTable turns={[turn('Step 1')]} requestNumbers={request('Step 1')} {...FOLD_PROPS} />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Request #1' }))
+
+    view.rerender(
+      <TrajectoryTable turns={[turn('步骤 1')]} requestNumbers={request('步骤 1')} {...FOLD_PROPS} />,
+    )
+
+    expect(screen.getByRole('button', { name: 'Request #1' })
+      .getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByText('Request #1')).toBeTruthy()
   })
 
   it('places the request boundary after leading steering input', () => {
@@ -738,6 +928,42 @@ describe('TrajectoryTable', () => {
     expect(recovered.style.getPropertyValue('--request-boundary-offset')).toBe('16px')
   })
 
+  it('localizes a sanitized AUTH request failure from its stable code', () => {
+    const turns: readonly TrajectoryTurnModel[] = [{
+      turn: 1,
+      groups: [{
+        title: 'Step 1',
+        cells: [{
+          index: 1,
+          kind: 'message',
+          text: '',
+          requestOnly: true,
+          isError: true,
+          timeSeconds: 0.1,
+        }],
+      }],
+    }]
+    render(
+      <TrajectoryTable
+        turns={turns}
+        requestNumbers={[{
+          turn: 1,
+          step: 1,
+          seq: 1,
+          group: 'Step 1',
+          number: 1,
+          status: 'error',
+          error: '',
+          errorCode: 'AUTH',
+        }]}
+        {...FOLD_PROPS}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Request #1' }))
+    expect(screen.getByText('API key is invalid')).toBeTruthy()
+  })
+
   it('shows the custom role tooltip only from the responsive icon', () => {
     const view = render(<TrajectoryTable turns={TURNS} {...FOLD_PROPS} />)
     const toolTag = view.container.querySelector<HTMLElement>('[data-role-kind="tool"]')
@@ -811,6 +1037,133 @@ describe('TrajectoryTable', () => {
 
     expect(screen.getByRole('tree', { name: 'Result JSON' })).toBeTruthy()
     expect(screen.getByText('value:')).toBeTruthy()
+  })
+
+  it.each([['English', t, 'Attachments', 'Image 1', 'Summary', 'Preview', 'Raw'],
+    ['Chinese', tZh, '附件', '图片 1', '概述', '预览', '原始内容']] as const)(
+    'keeps mixed attachments ordered and raw fields complete in %s',
+    (_locale, translate, listLabel, imageLabel, summaryTab, previewTab, rawTab) => {
+      const attachment = {
+        attachmentId: AttachmentId(`sha256:${'a'.repeat(64)}`),
+        mediaType: 'image/png' as const,
+        bytes: 68,
+        width: 40,
+        height: 800,
+        originalDimensions: { width: 400, height: 8000 },
+      }
+      const file = {
+        attachmentId: AttachmentId(`sha256:${'b'.repeat(64)}`),
+        name: `${'long-filename-'.repeat(12)}.txt`,
+        bytes: 0,
+      }
+      const content = [
+        { type: 'text' as const, text: '**before**' },
+        { type: 'image' as const, attachment },
+        { type: 'text' as const, text: 'after' },
+        { type: 'file' as const, attachment: file },
+        { type: 'image' as const, attachment },
+      ]
+      const turns = deriveTrajectoryLayout({
+        nodes: [{ kind: 'user', seq: 1, time: 1000, source: { kind: 'user' }, content }],
+        partial: null,
+        runningCalls: [],
+      }, translate)
+      const renderImages = vi.fn<RenderMessageImages>(renderImagesStub)
+      const view = render(<LocalizedTrajectoryTable turns={turns} {...FOLD_PROPS} t={translate} renderImages={renderImages} />)
+      fireEvent.click(view.container.querySelector('[data-trajectory-row-key]')!)
+      for (const tab of [summaryTab, previewTab]) {
+        fireEvent.click(screen.getByRole('tab', { name: tab }))
+        const list = screen.getByRole('list', { name: listLabel })
+        const names = [...list.querySelectorAll('[title]')].map(el => el.getAttribute('title'))
+        expect(names).toEqual([imageLabel, file.name, imageLabel.replace('1', '2')])
+        expect(within(list).getByText('TXT · 0B')).toBeTruthy()
+        expect(within(list).getAllByText('image/png · 68B · 40 × 800')).toHaveLength(2)
+        expect(renderImages).toHaveBeenCalledWith({ images: [{ attachment, label: imageLabel }], align: 'start', thumbnail: true })
+      }
+      fireEvent.click(screen.getByRole('tab', { name: rawTab }))
+      expect(screen.queryByTestId('record-images')).toBeNull()
+      const disclosures = [...view.container.querySelectorAll('details')]
+      expect(disclosures).toHaveLength(3)
+      expect(disclosures.every(el => !el.open)).toBe(true)
+      expect(disclosures.map((el): unknown => JSON.parse(el.querySelector('pre')!.textContent)))
+        .toEqual([content[1], content[3], content[4]])
+      const blocks = [...disclosures[0]!.parentElement!.children]
+      expect(blocks.map(el => el.tagName)).toEqual(['SECTION', 'DETAILS', 'SECTION', 'DETAILS', 'DETAILS'])
+      expect(blocks[0]!.querySelector('pre')!.textContent).toBe('**before**')
+      expect(blocks[2]!.querySelector('pre')!.textContent).toBe('after')
+    },
+  )
+
+  it('renders a tool-result image through the shared gallery in the Result tab', () => {
+    const attachment = {
+      attachmentId: `sha256:${'b'.repeat(64)}`,
+      mediaType: 'image/png',
+      bytes: 68,
+      width: 320,
+      height: 640,
+      name: 'capture.png',
+    } as unknown as NonNullable<
+      NonNullable<TrajectoryTurnModel['groups'][number]['cells'][number]['outputBlocks']>[number]['attachment']
+    >
+    const turns: readonly TrajectoryTurnModel[] = [{
+      turn: 1,
+      groups: [{
+        title: 'Step 1',
+        cells: [{
+          index: 1,
+          kind: 'tool',
+          text: 'read_image {"path":"a.png"}',
+          outputDetail: 'Images ×1',
+          outputBlocks: [{ type: 'image', content: '', attachment }],
+          timeSeconds: 0.1,
+        }],
+      }],
+    }]
+
+    render(<TrajectoryTable turns={turns} {...FOLD_PROPS} />)
+    fireEvent.click(screen.getByRole('row', { name: /TOOL/ }))
+    fireEvent.click(screen.getByRole('tab', { name: 'Result' }))
+
+    const gallery = screen.getAllByTestId('record-images').at(-1)
+    expect(gallery?.getAttribute('data-count')).toBe('1')
+    expect(gallery?.querySelector('[data-attachment-id]')?.getAttribute('data-attachment-id'))
+      .toBe(String(attachment.attachmentId))
+  })
+
+  it('keeps the failure name beside an image-only error result', () => {
+    const attachment = {
+      attachmentId: `sha256:${'c'.repeat(64)}`,
+      mediaType: 'image/png',
+      bytes: 68,
+      width: 320,
+      height: 320,
+      name: 'failed.png',
+    } as unknown as NonNullable<
+      NonNullable<TrajectoryTurnModel['groups'][number]['cells'][number]['outputBlocks']>[number]['attachment']
+    >
+    const turns: readonly TrajectoryTurnModel[] = [{
+      turn: 1,
+      groups: [{
+        title: 'Step 1',
+        cells: [{
+          index: 1,
+          kind: 'tool',
+          text: 'render {"target":"chart"}',
+          outputDetail: 'ToolError: RENDER_TRUNCATED',
+          outputBlocks: [{ type: 'image', content: '', attachment }],
+          isError: true,
+          timeSeconds: 0.1,
+        }],
+      }],
+    }]
+
+    render(<TrajectoryTable turns={turns} {...FOLD_PROPS} />)
+    fireEvent.click(screen.getByRole('row', { name: /TOOL/ }))
+    fireEvent.click(screen.getByRole('tab', { name: 'Result' }))
+
+    expect(screen.getByText('ToolError: RENDER_TRUNCATED')).toBeTruthy()
+    const gallery = screen.getAllByTestId('record-images').at(-1)
+    expect(gallery?.getAttribute('data-count')).toBe('1')
   })
 
   it('keeps the first row and a compact summary when a turn is collapsed', () => {

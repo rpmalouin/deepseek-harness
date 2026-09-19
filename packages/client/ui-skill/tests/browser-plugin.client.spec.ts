@@ -5,33 +5,30 @@
  * the source behavior contract driven directly on the captured source with
  * real ClientSessionContext projections — sessionId addressing, the
  * session-keyed catalog cache (single-flight per key, scope-birth warm
- * prewarm, connection/reset clear), startsWith filtering, RPC-failure
+ * prewarm, connection/reset clear), shared fuzzy name ranking, RPC-failure
  * rejection, pick → plain-text outcome (the plain-text-reference decision:
- * .agents/notes/implemented/architecture/2026-07-25-web-input-machine-and-slash-pipeline.md),
+ * .agents/notes/archived/architecture/2026-07-25-web-input-machine-and-slash-pipeline.md),
  * the synchronous
  * lexicon reads over the settled cache, and the reference codec's two
  * projections. Direct driving is deliberate: this spec owns only the
  * source's own contract.
  */
 import { Context } from '@deepseek-ai/cordis'
-import { describe, expect, it, vi } from 'vitest'
-import type { SessionId } from '@deepseek-ai/dsh-client-runtime/client'
-import { SlotRegistry } from '@deepseek-ai/dsh-client-runtime/client'
+import { describe, expect, it, onTestFinished, vi } from 'vitest'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import { SlotRegistry } from '@deepseek-ai/dsh-client-ui-renderer/client'
 import { InputTriggerService } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
-import { TestRemote } from '@deepseek-ai/dsh-client-test-runtime'
+import { RemoteError, TestRemote } from '@deepseek-ai/dsh-client-test-runtime'
+import type { RemoteFailure } from '@deepseek-ai/dsh-api-remotes/client'
 import type { ClientSessionContext, InputTriggerSource } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
 import { apply, inject } from '../src/client/index.ts'
 import { SkillRow as SkillToolRow } from '../src/client/SkillRow.tsx'
 
-type SkillRow = { name: string; description: string; whenToUse?: string; modelInvocable?: boolean }
+type SkillRow = { name: string; description: string; whenToUse?: string; path?: string; modelInvocable?: boolean }
 type ListResult =
   | { ok: true; value: { skills: SkillRow[] } }
-  | { ok: false; error: { code: string; message: string; details: object } }
-type ListFn = (payload: object, signal?: AbortSignal) => Promise<{ result: ListResult }>
-type InvokeResult =
-  | { ok: true; value: { accepted: true } }
-  | { ok: false; error: { code: string; message: string; details: object } }
-type InvokeFn = (payload: object) => Promise<{ result: InvokeResult }>
+  | { ok: false; error: RemoteFailure }
+type ListFn = (payload: object, signal?: AbortSignal) => Promise<ListResult>
 
 interface PresentationCapture {
   slots: SlotRegistry
@@ -63,21 +60,24 @@ function providePresentation(ctx: Context): PresentationCapture {
 }
 
 /** Boot the plugin over fake slash/connection faces; returns the captured source and its ctx. */
-async function bench(list: ListFn, addressed?: SessionId, invoke?: InvokeFn) {
+async function bench(list: ListFn, addressed?: SessionId) {
   const ctx = new Context()
+  const openResource = vi.fn()
+  ctx.provide('sidebarRight', { openResource })
   let captured: InputTriggerSource | undefined
   ctx.provide('inputTriggers', { registerSource: (src: InputTriggerSource) => { captured = src; return () => {} } })
-  const defaultInvoke: InvokeFn = () => Promise.resolve({ result: { ok: true as const, value: { accepted: true as const } } })
-  ctx.provide('connection', { api: { skills: { list, invoke: invoke ?? defaultInvoke } } })
   ctx.provide('sessions', {
+    list: { getSnapshot: () => ({ byId: {} }) },
     subagentAddress: (id: SessionId) => id === addressed
       ? { parentSessionId: sid('parent'), childSessionId: id, mode: 'continuable' as const }
       : undefined,
   })
-  new TestRemote(ctx)
+  const remote = new TestRemote(ctx, { skills: { list } })
   providePresentation(ctx)
-  await ctx.plugin({ inject: [...inject], apply }).await()
-  return { ctx, source: captured! }
+  const fiber = ctx.plugin({ inject: [...inject], apply })
+  onTestFinished(async () => { await fiber.dispose() })
+  await fiber.await()
+  return { ctx, source: captured!, remote, fiber, openResource }
 }
 
 const CATALOG: SkillRow[] = [
@@ -86,7 +86,7 @@ const CATALOG: SkillRow[] = [
   { name: 'deploy', description: 'deploy flow', modelInvocable: true },
 ]
 
-const listOk = (skills: SkillRow[]): ListFn => () => Promise.resolve({ result: { ok: true as const, value: { skills } } })
+const listOk = (skills: SkillRow[]): ListFn => () => Promise.resolve({ ok: true as const, value: { skills } })
 
 /** Counting fake: records payloads, resolves the shared catalog. */
 function countingList(skills: SkillRow[] = CATALOG) {
@@ -103,19 +103,19 @@ const sid = (id: string) => id as SessionId
 const proj = (id: string): ClientSessionContext => ({ sessionId: sid(id) })
 
 const req = (query: string, signal?: AbortSignal) =>
-  ({ query, position: 'leading' as const, signal: signal ?? new AbortController().signal })
+  ({ query, position: 'leading' as const, drilled: false, signal: signal ?? new AbortController().signal })
 
 describe('apply', () => {
   it('declares the services it binds', () => {
-    expect(inject).toEqual(['inputTriggers', 'connection', 'sessions', 'slots', 'locale', 'remote'])
+    expect(inject).toEqual(['inputTriggers', 'sessions', 'slots', 'locale', 'remote', 'remote.skills', 'sidebarRight'])
   })
 
   it('registers the dedicated skill row and its locale dictionaries', async () => {
     const ctx = new Context()
+    ctx.provide('sidebarRight', { openResource: vi.fn() })
     ctx.provide('inputTriggers', { registerSource: () => () => {} })
-    ctx.provide('connection', { api: { skills: { list: listOk(CATALOG) } } })
     ctx.provide('sessions', { subagentAddress: () => undefined })
-    new TestRemote(ctx)
+    new TestRemote(ctx, { skills: { list: listOk(CATALOG) } })
     const presentation = providePresentation(ctx)
     await ctx.plugin({ inject: [...inject], apply }).await()
     const entry = presentation.slots.entries('tool.call.toolview')[0]
@@ -125,17 +125,21 @@ describe('apply', () => {
     expect(presentation.dictionaries).toEqual([{
       namespace: 'skill', dictionaries: {
         zh: {
+          'row.title': 'Skill',
           'row.running': '正在加载 skill',
           'row.failed': 'skill 加载失败',
           'row.stopped': 'skill 加载已中止',
           'row.instructions': '说明',
+          'row.inspect': '查看',
           'menu.userOnly': '仅用户',
         },
         en: {
+          'row.title': 'Skill',
           'row.running': 'Loading skill',
           'row.failed': 'Skill load failed',
           'row.stopped': 'Skill load stopped',
           'row.instructions': 'Instructions',
+          'row.inspect': 'Inspect',
           'menu.userOnly': 'user-only',
         },
       },
@@ -144,11 +148,11 @@ describe('apply', () => {
 
   it('registers the "/" skill source; disposal frees the name (HMR safety)', async () => {
     const ctx = new Context()
+    ctx.provide('sidebarRight', { openResource: vi.fn() })
     // InputTriggerService itself injects 'sessions'; the stub unblocks its fiber.
     ctx.provide('sessions', {})
     await ctx.plugin(InputTriggerService).await()
-    ctx.provide('connection', { api: { skills: { list: listOk(CATALOG) } } })
-    new TestRemote(ctx)
+    new TestRemote(ctx, { skills: { list: listOk(CATALOG) } })
     const presentation = providePresentation(ctx)
     const fiber = ctx.plugin({ inject: [...inject], apply })
     await fiber.await()
@@ -170,7 +174,7 @@ describe('apply', () => {
 })
 
 describe('candidates: sessionId addressing', () => {
-  it('lists via {sessionId} and filters by startsWith(query)', async () => {
+  it('lists via {sessionId} and ranks case-insensitive subsequence matches with prefixes first', async () => {
     const { list, payloads } = countingList()
     const { source } = await bench(list)
     const items = await source.candidates(proj('s1'), req('co'))
@@ -180,14 +184,19 @@ describe('candidates: sessionId addressing', () => {
       { name: 'commit-helper', description: 'commit flow' },
       { name: 'code-review', description: 'review flow' },
     ])
+    const names = async (query: string) => (await source.candidates(proj('s1'), req(query))).map(c => c.name)
+    // 'de' prefixes deploy and is a subsequence of code-review: the prefix ranks first.
+    await expect(names('de')).resolves.toEqual(['deploy', 'code-review'])
+    await expect(names('REV')).resolves.toEqual(['code-review'])
+    await expect(names('zzz')).resolves.toEqual([])
   })
 
   it('rejects on a failed result (the slash shell owns the menu-side fold)', async () => {
     const { source } = await bench(() => Promise.resolve({
-      result: { ok: false, error: { code: 'internal', message: 'boom', details: {} } },
+      ok: false, error: new RemoteError('gateway/internal', 'boom', {}),
     }))
     await expect(source.candidates(proj('s1'), req('co')))
-      .rejects.toThrow('skill.list failed: internal: boom')
+      .rejects.toThrow('skills/list failed: gateway/internal: boom')
   })
 
   it('does not fetch Agent-bound skills for an addressed child', async () => {
@@ -244,7 +253,7 @@ describe('catalog cache', () => {
     const { source } = await bench((payload) => {
       payloads.push(payload)
       return fail
-        ? Promise.resolve({ result: { ok: false as const, error: { code: 'internal', message: 'boom', details: {} } } })
+        ? Promise.resolve({ ok: false as const, error: new RemoteError('gateway/internal', 'boom', {}) })
         : listOk(CATALOG)(payload)
     })
     await expect(source.candidates(proj('s1'), req(''))).rejects.toThrow('boom')
@@ -269,13 +278,13 @@ describe('catalog cache', () => {
 
   it('agent-preset/selected clears only the recomposed session', async () => {
     const { list, payloads } = countingList()
-    const { ctx, source } = await bench(list)
+    const { source, remote } = await bench(list)
     await source.candidates(proj('s1'), req(''))
     await source.candidates(proj('s2'), req(''))
     expect(payloads).toHaveLength(2)
     // The catalog a preset supplies is the preset's; the other session's
     // composition did not change, so its cached catalog still holds.
-    ctx.remote.$dispatch('agent-preset/selected', [sid('s1'), 'minimal'])
+    remote.emit('agent-preset/selected', [sid('s1'), 'minimal'])
     await source.candidates(proj('s1'), req(''))
     await source.candidates(proj('s2'), req(''))
     expect(payloads).toHaveLength(3)
@@ -351,6 +360,7 @@ describe('pick lands plain text', () => {
       session: proj('s1'),
       position: 'leading',
       via: 'menu',
+      action: 'pick',
       span: { start: 0, end: 4, draftRev: 7 },
     })
     expect(outcome).toEqual({ text: '/commit-helper ' })
@@ -378,5 +388,94 @@ describe('user-only marking', () => {
       { name: 'shared-skill', description: 'both surfaces' },
       { name: 'user-only-skill', description: '仅用户 · user surface only' },
     ])
+  })
+})
+
+describe('reference preview', () => {
+  const rows: SkillRow[] = [
+    { name: 'review', description: 'Review', path: '/skills/review/SKILL.md' },
+    { name: 'virtual', description: 'Virtual' },
+  ]
+
+  it('finishes the first click after a shared warm fetch and reloads after reconnect', async () => {
+    const gate = Promise.withResolvers<ListResult>()
+    const list = vi.fn<ListFn>().mockReturnValueOnce(gate.promise).mockImplementation(listOk(rows))
+    const { ctx, source, openResource } = await bench(list)
+    const session = proj('preview')
+    source.warm!(session)
+    expect(source.openReference!(session, { ref: '/review' })).toBe(true)
+    const candidates = source.candidates(session, req(''))
+    expect(openResource).not.toHaveBeenCalled()
+    expect(list).toHaveBeenCalledTimes(1)
+    gate.resolve({ ok: true, value: { skills: rows } })
+    await candidates
+    expect(openResource).toHaveBeenCalledExactlyOnceWith('dsh-resource://file/session/preview//skills/review/SKILL.md')
+    expect(source.openReference!(session, { ref: '/virtual' })).toBe(false)
+    expect(source.openReference!(session, { ref: '/missing' })).toBe(false)
+    expect(source.openReference!(session, { ref: '/review' })).toBe(true)
+    ctx.emit('connection/reset')
+    expect(source.openReference!(session, { ref: '/review' })).toBe(true)
+    await source.candidates(session, req(''))
+    expect(list).toHaveBeenCalledTimes(2)
+    expect(openResource).toHaveBeenCalledTimes(3)
+  })
+
+  it('keeps pending clicks bound to their own Session when another Session opens', async () => {
+    const first = Promise.withResolvers<ListResult>()
+    const second = Promise.withResolvers<ListResult>()
+    const list = vi.fn<ListFn>().mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
+    const { source, openResource } = await bench(list)
+    source.openReference!(proj('first'), { ref: '/review' })
+    const firstDone = source.candidates(proj('first'), req(''))
+    source.openReference!(proj('second'), { ref: '/review' })
+    const secondDone = source.candidates(proj('second'), req(''))
+    second.resolve({ ok: true, value: { skills: [{ ...rows[0]!, path: '/second/SKILL.md' }] } })
+    await secondDone
+    expect(openResource).toHaveBeenLastCalledWith('dsh-resource://file/session/second//second/SKILL.md')
+    first.resolve({ ok: true, value: { skills: rows } })
+    await firstDone
+    expect(openResource).toHaveBeenLastCalledWith('dsh-resource://file/session/first//skills/review/SKILL.md')
+    expect(list.mock.calls.map(([payload]) => payload)).toEqual([{ sessionId: 'first' }, { sessionId: 'second' }])
+  })
+
+  it.each(['reset', 'preset', 'dispose'] as const)('cancels a pending preview on %s even if the RPC completes late', async (reason) => {
+    const gate = Promise.withResolvers<ListResult>()
+    const { ctx, source, remote, fiber, openResource } = await bench(() => gate.promise)
+    const session = proj('preview')
+    const listener = vi.fn()
+    source.subscribeLexicon!(session, listener)
+    source.openReference!(session, { ref: '/review' })
+    const completion = expect(source.candidates(session, req(''))).rejects.toThrow()
+    if (reason === 'reset') ctx.emit('connection/reset')
+    else if (reason === 'preset') remote.emit('agent-preset/selected', [session.sessionId, 'minimal'])
+    else await fiber.dispose()
+    expect(listener).toHaveBeenCalledTimes(1)
+    gate.resolve({ ok: true, value: { skills: rows } })
+    await completion
+    expect(source.lexicon!(session)).toBeUndefined()
+    expect(listener).toHaveBeenCalledTimes(1)
+    expect(openResource).not.toHaveBeenCalled()
+  })
+
+  it('reports a failed preview fetch and allows the next click to retry', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    onTestFinished(() => { error.mockRestore() })
+    const list = vi.fn<ListFn>().mockRejectedValueOnce(new Error('offline')).mockImplementation(listOk(rows))
+    const { source, openResource } = await bench(list)
+    const session = proj('preview')
+    source.openReference!(session, { ref: '/review' })
+    await vi.waitFor(() => { expect(error).toHaveBeenCalledWith('[ui-skill] reference preview failed:', expect.any(Error)) })
+    expect(openResource).not.toHaveBeenCalled()
+    source.openReference!(session, { ref: '/review' })
+    await source.candidates(session, req(''))
+    expect(openResource).toHaveBeenCalledOnce()
+  })
+
+  it('does not fetch or preview a skill from addressed subagent history', async () => {
+    const list = vi.fn(listOk(rows))
+    const { source, openResource } = await bench(list, sid('child'))
+    expect(source.openReference!(proj('child'), { ref: '/review' })).toBe(false)
+    expect(list).not.toHaveBeenCalled()
+    expect(openResource).not.toHaveBeenCalled()
   })
 })

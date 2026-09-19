@@ -14,6 +14,7 @@ import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
 import type { ReplayOverrideDoc } from '@deepseek-ai/dsh-llm-replay'
 import {
   assertFixtureInventory,
+  captureExpandedTurnProcessAria,
   captureStableAria,
   compareOrRefreshGolden,
   launchWebScaffold,
@@ -21,14 +22,15 @@ import {
   webSnapshotMode,
   type WebScaffold,
 } from './scaffold.ts'
-import { connectFreshWorkspace, newEnglishPage, saveFailureShot } from './support.ts'
+import { connectFreshWorkspace, expandOwningTurnProcess, newEnglishPage, saveFailureShot } from './support.ts'
 
-const SNAPSHOT_DIR = fileURLToPath(new URL('./snapshots/skill-user-invoke', import.meta.url))
+const SNAPSHOT_DIR = fileURLToPath(new URL('./expected/skill-user-invoke', import.meta.url))
 const UI_EXPECTED = join(SNAPSHOT_DIR, 'ui.expected.md')
+const UI_EXPANDED_EXPECTED = join(SNAPSHOT_DIR, 'ui-expanded.expected.md')
 const MODE = webSnapshotMode()
 
 const SKILL_NAME = 'user-invoke-demo'
-const ARGS_TEXT = 'and confirm the fixture wiring'
+const ARGS_TEXT = '@"meeting notes.md" and confirm the fixture wiring'
 const REPLY = 'USER_INVOKE_REPLY acknowledged; following the injected skill.'
 
 async function seedUserOnlySkill(workspaceCwd: string): Promise<void> {
@@ -76,10 +78,11 @@ describe.skipIf(MODE === 'record')('web e2e: user-explicit skill invocation thro
       paceMs: 10,
     })
     await seedUserOnlySkill(scaffold.workspaceCwd)
+    await writeFile(join(scaffold.workspaceCwd, 'workspace', 'meeting notes.md'), '# Meeting notes\n\nSent reference preview.\n')
     browser = await chromium.launch()
     page = await newEnglishPage(browser)
     tripwire = watchConsole(page)
-    await page.goto(scaffold.baseUrl, { waitUntil: 'load' })
+    await page.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })
     await page.waitForSelector('[class*="frame"]', { timeout: 30_000 })
     await connectFreshWorkspace(page, scaffold.workspaceCwd)
   }, 120_000)
@@ -98,7 +101,7 @@ describe.skipIf(MODE === 'record')('web e2e: user-explicit skill invocation thro
 
   it('claims /name args into a gesture bubble, an injection row, and a replayed answer', async () => {
     onTestFailed(() => saveFailureShot(page, 'web-e2e-skill-user-invoke'))
-    const composer = page.locator('textarea:enabled').last()
+    const composer = page.locator('[data-composer-input][contenteditable="true"]').last()
     await composer.waitFor({ timeout: 15_000 })
 
     // The menu lists the user-only skill (its only entry point) before enter.
@@ -120,10 +123,20 @@ describe.skipIf(MODE === 'record')('web e2e: user-explicit skill invocation thro
     expect(await bubble.textContent()).toBe(`/${SKILL_NAME}`)
 
     // The rendered body arrives as a context-injection row named after the
-    // skill; expanding it reveals the canonical <skill_content> block, and
-    // the user's text is NOT folded into it.
+    // skill. Context plus the final answer contributes no summary count, so
+    // the Turn uses the fallback title while the row's own disclosure remains usable.
+    const injectionFlow = page.locator('[data-chat-flow-kind="context"]').filter({ hasText: SKILL_NAME })
+    await injectionFlow.waitFor({ state: 'attached', timeout: 15_000 })
+    await page.getByText('USER_INVOKE_REPLY', { exact: false }).first().waitFor({ timeout: 20_000 })
+    await settled
+    const process = page.getByRole('button', { name: 'Thought for a while', exact: true })
+    await process.waitFor({ state: 'visible', timeout: 10_000 })
+    // The chip derives from the step's logged injection, so it must survive
+    // every later Node rebuild of the Turn (process publication, turn close).
+    expect(await bubble.count()).toBe(1)
+    expect(await bubble.textContent()).toBe(`/${SKILL_NAME}`)
+    await expandOwningTurnProcess(page, injectionFlow)
     const injectionRow = page.getByRole('button', { name: `Context injection ${SKILL_NAME}` })
-    await injectionRow.waitFor({ timeout: 15_000 })
     await injectionRow.click()
     const injectionBody = page
       .locator('[data-context-injection-body]')
@@ -133,18 +146,43 @@ describe.skipIf(MODE === 'record')('web e2e: user-explicit skill invocation thro
     expect(injected).toContain('Reply with the fixture acknowledgement line.')
     expect(injected).not.toContain(ARGS_TEXT)
     await injectionRow.click()
-
-    // The injection started a turn; the replay adapter answers it.
-    await page.getByText('USER_INVOKE_REPLY', { exact: false }).first().waitFor({ timeout: 20_000 })
-    await settled
+    await process.click()
 
     const snapshot = await captureStableAria(page, '[class*="centerCol"]', scaffold.workspaceCwd)
     await compareOrRefreshGolden(UI_EXPECTED, snapshot, MODE)
+    const expanded = await captureExpandedTurnProcessAria(
+      page,
+      '[class*="centerCol"]',
+      scaffold.workspaceCwd,
+    )
+    await compareOrRefreshGolden(UI_EXPANDED_EXPECTED, expanded, MODE)
     expect(tripwire.pageErrors).toEqual([])
     expect(tripwire.warnings).toEqual([])
   }, 60_000)
 
+  it('previews sent skill and quoted file references with prose-link hover styling after reloading history', async () => {
+    onTestFailed(() => saveFailureShot(page, 'web-e2e-sent-reference-preview'))
+    await page.reload({ waitUntil: 'load' })
+    const skill = page.locator('[data-chat-flow-kind="user"] [data-ref-chip="skill"]').first()
+    await skill.waitFor({ timeout: 15_000 })
+    const preview = page.locator('[data-document-markdown]')
+    await skill.hover()
+    await expect.poll(() => skill.evaluate(el => getComputedStyle(el).textDecorationStyle)).toBe('dotted')
+    await skill.click()
+    await expect.poll(() => preview.textContent(), { timeout: 10_000 }).toContain('Reply with the fixture acknowledgement line.')
+    const file = page.locator('[data-chat-flow-kind="user"] [data-ref-chip="file"]').first()
+    await file.hover()
+    expect(await file.evaluate(el => getComputedStyle(el).textDecorationStyle)).toBe('dotted')
+    await file.click()
+    await expect.poll(() => preview.textContent()).toContain('Sent reference preview.')
+    await skill.click()
+    await expect.poll(() => preview.textContent()).toContain('Reply with the fixture acknowledgement line.')
+    expect(await page.locator('[data-chat-flow-kind="user"]').first().textContent()).toContain('and confirm the fixture wiring')
+    expect(tripwire.pageErrors).toEqual([])
+    expect(tripwire.warnings).toEqual([])
+  })
+
   it('keeps its snapshot inventory closed', async () => {
-    await assertFixtureInventory(SNAPSHOT_DIR, ['ui.expected.md'])
+    await assertFixtureInventory(SNAPSHOT_DIR, ['ui.expected.md', 'ui-expanded.expected.md'])
   })
 })

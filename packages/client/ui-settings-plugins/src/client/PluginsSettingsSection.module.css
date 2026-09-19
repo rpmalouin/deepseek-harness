@@ -24,7 +24,7 @@
   display: flex;
   align-items: flex-end;
   gap: 22px;
-  border-bottom: 1px solid var(--dsw-alias-border-l2);
+  border-bottom: 0.5px solid var(--dsw-alias-border-l2);
   margin-top: 2px;
 }
 
@@ -82,4 +82,27 @@
   margin: 0;
   font-size: 13px;
   color: var(--dsw-alias-label-tertiary);
+}
+
+/* Configurable tab: the card list. */
+
+.configurable {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Preset detail page: the settings section over the same cards. */
+
+.presetSettings {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.presetSettingsTitle {
+  margin: 0;
+  font-size: 15px;
+  line-height: 22px;
+  font-weight: 600;
 }

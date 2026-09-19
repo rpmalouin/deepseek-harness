@@ -1,9 +1,3 @@
-// parseAnsiLines, the ANSI model behind TerminalBlock: anser's SGR runs
-// resolved into inline styles and folded into per-line span arrays, with every
-// escape and control character that carries no color removed first. The DOM
-// side of the same model (which runs get a span wrapper) is in
-// terminal-block.spec.tsx.
-
 import { describe, expect, it } from 'vitest'
 import { parseAnsiLines } from '../src/ansi.ts'
 
@@ -12,12 +6,10 @@ const BS = '\u0008'
 /** A combining acute accent: zero-width, so it takes no terminal column. */
 const ACCENT = '\u0301'
 
-/** Paint `text` with the SGR `codes`, then reset. */
 function sgr(codes: string, text: string): string {
   return `${ESC}[${codes}m${text}${ESC}[0m`
 }
 
-/** The single span of a single-line, single-run parse. */
 function onlySpan(text: string) {
   const lines = parseAnsiLines(text)
   expect(lines).toHaveLength(1)
@@ -60,6 +52,8 @@ describe('parseAnsiLines: basic colors mapped onto theme tokens', () => {
     ['93', 'bright yellow', 'var(--dsw-alias-state-warn-secondary)'],
     ['34', 'blue', 'var(--dsw-alias-state-business-primary)'],
     ['94', 'bright blue', 'var(--dsw-static-blue-400)'],
+    ['36', 'cyan', 'var(--dsw-static-blue-600)'],
+    ['96', 'bright cyan', 'var(--dsw-static-blue-500)'],
   ])('SGR %s (%s) resolves to %s', (code, _name, token) => {
     expect(onlySpan(sgr(code, 'x'))).toEqual({ text: 'x', style: { color: token } })
   })
@@ -68,7 +62,6 @@ describe('parseAnsiLines: basic colors mapped onto theme tokens', () => {
 describe('parseAnsiLines: colors with no token equivalent', () => {
   it.each<[string, string, string]>([
     ['35', 'magenta', 'rgb(187, 0, 187)'],
-    ['36', 'cyan', 'rgb(0, 187, 187)'],
     ['38;5;208', '256-palette orange', 'rgb(255, 135, 0)'],
     ['38;2;10;20;30', 'truecolor', 'rgb(10, 20, 30)'],
   ])('SGR %s (%s) falls through to %s', (code, _name, literal) => {
