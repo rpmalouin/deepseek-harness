@@ -13,8 +13,14 @@
 *.i18n.yaml
 
 # Per-workspace build configuration, 435 package.json + 500 tsconfig files.
+# A leading "*" is required on both: the matcher fnmatches these against the FULL
+# relative path, so a bare name can only match a file at the repo root (verified
+# against incremental.py:888 - fnmatch, where "*" crosses "/"). Bare lines are kept
+# for the root-level copies of each.
 package.json
+*/package.json
 tsconfig*.json
+*/tsconfig*.json
 
 # Locale packs: eight json per package across ~400 packages, 2,544 files of
 # translated string keys. Same reasoning as the i18n yaml above.
