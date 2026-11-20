@@ -3,14 +3,16 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import Schema from '@deepseek-ai/schemastery'
-import { BrowserUseProviderName } from '@deepseek-ai/dsh-browser-use/brand'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { BrowserUseProviderName } from '@deepseek-ai/dsh-browser-use/types'
 import * as McpClient from '@deepseek-ai/dsh-mcp-client'
 import { createScope } from '@deepseek-ai/dsh-scope'
 import type { Scope } from '@deepseek-ai/dsh-scope'
-import { SessionResources } from './index.ts'
+import { BrowserSessionError, SessionResources } from './index.ts'
 import type {} from '@deepseek-ai/dsh-browser-use'
-import type {} from '@deepseek-ai/dsh-tools'
+import { ToolContextUnavailableError } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-system-prompt'
+import type {} from '@deepseek-ai/dsh-working-directory'
 
 /** Browser launch settings shared by the MCP integrations. */
 export interface BrowserMcpLaunchConfig {
@@ -94,10 +96,13 @@ interface ClientState {
  * Await one MCP client during each future Agent's creation.
  * A busy attachment leaves that activation without browser tools; its other turns continue.
  * Calls are serialized per Session; unload closes every server before releasing registration.
- * @param ctx - provider context supplying browser use, Agents, tools, and prompt assembly.
+ * @param ctx - provider context supplying browser use, Agents, tools, prompt assembly, and working directories.
  * @param options - provider identity, attachment exclusivity, and executable configuration.
+ * @throws when the working-directory provider is absent, before browser resources are registered.
  */
 export function mountSessionMcp(ctx: Context, options: SessionMcpOptions): void {
+  const workingDirectory = ctx.get('workingDirectory')
+  if (workingDirectory === undefined) throw new Error(`${options.name}: browser MCP requires a working-directory provider`)
   let resources!: SessionResources<Scope>
   const clients = new Map<Agent, ClientState>()
   const toolPrefix = `mcp__${options.name}__`
@@ -122,7 +127,7 @@ export function mountSessionMcp(ctx: Context, options: SessionMcpOptions): void 
   }
 
   ctx.effect(function* () {
-    yield ctx.browserUse.register(BrowserUseProviderName(options.name))
+    yield ctx.browserUse.register(brandString<BrowserUseProviderName>(options.name))
     resources = new SessionResources(ctx, {
       label: options.name,
       exclusive: options.exclusive,
@@ -137,7 +142,7 @@ export function mountSessionMcp(ctx: Context, options: SessionMcpOptions): void 
             if (!exec.name.startsWith(toolPrefix)) return next()
             if (exec.agent !== agent) {
               if (ctx.tools.get(exec.name, exec.agent) !== ctx.tools.get(exec.name, agent)) return next()
-              throw new Error(`${options.name}: browser tool belongs to another Session`)
+              throw new BrowserSessionError(`${options.name}: browser tool belongs to another Session`, 'BROWSER_FOREIGN_SESSION')
             }
             return next()
           })
@@ -147,7 +152,7 @@ export function mountSessionMcp(ctx: Context, options: SessionMcpOptions): void 
             command: options.command,
             args: options.args,
             ...options.env === undefined ? {} : { env: options.env },
-            ...agent.session.header.cwd === undefined ? {} : { cwd: agent.session.header.cwd },
+            cwd: await workingDirectory.ensure(agent, signal),
             ...options.toolCallTimeoutMs === undefined ? {} : { toolCallTimeoutMs: options.toolCallTimeoutMs },
             failOnStartupError: true,
             reconnect: { enabled: false },
@@ -195,8 +200,9 @@ export function mountSessionMcp(ctx: Context, options: SessionMcpOptions): void 
       && (exec.arguments as { server?: unknown }).server === options.name
     if (!exec.name.startsWith(toolPrefix) && !ownResource) return next()
     const agent = exec.agent
-    if (agent === undefined || clients.get(agent)?.status !== 'ready') {
-      throw new Error(`${options.name}: browser tool belongs to another Session`)
+    if (agent === undefined) throw new ToolContextUnavailableError(`${options.name}: browser tools require a calling Agent`)
+    if (clients.get(agent)?.status !== 'ready') {
+      throw new BrowserSessionError(`${options.name}: browser tool belongs to another Session`, 'BROWSER_FOREIGN_SESSION')
     }
     return resources.run(agent, exec.signal, async (_scope, combined) => {
       const original = exec.signal

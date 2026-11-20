@@ -18,8 +18,9 @@ vi.mock('../scripts/windows-sign.mjs', () => ({
 }))
 
 const versions = ['0.1.6-nightly.20260914.1', '0.1.6-nightly.20260914.2'] as const
-const environment = { DSH_DESKTOP_AUTO_UPDATE_ENV: 'test', DOWNLOAD_TEST_ORIGIN: 'https://download-test.deepseek.com',
+const environment = { DSH_DESKTOP_AUTO_UPDATE_ENV: 'test', DOWNLOAD_TEST_ORIGIN: 'https://download-test.deepseek.com', DOWNLOAD_TEST_RELEASE_ID: '0123456789abcdef0123456789abcdef',
   DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN: 'https://policy.example.com',
+  DSH_DESKTOP_MANDATORY_UPDATE_CONFIG: JSON.stringify({ allowedAuthOrigins: ['https://login.example.com'] }),
   DOWNLOAD_TEST_COS_BUCKET: 'bj-toc-download-test-1320056602' }
 const require = createRequire(import.meta.url)
 const { validateConfiguration } = require('app-builder-lib/out/util/config/config.js') as {
@@ -34,6 +35,8 @@ async function fixture<T>(body: (manifest: string, source: string) => Promise<T>
     await prepareInstalledUpdateBootstrap(manifest)
     const source = join(root, 'app')
     await mkdir(join(source, 'lib'), { recursive: true })
+    await mkdir(join(source, 'lib/welcome'), { recursive: true })
+    await writeFile(join(source, 'lib/welcome/design-platform.css'), 'body { --fixture-token: white; }\n')
     await mkdir(join(source, 'renderer'))
     for (const file of ['main.js', 'preload-app.cjs', 'preload-mandatory.cjs', 'preload-update-dialog.cjs']) {
       await writeFile(join(source, 'lib', file), '// inert fixture\n')
@@ -56,19 +59,23 @@ describe('installed-update application inputs and builder configuration', () => 
         .toMatchObject({ dependenciesFrozen: false, signed: false, bootTested: false })
       const directory = await verifyInstalledUpdateApplication(join(manifest, '..'))
       expect((await readdir(directory)).sort()).toEqual(['installed-update-identity.mjs', 'lib', 'qualification-bootstrap.mjs', 'renderer'])
+      expect(await readFile(join(directory, 'lib/welcome/design-platform.css'), 'utf8')).toBe('body { --fixture-token: white; }\n')
       await writeFile(join(source, 'lib/main.js'), '// later checkout\n')
       expect(await readFile(join(directory, 'lib/main.js'), 'utf8')).toBe('// inert fixture\n')
       await expect(prepareInstalledUpdateApplication(manifest, source)).rejects.toMatchObject({ code: 'EEXIST' })
     })
   })
 
-  it.each(['modified', 'added', 'missing'] as const)('rejects %s frozen application bytes', async (failure) => {
+  it.each([
+    ['modified', 'lib/main.js'], ['added', 'lib/unrecorded.js'], ['missing', 'lib/main.js'],
+    ['modified', 'lib/welcome/design-platform.css'], ['missing', 'lib/welcome/design-platform.css'],
+  ] as const)('rejects %s frozen application bytes in %s', async (failure, file) => {
     await fixture(async (manifest, source) => {
       await prepareInstalledUpdateApplication(manifest, source)
       const root = join(manifest, '..')
       const directory = await verifyInstalledUpdateApplication(root)
-      if (failure === 'missing') await rm(join(directory, 'lib/main.js'))
-      else await writeFile(join(directory, failure === 'added' ? 'lib/unrecorded.js' : 'lib/main.js'), '// invalid\n')
+      if (failure === 'missing') await rm(join(directory, file))
+      else await writeFile(join(directory, file), '// invalid\n')
       await expect(verifyInstalledUpdateApplication(root)).rejects.toThrow()
     })
   })
@@ -87,8 +94,10 @@ describe('installed-update application inputs and builder configuration', () => 
         expect(config.extraMetadata.main).toBe('qualification-bootstrap.mjs')
         expect(config.directories.output).toBe(join(manifest, '..', versions[index]!, 'installer'))
         const dsh = join(manifest, '..', versions[index]!, 'dsh')
-        expect(config.files[2]).toMatchObject({ from: dsh, to: 'dsh' })
-        expect(config.files[3]).toMatchObject({ from: join(dsh, 'node_modules'), to: 'dsh/node_modules' })
+        expect(config.files.at(-2)).toMatchObject({ from: dsh, to: 'dsh' })
+        expect(config.files.at(-1)).toMatchObject({ from: join(dsh, 'node_modules'), to: 'dsh/node_modules' })
+        expect(config.files).toContain('!node_modules/**/*.{js,cjs,mjs,ts,cts,mts,css}.map')
+        expect(config.files).toContain('!node_modules/**/*.tsbuildinfo')
         expect(config.win.forceCodeSigning).toBe(true)
         expect(config.win.signtoolOptions.publisherName).toBe('CN=Fixture,O=Fixture,C=CN')
         expect(typeof config.win.signtoolOptions.sign).toBe('function')

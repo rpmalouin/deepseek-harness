@@ -1,3 +1,5 @@
+import type { AttachmentId } from '@deepseek-ai/dsh-attachment/types'
+import { brandString } from '@deepseek-ai/dsh-brand'
 // @vitest-environment jsdom
 /**
  * SlotTestRuntime behavior: root declaration + rendering, session
@@ -8,7 +10,7 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import { stubSettingsScope } from '../src/settings-scope.ts'
+import { stubConfigForm } from '../src/config-form.ts'
 import { act, cleanup } from '@testing-library/react'
 import { useSyncExternalStore } from 'react'
 import { createSnapshotStore, defineStore } from '@deepseek-ai/dsh-client-store'
@@ -16,7 +18,7 @@ import { createScope, type SessionReference } from '@deepseek-ai/dsh-api-session
 import type { WorkspaceId } from '@deepseek-ai/dsh-api-workspace-controller/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type {
-  PropsRenderSlots, SessionStandardProps, SlotRendererHost,
+  GlobalStandardProps, PropsRenderSlots, SessionStandardProps, SlotRendererHost,
 } from '@deepseek-ai/dsh-client-ui-slots'
 import { SlotTestRuntime } from '@deepseek-ai/dsh-client-test-runtime'
 
@@ -177,6 +179,27 @@ describe('sessions', () => {
     await runtime.dispose()
   })
 
+  it('resolves loaded parent projection addresses without retaining a session', async () => {
+    const runtime = await runtimeWithFrame()
+    try {
+      const parent = 'parent' as SessionId
+      const child = 'child' as SessionId
+      runtime.sessions.list.update((draft) => {
+        draft.projectionsBySession = {
+          [parent]: { state: 'ready', error: null, values: { subagentCatalog: [{ createdAt: 1, id: child, mode: 'continuable', label: 'worker' }] } },
+        }
+      })
+      expect(runtime.sessions.subagentAddress(child)).toEqual({
+        parentSessionId: parent, childSessionId: child, mode: 'continuable',
+      })
+      expect(runtime.sessions.subagentAddress(parent)).toBeUndefined()
+      expect(runtime.sessions.binding(child)).toBeUndefined()
+      expect(runtime.sessions.binding(parent)).toBeUndefined()
+    } finally {
+      await runtime.dispose()
+    }
+  })
+
   it('accepts explicit addresses without a catalog and keeps them independent of references', async () => {
     const runtime = await runtimeWithFrame()
     await runtime.sessions.add({ id: 's1' })
@@ -192,8 +215,7 @@ describe('sessions', () => {
     await runtime.sessions.updateSummary('s1', { displayTitle: 'renamed', running: true })
     expect(runtime.sessions.list.getSnapshot().byId['s1' as SessionId])
       .toMatchObject({ displayTitle: 'renamed', running: true })
-    runtime.sessions.setSubagentCatalogOpen('s2' as SessionId, true)
-    await runtime.sessions.refreshSubagents('s2' as SessionId)
+    await runtime.sessions.refreshProjections('s2' as SessionId)
     reference.release()
     expect(runtime.sessions.binding('s1')).toBeUndefined()
     expect(runtime.sessions.subagentAddress('s1' as SessionId)).toEqual(address)
@@ -201,8 +223,7 @@ describe('sessions', () => {
       sessionId: 's1' as SessionId, atSeq: 7, increaseTitle: true,
     })).resolves.toBe('s1')
     expect(runtime.sessions.calls).toEqual([
-      { method: 'setSubagentCatalogOpen', args: ['s2', true] },
-      { method: 'refreshSubagents', args: ['s2'] },
+      { method: 'refreshProjections', args: ['s2'] },
       { method: 'fork', args: [{ sessionId: 's1', atSeq: 7, increaseTitle: true }] },
     ])
     await runtime.dispose()
@@ -213,13 +234,14 @@ describe('sessions', () => {
     const parentId = 'parent' as SessionId
     await runtime.sessions.add({ id: 'child' })
     runtime.sessions.list.update((draft) => {
-      draft.subagentsByParent = {
+      draft.projectionsBySession = {
         [parentId]: {
-          state: 'ready', error: null, parentAvailable: true,
-          entries: [
-            { kind: 'child', id: 'other' as SessionId, mode: 'one-shot', activity: 'inactive', hasChildren: false },
-            { kind: 'child', id: 'child' as SessionId, mode: 'continuable', label: 'Child', activity: 'inactive', hasChildren: false },
-          ],
+          state: 'ready', error: null,
+          values: { subagentCatalog: [
+            { createdAt: 1, id: 'other' as SessionId, mode: 'one-shot' },
+            { createdAt: 2, id: 'child' as SessionId, mode: 'continuable', label: 'Child' },
+            { createdAt: 3, id: 'external' as SessionId, mode: 'external' },
+          ] },
         },
       }
     })
@@ -228,6 +250,9 @@ describe('sessions', () => {
       parentSessionId: parentId, childSessionId: 'child', mode: 'continuable',
     })
     expect(runtime.sessions.subagentAddress('missing' as SessionId)).toBeUndefined()
+    expect(runtime.sessions.subagentAddress('external' as SessionId)).toBeUndefined()
+    expect(runtime.sessions.binding(parentId)).toBeUndefined()
+    expect(runtime.sessions.binding('child')).toBeUndefined()
     await runtime.dispose()
   })
 
@@ -240,11 +265,22 @@ describe('sessions', () => {
     const second = runtime.sessions.retain(id, { source: 'testOperation' })
     const scope = first.binding.ctx
     await Promise.all([first.ready, second.ready])
-    expect(info.getSnapshot()).toEqual({ referenceCount: 2, retainedBy: { testOperation: 2 } })
+    expect(info.getSnapshot()).toEqual({ referenceCount: 2, retainedBy: { testOperation: 2 }, connectionCount: 2 })
     expect(runtime.sessions.list.getSnapshot().byId[id]?.retainedBy).toEqual({ testOperation: 2 })
+    expect('retainedFacets' in info.getSnapshot()).toBe(false)
+    const rendered = runtime.sessions.retain(id)
+    expect(info.getSnapshot().retainedFacets).toEqual({ conversation: 1 })
+    rendered.release()
+    const draftHeld = runtime.sessions.retain(id, { source: 'testOperation', connection: false })
+    await draftHeld.ready
+    expect(info.getSnapshot()).toMatchObject({ referenceCount: 3, connectionCount: 2 })
     first.release()
-    expect(info.getSnapshot()).toEqual({ referenceCount: 1, retainedBy: { testOperation: 1 } })
     second.release()
+    expect(info.getSnapshot()).toEqual({ referenceCount: 1, retainedBy: { testOperation: 1 } })
+    const another = runtime.sessions.retain(id, { source: 'testOperation', connection: false })
+    another.release()
+    draftHeld.release()
+    expect('retainedFacets' in info.getSnapshot()).toBe(false)
     await scope.fiber.dispose()
     expect(info.getSnapshot()).toEqual({ referenceCount: 0, retainedBy: {} })
 
@@ -536,6 +572,27 @@ describe('workspaces', () => {
     expect(view.container.textContent).toContain('ws:pending')
     await runtime.dispose()
   })
+  it('skips default initialization without a fixture and forwards the caller lifetime', async () => {
+    const runtime = await SlotTestRuntime.create()
+    try {
+      const signal = new AbortController().signal
+      await expect(runtime.workspaces.initializeDefault(signal)).resolves.toBeUndefined()
+      const workspace = {
+        workspaceId: 'default' as WorkspaceId, title: 'default-workspace', path: '/default', sessionIds: [],
+        createdAt: '2026-09-20T00:00:00Z', updatedAt: '2026-09-20T00:00:00Z',
+      }
+      const initialize = vi.fn(async () => workspace)
+      runtime.workspaces.stub('initializeDefault', initialize)
+      await expect(runtime.workspaces.initializeDefault(signal)).resolves.toBe(workspace)
+      expect(initialize).toHaveBeenCalledWith(signal)
+      expect(runtime.workspaces.calls).toEqual([
+        { method: 'initializeDefault', args: [signal] },
+        { method: 'initializeDefault', args: [signal] },
+      ])
+    } finally {
+      await runtime.dispose()
+    }
+  })
 })
 
 describe('feature mount and disposal', () => {
@@ -696,11 +753,14 @@ describe('fixture session face', () => {
     await runtime.sessions.add({ id: 's1' })
     const bare = runtime.sessions.behavior('s1')
     expect(() => bare.prompt()).toThrow(/prompt is not stubbed/)
-    expect(() => bare.readAttachment('att-1' as Parameters<typeof bare.readAttachment>[0])).toThrow(/readAttachment is not stubbed/)
+    expect(() => bare.readAttachment({
+      attachmentId: brandString<AttachmentId>('att-1'), mediaType: 'image/png', bytes: 1, width: 1, height: 1,
+    })).toThrow(/readAttachment is not stubbed/)
     expect(() => bare.updateQueue()).toThrow(/updateQueue is not stubbed/)
     expect(() => bare.cancel()).toThrow(/cancel is not stubbed/)
     expect(() => bare.command()).toThrow(/command is not stubbed/)
     expect(() => bare.loadOlder()).toThrow(/loadOlder is not stubbed/)
+    expect(() => bare.consumeOlder()).toThrow('test session "s1": consumeOlder is not stubbed — supply it on the fixture\'s session face')
     expect(() => bare.loadThrough()).toThrow(/loadThrough is not stubbed/)
     expect(() => bare.rename()).toThrow(/rename is not stubbed/)
     const submission = bare.beginSubmission()
@@ -742,6 +802,25 @@ describe('fixture session face', () => {
     await runtime.dispose()
   })
 
+  it('publishes running status through the real ui-session-status root hook', async () => {
+    const reference = createSnapshotStore<SessionReference | undefined>(undefined)
+    const runtime = await runtimeWithFrame(reference)
+    runtime.slots.register({ name: 'trt.chat' }, (props: SessionStandardProps & GlobalStandardProps) => (
+      <span>running:{props.useSessionStatus(status => String(status.get(props.sessionId)?.running))}</span>
+    ))
+    const view = runtime.renderRoot()
+    await runtime.sessions.add({ id: 's1' })
+    using bound = runtime.sessions.retain('s1' as SessionId)
+    await bound.ready
+    act(() => { reference.set(bound) })
+    expect(view.container.textContent).toContain('running:false')
+
+    act(() => { runtime.remote.emit('api-session/status', ['s1', true]) })
+    expect(view.container.textContent).toContain('running:true')
+    expect(runtime.ctx.uiSession.sessionStatus.getSnapshot().get('s1' as SessionId)?.running).toBe(true)
+    await runtime.dispose()
+  })
+
   it('copies projections into a later Session generation', async () => {
     const runtime = await runtimeWithFrame()
     const id = await runtime.sessions.add({ id: 'seeded-projection' })
@@ -756,6 +835,41 @@ describe('fixture session face', () => {
 })
 
 describe('workspaces action face', () => {
+  it('records pin and unpin actions, updates the ordered set, and honors stubs', async () => {
+    const runtime = await SlotTestRuntime.create()
+    try {
+      const ws = runtime.workspaces
+      const first = 'first' as SessionId
+      const second = 'second' as SessionId
+      await ws.pinSession(first)
+      await ws.pinSession(second)
+      await ws.pinSession(first)
+      expect(ws.list.getSnapshot().pinnedSessionIds).toEqual([first, second])
+      await ws.unpinSession(first)
+      expect(ws.list.getSnapshot().pinnedSessionIds).toEqual([second])
+
+      const pin = vi.fn(async () => {})
+      const unpin = vi.fn(async () => {})
+      ws.stub('pinSession', pin)
+      ws.stub('unpinSession', unpin)
+      await ws.pinSession(first)
+      await ws.unpinSession(second)
+      expect(pin).toHaveBeenCalledWith(first)
+      expect(unpin).toHaveBeenCalledWith(second)
+      expect(ws.list.getSnapshot().pinnedSessionIds).toEqual([second])
+      expect(ws.calls).toEqual([
+        { method: 'pinSession', args: [first] },
+        { method: 'pinSession', args: [second] },
+        { method: 'pinSession', args: [first] },
+        { method: 'unpinSession', args: [first] },
+        { method: 'pinSession', args: [first] },
+        { method: 'unpinSession', args: [second] },
+      ])
+    } finally {
+      await runtime.dispose()
+    }
+  })
+
   it('records every IWorkspaces verb with inert defaults and honors stubs', async () => {
     const runtime = await SlotTestRuntime.create()
     const ws = runtime.workspaces
@@ -834,7 +948,7 @@ describe('single-slot mounting edge arms', () => {
 
 describe('stubbed settings scope', () => {
   it('records both write kinds and publishes a Host acceptance to its listeners', async () => {
-    const host = stubSettingsScope<{ preference: string }>()
+    const host = stubConfigForm<{ preference: string }>()
     let notified = 0
     const stop = host.scope.subscribe(() => { notified += 1 })
     expect(host.listenerCount()).toBe(1)
@@ -843,7 +957,8 @@ describe('stubbed settings scope', () => {
     })
 
     await host.scope.set('preference', 'dark')
-    await host.scope.unset('preference')
+    await expect(host.scope.unset('preference')).resolves.toBe(true)
+    await expect(host.scope.mutate([{ op: 'set', path: ['preference'], value: 'dark' }])).resolves.toBe(true)
     host.publish({
       status: 'ready',
       value: { preference: 'system' },

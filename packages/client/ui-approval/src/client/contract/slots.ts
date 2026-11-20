@@ -2,7 +2,7 @@
 import type { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type {
-  PropsLocale, PropsRenderSlots, PropsRuntime,
+  PropsLocale, PropsRenderFactories, PropsRuntime,
 } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ApprovalKey } from '../locales.ts'
 
@@ -32,6 +32,16 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
     approval: ApprovalKey
   }
 
+  interface SlotFactoryMap {
+    /** Shared decision card; the caller owns authorization and persistence. */
+    'conversation.approval.card': {
+      scope: 'session'
+      props: ApprovalCardInput
+      locale: 'approval'
+      children: { 'conversation.approval.detail': { kind: 'single'; scope: 'session' } }
+    }
+  }
+
   interface SlotMap {
     /** Optional detail for the Tool call correlated with an approval request. */
     'conversation.approval.detail': {
@@ -56,6 +66,8 @@ export interface ApprovalPresentationRequest {
   readonly callId?: ToolCallId
   /** Human-readable reason supplied by the requester. */
   readonly reason?: string
+  /** Localized presentation copy; the audit reason remains unchanged. */
+  readonly displayReason?: { readonly en: string; readonly [locale: string]: string }
   /** Cancellation projected from the Host waterfall. */
   readonly signal?: AbortSignal
 }
@@ -64,6 +76,9 @@ export interface ApprovalPresentationRequest {
 export type ApprovalDecision = 'allowed-once' | 'rejected'
 
 let nextApprovalKey = 0
+
+/** Domain discriminator literal carried by {@link PendingApproval.kind}. */
+export type ApprovalInteractionKind = 'approval'
 
 /** One answerable Client presentation of a pending Host waterfall. */
 export class PendingApproval {
@@ -77,6 +92,8 @@ export class PendingApproval {
   readonly callId: ToolCallId | undefined
   /** Human-readable reason supplied by the asker. */
   readonly reason: string | undefined
+  /** Localized presentation copy, when supplied by the asker. */
+  readonly displayReason: ApprovalPresentationRequest['displayReason']
   /** Result returned by the Remote Event listener to the Host waterfall. */
   readonly result: Promise<ApprovalDecision>
 
@@ -98,6 +115,7 @@ export class PendingApproval {
     this.toolName = request.toolName
     this.callId = request.callId
     this.reason = request.reason
+    this.displayReason = request.displayReason
     const completion = Promise.withResolvers<ApprovalDecision>()
     this.result = completion.promise
     this.#resolve = completion.resolve
@@ -113,6 +131,14 @@ export class PendingApproval {
     this.#onAbort = onAbort
     request.signal.addEventListener('abort', onAbort, { once: true })
     if (request.signal.aborted) onAbort()
+  }
+
+  /**
+   * Availability of this pending request after answer or withdrawal.
+   * @returns whether this request can still accept a decision.
+   */
+  get answerable(): boolean {
+    return !this.#settled
   }
 
   /**
@@ -159,9 +185,46 @@ export class PendingApproval {
   }
 }
 
+/** Locale lookup supplied by the approval registration. */
+export interface ApprovalInjected {
+  /**
+   * Resolve requester-owned copy in the current UI language.
+   * @param reason - localized presentation text with an English fallback.
+   * @returns text for the active UI language.
+   */
+  resolveReason(reason: NonNullable<ApprovalPresentationRequest['displayReason']>): string
+}
+
 /** Full props of the approval composer takeover. */
 export type ApprovalComposerProps =
   PropsRuntime<'conversation.composer'>
-  & PropsRenderSlots<'conversation.approval.detail'>
+  & PropsRenderFactories
   & { matched: PendingApproval }
   & PropsLocale<'approval'>
+  & ApprovalInjected
+
+/** Data and decisions accepted by the shared approval card. */
+export interface ApprovalCardInput {
+  /** Identity whose change resets the pending submission. */
+  requestKey: string
+  /** Localized question describing the requested operation. */
+  title: string
+  /** Localized scope or consequence of the decision. */
+  description?: string
+  /** Caller-localized warning label and explanation, with paragraphs separated by blank lines (`\n\n`). */
+  warning?: { label: string; title: string; detail: string }
+  /** Subject metadata for human recognition; the caller admits icon URLs. Never an authorization identity. */
+  subject?: { name: string; icon?: string }
+  /** Optional tool-owned detail rendered through the existing child slot. */
+  callId?: ToolCallId
+  /** Caller-specific scope label; ordinary approvals use Allow once. */
+  allowLabel?: string
+  /** Whether the caller still accepts an answer. */
+  canAnswer: () => boolean
+  /** Grant this request with the caller's stated scope. */
+  onAllow: () => Promise<void>
+  /** Refuse this request. */
+  onReject: () => Promise<void>
+  /** Explicit persistent choice; absent when the caller cannot save permission. */
+  onAlways?: () => Promise<void>
+}

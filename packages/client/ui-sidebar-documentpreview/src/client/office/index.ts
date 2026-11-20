@@ -2,20 +2,20 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { retainDocumentTabs } from '../document/tab-lifetime.ts'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
-import type {} from '@deepseek-ai/dsh-office-to-pdf/remote'
+import type {} from '@deepseek-ai/dsh-office-kit/remote'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-api-workspace-files/remote'
-import type {} from '@deepseek-ai/dsh-client-connection/client'
-import { documentFileBytes } from '../rpc.ts'
 import { failureLine } from '../failure-line.ts'
 import { documentTabInfoFactory } from '../document/contract.ts'
-import { en, zh, type OfficePreviewKey } from './locales.ts'
+import { en, ja, es, fr, de, ru, pt, zh, type OfficePreviewKey } from './locales.ts'
 import { OfficePreviewCache, type ReadOfficeBytes, type ReadOfficeDocument } from './cache.ts'
 import { pdfBodyRegistration } from '../pdf/index.ts'
 import { LazyPdfBody } from '../pdf/LazyPdfBody.tsx'
 import { OfficeBody, type OfficeBodyInjected } from './OfficeBody.tsx'
+import { OfficeFontAction } from './OfficeFontAction.tsx'
+import { officeFace } from './face.ts'
 import { createOfficeStore } from './store.ts'
-import type { Config } from '../../config.ts'
+import type { OfficeLimits } from '../../types.ts'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -28,10 +28,10 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
  * @param ctx - Client renderer registry, localized copy, and optional Host Remotes.
  * @param config - Resolved Office preview cache limits.
  */
-export function apply(ctx: Context, config: Config['office']): void {
+export function apply(ctx: Context, config: OfficeLimits): void {
   const id = '@deepseek-ai/dsh-client-ui-sidebar-documentpreview/office'
-  const extensions = ['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx']
-  ctx.effect(() => ctx.locale.register('sidebarOffice', { zh, en }))
+  const extensions = ['doc', 'docx', 'ppt', 'pptx']
+  ctx.effect(() => ctx.locale.register('sidebarOffice', { zh, en, ja, es, fr, de, ru, pt }))
   const t = ctx.locale.bind('sidebarOffice')
   const unavailable: ReadOfficeDocument = (_file, signal) => {
     signal.throwIfAborted()
@@ -44,16 +44,22 @@ export function apply(ctx: Context, config: Config['office']): void {
     title: () => t('title'), loading: 'renderer', wrap: false,
   }))
   const store = createOfficeStore()
+  ctx.effect(() => ctx.slots.inject('sidebar.right.tab.document.action', () => ctx.slots.register({
+    name: 'sidebar.right.tab.document.action', key: id, locale: 'sidebarOffice', store,
+  }, OfficeFontAction)))
   const retainTab = retainDocumentTabs(ctx)
   const documentT = ctx.locale.bind('sidebarDocumentPreview')
+  const face = officeFace(
+    (file, signal) => read(file, signal),
+    failure => 'code' in failure ? failureLine(documentT, failure) : documentT('error.unavailable', { message: failure.message }),
+  )
   ctx.effect(() => ctx.slots.inject('sidebar.right.tab.document', () => ctx.slots.register({
     name: 'sidebar.right.tab.document', key: id, locale: 'sidebarOffice', store,
     children: { 'sidebar.right.tab.document.office.pdf': {
       kind: 'keyed', scope: 'session', inject: { hooks: { tabInfo: documentTabInfoFactory } },
     } },
-    inject: (_sessionId, actions): OfficeBodyInjected => ({
-      read: (file, signal) => read(file, signal),
-      describeFailure: failure => 'code' in failure ? failureLine(documentT, failure) : documentT('error.unavailable', { message: failure.message }),
+    inject: (sessionId, actions): OfficeBodyInjected => ({
+      ...face(sessionId, actions),
       retainTab: (tabId, signal) => { retainTab(tabId, signal, actions.forget) },
     }),
   }, OfficeBody)))
@@ -61,23 +67,21 @@ export function apply(ctx: Context, config: Config['office']): void {
   ctx.effect(() => ctx.slots.inject('sidebar.right.tab.document.office.pdf', () => ctx.slots.register({
     name: 'sidebar.right.tab.document.office.pdf', key: id, locale: 'sidebarPdf', ...pdfPresentation,
   }, LazyPdfBody)))
-  ctx.inject(['remote', 'remote.officeToPdf', 'remote.workspaceFiles'], (scope) => {
+  ctx.inject(['remote', 'remote.officeKit', 'remote.workspaceFiles'], (scope) => {
     const convert: ReadOfficeBytes = async (file, signal, priority) => {
       signal.throwIfAborted()
-      const result = await scope.remote.officeToPdf.render(file.sessionId, file.path, priority, signal)
+      const result = await scope.remote.officeKit.render(file.sessionId, file.path, priority, signal)
       signal.throwIfAborted()
-      if (!result.ok) {
-        if (result.error.code === 'document-render/failed') {
-          throw new Error(t(conversionErrorKey(result.error.details.reason)), { cause: result.error })
-        }
-        return result
+      if (!result.ok && result.error.code === 'document-render/failed') {
+        throw new Error(t(conversionErrorKey(result.error.details.reason)), { cause: result.error })
       }
-      return { ok: true, value: { ...documentFileBytes(result.value),
-        missingFonts: result.value.missingFonts, generation: result.value.generation } }
+      return result
     }
     const createCache = () => new OfficePreviewCache(
       async (file, signal) => {
-        const authorized = await scope.remote.workspaceFiles.readBytes(file.sessionId, file.path, { offset: 0, length: 1 }, signal)
+        const authorized = await scope.remote.workspaceFiles.readBytes(
+          file.sessionId, file.path, { range: { offset: 0, length: 1 } }, signal,
+        )
         signal.throwIfAborted()
         if (!authorized.ok) return authorized
         const metadata = await scope.remote.workspaceFiles.stat(file.sessionId, file.path, signal)
@@ -89,7 +93,7 @@ export function apply(ctx: Context, config: Config['office']): void {
       },
       convert, config.maxCachedEntries, config.maxCachedBytes, config.maxPending, config.maxReaders,
       async (signal) => {
-        const result = await scope.remote.officeToPdf.generation(signal)
+        const result = await scope.remote.officeKit.generation(signal)
         signal.throwIfAborted()
         if (!result.ok) throw new Error(t('unavailable'), { cause: result.error })
         return result

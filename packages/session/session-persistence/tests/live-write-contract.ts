@@ -12,9 +12,16 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
-import { SessionId } from '@deepseek-ai/dsh-session'
+import { appendPluginRecord, pluginRecordOf, type SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type { SessionPersistence } from '../src/index.ts'
+import { brandString } from '@deepseek-ai/dsh-brand'
+
+declare module '@deepseek-ai/dsh-session/types' {
+  interface PluginRecordMap {
+    'plugin:persistence-test/state': { count: number }
+  }
+}
 
 /** One mounted backend under a session store, plus same-storage remount support. */
 export interface LiveWriteBackend {
@@ -24,7 +31,7 @@ export interface LiveWriteBackend {
   readonly remount: () => Promise<Context>
 }
 
-async function readAll(persistence: SessionPersistence, id: ReturnType<typeof SessionId>): Promise<readonly SessionEvent[]> {
+async function readAll(persistence: SessionPersistence, id: SessionId): Promise<readonly SessionEvent[]> {
   const reader = await persistence.open(id, 'read')
   try {
     return (await reader.read()).events
@@ -48,7 +55,7 @@ export function runLiveWritePathContract(
   describe(`live session write path: ${name}`, () => {
     it('routes published events into the active write handle within one batching window', async ({ task, signal }) => {
       const { ctx } = await make()
-      const session = ctx.sessions.create(SessionId('routed'))
+      const session = ctx.sessions.create(brandString<SessionId>('routed'))
       const handle = await ctx.sessionPersistence.create(session.header)
       vi.useFakeTimers()
       try {
@@ -78,16 +85,39 @@ export function runLiveWritePathContract(
 
     it('a session without an active write handle persists nothing', async () => {
       const { ctx } = await make()
-      const session = ctx.sessions.create(SessionId('unrouted'))
+      const session = ctx.sessions.create(brandString<SessionId>('unrouted'))
       session.append('turn/start', { turn: 1 })
       await ctx.sessions.flush(session)
       await expect(ctx.sessionPersistence.stat(session.id)).resolves.toBeUndefined()
       await ctx.fiber.dispose()
     })
 
+    it('persists a plugin record that a restarted process reads back', async () => {
+      const { ctx, remount } = await make()
+      const session = ctx.sessions.create(brandString<SessionId>('plugin-record'))
+      const handle = await ctx.sessionPersistence.create(session.header)
+      session.append('turn/start', { turn: 1 })
+      appendPluginRecord(session, 'plugin:persistence-test/state', { count: 1 })
+      await expect(ctx.sessions.flush(session)).resolves.toBe(true)
+      await handle.close()
+      await ctx.fiber.dispose()
+
+      const restarted = await remount()
+      const events = await readAll(restarted.sessionPersistence, session.id)
+      expect(events.map(event => [event.type, event.ignorable])).toEqual([
+        ['turn/start', undefined],
+        ['plugin:persistence-test/state', true],
+      ])
+      expect(events.map(pluginRecordOf)).toEqual([
+        undefined,
+        { type: 'plugin:persistence-test/state', seq: 1, time: events[1]?.time, data: { count: 1 } },
+      ])
+      await restarted.fiber.dispose()
+    })
+
     it('session/flush drains immediately and surfaces a retained background failure', async () => {
       const { ctx } = await make()
-      const session = ctx.sessions.create(SessionId('flush-surfaces'))
+      const session = ctx.sessions.create(brandString<SessionId>('flush-surfaces'))
       const handle = await ctx.sessionPersistence.create(session.header)
       const warned = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => undefined)
       const failure = new Error('backend write refused')
@@ -117,8 +147,8 @@ export function runLiveWritePathContract(
 
     it('service-level flush drains every active handle and aggregates the failures', async () => {
       const { ctx } = await make()
-      const healthy = ctx.sessions.create(SessionId('flush-all-healthy'))
-      const failing = ctx.sessions.create(SessionId('flush-all-failing'))
+      const healthy = ctx.sessions.create(brandString<SessionId>('flush-all-healthy'))
+      const failing = ctx.sessions.create(brandString<SessionId>('flush-all-failing'))
       const healthyHandle = await ctx.sessionPersistence.create(healthy.header)
       const failingHandle = await ctx.sessionPersistence.create(failing.header)
       const service = ctx.sessionPersistence as unknown as {
@@ -155,7 +185,7 @@ export function runLiveWritePathContract(
       const { ctx } = await make()
       let session: ReturnType<Context['sessions']['create']> | undefined
       const owner = await ctx.plugin(Object.assign((inner: Context) => {
-        session = inner.sessions.create(SessionId('disposed-drains'))
+        session = inner.sessions.create(brandString<SessionId>('disposed-drains'))
       }, { inject: ['sessions'] }))
       if (session === undefined) throw new Error('session was not created')
       const handle = await ctx.sessionPersistence.create(session.header)
@@ -163,7 +193,7 @@ export function runLiveWritePathContract(
       // Buffered, not yet written: disposal must drain before the close.
       await owner.dispose()
       await vi.waitFor(async () => {
-        expect((await readAll(ctx.sessionPersistence, SessionId('disposed-drains'))).map(event => event.seq)).toEqual([0])
+        expect((await readAll(ctx.sessionPersistence, brandString<SessionId>('disposed-drains'))).map(event => event.seq)).toEqual([0])
       })
       await expect(handle.append([])).rejects.toThrow(/closed handle/)
       await ctx.fiber.dispose()
@@ -173,7 +203,7 @@ export function runLiveWritePathContract(
       const { ctx } = await make()
       let session: ReturnType<Context['sessions']['create']> | undefined
       const owner = await ctx.plugin(Object.assign((inner: Context) => {
-        session = inner.sessions.create(SessionId('disposed-drain-fails'))
+        session = inner.sessions.create(brandString<SessionId>('disposed-drain-fails'))
       }, { inject: ['sessions'] }))
       if (session === undefined) throw new Error('session was not created')
       const handle = await ctx.sessionPersistence.create(session.header)
@@ -191,7 +221,7 @@ export function runLiveWritePathContract(
     it('backend teardown drains buffered events through the close sweep', async () => {
       const backend = await make()
       const { ctx } = backend
-      const session = ctx.sessions.create(SessionId('teardown-drains'))
+      const session = ctx.sessions.create(brandString<SessionId>('teardown-drains'))
       const handle = await ctx.sessionPersistence.create(session.header)
       session.append('turn/start', { turn: 1 })
       // Root disposal closes the still-open handle; close drains the buffer.
@@ -205,7 +235,7 @@ export function runLiveWritePathContract(
 
     it('close itself surfaces a failing drain and still releases write ownership', async () => {
       const { ctx } = await make()
-      const session = ctx.sessions.create(SessionId('close-drain-fails'))
+      const session = ctx.sessions.create(brandString<SessionId>('close-drain-fails'))
       const handle = await ctx.sessionPersistence.create(session.header)
       const failure = new Error('storage refused the drain')
       vi.spyOn(ctx.sessionPersistence as unknown as { persistBatch: () => Promise<void> }, 'persistBatch')
@@ -220,7 +250,7 @@ export function runLiveWritePathContract(
 
     it('close normalizes a non-Error drain failure', async () => {
       const { ctx } = await make()
-      const session = ctx.sessions.create(SessionId('close-drain-string'))
+      const session = ctx.sessions.create(brandString<SessionId>('close-drain-string'))
       const handle = await ctx.sessionPersistence.create(session.header)
       vi.spyOn(ctx.sessionPersistence as unknown as { persistBatch: () => Promise<void> }, 'persistBatch')
         // oxlint-disable-next-line typescript/prefer-promise-reject-errors -- the non-Error arm is the case under test.
@@ -232,7 +262,7 @@ export function runLiveWritePathContract(
 
     it('a failed drain retains order, quiets the timer, and recovers exactly once', async () => {
       const { ctx } = await make()
-      const session = ctx.sessions.create(SessionId('retained-order'))
+      const session = ctx.sessions.create(brandString<SessionId>('retained-order'))
       const handle = await ctx.sessionPersistence.create(session.header)
       const warned = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => undefined)
       const host = ctx.sessionPersistence as unknown as { persistBatch: (...args: unknown[]) => Promise<void> }
@@ -265,7 +295,7 @@ export function runLiveWritePathContract(
 
     it('a second write handle after close routes subsequent events', async () => {
       const { ctx } = await make()
-      const session = ctx.sessions.create(SessionId('rebind'))
+      const session = ctx.sessions.create(brandString<SessionId>('rebind'))
       const first = await ctx.sessionPersistence.create(session.header)
       session.append('turn/start', { turn: 1 })
       await ctx.sessions.flush(session)

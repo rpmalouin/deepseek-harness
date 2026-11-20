@@ -54,7 +54,7 @@ The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-a
 
 ### Adding a provider
 
-One optional asynchronous provider may be registered through `ctx.sessionTitle.register(provider)`; a second registration throws. The shipped model-backed providers are [first-prompt](../session-title-first-prompt-llm/README.md) and [all-prompts](../session-title-all-prompts-llm/README.md), both using the shared [LLM generation policy](../session-title-llm/README.md). A provider starts only after a marked loop-built request's exact route matches the logged `request/header`, and a newer revision supersedes and aborts older work.
+One optional asynchronous provider may be registered through `ctx.sessionTitle.register(provider)`; a second registration throws until the first provider's disposal starts, so a replacement can activate while the previous provider drains, and the previous provider's late results never commit. The shipped model-backed providers are [first-prompt](../session-title-first-prompt-llm/README.md) and [all-prompts](../../experimental/session-title-all-prompts-llm/README.md), both using the shared [LLM execution module](../session-title-llm/README.md). Immediately before each call the service captures the latest accepted title snapshot, including the fallback it just ensured, and passes it as `request.currentTitle`; the provider owns whether and how to use it. A provider starts only after a marked loop-built request's exact route matches the logged `request/header`, and a newer revision supersedes and aborts older work. For unchanged routes, an active marked request starts pending automatic generation without a new header event; accepted human messages may follow the current `step/start`. First-prompt generation excludes seeded Sessions and subagent-origin Sessions; an independent fork does not become eligible when its source relationship is absent.
 
 ### Reading titles
 
@@ -88,6 +88,8 @@ Titles are durable, log-only state: every accepted revision is a `session/title`
 
 ### Lifecycle and concurrency
 
+Messages received during activation wait for the service to become ready and request the built-in fallback. Providers register after service readiness; earlier messages and requests do not trigger them retroactively. Activation failure, service disposal, or Session removal prevents the deferred fallback from writing.
+
 Per-session work state tracks a revision counter, an in-flight fallback, and pending and active provider work. A newer user message, provider disposal, session disposal, or explicit refresh aborts older work through an `AbortController`; a completion whose provider, revision, session, or signal is stale cannot append. Explicit refreshes reserve their revision before provider work; overlapping automatic and explicit fallback requests share one session-local in-flight append. Service teardown cancels queued work and drains calls that ignore cancellation before unloading completes.
 
 ### Normalization
@@ -104,9 +106,9 @@ Accepted titles are cleaned of terminal control sequences, directional and invis
 Read these pages when the service contract is not enough. They move from the subsystem reference to the model-backed providers that plug in here.
 
 - [Session title subsystem](../../../docs/subsystems/session-title.md) — durable title state and the provider vocabulary types.
-- [Shared LLM title policy](../session-title-llm/README.md) — the model-backed generation helper both shipped providers use.
+- [Shared LLM execution module](../session-title-llm/README.md) — the model-backed execution module both shipped providers use.
 - [First-message title provider](../session-title-first-prompt-llm/README.md) — titles from the first eligible human message.
-- [All-messages title provider](../session-title-all-prompts-llm/README.md) — titles from every eligible human message.
+- [All-messages title provider](../../experimental/session-title-all-prompts-llm/README.md) — titles from every eligible human message.
 - [Session package map](../README.md) — adjacent persistence, projection, title, and telemetry packages.
 
 -----

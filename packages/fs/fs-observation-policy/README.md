@@ -25,7 +25,9 @@ English | [中文](README.zh.md)
 <a id="use-this-package"></a>
 ## Use this package
 
-Load this plugin alongside a `ctx.fs` backend and the `dsh-tool-fs` tools when a deployment wants the model to read a file before it can overwrite or edit it. The plugin needs no configuration and injects no service; it only listens for the `fs/*` events the tools dispatch.
+`fs/delete-intent` requires the same present observation as `fs/edit-intent`: unseen sources fail with `FS_NOT_OBSERVED`, confirmed-absent sources fail with `FS_NOT_FOUND`, and present sources supply their observed version. Patches and move sources reuse `fs/edit-intent`; move destinations reuse `fs/write-intent`.
+
+Load this plugin alongside a `ctx.fs` backend and the `dsh-tool-fs` tools when a deployment wants the model to read a file before it can overwrite or edit it. The plugin needs no configuration and injects no service; it only listens for the `fs/*` events the tools dispatch. The shipped compositions leave it off: [`dsh-base`](../../bundle/base/cordis.patch.yml) lists its `fs-observation-policy` row `disabled: true`; set that row to `disabled: false` to restore the guard for every mutating tool. The [defaults Agent Note](../../../.agents/notes/implemented/feature/2026-10-29-shipped-fs-mutation-defaults.md) records why.
 
 ### Minimal composition
 
@@ -66,12 +68,12 @@ The plugin is built on two ideas:
 
 | File | Role |
 |---|---|
-| [`src/index.ts`](src/index.ts) | The three `fs/*` listeners and the observed-state gate |
+| [`src/index.ts`](src/index.ts) | The four `fs/*` listeners and the observed-state gate |
 | [`src/types.ts`](src/types.ts) | The opaque event actor shape from which the owner session is derived |
 
 ### Decision flow
 
-`fs/write-intent` resolves unseen or confirmed absent to `{ kind: 'createIfAbsent' }` and observed present to `{ kind: 'replaceIfVersion', version: vObserved }`. `fs/edit-intent` rejects an unseen target with `FS_NOT_OBSERVED`, a confirmed-absent target with `FS_NOT_FOUND`, and otherwise supplies the observed version as the compare-and-swap basis. `fs/observed` records `{ kind: 'present', version }` or `{ kind: 'absent' }` for the owner and target — a synchronous, side-effect-only `WeakMap.set`, because successful mutations have already committed.
+`fs/write-intent` maps unseen or absent state to guarded creation and present state to guarded replacement. `fs/edit-intent` and `fs/delete-intent` share the present-state check. `fs/observed` synchronously records presence/version or absence for the opaque owner and target. All four listeners and the recorded state are released on disposal.
 
 ### Single-slot, first-wins
 
@@ -95,7 +97,7 @@ Read these pages when the package-level contract is not enough. They move from t
 - [tool-fs](../tool-fs/README.md) — the model-facing tools that dispatch the `fs/*` events.
 - [fs-local](../fs-local/README.md) — the host-filesystem backend this policy guards.
 - [fs-sandbox](../fs-sandbox/README.md) — the sandbox-enforcing backend this policy composes with.
-- [Fsspec-style seam-split Agent Note](../../../.agents/notes/implemented/simplification/2026-06-26-fsspec-style-fs-seam.md) — why the policy is an event plugin rather than a provider method.
+- [Fsspec-style seam-split reference](../fs/README.md) — why the policy is an event plugin rather than a provider method.
 
 -----
 
@@ -126,7 +128,7 @@ These limits define when the policy is a poor fit or needs special operational c
 - **Observed state does not survive a session resume** — persistence of the record is deferred, so a resumed session must re-read files before guarded writes and edits.
 - **Actors without an agent session can never satisfy the policy** — their edits throw `FS_NOT_OBSERVED` and their writes always resolve `createIfAbsent`, so a non-agent caller cannot overwrite an existing file through the gate.
 - **Direct `ctx.fs` reads emit no `fs/observed`** — a file read outside the `read` tool stays unobserved, and a later guarded edit rejects with `FS_NOT_OBSERVED` until the tool reads it.
-- **Authorization is version freshness, not view completeness** — any windowed read authorizes a full-file overwrite of an unchanged file, deliberately weaker than a full-view rule ([seam-split Agent Note](../../../.agents/notes/implemented/simplification/2026-06-26-fsspec-style-fs-seam.md)).
+- **Authorization is version freshness, not view completeness** — any windowed read authorizes a full-file overwrite of an unchanged file, deliberately weaker than a full-view rule ([seam-split reference](../fs/README.md)).
 
 <a id="dev-note"></a>
 ### Dev Note
@@ -137,5 +139,3 @@ These limits define when the policy is a poor fit or needs special operational c
 None.
 
 </details>
-
-**Runtime invariant:** No companion is published. This package exposes no independent event sequence or mutable data relation beyond contracts enforced at its owning seam.

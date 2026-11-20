@@ -29,6 +29,8 @@ kind: "package-reference"
 
 ### 注册命令
 
+从 `@deepseek-ai/dsh-commands/types` 以类型方式导入 `CommandDefinitionId` 和 `CommandId`。使用 `@deepseek-ai/dsh-brand` 的 `brandString<T>()` 为已准入的字符串添加品牌；它不验证或生成 id。
+
 插件通过 `ctx.commands.register()` 注册命令，提供小写名称、发现界面中的说明、可选的 `input` 提示和处理器。可选的品牌类型字段 `definitionId` 为适配器提供带插件命名空间的稳定定义标识，它独立于显示文案和每次执行的 `commandId`。有效描述符只携带被选中定义的标识，作用域覆盖不会继承被遮蔽注册项的标识。
 
 ```text
@@ -61,6 +63,8 @@ ctx.commands.register({
 
 交互式适配器调用 `execute(agent, line, attachments, signal)`，传入确切的接收 agent、完整命令行与本次提交的有序附件。它返回已结算的 `CommandExecution`——规范化结果加生命周期配对 `commandId`——语法无效或名称未知时返回 `undefined`。`list(agent)` 与 `find(agent, name)` 在应用 agent 作用域遮蔽后用于命令发现。
 
+无状态入口 `@deepseek-ai/dsh-commands/builtin` 为 Host 和 Client 适配器共享第一方身份、中英文输入 token 及描述符解析。`builtinCommandName()` 根据定义识别能力，不依赖注册名；`resolveCommand()` 保留精确名称优先级，并按定义 ID 解析别名。支持范围由适配器决定，注册器本身仍接受任意定义。
+
 ### 取消
 
 调用方的中止信号会让注册表停止等待处理器；无视信号的处理器可能在调用方停止等待后继续产生自身的外部副作用。被取消或抛异常的处理器在日志中以 `command/done` 错误结算。
@@ -80,9 +84,9 @@ ctx.commands.register({
 | 文件 | 职责 |
 |---|---|
 | [`src/index.ts`](src/index.ts) | `CommandRuntime` 服务：注册、作用域、分派、生命周期事件 |
-| [`src/types.ts`](src/types.ts) | 命令定义、描述符、执行与结果类型 |
-| [`src/brand.ts`](src/brand.ts) | 稳定命令定义标识和每次执行的生命周期 id |
-| [`src/invariant.ts`](src/invariant.ts) | 不变式伴生插件：按会话日志配对 `command/run` 与 `command/done` |
+| [`src/types.ts`](src/types.ts) | 公开类型入口：标识类型再导出、描述符、执行与结果 |
+| [`src/brand.ts`](src/brand.ts) | 命令标识定义与兼容构造函数 |
+| [`src/builtin.ts`](src/builtin.ts) | Host 和 Client 适配器共享的第一方身份及输入 token 解析 |
 
 ### 生命周期事件
 
@@ -106,7 +110,7 @@ ctx.commands.register({
 当包级约定不够用时阅读以下页面。它们从共享命令词汇逐步进入设计证据与相邻表面。
 
 - [命令子系统参考](../../../docs/subsystems/commands.zh.md)——注册表语义、输入元数据与 `ctx.commands` 的 Cordis 接口面。
-- [命令注册 Agent Note](../../../.agents/notes/implemented/feature/2026-07-19-plugin-command-registration.zh.md)——此服务背后的边界与分发约定。
+- [历史命令注册 Agent Note](../../../.agents/notes/archived/feature/2026-07-19-plugin-command-registration.md)——此服务背后的边界与分发约定。
 - [交互组映射](../README.zh.md)——相邻的审批、权限与问答包。
 - [Plan mode 包](../../plan/plan-mode/README.zh.md)——一个驱动模型可见工作的已交付命令生产方。
 

@@ -11,7 +11,9 @@
     "src/terminal.ts",
     "src/retention.ts",
     "src/stream.ts",
-    "src/shells.ts"
+    "src/shells.ts",
+    "src/agent.ts",
+    "src/screen.ts"
   ],
   "references": [
     {
@@ -39,6 +41,9 @@
       "path": "../../session/session-projection"
     },
     {
+      "path": "../../session/working-directory"
+    },
+    {
       "path": "../../subprocess/subprocess"
     },
     {
@@ -52,6 +57,9 @@
     },
     {
       "path": "../../util/lazy-require"
+    },
+    {
+      "path": "../../util/values"
     }
   ]
 }

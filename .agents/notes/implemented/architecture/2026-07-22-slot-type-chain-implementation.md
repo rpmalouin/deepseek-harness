@@ -4,7 +4,7 @@ Status: implemented
 
 English | [中文](2026-07-22-slot-type-chain-implementation.zh.md)
 
-> Scope: the definitive slot-system design for the web client — how UI plugins compose the page, where render authority lives, how component props are typed, and where business live-data goes. The [web client architecture RFC](2026-07-19-gui-web-client-architecture.md) owns the surrounding context (loading chain, object layer, services) and defers its slot sections here.
+> Scope: the definitive slot-system design for the web client — how UI plugins compose the page, where render authority lives, how component props are typed, and where business live-data goes. The [Web Client reference](../../../../docs/subsystems/web-client.md) documents the surrounding loading chain, object layer, and services.
 
 ## Problem
 
@@ -12,7 +12,7 @@ The page is composed at runtime from independently loaded plugins, so the UI nee
 
 ## Decision
 
-Global main-panel selection and its root lifetime are defined by the [global main-panels decision](2026-09-08-global-main-panels.md).
+Global main-panel selection and its root lifetime are defined by the [global main-panels reference](../../../../packages/client/ui-layout/README.md).
 
 One sentence: **the ui-renderer renders only `'root'`; a plugin composes UI through a single `register` call that simultaneously occupies a slot, declares+authorizes its child slots, declares its store, and injects its business face; components are pure functions whose props arrive in four shares, each auto-derived from its single source of truth.**
 
@@ -50,12 +50,13 @@ A contributor whose activation order is independent from the declaring entry use
 | child render | `PropsRenderSlots<S>` | register's `children` keys | `renderSlot(key, owner)`, key statically narrowed to S; chain keys add `renderSlotChain` |
 | store | `PropsStore<H>` | store factory return type | `useStore` selector hook + `actions.*` (draft-param stripped) |
 | business | `I` | inject return type | plain data + callbacks; a reserved `hooks` compartment of bare observables arrives bound as `use<Name>` selector hooks (`InjectFace<I>`) |
+| kind-specific | `MatchedShare` / `HocShare` | SlotMap entry's kind | chain `matched`; hoc `children`, the next inner layer or the owner content |
 
 `sessionId` is framework-supplied wherever `scope: 'session'` is declared — owner params do not carry it. The register call site is the double-lock choke point: a component whose renderSlot keys exceed the `children` declaration, or that misses a declared face, or whose store/inject shapes drift, is a compile error on that line. Delegation is ordinary props passing (hand the `renderSlot` function down, optionally behind a narrower signature) — there is no whitelist face object and no minting API.
 
 ### The chain kind: entries self-nominate, first match renders
 
-The fourth `SlotKind`, `'chain'`, inverts routing authority relative to `keyed`: a keyed dispatch site picks its occupant by `entryKey`, while a chain entry nominates itself — the owner dispatches one common currency of owner props and never learns who takes over, so a new takeover package registers with zero owner edits. A chain registration carries a `select` pure selector (`ChainSelect<O, M>`: `(owner) => matched | null`) and an optional `priority` (ascending; ties keep registration = assembly order — the deployment-controllable inject topology — under the same stable sort as list `order`); registering without `select` is one of the loud-at-load cases above. At render, the outlet runs the selectors in chain order: the first non-null return elects its entry and the returned value joins the component's props as `matched` (the component never re-derives its own match), `null` passes the turn to the next entry, and all-null renders the owner's fallback body (`ChainRenderOpts`).
+A fifth kind, `'hoc'`, nests entries around owner-supplied `children` and adds a kind-specific `children` prop the same way `chain` adds `matched`; its decision lives in the [hoc slot kind note](2026-11-03-hoc-slot-kind.md). The fourth `SlotKind`, `'chain'`, inverts routing authority relative to `keyed`: a keyed dispatch site picks its occupant by `entryKey`, while a chain entry nominates itself — the owner dispatches one common currency of owner props and never learns who takes over, so a new takeover package registers with zero owner edits. A chain registration carries a `select` pure selector (`ChainSelect<O, M>`: `(owner) => matched | null`) and an optional `priority` (ascending; ties keep registration = assembly order — the deployment-controllable inject topology — under the same stable sort as list `order`); registering without `select` is one of the loud-at-load cases above. At render, the outlet runs the selectors in chain order: the first non-null return elects its entry and the returned value joins the component's props as `matched` (the component never re-derives its own match), `null` passes the turn to the next entry, and all-null renders the owner's fallback body (`ChainRenderOpts`).
 
 The decline decision lives in `select`, never in a mounted component probing its own props: a component that mounts only to render null still runs its hooks and effects for nothing, and the resulting mount/unmount churn breaks memoization and React key semantics, whereas a selector is a pure function — unit-testable, zero mount side effects — the same discipline as "presentation methods are pure functions of `args`". Purity is the selector's contract: it reads no external mutable state and produces no side effects, so the routing decision is entirely a function of the owner props and safe to run on every dispatch. Selectors route; they never mint — per-dispatch object construction would churn identity every render, so wrapping a matched value in a richer face happens inside the elected component (`useMemo` keyed on `matched`).
 

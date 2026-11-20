@@ -1,7 +1,6 @@
 /**
- * Assembled-app regression: a persisted `origin: 'subagent'` child whose log
- * carries no descriptor event is surfaced by `list_agents` as a
- * `[diagnostic: corrupt]` row instead of being silently dropped.
+ * Assembled-app regression: a parent-owned catalog event remains sufficient
+ * for descendant discovery when the persisted child has no descriptor event.
  */
 
 import { readFile, readdir, writeFile } from 'node:fs/promises'
@@ -16,9 +15,10 @@ import {
 } from '@deepseek-ai/dsh-session-snapshot'
 import { LOADER_SMOKE_TEST_TIMEOUT_MS, runLoaderSmoke } from '@deepseek-ai/dsh-loader-smoke'
 import { createMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
-import { SessionSeq, SESSION_FORMAT_VERSION, SessionId, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session'
-import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import { SessionSeq, SESSION_FORMAT_VERSION, type SessionId, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session'
+import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import { describe, expect, it } from 'vitest'
+import { brandString } from '@deepseek-ai/dsh-brand'
 
 const fixtureDir = fileURLToPath(new URL('./expected/subagent-diagnostic', import.meta.url))
 const replayOverride = join(fixtureDir, 'replay.override.json')
@@ -26,8 +26,8 @@ const parentExpected = join(fixtureDir, 'parent.expected.jsonl')
 const configPath = fileURLToPath(new URL('../subagent-diagnostic-snapshot.patch.yml', import.meta.url))
 const binScript = fileURLToPath(new URL('../../../../../../packages/test-support/loader-smoke/tests/fixtures/headless-driver.ts', import.meta.url))
 const tsconfigPath = fileURLToPath(new URL('../../../../../../tsconfig.json', import.meta.url))
-const parentId = SessionId('subagent-diagnostic-parent')
-const childId = SessionId('subagent-diagnostic-child')
+const parentId = brandString<SessionId>('subagent-diagnostic-parent')
+const childId = brandString<SessionId>('subagent-diagnostic-child')
 const refreshing = process.env.DSH_SNAPSHOT === 'refresh'
 const task = 'Call list_agents once and report what it shows.'
 
@@ -42,11 +42,10 @@ async function expectSession(actual: string, expectedPath: string): Promise<void
 }
 
 /**
- * Seed a completed parent turn plus one cold child that durably classifies
- * as a subagent (`origin`) but never appended its descriptor event — the
- * publication-window death the diagnostic row exists for.
+ * Seed a completed parent turn with one catalogued cold child whose own log
+ * has no descriptor event. Descendant discovery requires no activation descriptor.
  */
-async function seedDescriptorlessChild(root: string, cwd: string): Promise<void> {
+async function seedCataloguedDescriptorlessChild(root: string, cwd: string): Promise<void> {
   const ctx = new Context()
   await ctx.plugin(JsonlSessionPersistence, { root, compression: 'none' })
   const parentMeta: SessionHeader = {
@@ -62,12 +61,24 @@ async function seedDescriptorlessChild(root: string, cwd: string): Promise<void>
     { type: 'step/start', seq: SessionSeq(1), time: 11, data: { turn: 1, step: 1 } },
     {
       type: 'system/message', seq: SessionSeq(2), time: 12,
-      data: { turn: 1, step: 1, message: createMessage({ role: 'system', content: [], source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt' } }) },
+      data: { turn: 1, step: 1, message: createMessage({ role: 'system', content: [], source: { kind: 'system-prompt' } }) },
       surfaceOp: 'append',
     },
     { type: 'user/message', seq: SessionSeq(3), time: 13, data: createUserMessage({ content: [{ type: 'text', text: 'Start a background job.' }], source: { kind: 'user' } }), surfaceOp: 'append' },
     { type: 'step/end', seq: SessionSeq(4), time: 14, data: { turn: 1, step: 1 } },
     { type: 'turn/end', seq: SessionSeq(5), time: 15, data: { turn: 1, reason: { kind: 'completed' } } },
+    {
+      type: 'subagent/catalog',
+      seq: SessionSeq(6),
+      time: 16,
+      data: {
+        version: 0,
+        childId,
+        childCreatedAt: 2,
+        mode: 'continuable',
+        label: 'descriptorless child',
+      },
+    },
   ]
   const childMeta: SessionHeader = {
     version: SESSION_FORMAT_VERSION,
@@ -95,8 +106,8 @@ async function seedDescriptorlessChild(root: string, cwd: string): Promise<void>
   }
 }
 
-describe('descriptor-less cold child diagnostic snapshot', () => {
-  it('surfaces the unreadable child as a corrupt diagnostic through the assembled headless app', async () => {
+describe('parent-owned cold child catalog snapshot', () => {
+  it('discovers a descriptorless catalogued child with its tree position through the assembled headless app', async () => {
     let cwd = ''
     const result = await runLoaderSmoke({
       label: 'subagent diagnostic headless stream-json snapshot',
@@ -112,7 +123,7 @@ describe('descriptor-less cold child diagnostic snapshot', () => {
       },
       prepare: async (runCwd) => {
         cwd = runCwd
-        await seedDescriptorlessChild(join(runCwd, '.sessions'), runCwd)
+        await seedCataloguedDescriptorlessChild(join(runCwd, '.sessions'), runCwd)
       },
       inspect: async (runCwd) => {
         const sessionsDir = join(runCwd, '.sessions')
@@ -121,9 +132,9 @@ describe('descriptor-less cold child diagnostic snapshot', () => {
         const parent = logs.find(content => content.includes('"subagent-diagnostic-parent"'))
         if (parent === undefined) throw new Error('missing persisted parent log')
 
-        // THE model-visible fact: the descriptor-less child is reported, not
-        // silently dropped, and its reason is the corrupt classification.
-        expect(parent).toContain(`${childId} [diagnostic: corrupt]`)
+        // Discovery reads child catalogs without requiring activation descriptors.
+        expect(parent).toContain(`${childId} [inactive] — descriptorless child`)
+        expect(parent).not.toContain(`${childId} [corrupt]`)
 
         const context: NormalizeContext = { sessionIds: [parentId, childId], cwd }
         const normalizedParent = normalizeSessionSnapshot(parent, context)
@@ -139,7 +150,7 @@ describe('descriptor-less cold child diagnostic snapshot', () => {
     expect(records.at(-1)).toMatchObject({
       type: 'result',
       sessionId: parentId,
-      output: 'The stored subagent is unreadable. PARENT_DONE',
+      output: 'The catalogued subagent is ready. PARENT_DONE',
     })
   }, LOADER_SMOKE_TEST_TIMEOUT_MS)
 })

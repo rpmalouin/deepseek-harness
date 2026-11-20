@@ -41,11 +41,11 @@ const result = await runLoaderSmoke({
 })
 ```
 
-Set `expectedExitCode` when the scenario pins a designed failure surface — a one-shot turn ending in an error result — and a run that exits any other way, including succeeding, still fails the smoke.
+Set `sourceImport: 'tsx/esm'` when a source smoke exercises the supported `dsh` launcher; built mode ignores this option. Set `expectedExitCode` when the scenario pins a designed failure surface — a one-shot turn ending in an error result — and a run that exits any other way, including succeeding, still fails the smoke.
 
 ### Testing a shipped profile
 
-Profile integration drivers use the repository-only `tests/fixtures/production-profile.ts` helper. It loads the named shipped profile and its bundle patches through `loadProfile`, materializes the retained link-mode fallback, mounts `PluginPackages` with native lookup as the link-mode launcher does, and passes the bundle patches followed by the test's `*.patch.yml` files to the root `cordis:include` mounted by `boot`. Those patches should contain only the test provider or model, isolated persistence paths, and subject-specific changes. Package-level unit tests that need an agent loop without profile integration mount `dsh-agent-loop-testkit` locally instead.
+Profile integration drivers use the repository-only `tests/fixtures/production-profile.ts` helper. It loads the named shipped profile and its bundle patches through `loadProfile`, computes the runtime resolution, installs it through `PluginPackages`, and passes the bundle patches followed by the test's `*.patch.yml` files to the root `cordis:include` mounted by `boot`. Those patches should contain only the test provider or model, isolated persistence paths, and subject-specific changes. Package-level unit tests that need an agent loop without profile integration mount `dsh-agent-loop-testkit` locally instead.
 
 ### Driving a fixture turn
 
@@ -81,7 +81,6 @@ The harness is built on one separation: the smoke runs in a child process under 
 |---|---|
 | [`src/index.ts`](src/index.ts) | Mode resolver, `runLoaderSmoke` subprocess harness, options and result types |
 | [`src/agent-turn.ts`](src/agent-turn.ts) | `runFixtureTurn` direct-agent driver and result envelope |
-| — | No runtime invariant companion is published; this test-support package owns no production event stream or mutable data; consuming test suites exercise its behavior. |
 | [`tests/fixtures/production-profile.ts`](tests/fixtures/production-profile.ts) | Repository-only shipped-profile composition helper for integration fixtures |
 
 </details>

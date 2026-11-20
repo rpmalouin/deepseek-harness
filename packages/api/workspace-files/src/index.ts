@@ -1,13 +1,14 @@
 /**
  * Workspace file service: read-only file previews, workspace directory
- * listings, and the filesystem-observation change feed, exposed as
- * `workspaceFiles`.
+ * listings, workspace-wide name and path search, and the
+ * filesystem-observation change feed, exposed as `workspaceFiles`.
  *
  * File reads follow the composed filesystem's read access, including paths
- * outside the workspace. The selected Session header supplies the base for
- * relative paths, with the sandbox policy root as its no-cwd fallback, not a
- * read-containment restriction. Directory listings and change observations
- * remain workspace-scoped. File-kind checks and configured read caps apply to
+ * outside the workspace. The selected Session's workspace root supplies the
+ * base for relative paths, with the header directory and then the sandbox
+ * policy root as fallbacks, not a read-containment restriction. Directory
+ * listings, searches, and change observations remain workspace-scoped; a
+ * search reports workspace-relative paths. File-kind checks and configured read caps apply to
  * every preview; this service exposes no mutations.
  *
  * A page is cut from `streamText`, which decodes and rejects non-UTF-8 as it
@@ -27,15 +28,21 @@ import type { FsDirEntry, FsInfo, FsPathInfo, FsTarget } from '@deepseek-ai/dsh-
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import type {} from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
+import type {} from '@deepseek-ai/dsh-session-projection-cache'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { Remote, RemoteError, TypertRemoteService, type TypertLookup } from '@deepseek-ai/dsh-typert-protocol'
+import type {} from '@deepseek-ai/dsh-working-directory'
 import { WorkspaceChangeFeed } from './changes.ts'
+import { searchWorkspace, type SearchLimits } from './search.ts'
 import type {
   WorkspaceByteRange,
+  WorkspaceByteReadOptions,
   WorkspaceDirectoryEntry,
   WorkspaceDirectoryListing,
   WorkspaceFileBytes,
   WorkspaceFileRange,
+  WorkspaceFileSearchRequest,
+  WorkspaceFileSearchResult,
   WorkspaceFileStat,
   WorkspaceFileText,
   WorkspaceFileWatchFrame,
@@ -54,8 +61,32 @@ declare module '@deepseek-ai/cordis' {
 export interface WorkspaceFileScope {
   /** Session identity received on the wire. */
   readonly sessionId: SessionId
-  /** Session workspace root, or the deployment fallback when its header has no cwd. */
+  /**
+   * Session workspace root: for a live Session the root the sandbox policy
+   * bounds it by; for a stored one its directory in the projection cache, else
+   * its header directory, else the deployment fallback.
+   */
   readonly workspaceRoot: string
+}
+
+/**
+ * Resolve the workspace root a Session's file views and directory listings
+ * use, without loading its event body or activating an Agent.
+ * @param ctx - Host context carrying the Session store and the sandbox policy, and optionally persistence
+ *   and the projection cache.
+ * @param sessionId - Session identity received on the wire.
+ * @param signal - cancellation for the persistence read of a stored Session.
+ * @returns the scope, or undefined when no live or stored Session has that identity.
+ */
+async function workspaceFileScopeOf(
+  ctx: Context, sessionId: SessionId, signal?: AbortSignal,
+): Promise<WorkspaceFileScope | undefined> {
+  const live = ctx.get('sessions')?.get(sessionId)
+  if (live !== undefined) return { sessionId, workspaceRoot: ctx.sandboxPolicy.resolve({ session: live }).workspaceRoot }
+  const stored = await ctx.get('sessionPersistence')?.stat(sessionId, signal === undefined ? undefined : { signal })
+  if (stored === undefined) return undefined
+  const cached = ctx.get('sessionProjectionCache')?.cachedSnapshot(stored.header, ['workingDirectory'])?.values.workingDirectory
+  return { sessionId, workspaceRoot: cached ?? stored.header.cwd ?? ctx.sandboxPolicy.workspaceRoot }
 }
 
 declare module '@deepseek-ai/dsh-typert-protocol' {
@@ -65,7 +96,7 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
   }
 }
 
-/** Deployment caps on one page or one listing. */
+/** Deployment caps on one page, one listing, or one search. */
 export interface Config {
   /**
    * Inclusive byte cap on one page's text and on one byte window.
@@ -81,6 +112,8 @@ export interface Config {
   readonly maxLines: number
   /** Cap on returned directory entries; the rest is dropped and reported cut. */
   readonly maxEntries: number
+  /** Budgets on one search's matches, listed files, deadline and ripgrep process. */
+  readonly search: SearchLimits
 }
 
 /** One page cut from a decoded text stream. */
@@ -187,13 +220,20 @@ export class WorkspaceFiles extends TypertRemoteService {
     maxFileBytes: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER - 1).default(32 * 1024 * 1024),
     maxLines: z.number().step(1).min(1).default(5000),
     maxEntries: z.number().step(1).min(1).default(2000),
+    search: z.object({
+      maxResults: z.number().step(1).min(1).default(512),
+      maxEntries: z.number().step(1).min(1).default(100000),
+      graceMs: z.number().step(1).min(1).max(2147483647).default(3000),
+      timeoutMs: z.number().step(1).min(1).max(2147483647).default(30000),
+      stderrMaxBytes: z.number().step(1).min(1).default(65536),
+    }),
   })
 
   private readonly feed: WorkspaceChangeFeed
 
   /**
    * @param ctx - Host context carrying the filesystem and the sandbox policy.
-   * @param config - deployment caps on one page or one listing.
+   * @param config - deployment caps on one page, one listing, or one search.
    */
   constructor(ctx: Context, private readonly config: Config) {
     super(ctx, 'workspaceFiles')
@@ -202,22 +242,23 @@ export class WorkspaceFiles extends TypertRemoteService {
       scope.typert.lookups.register('workspaceFileScope', {
         parameter: 'workspaceFileScope',
         wire: 'workspaceFileScopeId',
+        resource: 'session',
         hostTypeSymbol: '@deepseek-ai/dsh-api-workspace-files#WorkspaceFileScope',
         wireTypeSymbol: '@deepseek-ai/dsh-session/types#SessionId',
-        resolve: async (sessionId) => {
-          const live = scope.sessions.get(sessionId)?.header
-          const stored = live === undefined
-            ? await scope.get('sessionPersistence')?.stat(sessionId)
-            : undefined
-          const header = live ?? stored?.header
-          if (header === undefined) return undefined
-          return {
-            sessionId,
-            workspaceRoot: header.cwd ?? scope.sandboxPolicy.workspaceRoot,
-          }
-        },
+        resolve: sessionId => workspaceFileScopeOf(scope, sessionId),
       })
     })
+  }
+
+  /**
+   * Resolve the scope other Host services use to open the same `session/<id>/<path>` addresses:
+   * a live Session's sandbox workspace root, else a stored Session's cached directory, else its header directory.
+   * @param sessionId - Session identity received on the wire.
+   * @param signal - cancellation for the persistence read of a stored Session.
+   * @returns the scope, or undefined when no live or stored Session has that identity.
+   */
+  scopeOf(sessionId: SessionId, signal?: AbortSignal): Promise<WorkspaceFileScope | undefined> {
+    return workspaceFileScopeOf(this.ctx, sessionId, signal)
   }
 
   /**
@@ -245,38 +286,29 @@ export class WorkspaceFiles extends TypertRemoteService {
   }
 
   /**
-   * Read one byte window of a regular file readable by the filesystem backend: raw
-   * bytes, no text decoding and no binary rejection.
+   * Read a complete regular file or one byte range without text decoding.
    * @param workspaceFileScope - header-derived workspace root for the Session identity on the wire.
-   * @param path - absolute path or path relative to the workspace root; files outside it are allowed.
-   * @param range - the byte window; omitted fields take the window defaults.
+   * @param path - target path, absolute or workspace-relative; relative to the base file's directory when provided.
+   * @param options - optional base file and range; without a range the complete-file cap applies.
    * @param signal - caller cancellation.
-   * @returns the window in base64, the file's version and size at the stat before it, and whether it reaches the last byte.
+   * @returns native bytes with the file's version and size at the preceding stat, byte offset, and EOF marker.
    */
   @Remote
   async readBytes(
     workspaceFileScope: WorkspaceFileScope,
     path: string,
-    range: WorkspaceByteRange,
+    options: WorkspaceByteReadOptions,
     signal: AbortSignal,
   ): Promise<WorkspaceFileBytes> {
-    const { offset, length } = this.resolveWindow(range, path)
-    const { target, info } = await this.locateFile(workspaceFileScope, path, signal)
-    const data = await this.ctx.fs.readByteRange(target, { offset, length }, signal)
-    const eof = info.size === undefined ? data.length < length : offset + data.length >= info.size
-    return { ...this.statOf(target, info), offset, data: Buffer.from(data).toString('base64'), eof }
-  }
-
-  /**
-   * Read a complete regular file as bytes, subject to the configured full-file cap.
-   * @param workspaceFileScope - header-derived workspace root for the Session identity on the wire.
-   * @param path - absolute or workspace-relative file path.
-   * @param signal - caller cancellation.
-   * @returns one complete base64 window with offset zero and eof true; oversized files fail with too-large.
-   */
-  @Remote
-  async readAll(workspaceFileScope: WorkspaceFileScope, path: string, signal: AbortSignal): Promise<WorkspaceFileBytes> {
-    const { target, info } = await this.locateFile(workspaceFileScope, path, signal)
+    const window = options.range === undefined ? undefined : this.resolveWindow(options.range, path)
+    const resolved = options.baseFile === undefined ? path : await this.relativePath(workspaceFileScope, options.baseFile, path, signal)
+    const { target, info } = await this.locateFile(workspaceFileScope, resolved, signal)
+    if (window !== undefined) {
+      const { offset, length } = window
+      const data = await this.ctx.fs.readByteRange(target, window, signal)
+      const eof = info.size === undefined ? data.length < length : offset + data.length >= info.size
+      return { ...this.statOf(target, info), offset, data, eof }
+    }
     const limit = this.config.maxFileBytes
     const data = await this.ctx.fs.readBytes(target, signal, limit).catch((cause: unknown) => {
       if (typeof cause === 'object' && cause !== null && 'code' in cause && cause.code === 'FS_TOO_LARGE') {
@@ -284,32 +316,7 @@ export class WorkspaceFiles extends TypertRemoteService {
       }
       throw cause
     })
-    return { ...this.statOf(target, info), offset: 0, data: Buffer.from(data).toString('base64'), eof: true }
-  }
-
-  /**
-   * Read a complete file relative to another file's directory, including outside the workspace.
-   * @param workspaceFileScope - header-derived workspace root for the Session identity on the wire.
-   * @param path - base file, absolute or workspace-relative.
-   * @param relativePath - relative filesystem path, not a URL or absolute path.
-   * @param signal - caller cancellation.
-   * @returns the complete related file using the ordinary file-size and access checks.
-   */
-  @Remote
-  async readRelated(
-    workspaceFileScope: WorkspaceFileScope,
-    path: string,
-    relativePath: string,
-    signal: AbortSignal,
-  ): Promise<WorkspaceFileBytes> {
-    const relative = relativePath.replace(/\\/g, '/')
-    if (relative.length === 0 || relative.startsWith('/') || /^[a-z][a-z\d+.-]*:/iu.test(relative) || relative.includes(NUL)) {
-      throw new RemoteError('gateway/bad-request', 'relativePath must be a relative filesystem path', {})
-    }
-    const { target } = await this.locateFile(workspaceFileScope, path, signal)
-    const absolute = this.ctx.fs.processPath(target)
-    const paths = absolute.startsWith('/') ? posix : win32
-    return this.readAll(workspaceFileScope, paths.resolve(paths.dirname(absolute), relative), signal)
+    return { ...this.statOf(target, info), offset: 0, data, eof: true }
   }
 
   /**
@@ -335,7 +342,10 @@ export class WorkspaceFiles extends TypertRemoteService {
   @Remote
   async list(workspaceFileScope: WorkspaceFileScope, path: string, signal: AbortSignal): Promise<WorkspaceDirectoryListing> {
     const { root, workspaceRoot, entry } = await this.inspect(workspaceFileScope, path, signal)
-    if (entry.type !== 'directory') {
+    // A final link — a Windows junction or a symlink — is listed through the
+    // directory it resolves to, matching the child type `listDir` reports for
+    // that entry; `read` keeps its own no-follow gate on the final component.
+    if (entry.type !== 'directory' && entry.type !== 'symlink') {
       throw new RemoteError(
         'workspace-file/not-directory',
         `"${path}" is a ${entry.type}`,
@@ -343,6 +353,12 @@ export class WorkspaceFiles extends TypertRemoteService {
       )
     }
     const target = await this.confine(root, workspaceRoot, path, signal)
+    if (entry.type === 'symlink') {
+      const info = await this.ctx.fs.stat(target, signal)
+      if (info?.type !== 'directory') {
+        throw new RemoteError('workspace-file/not-directory', `"${path}" does not resolve to a directory`, { path, kind: 'symlink' })
+      }
+    }
     const children = await this.ctx.fs.listDir(target, signal)
     return {
       path: workspacePathOf(this.ctx.fs.fileUrl(root), this.ctx.fs.fileUrl(target)),
@@ -352,17 +368,74 @@ export class WorkspaceFiles extends TypertRemoteService {
   }
 
   /**
-   * Stream every `fs/observed` observation of a file inside the Session's
-   * workspace. Only instrumented filesystem operations report here; the OS is
-   * not watched.
+   * Search files and their inferred ancestor directories with packaged ripgrep.
+   * Native ignore rules apply unless disabled; VCS metadata, symlinks and empty
+   * directories are absent. Within the bounded set of listed files, matches
+   * sort by depth, then workspace-relative path.
    * @param workspaceFileScope - header-derived workspace root for the Session identity on the wire.
+   * @param request - the query, literal exclusions, and hidden/ignore switches.
+   * @param signal - caller cancellation, forwarded to the subprocess; rejection preserves its reason.
+   * @returns matches capped by search.maxResults; incomplete marks excess rg files or exit 2.
+   * @throws RemoteError `gateway/bad-request`: the query is blank.
+   * @throws RemoteError `workspace-file/not-found`: the workspace root does not exist.
+   * @throws RemoteError `workspace-file/not-directory`: the workspace root is not a directory.
+   * @throws RemoteError `workspace-file/search-failed`: subprocess is missing, rg cannot launch or execute, or the search times out.
+   */
+  @Remote
+  async search(
+    workspaceFileScope: WorkspaceFileScope,
+    request: WorkspaceFileSearchRequest,
+    signal: AbortSignal,
+  ): Promise<WorkspaceFileSearchResult> {
+    const query = request.query.trim()
+    if (query.length === 0) throw new RemoteError('gateway/bad-request', 'query must not be blank', {})
+    signal.throwIfAborted()
+    const { workspaceRoot } = workspaceFileScope
+    const root = await this.ctx.fs.resolve(workspaceRoot, { signal })
+    const info = await this.ctx.fs.stat(root, signal)
+    if (info === undefined) {
+      throw new RemoteError('workspace-file/not-found', `no entry at "${workspaceRoot}"`, { path: workspaceRoot })
+    }
+    if (info.type !== 'directory') {
+      throw new RemoteError('workspace-file/not-directory', `"${workspaceRoot}" is a ${info.type}`, { path: workspaceRoot, kind: info.type })
+    }
+    const subprocess = this.ctx.get('subprocess')
+    if (subprocess === undefined) {
+      throw new RemoteError('workspace-file/search-failed', 'Workspace file search requires a subprocess provider', {})
+    }
+    return searchWorkspace(subprocess, {
+      cwd: this.ctx.fs.processPath(root),
+      query,
+      excludedPaths: request.excludedPaths,
+      includeHidden: request.includeHidden,
+      respectGitignore: request.respectGitignore,
+      ...this.config.search,
+    }, signal)
+  }
+
+  /**
+   * Watch one file or a directory's direct entries in the Session's filesystem.
+   * Files use the backend's read authority; directories remain workspace-scoped.
+   * @param workspaceFileScope - header-derived workspace root for the Session identity on the wire.
+   * @param path - target path; the Host determines its type and confines directories to the workspace.
    * @param signal - generation cancellation.
-   * @returns `ready` once the Host observation queue is active and the workspace
-   *   root is resolved, then queued and live observations in emission order.
+   * @returns `ready` once the target watch is active, then current metadata for queued and live invalidations.
+   * @throws RemoteError when watching is unavailable or a directory is outside the workspace.
    */
   @Remote({ mode: 'stream' })
-  changes(workspaceFileScope: WorkspaceFileScope, signal: AbortSignal): AsyncIterable<WorkspaceFileWatchFrame> {
-    return this.feed.follow(workspaceFileScope.workspaceRoot, signal)
+  changes(workspaceFileScope: WorkspaceFileScope, path: string, signal: AbortSignal): AsyncIterable<WorkspaceFileWatchFrame> {
+    return this.feed.follow(workspaceFileScope.workspaceRoot, path, signal)
+  }
+
+  private async relativePath(scope: WorkspaceFileScope, baseFile: string, path: string, signal: AbortSignal): Promise<string> {
+    const relative = path.replace(/\\/g, '/')
+    if (relative.length === 0 || relative.startsWith('/') || /^[a-z][a-z\d+.-]*:/iu.test(relative) || relative.includes(NUL)) {
+      throw new RemoteError('gateway/bad-request', 'path must be relative when baseFile is provided', {})
+    }
+    const { target } = await this.locateFile(scope, baseFile, signal)
+    const absolute = this.ctx.fs.processPath(target)
+    const paths = absolute.startsWith('/') ? posix : win32
+    return paths.resolve(paths.dirname(absolute), relative)
   }
 
   /** Apply the page defaults and caps here, so the request never carries them implicitly. */

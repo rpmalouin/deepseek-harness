@@ -11,6 +11,8 @@
     "src/types.ts"
   ],
   "references": [
+    { "path": "../../team/agent-team" },
+    { "path": "../../client/product-analytics/tsconfig.client.json" },
     {
       "path": "../../../vendor/cordis"
     },
@@ -33,10 +35,16 @@
       "path": "../../context/session-reference"
     },
     {
+      "path": "../../core/session"
+    },
+    {
       "path": "../../extensions/cordis-host-runner"
     },
     {
       "path": "../../goal/goal"
+    },
+    {
+      "path": "../../schedule/schedule"
     },
     {
       "path": "../../feedback/message-feedback"
@@ -54,7 +62,7 @@
       "path": "../../llm/llm"
     },
     {
-      "path": "../../preset/agent-presets"
+      "path": "../../preset/agent-preset-registry"
     },
     {
       "path": "../../settings/settings"
@@ -67,6 +75,9 @@
     },
     {
       "path": "../../interaction/user-questions"
+    },
+    {
+      "path": "../job-controller/tsconfig.client.json"
     },
     {
       "path": "../session-controller/tsconfig.client.json"
@@ -93,7 +104,19 @@
       "path": "../../boot/plugin-manager"
     },
     {
-      "path": "../../document/office-to-pdf"
+      "path": "../../mcp/mcp-manager"
+    },
+    {
+      "path": "../../boot/plugin-market"
+    },
+    {
+      "path": "../../document/office-kit"
+    },
+    {
+      "path": "../../account/deepseek-account"
+    },
+    {
+      "path": "../../web/web"
     }
   ]
 }

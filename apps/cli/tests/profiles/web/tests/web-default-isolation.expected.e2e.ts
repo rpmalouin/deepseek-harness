@@ -3,12 +3,13 @@
 import { FiberState } from '@deepseek-ai/cordis'
 import type { WebBootGraph } from '@deepseek-ai/dsh-client-modules/client'
 import { expect, it } from 'vitest'
-import { experimentalRuntimeReferences, modulePackage } from './runtime-roster.ts'
+import { modulePackage } from './runtime-roster.ts'
+import { experimentalRuntimeReferences } from './runtime-roster-isolation.ts'
 import { withDefaultWeb, webGet } from './default-web-process.ts'
 
-const experimentalName = '@deepseek-ai/dsh-experimental-client-ui-agent-team'
+const experimentalName = '@deepseek-ai/dsh-experimental-client-ui-voice-input'
 
-it('boots the default Web profile without experimental Host modules, mounted plugins, or Client entries', async (test) => {
+it('boots default Web with the shipped Schedule rows, without experimental modules, time context, or an active built-in Browser', async (test) => {
   await withDefaultWeb(test, async ({ url, request }) => {
     const auth = await webGet(url, test.signal)
     const cookie = auth.headers['set-cookie']?.[0]?.split(';', 1)[0]
@@ -29,6 +30,22 @@ it('boots the default Web profile without experimental Host modules, mounted plu
     expect(roster.plugins.length).toBeGreaterThan(roster.entries.length)
     expect(roster.modules.some(url => modulePackage(url) === '@deepseek-ai/dsh')).toBe(true)
     expect(roster.client.entries.length).toBeGreaterThan(0)
+    const browser = roster.entries.find(entry => entry.name === '@deepseek-ai/dsh-client-ui-sidebar-browser')
+    expect(browser).toBeDefined()
+    expect(browser!.state).toBeUndefined()
+    expect(delivered.entries.some(entry => entry.id === '@deepseek-ai/dsh-client-ui-sidebar-browser')).toBe(false)
+    // The shipped composition mounts the Host Schedule service and its task
+    // page; the clock stays preset-level, so neither plane carries a row for it.
+    expect(roster.entries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: '@deepseek-ai/dsh-agent-team', state: FiberState.ACTIVE }),
+      expect.objectContaining({ name: '@deepseek-ai/dsh-tool-agent-team', state: FiberState.ACTIVE }),
+      expect.objectContaining({ name: '@deepseek-ai/dsh-client-ui-agent-team', state: FiberState.ACTIVE }),
+      expect.objectContaining({ name: '@deepseek-ai/dsh-schedule', state: FiberState.ACTIVE }),
+      expect.objectContaining({ name: '@deepseek-ai/dsh-client-ui-schedule', state: FiberState.ACTIVE }),
+    ]))
+    expect(delivered.entries.some(entry => entry.id === '@deepseek-ai/dsh-client-ui-schedule')).toBe(true)
+    expect(roster.entries.some(entry => entry.name === '@deepseek-ai/dsh-time-context')).toBe(false)
+    expect(delivered.entries.some(entry => entry.id === '@deepseek-ai/dsh-time-context')).toBe(false)
     expect(experimentalRuntimeReferences(roster)).toEqual([])
 
     const contaminated = await request('mount-experimental')
@@ -36,7 +53,7 @@ it('boots the default Web profile without experimental Host modules, mounted plu
     const mounted = contaminated.plugins.filter(plugin => plugin.modules.some(url => modulePackage(url) === experimentalName))
     expect(mounted).toEqual([expect.objectContaining({ state: FiberState.ACTIVE })])
     expect(experimentalRuntimeReferences(contaminated)).toEqual(expect.arrayContaining([
-      expect.stringContaining('/packages/experimental/client-ui-agent-team/'),
+      expect.stringContaining('/packages/experimental/client-ui-voice-input/'),
     ]))
   })
 })

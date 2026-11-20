@@ -41,7 +41,7 @@ import type { PermissionSelectInjected } from './PermissionSelect.tsx'
 import { PermissionRow } from './PermissionRow.tsx'
 import type { PermissionRowInjected } from './PermissionRow.tsx'
 import {
-  accessEn, accessZh, en, PERMISSION_ACCESS_NS, zh,
+  accessEn, accessJa, accessEs, accessFr, accessDe, accessRu, accessPt, accessZh, en, ja, es, fr, de, ru, pt, PERMISSION_ACCESS_NS, zh,
 } from './locales.ts'
 import {
   AUTO_REVIEW_PRESET, displayPermissionPreset, FULL_ACCESS_PRESET,
@@ -59,7 +59,7 @@ export type {
 export const inject = [
   'commandUi', 'connection', 'sessions', 'slots', 'locale', 'remote',
   'remote.permissionPresets', 'remote.settings',
-  'settingsScope', 'settingsSchema',
+  'configForms', 'settingsSchema',
 ]
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
@@ -113,8 +113,18 @@ function optionsOf(
 export function apply(ctx: ClientContext): void {
   const command = ctx.get('commandUi') as CommandUiContract
   const sessions = ctx.sessions
+  const accessDictionaries = {
+    zh: accessZh,
+    en: accessEn,
+    ja: accessJa,
+    es: accessEs,
+    fr: accessFr,
+    de: accessDe,
+    ru: accessRu,
+    pt: accessPt,
+  }
   ctx.effect(
-    () => ctx.locale.register(PERMISSION_ACCESS_NS, { zh: accessZh, en: accessEn }),
+    () => ctx.locale.register(PERMISSION_ACCESS_NS, accessDictionaries),
     'ui-permission: current-session dictionaries',
   )
   const t = ctx.locale.bind(PERMISSION_ACCESS_NS)
@@ -141,11 +151,11 @@ export function apply(ctx: ClientContext): void {
     'ui-permission: dismiss stale slash choices',
   )
 
-  ctx.effect(() => ctx.locale.register('settings.permission', { zh, en }), 'ui-permission: settings row dictionaries')
+  ctx.effect(() => ctx.locale.register('settings.permission', { zh, en, ja, es, fr, de, ru, pt }), 'ui-permission: settings row dictionaries')
 
-  // The shared SettingsScope mirror updates after document commits and reconnects.
+  // The shared ConfigForm mirror updates after document commits and reconnects.
   const controller = new PermissionPresetSettingsController(
-    ctx.settingsScope.describe(), ctx, ctx.settingsSchema)
+    ctx.configForms.describe(), ctx, catalog)
   const load = (): Promise<void> => controller.load()
   const select = (preset: string): Promise<void> => controller.select(preset)
   const injected = (): PermissionRowInjected => ({

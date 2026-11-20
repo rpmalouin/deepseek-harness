@@ -9,7 +9,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  IconDislikeFill16, IconDislikeOutline16, IconLikeFill16, IconLikeOutline16, Tooltip,
+  IconDislikeFillRegular, IconDislikeOutlineRegular, IconLikeFillRegular, IconLikeOutlineRegular, Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { MessageFeedbackRating } from '@deepseek-ai/dsh-message-feedback/types'
 import type { MessageFeedbackActionFailure } from './controller.ts'
@@ -17,12 +17,17 @@ import type { MessageFeedbackActionProps } from './slots.ts'
 import css from './MessageFeedbackActions.module.css'
 
 /**
- * One message's feedback controls.
- * @param props - the owner's message identity, the injected verbs, and the
- * shared feedback hook.
- * @returns the rating buttons with any failure notice beside them.
+ * One message's feedback controls, rendered only while the current Peer may
+ * record message feedback in this Session.
+ * @param props - the owner's message identity, the injected verbs, the
+ * shared feedback hook, and the Session access Hook.
+ * @returns the rating buttons with any failure notice beside them, or nothing without access.
  */
-export function MessageFeedbackActions({
+export function MessageFeedbackActions(props: MessageFeedbackActionProps) {
+  return props.useAccess('messageFeedback/put') ? <FeedbackRatingButtons {...props} /> : null
+}
+
+function FeedbackRatingButtons({
   messageId, ensure, current, retract, openDialog, useFeedback, t,
 }: MessageFeedbackActionProps) {
   const item = useFeedback(view => view.items.get(messageId))
@@ -88,7 +93,7 @@ export function MessageFeedbackActions({
           onPointerEnter={seed}
           onClick={onLike}
         >
-          {rating === 'positive' ? <IconLikeFill16 /> : <IconLikeOutline16 />}
+          {rating === 'positive' ? <IconLikeFillRegular /> : <IconLikeOutlineRegular />}
         </button>
       </Tooltip>
       <Tooltip label={dislikeLabel} side="bottom">
@@ -103,7 +108,7 @@ export function MessageFeedbackActions({
           onPointerEnter={seed}
           onClick={onDislike}
         >
-          {rating === 'negative' ? <IconDislikeFill16 /> : <IconDislikeOutline16 />}
+          {rating === 'negative' ? <IconDislikeFillRegular /> : <IconDislikeOutlineRegular />}
         </button>
       </Tooltip>
       {failure === null && loadFailed && (

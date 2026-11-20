@@ -1,0 +1,11 @@
+- region "Background jobs":
+  - heading "Background jobs" [level=2]
+  - list:
+    - listitem:
+      - button "Finished 1" [expanded]
+      - button "Clear"
+    - listitem:
+      - button "Hide live output of printf 'streamed-%s\\n' marker-line; for _ in $(seq 1 3000); do [ -e .live-job-stream.release ] && break; sleep 0.2; done" [expanded]: "printf 'streamed-%s\\n' marker-line; for _ in $(seq 1 3000); do [ -e .live-job-stream.release ] && break; sleep 0.2; done bash · signal: SIGTERM; web e2e cancellation {{duration}}"
+      - text: $ printf 'streamed-%s\n' marker-line; for _ in $(seq 1 3000); do [ -e .live-job-stream.release ] && break; sleep 0.2; done
+      - button "Copy"
+      - text: streamed-marker-line

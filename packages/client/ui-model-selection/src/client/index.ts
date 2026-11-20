@@ -22,17 +22,18 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-session/client'
 import type { TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
-import { IconDataOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconDataOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { ModelDirectoryState } from './directory.ts'
 import { ModelDirectoryResolver } from './service.ts'
 import type { ModelSelectInjected } from './slots.ts'
 import { ModelSelect } from './ModelSelect.tsx'
-import { en, zh, type ModelKey } from './locales.ts'
+import { en, ja, es, fr, de, ru, pt, zh, type ModelKey } from './locales.ts'
+import { orderModelProviders } from './provider-order.ts'
 
 export { ModelDirectory } from './directory.ts'
 export type { ModelDirectoryState } from './directory.ts'
 export { ModelDirectoryResolver } from './service.ts'
-export type { ModelSelectInjected } from './slots.ts'
+export type { ModelLabelOwner, ModelSelectInjected } from './slots.ts'
 export type { ModelKey } from './locales.ts'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
@@ -47,30 +48,16 @@ function rowId(providerId: string, modelId: string): string {
   return `${providerId}/${modelId}`
 }
 
-const BUILTIN_DESCRIPTION_KEYS: Readonly<Record<string, ModelKey>> = {
-  'deepseek-official/deepseek-v4-flash': 'option.deepseekV4Flash.description',
-  'deepseek-official/deepseek-v4-pro': 'option.deepseekV4Pro.description',
-}
-
-function descriptionOf(
-  providerId: string,
-  model: ModelDirectoryState['groups'][number]['models'][number],
-  t: TranslateNS<'model'>,
-): string | undefined {
-  const key = BUILTIN_DESCRIPTION_KEYS[rowId(providerId, model.id)]
-  return key !== undefined && model.description === en[key] ? t(key) : model.description
-}
-
 /** Flatten the directory into popup rows; failure rows are listed for visibility but never selectable. */
 function optionsOf(directory: ModelDirectoryState, t: TranslateNS<'model'>): SelectOption[] {
   const rows: SelectOption[] = []
-  for (const group of directory.groups) {
+  for (const group of orderModelProviders(directory.groups)) {
+    const name = group.id === 'deepseek-account' ? t('provider.account') : group.name
     for (const model of group.models) {
-      const description = descriptionOf(group.id, model, t)
       rows.push({
         id: rowId(group.id, model.id),
         label: model.name,
-        detail: description !== undefined ? `${group.name} · ${description}` : group.name,
+        group: { name: group.id, label: name },
         ...(directory.current !== null
           && directory.current.provider === group.id
           && directory.current.model === model.id
@@ -81,7 +68,7 @@ function optionsOf(directory: ModelDirectoryState, t: TranslateNS<'model'>): Sel
   for (const failure of directory.failures) {
     rows.push({
       id: `failure/${failure.id}`,
-      label: failure.name,
+      label: failure.id === 'deepseek-account' ? t('provider.account') : failure.name,
       detail: t('option.loadError', { message: failure.message }),
     })
   }
@@ -126,15 +113,13 @@ export const inject = ['commandUi', 'locale', 'sessions', 'slots', 'remote', 're
  * @param ctx - client root context.
  */
 export function apply(ctx: ClientContext): void {
-  ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'ui-model-selection: dictionaries')
+  ctx.effect(() => ctx.locale.register(NS, { zh, en, ja, es, fr, de, ru, pt }), 'ui-model-selection: dictionaries')
 
   // Non-slot faces (the command description, the popup option builder) read
   // through the bound translate; the seat component reads the standard seat.
   const t = ctx.locale.bind(NS)
 
-  // The composer-block reason is this plugin's own copy, read at raise time so
-  // a locale change reaches the next publish.
-  ctx.plugin(ModelDirectoryResolver, { blockReason: () => t('blocked.composer') })
+  ctx.plugin(ModelDirectoryResolver)
 
   // Entry 1: the /model popupSelect over the shared directory.
   ctx.inject(['commandUi', 'modelDirectories'], (scope: ClientContext) => {
@@ -145,10 +130,15 @@ export function apply(ctx: ClientContext): void {
       name: 'model',
       label: () => t('command.label'),
       description: () => t('command.description'),
-      icon: IconDataOutline16,
+      icon: IconDataOutlineRegular,
       available: session => sessions.subagentAddress(session.sessionId) === undefined,
       ui: {
         kind: 'popupSelect',
+        searchLabels: () => ({
+          placeholder: t('search.placeholder'),
+          empty: t('empty.models'),
+          noResults: t('search.empty'),
+        }),
         options: async (session) => {
           if (sessions.subagentAddress(session.sessionId) !== undefined) {
             throw new Error('model selection is unavailable for addressed subagent sessions')
@@ -181,6 +171,11 @@ export function apply(ctx: ClientContext): void {
     scope.slots.inject('conversation.input.model', () => scope.slots.register({
       name: 'conversation.input.model',
       locale: NS,
+      children: {
+        'conversation.input.model.label': { kind: 'single', scope: 'session', inline: true },
+        'conversation.input.model.options': { kind: 'list', scope: 'session' },
+        'conversation.input.model.pane': { kind: 'keyed', scope: 'session' },
+      },
       inject: (sessionId): ModelSelectInjected => {
         const directory = models.directoryFor(sessionId)
         const available = sessions.subagentAddress(sessionId) === undefined
@@ -190,6 +185,7 @@ export function apply(ctx: ClientContext): void {
           load: () => {
             if (available) directory.load().catch(() => { /* surfaced on the store */ })
           },
+          resolveText: text => ctx.locale.resolveText(text),
           select: (selection: ModelSelection) => available
             ? directory.select(selection)
             : Promise.resolve(undefined),

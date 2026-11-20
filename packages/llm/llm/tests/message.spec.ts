@@ -1,18 +1,92 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, expectTypeOf, it } from 'vitest'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { AttachmentId } from '@deepseek-ai/dsh-attachment'
 import {
-  ToolCallId,
+  type ToolCallId,
+  boundContextSummary,
+  CONTEXT_SUMMARY_MAX_CHARS,
   createAssistantMessage,
+  createDeveloperMessage,
+  createSystemMessage,
   createToolResultMessage,
   createUserMessage,
   freezeMessage,
-  MessageId,
+  type MessageId,
 } from '@deepseek-ai/dsh-llm'
+import { extractTextContent } from '@deepseek-ai/dsh-llm/message'
+
+describe('extractTextContent', () => {
+  it('preserves whitespace and empty text blocks while omitting non-text blocks', () => {
+    const message = createUserMessage({
+      source: { kind: 'test' },
+      content: [
+        { type: 'text', text: ' \talpha\n' },
+        { type: 'reasoning', text: 'private reasoning' },
+        { type: 'image', attachment: {
+          attachmentId: brandString<AttachmentId>(`sha256:${'a'.repeat(64)}`),
+          mediaType: 'image/png', bytes: 1, width: 1, height: 1,
+        } },
+        { type: 'tool-call', id: brandString<ToolCallId>('call'), name: 'tool', arguments: '{}' },
+        { type: 'text', text: '' },
+        { type: 'tool-removal', toolName: 'removed' },
+        { type: 'text', text: 'β \r\n' },
+      ],
+    })
+    expect(extractTextContent(message.content)).toBe(' \talpha\nβ \r\n')
+    expect(extractTextContent(message.content, undefined)).toBe(' \talpha\nβ \r\n')
+    expect(extractTextContent(message.content, {})).toBe(' \talpha\nβ \r\n')
+    expect(extractTextContent(message.content, { separator: '' })).toBe(' \talpha\nβ \r\n')
+    expect(extractTextContent(message.content, { separator: '\n' })).toBe(' \talpha\n\n\nβ \r\n')
+    expect(extractTextContent(message.content, { separator: ' ' })).toBe(' \talpha\n  β \r\n')
+    expect(extractTextContent(message.content, { separator: '::' })).toBe(' \talpha\n::::β \r\n')
+    expect(Object.isFrozen(message.content)).toBe(true)
+    expect(message.content[0]).toEqual({ type: 'text', text: ' \talpha\n' })
+  })
+
+  it('returns empty text when there are no text blocks and keeps separators between empty text blocks', () => {
+    expect(extractTextContent([])).toBe('')
+    expect(extractTextContent([{ type: 'reasoning', text: 'not plain text' }], { separator: '\n' })).toBe('')
+    expect(extractTextContent([
+      { type: 'text', text: '' },
+      { type: 'reasoning', text: 'ignored' },
+      { type: 'text', text: '' },
+    ], { separator: '\n' })).toBe('\n')
+  })
+})
 
 describe('message construction', () => {
+  it('detaches and freezes developer tool names without copying their definitions', () => {
+    const content = [{ type: 'tool-addition' as const, toolName: 'search' }]
+    const message = createDeveloperMessage({ content, source: { kind: 'test' } })
+    content[0]!.toolName = 'changed'
+    expect(message.role).toBe('developer')
+    expect(message.content).toEqual([{ type: 'tool-addition', toolName: 'search' }])
+    expect(Object.isFrozen(message.content[0])).toBe(true)
+    expect(freezeMessage(message).id).toBe(message.id)
+  })
+
+  it('bounds producer summaries while preserving summaries at the exact limit', () => {
+    const exact = 'x'.repeat(CONTEXT_SUMMARY_MAX_CHARS)
+    expect(boundContextSummary(exact)).toBe(exact)
+    expect(boundContextSummary(exact + 'x')).toBe(exact.slice(0, -1) + '…')
+  })
+
+  it('preserves system-prompt attribution on immutable system messages', () => {
+    const expectedSource: { kind: 'system-prompt' } = { kind: 'system-prompt' }
+    const message = createSystemMessage('rule')
+    expectTypeOf(message.source).toEqualTypeOf(expectedSource)
+    expect(message.role).toBe('system')
+    expect(message.content).toEqual([{ type: 'text', text: 'rule' }])
+    expect(message.source).toEqual(expectedSource)
+    expect(Object.isFrozen(message)).toBe(true)
+    expect(Object.isFrozen(message.source)).toBe(true)
+    expect(createSystemMessage('').content).toEqual([])
+  })
+
   it('assigns identity immediately and returns a detached deep-frozen message', () => {
     const input = {
       content: [{ type: 'text' as const, text: 'original' }],
-      source: { kind: 'plugin' as const, plugin: 'test' },
+      source: { kind: 'test' as const },
     }
 
     const message = createUserMessage(input)
@@ -34,7 +108,7 @@ describe('message construction', () => {
   })
 
   it('freezes an existing identity without minting a replacement', () => {
-    const id = MessageId('existing')
+    const id = brandString<MessageId>('existing')
     const input = {
       id,
       role: 'assistant' as const,
@@ -75,7 +149,7 @@ describe('message construction', () => {
   })
 
   it('couples tool-result content and its cited call seq to one call identity', () => {
-    const callId = ToolCallId('call-1')
+    const callId = brandString<ToolCallId>('call-1')
     const message = createToolResultMessage({
       callId,
       content: [{ type: 'text', text: 'result' }],
@@ -83,14 +157,11 @@ describe('message construction', () => {
     })
 
     expect(message).toMatchObject({
-      role: 'user',
+      role: 'tool',
+      toolCallId: callId,
+      isError: false,
       source: { kind: 'tool', callId },
-      content: [{
-        type: 'tool-result',
-        toolCallId: callId,
-        content: [{ type: 'text', text: 'result' }],
-        isError: false,
-      }],
+      content: [{ type: 'text', text: 'result' }],
     })
     expect(message.id).not.toHaveLength(0)
     expect(Object.isFrozen(message)).toBe(true)

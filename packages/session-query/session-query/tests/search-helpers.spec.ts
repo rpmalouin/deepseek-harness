@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import { createUserMessage, ToolCallId , createMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, type ToolCallId, createMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 import SessionStore, {
   SESSION_FORMAT_VERSION,
-  SessionId,
+  type SessionId,
   SessionSeq,
 } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
@@ -21,10 +23,16 @@ import {
 } from '@deepseek-ai/dsh-session-query'
 import { TestSessionQueryEngine } from './test-service.ts'
 
-const id = SessionId('session')
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'test': { kind: 'test' } & ContextFormed
+  }
+}
+
+const id = brandString<SessionId>('session')
 
 function header(value: string, extra: Partial<SessionHeader> = {}): SessionHeader {
-  return { version: SESSION_FORMAT_VERSION, id: SessionId(value), createdAt: 10, isSeeded: false, ...extra }
+  return { version: SESSION_FORMAT_VERSION, id: brandString<SessionId>(value), createdAt: 10, isSeeded: false, ...extra }
 }
 
 function expectCode(code: SessionQueryErrorCode): Error {
@@ -33,17 +41,13 @@ function expectCode(code: SessionQueryErrorCode): Error {
 
 describe('session-query semantic extraction', () => {
   it('extracts first-party message, tool, todo, and failure detail', () => {
-    const callId = ToolCallId('call')
+    const callId = brandString<ToolCallId>('call')
     const messageContent: SessionEvent<'user/message'>['data']['content'] = [
       { type: 'text', text: ' visible ' },
       { type: 'reasoning', text: 'thought' },
       { type: 'tool-call', id: callId, name: 'read', arguments: '{"path":"a"}' },
-      {
-        type: 'tool-result',
-        toolCallId: callId,
-        content: [{ type: 'text', text: 'nested' }],
-        isError: false,
-      },
+      { type: 'text', text: 'nested' },
+      { type: 'plugin:text', text: 'opaque hidden', content: [{ type: 'text', text: 'hidden child' }] } as never,
       { type: 'future-content', payload: 'hidden' } as never,
     ]
     const events: SessionEvent[] = [
@@ -63,7 +67,7 @@ describe('session-query semantic extraction', () => {
         }),
       }, surfaceOp: 'append' },
       { type: 'user/message', seq: SessionSeq(2), time: 3, data: createUserMessage({
-        content: messageContent, source: { kind: 'plugin', plugin: 'test' },
+        content: messageContent, source: { kind: 'test' },
       }), surfaceOp: 'append' },
       { type: 'tool/call', seq: SessionSeq(3), time: 5, data: { turn: 1, step: 1, callId, name: 'bash', arguments: '{"cmd":"pwd"}' } },
       {
@@ -174,7 +178,7 @@ describe('session-query document and filter helpers', () => {
     { type: 'user/message', seq: SessionSeq(2), time: 12, data:
       createUserMessage({
         content: [{ type: 'text', text: 'replacement' }],
-        source: { kind: 'plugin', plugin: 'test' },
+        source: { kind: 'test' },
       }),
     surfaceOp: { op: 'replace', startSeq: SessionSeq(0), endSeq: SessionSeq(0) },
     sourceEventSeqs: [SessionSeq(0)] },
@@ -193,13 +197,13 @@ describe('session-query document and filter helpers', () => {
   })
 
   it('applies every session clause with OR values and validates closed values', () => {
-    const parent = SessionId('parent')
+    const parent = brandString<SessionId>('parent')
     const records = [
       { header: header('a', { cwd: '/a', parentSession: parent }), live: true, persisted: false, marker: 1 },
       { header: header('b', { createdAt: 20 }), live: false, persisted: true, marker: 2 },
     ]
     expect(filterSessionResults(records, [
-      { kind: 'id', values: [SessionId('a'), SessionId('x')] },
+      { kind: 'id', values: [brandString<SessionId>('a'), brandString<SessionId>('x')] },
       { kind: 'cwd', values: ['/a', null] },
       { kind: 'created-at', from: 5, to: 15 },
       { kind: 'parent', values: [parent, null] },
@@ -250,7 +254,7 @@ describe('session-query document and filter helpers', () => {
       time: 1,
       data: createUserMessage({
         content: [{ type: 'text', text: 'bad' }],
-        source: { kind: 'plugin', plugin: 'test' },
+        source: { kind: 'test' },
       }),
       surfaceOp: { op: 'replace', startSeq: SessionSeq(9), endSeq: SessionSeq(9) },
     }]

@@ -1,10 +1,13 @@
+import { mountWorkingDirectoryFixture } from '../../subagent/tests/working-directory-fixture.ts'
+import { randomUUID } from 'node:crypto'
+import { startExternalActivation, externalTestParent } from '../../subagent/tests/external-activation-helpers.ts'
 import { readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
-import * as yaml from 'js-yaml'
+import { parseEntryYaml } from '@deepseek-ai/cordis-plugin-include'
 import { describe, expect, it, vi } from 'vitest'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
@@ -356,7 +359,7 @@ function expectedFailureDiagnostic(
 }
 
 describe('task admission and package contracts', () => {
-  it('ships one independently installable provider-only Bundle patch', () => {
+  it('ships the provider with a global delegation tool', () => {
     const root = fileURLToPath(new URL('..', import.meta.url))
     const manifest = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as {
       dependencies?: Record<string, string>
@@ -367,7 +370,7 @@ describe('task admission and package contracts', () => {
     expect(manifest.files).toContain('cordis.patch.yml')
     expect(manifest.dependencies).toHaveProperty(
       '@deepseek-ai/dsh-sdk-protocol',
-      'workspace:^',
+      'workspace:*',
     )
     expect(manifest.dependencies).toHaveProperty('@openai/codex', CODEX_VERSION)
     expect(manifest.dependencies).not.toHaveProperty('@deepseek-ai/dsh-subagent-claude-code')
@@ -402,15 +405,14 @@ describe('task admission and package contracts', () => {
       )
     }
 
-    const parsed = yaml.load(readFileSync(resolve(root, manifest.dsh!.bundle!.patch!), 'utf8'))
-    const rows = Array.isArray(parsed)
-      ? (parsed as Array<{ insert?: Array<{ id?: string; name?: string }> }>).flatMap(entry => entry.insert ?? [])
-      : []
-    expect(rows).toEqual([{
-      id: 'subagent-codex',
-      name: '@deepseek-ai/dsh-subagent-codex',
-    }])
-    expect(JSON.stringify(rows)).not.toContain('tool-subagent')
+    const parsed = parseEntryYaml(readFileSync(resolve(root, manifest.dsh!.bundle!.patch!), 'utf8'))
+    expect(parsed).toEqual([{ insert: [
+      { id: 'subagent-codex', name: '@deepseek-ai/dsh-subagent-codex' },
+      { id: 'tool-subagent-codex', name: '@deepseek-ai/dsh-tool-subagent', config: {
+        provider: 'codex', toolName: 'subagent_codex', maxDepth: 'provider-managed',
+      } },
+    ] }])
+    expect(manifest.dependencies).toHaveProperty('@deepseek-ai/dsh-tool-subagent', 'workspace:*')
   })
 
   it('accepts one or more text blocks and rejects empty or non-text tasks', () => {
@@ -428,6 +430,7 @@ describe('task admission and package contracts', () => {
   it('registers the default descriptor, validates config, and unregisters on HMR', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionProjectionRegistry)
+    await mountWorkingDirectoryFixture(ctx)
     await ctx.plugin(SubagentRuntime)
     await ctx.plugin(LocalSubprocessRuntime)
     const fiber = await ctx.plugin(codex, {})
@@ -435,16 +438,15 @@ describe('task admission and package contracts', () => {
     expect(provider).toMatchObject({
       name: 'codex',
       capabilities: {
+        agentPreset: false,
         outputSchema: false,
         depthLimit: false,
-        toolFilter: false,
-        persona: false,
       },
       inheritsParentContext: false,
     })
-    expect(ctx.subagents.list()).toEqual(['codex'])
+    expect(ctx.subagents.getProvider('codex')).toBeDefined()
     await fiber.dispose()
-    expect(ctx.subagents.list()).toEqual([])
+    expect(ctx.subagents.getProvider('codex')).toBeUndefined()
 
     for (const disposeGraceMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
       await expect(ctx.plugin(codex, { disposeGraceMs }))
@@ -458,6 +460,7 @@ describe('task admission and package contracts', () => {
   it('keeps named instances, runs, and HMR ownership isolated', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionProjectionRegistry)
+    await mountWorkingDirectoryFixture(ctx)
     await ctx.plugin(SubagentRuntime)
     await ctx.plugin(LocalSubprocessRuntime)
     const safeChild = fakeChild()
@@ -491,15 +494,16 @@ describe('task admission and package contracts', () => {
       permissionMode: 'dangerously-bypass-approvals-and-sandbox',
       disposeGraceMs: 29,
     })
-    expect(ctx.subagents.list()).toEqual(['codex-safe', 'codex-bypass'])
+    expect(ctx.subagents.getProvider('codex-safe')).toBeDefined()
+    expect(ctx.subagents.getProvider('codex-bypass')).toBeDefined()
     expect(added).toEqual(['codex-safe', 'codex-bypass'])
 
     const safeController = new AbortController()
-    const safeStarting = ctx.subagents.start(
+    const safeStarting = startExternalActivation(ctx,
       'codex-safe',
       request(undefined, safeController.signal),
     )
-    const bypassStarting = ctx.subagents.start('codex-bypass', request())
+    const bypassStarting = startExternalActivation(ctx, 'codex-bypass', request())
     for (const [child, model] of [
       [safeChild, 'codex-safe-model'],
       [bypassChild, 'codex-bypass-model'],
@@ -518,9 +522,10 @@ describe('task admission and package contracts', () => {
       bypassStarting,
     ])
     await safeFiber.dispose()
-    expect(ctx.subagents.list()).toEqual(['codex-bypass'])
+    expect(ctx.subagents.getProvider('codex-bypass')).toBeDefined()
+    expect(ctx.subagents.getProvider('codex-safe')).toBeUndefined()
     expect(removed).toEqual(['codex-safe'])
-    await expect(ctx.subagents.start('codex-safe', request()))
+    await expect(startExternalActivation(ctx, 'codex-safe', request()))
       .rejects.toMatchObject({ code: 'NO_PROVIDER' })
 
     const safeTurn = await safeChild.peer.nextMethod('turn/start')
@@ -535,7 +540,7 @@ describe('task admission and package contracts', () => {
       output: [{ type: 'text', text: 'bypass answer' }],
       stopReason: 'completed',
     })
-    safeController.abort(new Error('stop only the safe instance'))
+    void safeRun.dispose()
     await expect(safeRun.result).resolves.toEqual({
       output: [],
       stopReason: 'aborted',
@@ -561,6 +566,7 @@ describe('task admission and package contracts', () => {
   it('rejects duplicate provider names without replacing the first instance', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionProjectionRegistry)
+    await mountWorkingDirectoryFixture(ctx)
     await ctx.plugin(SubagentRuntime)
     await ctx.plugin(LocalSubprocessRuntime)
     const firstFiber = await ctx.plugin(codex, {
@@ -572,7 +578,6 @@ describe('task admission and package contracts', () => {
       permissionMode: 'dangerously-bypass-approvals-and-sandbox',
     })).rejects.toMatchObject({ code: 'DUPLICATE_PROVIDER' })
     expect(ctx.subagents.getProvider('codex-duplicate')).toBe(first)
-    expect(ctx.subagents.list()).toEqual(['codex-duplicate'])
     await firstFiber.dispose()
     await ctx.fiber.dispose()
   })
@@ -597,13 +602,14 @@ describe('task admission and package contracts', () => {
   it('resolves the safe permission default when apply is called directly', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionProjectionRegistry)
+    await mountWorkingDirectoryFixture(ctx)
     await ctx.plugin(SubagentRuntime)
     await ctx.plugin(LocalSubprocessRuntime)
     const child = fakeChild()
     vi.spyOn(ctx.subprocess, 'spawn').mockReturnValue(child.handle)
     codex.apply(ctx, { env: {}, disposeGraceMs: 3_000 })
     expect(ctx.subagents.getProvider('codex')).toBeDefined()
-    const starting = ctx.subagents.start('codex', request())
+    const starting = startExternalActivation(ctx, 'codex', request())
     const initialize = await child.peer.nextMethod('initialize')
     child.peer.respond(initialize, { userAgent: 'codex-cli 0.153.4' })
     await child.peer.nextMethod('initialized')
@@ -689,26 +695,27 @@ describe('task admission and package contracts', () => {
     wire.close()
   })
 
-  it('requires a parent session cwd without suggesting unsupported config', async () => {
+  it.each([false, true])('rejects a missing parent directory before spawning (cancelled: %s)', async (cancelled) => {
     const ctx = new Context()
-    await ctx.plugin(SessionProjectionRegistry)
-    await ctx.plugin(SubagentRuntime)
-    await ctx.plugin(LocalSubprocessRuntime)
-    const spawn = vi.spyOn(ctx.subprocess, 'spawn')
-    await ctx.plugin(codex, {})
-
-    await expect(ctx.subagents.start('codex', {
-      prompt: [{ type: 'text', text: 'task' }],
-      parent: {
-        id: 'parent-without-cwd',
-        session: { header: {} },
-      } as unknown as Agent,
-      signal: new AbortController().signal,
-    })).rejects.toThrow(
-      'subagent-codex: no working directory for the child — delegate from a parent session that has one',
-    )
-    expect(spawn).not.toHaveBeenCalled()
-    await ctx.fiber.dispose()
+    try {
+      await ctx.plugin(SessionProjectionRegistry)
+      await mountWorkingDirectoryFixture(ctx)
+      await ctx.plugin(SubagentRuntime)
+      await ctx.plugin(LocalSubprocessRuntime)
+      await ctx.plugin(codex, {})
+      const spawn = vi.spyOn(ctx.subprocess, 'spawn')
+      const controller = new AbortController()
+      if (cancelled) controller.abort()
+      const provider = ctx.subagents.getProvider('codex')!
+      await expect(Promise.resolve().then(async () => provider.start!({
+        ...request(undefined, controller.signal),
+        parent: await externalTestParent(ctx),
+        cwd: resolve('missing-parent-' + randomUUID()),
+      }))).rejects.toThrow(cancelled
+        ? 'request was aborted before app-server startup'
+        : 'stage: initialize; category: unknown')
+      expect(spawn).not.toHaveBeenCalled()
+    } finally { await ctx.fiber.dispose() }
   })
 
   it('keeps the namespace export shape', () => {
@@ -813,6 +820,55 @@ describe('CodexAppServerWire', () => {
       stopReason: 'completed',
     })
     wire.close()
+  })
+
+  it('ranks final_answer above partial_answer above nullable-phase answers and never selects commentary', async () => {
+    const scenarios: Array<{
+      readonly frames: JsonObject[]
+      readonly text: string
+    }> = [
+      {
+        frames: [
+          agentMessage('partial', 'partial_answer'),
+          agentMessage('final', 'final_answer'),
+        ],
+        text: 'final',
+      },
+      {
+        frames: [
+          agentMessage('final', 'final_answer'),
+          agentMessage('partial after final', 'partial_answer'),
+        ],
+        text: 'final',
+      },
+      {
+        frames: [agentMessage('only partial', 'partial_answer')],
+        text: 'only partial',
+      },
+      {
+        frames: [
+          agentMessage('unphased', null),
+          agentMessage('commentary before partial', 'commentary'),
+          agentMessage('first partial', 'partial_answer'),
+          agentMessage('last partial', 'partial_answer'),
+          agentMessage('commentary after partial', 'commentary'),
+          agentMessage('unphased after partial', null),
+        ],
+        text: 'last partial',
+      },
+    ]
+    for (const scenario of scenarios) {
+      const { child, wire } = await initializeWire()
+      const result = wire.runTurn(['task'], new AbortController().signal)
+      const turnStart = await child.peer.nextMethod('turn/start')
+      child.peer.respond(turnStart, { turn: { id: 'turn-1' } })
+      child.peer.send(...scenario.frames, turnCompleted('completed'))
+      await expect(result).resolves.toEqual({
+        output: [{ type: 'text', text: scenario.text }],
+        stopReason: 'completed',
+      })
+      wire.close()
+    }
   })
 
   it('groups representative string errors without changing stop reasons', async () => {
@@ -952,7 +1008,7 @@ describe('CodexAppServerWire', () => {
     }> = [
       {
         frames: [turnCompleted('completed')],
-        message: 'without a final answer',
+        message: 'without an answer',
         category: 'invalid-result',
       },
       {
@@ -961,7 +1017,7 @@ describe('CodexAppServerWire', () => {
           agentMessage(' \n ', 'final_answer'),
           turnCompleted('completed'),
         ],
-        message: 'without a final answer',
+        message: 'without an answer',
         category: 'invalid-result',
       },
       {
@@ -1503,7 +1559,6 @@ describe('run lifecycle and quiescence', () => {
       graceMs: DEFAULT_DISPOSE_GRACE_MS,
       env: { OPENAI_API_KEY: 'fake' },
     })
-    expect(run.localAgent).toBeUndefined()
 
     const turnStart = await child.peer.nextMethod('turn/start')
     child.peer.send(
@@ -2119,6 +2174,7 @@ describe('run lifecycle and quiescence', () => {
   it('uses the registered provider config and logs flattened errors', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionProjectionRegistry)
+    await mountWorkingDirectoryFixture(ctx)
     await ctx.plugin(SubagentRuntime)
     await ctx.plugin(LocalSubprocessRuntime)
     const child = fakeChild()
@@ -2135,41 +2191,7 @@ describe('run lifecycle and quiescence', () => {
       disposeGraceMs: 25,
     })
 
-    const invalidCwdParent = {
-      id: 'parent-with-invalid-cwd',
-      session: { header: { cwd: 'relative/SECRET_TOKEN' } },
-    } as unknown as Agent
-    const invalidCwdError: unknown = await ctx.subagents.start('codex-diagnostic', {
-      prompt: [{ type: 'text', text: 'task' }],
-      parent: invalidCwdParent,
-      signal: new AbortController().signal,
-    }).then(
-      () => undefined,
-      (error: unknown) => error,
-    )
-    expect(invalidCwdError).toBeInstanceOf(Error)
-    if (!(invalidCwdError instanceof Error)) {
-      throw new Error('expected safe invalid-cwd failure')
-    }
-    expect(invalidCwdError.message).toContain(
-      expectedFailureDiagnostic('initialize', 'unknown'),
-    )
-    expect(invalidCwdError.message).not.toContain('relative/SECRET_TOKEN')
-    expect(invalidCwdError.cause).toBeInstanceOf(Error)
-    expect((invalidCwdError.cause as Error).message)
-      .toContain('relative/SECRET_TOKEN')
-    expect(spawn).not.toHaveBeenCalled()
-
-    const invalidCwdAbort = new AbortController()
-    invalidCwdAbort.abort(new Error('cancel invalid cwd startup'))
-    await expect(ctx.subagents.start('codex-diagnostic', {
-      prompt: [{ type: 'text', text: 'task' }],
-      parent: invalidCwdParent,
-      signal: invalidCwdAbort.signal,
-    })).rejects.toThrow('aborted before app-server startup')
-    expect(spawn).not.toHaveBeenCalled()
-
-    const starting = ctx.subagents.start('codex-diagnostic', {
+    const starting = startExternalActivation(ctx, 'codex-diagnostic', {
       prompt: [{ type: 'text', text: 'task' }],
       parent: fakeParent,
       signal: new AbortController().signal,

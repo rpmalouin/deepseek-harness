@@ -2,9 +2,11 @@
 
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { RunningToolCall, ToolResultNode } from '@deepseek-ai/dsh-client-ui-chat/client'
+import type { StartedToolCall, ToolResultNode } from '@deepseek-ai/dsh-client-ui-chat/client'
+import type { ToolCallOwnerProps } from '@deepseek-ai/dsh-client-ui-tool/client'
 import { makeTranslate } from '@deepseek-ai/dsh-client-test-runtime'
 import { zh as commonZh } from '@deepseek-ai/dsh-client-locale/src/locales/zh.ts'
+import { PartialArguments } from '@deepseek-ai/dsh-util-values'
 import { SkillRow } from '../src/client/SkillRow.tsx'
 import { zh } from '../src/client/locales.ts'
 
@@ -15,12 +17,14 @@ const t: SkillRowProps['t'] = makeTranslate(zh, commonZh)
 afterEach(cleanup)
 
 function settled(over: Partial<ToolResultNode> = {}): ToolResultNode {
+  const call = over.call === undefined ? { name: 'skill', argsRaw: '{"name":"dsh-manage-issues"}' } : over.call
   return {
     kind: 'tool-result',
     seq: 3,
     time: 3_000,
     callId: 'call-skill',
-    call: { name: 'skill', argsRaw: '{"name":"dsh-manage-issues"}' },
+    name: call?.name ?? '', args: call === null ? PartialArguments.EMPTY : PartialArguments.fromText(call.argsRaw),
+    call,
     callTime: 2_000,
     content: [{ type: 'text', text: 'Follow the issue workflow.\nKeep project fields in sync.' }],
     isError: false,
@@ -29,29 +33,41 @@ function settled(over: Partial<ToolResultNode> = {}): ToolResultNode {
   }
 }
 
-function running(argsRaw = '{"name":"dsh-manage-issues"}'): RunningToolCall {
+function running(argsRaw = '{"name":"dsh-manage-issues"}'): StartedToolCall {
   return {
-    callId: 'call-skill', name: 'skill', argsRaw, turn: 1, step: 1, time: 2_000, subCalls: [],
+    phase: 'start' as const, args: PartialArguments.fromText(argsRaw), callId: 'call-skill', name: 'skill', argsRaw, turn: 1, step: 1, time: 2_000, subCalls: [],
   }
 }
 
 function props(block: SkillRowProps['block'], inspect?: () => void): SkillRowProps {
-  return {
+  const owner: ToolCallOwnerProps = {
     callId: block.callId,
     toolName: 'skill',
-    block,
-
+    ...('kind' in block ? { phase: 'result' as const, block }
+      : block.phase === 'preparing' ? { phase: 'preparing' as const, block } : { phase: 'start' as const, block }),
+    useDisclosure: () => ({ expanded: false, setExpanded: vi.fn(), toggle: vi.fn() }),
+    loadImage: vi.fn<ToolCallOwnerProps['loadImage']>(),
     openFile: vi.fn(),
     inspect,
-    t,
-  } as unknown as SkillRowProps
+  }
+  return { ...owner, t } as SkillRowProps
 }
 
 describe('SkillRow', () => {
+  it('shows preparation without arguments, instructions, or disclosure', () => {
+    const view = render(<SkillRow {...props({
+      phase: 'preparing', args: PartialArguments.EMPTY, callId: 'call-skill', name: 'skill', turn: 1, step: 1, time: 1, subCalls: [],
+    })} />)
+    expect(view.getByText('准备加载技能')).toBeTruthy()
+    expect(view.container.querySelector('svg')).not.toBeNull()
+    expect(view.queryByRole('button')).toBeNull()
+    expect(view.container.querySelector('pre')).toBeNull()
+  })
+
   it('renders a compact Bash-shaped summary and discloses the exact instructions', () => {
     const inspect = vi.fn()
     const view = render(<SkillRow {...props(settled(), inspect)} />)
-    const row = screen.getByRole('button', { name: 'Skilldsh-manage-issues' })
+    const row = screen.getByRole('button', { name: '加载技能dsh-manage-issues' })
     expect(row.getAttribute('aria-expanded')).toBe('false')
     expect(view.container.querySelector('[data-tool="skill"]')?.getAttribute('data-state')).toBe('ok')
     expect(view.container.querySelector('[data-tool="skill"] svg')?.getAttribute('width')).toBe('14')
@@ -86,7 +102,7 @@ describe('SkillRow', () => {
     expect(row.getAttribute('role')).toBeNull()
     expect(view.container.textContent).toContain('正在加载 skill')
     expect(view.container.textContent).toContain('dsh-manage-issues')
-    expect(view.container.querySelector('svg [fill="currentColor"]')).not.toBeNull()
+    expect(view.container.querySelector('svg[data-icon="dsw-icon-skill-outline-regular"]')).not.toBeNull()
   })
 
   it('uses the first failure line in the summary and exposes the full error', () => {
@@ -95,8 +111,10 @@ describe('SkillRow', () => {
       isError: true,
       error: { name: 'SkillError', code: 'missing' },
     }))} />)
-    const row = screen.getByRole('button', { name: 'skill 加载失败SkillSkillError: missing resource' })
+    const row = screen.getByRole('button', { name: 'skill 加载失败加载技能SkillError: missing resource' })
     expect(view.container.querySelector('[data-tool="skill"]')?.getAttribute('data-state')).toBe('error')
+    expect(view.container.querySelector('[data-tool="skill"] [role="button"] svg')).not.toBeNull()
+    expect(view.container.querySelector('[data-tool="skill"] [data-state]')).toBeNull()
     expect(row.textContent).not.toContain('Check SKILL.md.')
     fireEvent.click(row)
     const output = view.container.querySelector('pre')!
@@ -108,8 +126,10 @@ describe('SkillRow', () => {
     const stoppedView = render(<SkillRow {...props(settled({
       error: { name: 'InterruptedError', code: 'interrupted' },
     }))} />)
-    expect(stoppedView.container.textContent).toContain('skill 加载已中止')
-    expect(stoppedView.container.querySelector('[data-state="warning"]')).not.toBeNull()
+    const stoppedSummary = stoppedView.getByText('skill 加载已中止')
+    expect(stoppedSummary.parentElement?.className).toContain('stoppedSummary')
+    expect(stoppedView.container.querySelector('[data-tool="skill"] [role="button"] svg')).not.toBeNull()
+    expect(stoppedView.container.querySelector('[data-tool="skill"] [data-state]')).toBeNull()
     cleanup()
 
     const structuredView = render(<SkillRow {...props(settled({
@@ -124,7 +144,7 @@ describe('SkillRow', () => {
       isError: true,
       error: { name: 'SkillError', code: 'missing' },
     }))} />)
-    const errorRow = screen.getByRole('button', { name: 'skill 加载失败SkillSkillError: missing' })
+    const errorRow = screen.getByRole('button', { name: 'skill 加载失败加载技能SkillError: missing' })
     fireEvent.click(errorRow)
     expect(screen.getAllByText('SkillError: missing')).toHaveLength(2)
   })

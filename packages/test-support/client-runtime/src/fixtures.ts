@@ -74,7 +74,7 @@ export function sessionSnapshot(sessionId: SessionId): SessionSnapshot {
     openState: 'open',
     openError: null,
     hasMore: false,
-    loadingOlder: false,
+    loadingOlder: false, historyLoadStatus: 'idle', historyWasPartial: false,
     promptError: null,
     blank: false,
     lastAgentError: null,
@@ -111,6 +111,7 @@ export function workspaceSnapshot(): WorkspaceSnapshot {
   return {
     items: [],
     archivedSessionIds: [],
+    pinnedSessionIds: [],
     state: 'idle',
     phase: 'ready',
     error: null,

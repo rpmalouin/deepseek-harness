@@ -25,6 +25,17 @@ import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-session-projection'
 import type { ShellExecutor, ShellRunResult } from '@deepseek-ai/dsh-shell'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { ContextFormed } from '@deepseek-ai/dsh-llm'
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    /** Location attribution; readers preserve the content without this producer.
+     * Its projection uses the kind to avoid repeated injection.
+     * @persistenceAttribution
+     */
+    'tmux-context': { kind: 'tmux-context' } & ContextFormed
+  }
+}
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'tmux-context'
@@ -123,7 +134,7 @@ async function queryTmuxLocation(
   ].join('\n')
   let result: ShellRunResult
   try {
-    result = await bash.run(bash.resolve({ command, signal }))
+    result = await (await bash.execute(bash.resolve({ command, signal }))).result()
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error)
     logger.warn(`tmux location query failed: ${message}; injecting no location this turn`)
@@ -197,34 +208,27 @@ const tmuxContextStateSchema = zod.object({
   time: zod.number(),
 }).nullable()
 
-type TmuxContextState = zod.infer<typeof tmuxContextStateSchema>
-
 /**
  * Register a prepended pre-step listener for the lifetime of `ctx`.
+ * Steps admitted during activation await the projection registration; a
+ * registration failure or owner disposal prevents the request from proceeding.
  * @param ctx - plugin context; the listener is disposed with it.
  * @param config - durable refresh scheduling configuration.
+ * @returns when the listener and projection are ready.
  * @throws when the refresh interval is invalid.
  */
-declare module '@deepseek-ai/dsh-session-projection/types' {
-  interface SessionProjectionStateMap {
-    /** The stable state block of this plugin's latest durable injection, or null. */
-    tmuxContext: TmuxContextState
-  }
-}
-
-export function apply(ctx: Context, config: Config): void {
+export async function apply(ctx: Context, config: Config): Promise<void> {
   const refreshIntervalMs = config.refreshIntervalMs
   validateRefreshInterval(refreshIntervalMs)
 
-  ctx.sessionProjections.register({
+  const projectionReady = ctx.sessionProjections.register({
     key: 'tmuxContext',
     stateVersion: 1,
     stateSchema: tmuxContextStateSchema,
     init: () => null,
     apply: (state, event) => {
       if (event.type !== 'user/message'
-        || event.data.source.kind !== 'plugin'
-        || event.data.source.plugin !== name) return state
+        || event.data.source.kind !== name) return state
       const [block] = event.data.content
       if (block?.type !== 'text') return state
       const newline = block.text.indexOf('\n')
@@ -237,11 +241,13 @@ export function apply(ctx: Context, config: Config): void {
     { agent, turn, step, signal },
     next,
   ): Promise<PreStepDecision> => {
+    const tmuxContextProjectionHandle = await projectionReady
+    ctx.fiber.assertActive()
     const decision = await next()
     if (decision.kind === 'reject' || signal.aborted || step !== 1) return decision
     const bash = ctx.get('shell')
     if (bash === undefined) return decision
-    const previous = ctx.sessionProjections.stateOf(agent.session, 'tmuxContext') as TmuxContextState
+    const previous = tmuxContextProjectionHandle.stateOf(agent.session)
     if (refreshIntervalMs !== undefined && refreshIntervalMs > 0 && previous !== null) {
       const now = Date.now()
       if (now >= previous.time && now - previous.time < refreshIntervalMs) return decision
@@ -256,10 +262,11 @@ export function apply(ctx: Context, config: Config): void {
       messages: [
         createUserMessage({
           content: [{ type: 'text', text }],
-          source: { kind: 'plugin', plugin: name, form: 'snapshot', sections: [{ name, text }] },
+          source: { kind: name, form: 'snapshot', sections: [{ name, text }] },
         }),
         ...decision.messages,
       ],
     }
   }, { prepend: true })
+  await projectionReady
 }

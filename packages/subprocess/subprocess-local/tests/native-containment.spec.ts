@@ -39,12 +39,13 @@ function directSpawnFailure(argv: readonly string[]): Promise<SpawnFailure> {
 async function waitForPid(path: string): Promise<number> {
   const deadline = Date.now() + 5_000
   while (Date.now() < deadline) {
+    let pid = Number.NaN
     try {
-      const pid = Number(readFileSync(path, 'utf8').trim())
-      if (Number.isSafeInteger(pid) && pid > 0) return pid
-    } catch {
+      pid = Number(readFileSync(path, 'utf8').trim())
+    } catch (_pidFileMissing) {
       // The target has not written the file yet.
     }
+    if (Number.isSafeInteger(pid) && pid > 0) return pid
     await new Promise(resolve => setTimeout(resolve, 20))
   }
   throw new Error(`pid file ${path} was not written`)
@@ -141,9 +142,11 @@ async function waitForInputReadiness(handle: SubprocessTerminalHandle): Promise<
   throw new Error(`terminal ${String(handle.pid)} never became input-ready`)
 }
 
-const linuxNative = process.platform === 'linux' && probeLinuxScope()
+const literalArgv = process.platform === 'linux' ? probeLinuxScope() : undefined
 
-describe.skipIf(!linuxNative)('Linux user-systemd native containment', () => {
+describe.skipIf(literalArgv === undefined)('Linux user-systemd native containment', () => {
+  const scopeOptions = literalArgv ?? []
+
   it('aborts an established scope before bootstrap consumption and joins its managed handle', async () => {
     const controller = new AbortController()
     const request: SubprocessSpawnSpec = {
@@ -151,7 +154,7 @@ describe.skipIf(!linuxNative)('Linux user-systemd native containment', () => {
       signal: controller.signal,
       stdio: { stdin: 'pipe', stdout: { maxBytes: 1_024 }, stderr: { maxBytes: 1_024 } },
     }
-    const handle = bindManagedProcess(request, launchLinuxScope(request, targetEnvironment(request), {
+    const handle = bindManagedProcess(request, launchLinuxScope(request, targetEnvironment(request), scopeOptions, {
       runnerInvocation: [process.execPath, join(import.meta.dirname, 'fixtures/hold-linux-bootstrap.ts')],
     }))
     try {
@@ -173,7 +176,7 @@ describe.skipIf(!linuxNative)('Linux user-systemd native containment', () => {
     const pidFile = join(scratch, `setsid-${Date.now()}.pid`)
     const command = `setsid sh -c 'echo $$ > "$1"; trap "" TERM; while :; do sleep 60; done' sh ${JSON.stringify(pidFile)} & wait`
     const request = spec(['bash', '-c', command], 80)
-    const handle = bindManagedProcess(request, launchLinuxScope(request, targetEnvironment(request)))
+    const handle = bindManagedProcess(request, launchLinuxScope(request, targetEnvironment(request), scopeOptions))
     let descendant: number | undefined
     try {
       descendant = await waitForPid(pidFile)
@@ -185,7 +188,7 @@ describe.skipIf(!linuxNative)('Linux user-systemd native containment', () => {
       handle.terminate()
       await Promise.allSettled([handle.done, handle.waitForExit()])
       if (descendant !== undefined) {
-        try { process.kill(descendant, 'SIGKILL') } catch { /* already contained */ }
+        try { process.kill(descendant, 'SIGKILL') } catch (_descendantGone) { /* Containment already killed the descendant. */ }
       }
     }
   })
@@ -194,7 +197,7 @@ describe.skipIf(!linuxNative)('Linux user-systemd native containment', () => {
     const missingArgv = [`missing-native-target-${Date.now()}`, 'literal arg']
     const expectedMissing = await directSpawnFailure(missingArgv)
     const missing = spec(missingArgv)
-    const missingHandle = bindManagedProcess(missing, launchLinuxScope(missing, targetEnvironment(missing)))
+    const missingHandle = bindManagedProcess(missing, launchLinuxScope(missing, targetEnvironment(missing), scopeOptions))
     await expect(missingHandle.done).rejects.toMatchObject({
       name: expectedMissing.name,
       message: expectedMissing.message,
@@ -209,7 +212,7 @@ describe.skipIf(!linuxNative)('Linux user-systemd native containment', () => {
     const deniedArgv = [deniedPath, 'literal arg']
     const expectedDenied = await directSpawnFailure(deniedArgv)
     const denied = spec(deniedArgv)
-    const deniedHandle = bindManagedProcess(denied, launchLinuxScope(denied, targetEnvironment(denied)))
+    const deniedHandle = bindManagedProcess(denied, launchLinuxScope(denied, targetEnvironment(denied), scopeOptions))
     await expect(deniedHandle.done).rejects.toMatchObject({
       name: expectedDenied.name,
       message: expectedDenied.message,
@@ -288,7 +291,7 @@ while :; do sleep 60; done
     } finally {
       if (handle !== undefined) await handle.terminate().catch(() => {})
       if (descendant !== undefined) {
-        try { process.kill(descendant, 'SIGKILL') } catch { /* already contained */ }
+        try { process.kill(descendant, 'SIGKILL') } catch (_descendantGone) { /* Containment already killed the descendant. */ }
       }
       await fiber.dispose()
     }

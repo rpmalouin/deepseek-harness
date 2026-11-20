@@ -89,21 +89,84 @@ describe('TerminalBlock prompt label', () => {
 })
 
 describe('TerminalBlock states', () => {
-  it('running with nothing printed yet shows the command line only: no placeholder, no copy, no body', () => {
-    const view = render(<TerminalBlock command="sleep 5" running />)
-    expect(view.getByText('sleep 5')).toBeTruthy()
+  it.each([
+    { output: undefined, running: false, exitCode: undefined },
+    { output: 'launch acknowledgement', running: false, exitCode: 7, signal: 'SIGTERM' },
+    { output: 'launch acknowledgement', running: false, exitCode: 0 },
+    { output: '', running: false, exitCode: 0 },
+  ])('background suppresses execution presentation for %j', (execution) => {
+    const view = render(<TerminalBlock command={'worker --watch\nprintf ready\n'} cwd="/workspace/app" background {...execution} />)
+    expect(promptRows(view.container)).toEqual(['appworker --watch', '$printf ready'])
+    expect(runStateOf(view.container)).toEqual({ state: null, label: undefined })
+    expect(outputLines(view.container)).toEqual([])
+    expect(view.queryByText('launch acknowledgement')).toBeNull()
     expect(view.queryByText('无输出')).toBeNull()
+    expect(view.queryByText('信号 SIGTERM')).toBeNull()
     expect(view.queryByRole('button')).toBeNull()
-    expect(view.container.firstElementChild?.getAttribute('data-running')).toBe('')
+    expect(view.container.firstElementChild?.hasAttribute('data-running')).toBe(false)
     expect(view.container.firstElementChild?.hasAttribute('data-body')).toBe(false)
   })
 
-  it('running shows the output printed so far under the banner, still without a copy control', () => {
-    const view = render(<TerminalBlock command="pnpm add x" running output={'Progress: resolved 1\n'} />)
-    expect(outputLines(view.container)).toEqual(['Progress: resolved 1'])
+  it('keeps command and prompt DOM when a background launch returns', () => {
+    const view = render(<TerminalBlock command="worker --watch" cwd="/workspace/app" background running />)
+    const command = view.container.querySelector('[data-command-text]')
+    expect(runStateOf(view.container).state).toBe('ongoing')
+    view.rerender(<TerminalBlock command="worker --watch" cwd="/workspace/app" background />)
+    expect(view.container.querySelector('[data-command-text]')).toBe(command)
+    expect(runStateOf(view.container)).toEqual({ state: null, label: undefined })
+    expect(view.queryByText('无输出')).toBeNull()
+    expect(view.queryByRole('button')).toBeNull()
+  })
+
+  it('keeps an explicit copyText override available in background mode', () => {
+    const view = render(<TerminalBlock command="worker" background copyText="explicit copy" />)
+    expect(view.getByRole('button', { name: '复制' })).toBeTruthy()
+    expect(view.queryByText('无输出')).toBeNull()
+    expect(runStateOf(view.container)).toEqual({ state: null, label: undefined })
+  })
+
+  it('running with no output shows the command line only: no output box, no placeholder, no copy', () => {
+    const view = render(<TerminalBlock command="sleep 5" running />)
+    expect(view.getByText('sleep 5')).toBeTruthy()
+    expect(outputLines(view.container)).toEqual([])
+    expect(view.queryByText('无输出')).toBeNull()
     expect(view.queryByRole('button')).toBeNull()
     expect(view.container.firstElementChild?.getAttribute('data-running')).toBe('')
+    // Banner-only: no body, so no banner divider either.
+    expect(view.container.firstElementChild?.getAttribute('data-body')).toBeNull()
+  })
+
+  it('copyText overrides the copy payload and keeps the control before any output', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+    const view = render(<TerminalBlock command="npm run build --verbose" running copyText="npm run build --verbose" />)
+    // No output yet, but the command is already copyable.
+    const button = view.getByRole('button', { name: '复制' })
+    await act(async () => { fireEvent.click(button) })
+    expect(writeText).toHaveBeenCalledWith('npm run build --verbose')
+  })
+
+  it('omits the run-state dot and its assistive label when the host carries the state', () => {
+    const view = render(<TerminalBlock command="sleep 5" running output="partial" runStateDot={false} />)
+    expect(view.container.querySelector('[class*="runState"]')).toBeNull()
+    expect(view.queryByText('运行中')).toBeNull()
+  })
+
+  it('running with supplied output streams the live text without a default copy control', () => {
+    const view = render(<TerminalBlock command="sleep 5" running output="partial" />)
+    expect(view.getByText('partial')).toBeTruthy()
+    expect(view.queryByText('无输出')).toBeNull()
+    expect(view.queryByRole('button', { name: '复制' })).toBeNull()
+    expect(view.container.firstElementChild?.getAttribute('data-running')).toBe('')
+    // Live output renders a body, so the banner divider returns.
     expect(view.container.firstElementChild?.getAttribute('data-body')).toBe('')
+  })
+
+  it('running with an empty live stream draws neither output nor placeholder', () => {
+    const view = render(<TerminalBlock command="tail -f log" running output="" />)
+    expect(outputLines(view.container)).toEqual([])
+    expect(view.queryByText('无输出')).toBeNull()
+    expect(view.queryByRole('button')).toBeNull()
   })
 
   it('running still shows a settled-looking status pill when one is supplied', () => {
@@ -385,12 +448,30 @@ describe('writeClipboard', () => {
     expect(writeText).toHaveBeenCalledWith('payload')
   })
 
-  it('reports false when the Clipboard API rejects', async () => {
+  it('reports false when the Clipboard API rejects and no fallback exists', async () => {
     Object.defineProperty(navigator, 'clipboard', {
       configurable: true,
       value: { writeText: vi.fn().mockRejectedValue(new Error('denied')) },
     })
+    Object.defineProperty(document, 'execCommand', { configurable: true, value: undefined })
     await expect(writeClipboard('payload')).resolves.toBe(false)
+  })
+
+  it('falls back to execCommand when the Clipboard API rejects', async () => {
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: vi.fn().mockRejectedValue(new Error('denied')) },
+    })
+    let selected: string | undefined
+    const exec = vi.fn(() => {
+      selected = document.querySelector<HTMLTextAreaElement>('textarea[readonly]')?.value
+      return true
+    })
+    Object.defineProperty(document, 'execCommand', { configurable: true, value: exec })
+    await expect(writeClipboard('payload')).resolves.toBe(true)
+    expect(exec).toHaveBeenCalledWith('copy')
+    expect(selected).toBe('payload')
+    expect(document.querySelector('textarea')).toBeNull()
   })
 
   it('selects a detached textarea for the execCommand fallback and removes it after', async () => {
@@ -405,6 +486,25 @@ describe('writeClipboard', () => {
     expect(exec).toHaveBeenCalledWith('copy')
     expect(selected).toBe('payload')
     expect(document.querySelector('textarea')).toBeNull()
+  })
+
+  it('returns focus to the copy control after the execCommand fallback', async () => {
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined })
+    Object.defineProperty(document, 'execCommand', { configurable: true, value: vi.fn(() => true) })
+    const button = document.createElement('button')
+    document.body.appendChild(button)
+    button.focus()
+    await expect(writeClipboard('payload')).resolves.toBe(true)
+    expect(document.activeElement).toBe(button)
+    button.remove()
+  })
+
+  it('copies through the fallback when nothing had focus', async () => {
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined })
+    Object.defineProperty(document, 'execCommand', { configurable: true, value: vi.fn(() => true) })
+    const activeElement = vi.spyOn(document, 'activeElement', 'get').mockReturnValue(null)
+    await expect(writeClipboard('payload')).resolves.toBe(true)
+    activeElement.mockRestore()
   })
 
   it('reports execCommand\'s own refusal verbatim', async () => {

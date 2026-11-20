@@ -1,10 +1,11 @@
 /** First-party Host inspect providers registered by the Cordis tool package. */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { HOST_BUILTIN_INSPECTION } from '@deepseek-ai/dsh-cordis-host-runner'
-import type { HostCordisInspectProviderRegistration } from '@deepseek-ai/dsh-cordis-host-runner'
+import { getDshRuntimeVersion } from '@deepseek-ai/dsh-app-boot'
+import { InspectError, type HostCordisInspectProviderRegistration } from '@deepseek-ai/dsh-cordis-host-runner'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import { EVENT_API, queryEventApi, queryServiceApi } from './api-catalog.ts'
+import { queryLiveConfig } from './config.ts'
 
 const EMPTY_INPUT = { type: 'object', properties: {}, additionalProperties: false } as const
 const ANY_OUTPUT = { description: 'JSON data owned by this inspect provider.' } as const
@@ -16,11 +17,27 @@ const SERVICE_OUTPUT = {
 const EVENT_OUTPUT = {
   description: 'Compact Event directory, or one exact Event contract with only its referenced type declarations.',
 } as const
+const CONFIG_INPUT: JsonValue = {
+  type: 'object',
+  properties: {
+    entry: { type: 'string', description: 'Exact Loader entry id from the directory; returns that entry\'s projected Config schema.' },
+    name: { type: 'string', description: 'Exact plugin package name; limits the directory to its entries.' },
+    offset: { type: 'number', description: 'Zero-based directory offset; defaults to 0.' },
+    limit: { type: 'number', description: 'Directory page size, from 1 to 100; defaults to 25.' },
+  },
+  additionalProperties: false,
+}
+const CONFIG_OUTPUT = {
+  description: 'One directory page of live entries with patch ids, Config status, total, and nextOffset, or one entry\'s projected JSON Schema with shared definitions, omission acceptance, and projection limitations.',
+} as const
+const RUNTIME_OUTPUT = {
+  description: 'Object whose version field is the exact running DSH version.',
+} as const
 const HOST_EVENTS = EVENT_API.filter(event => !event.name.startsWith('cordis/'))
 
 /**
  * Construct Host providers over generated Catalogs, evaluator declarations, and live Tool scope.
- * @param ctx - Host context used for Agent-scoped live Tool queries.
+ * @param ctx - Host context used for live Loader Config and Agent-scoped Tool queries.
  * @returns registrations for static catalogs and live Host capabilities.
  */
 export function hostInspectProviders(ctx: Context): HostCordisInspectProviderRegistration[] {
@@ -41,10 +58,22 @@ export function hostInspectProviders(ctx: Context): HostCordisInspectProviderReg
       EVENT_INPUT,
       EVENT_OUTPUT,
     ),
-    registration('Builtin', 'Plain-JavaScript symbols available to a dynamic Host half.', 'listBuiltins', () => ({
-      builtins: HOST_BUILTIN_INSPECTION,
-      referencedTypes: [],
-    } as unknown as JsonValue)),
+    registration(
+      'Config',
+      'Progressive live plugin Config discovery: paged entry directory with schema status, then one entry\'s exact JSON Schema.',
+      'listConfigs',
+      input => queryLiveConfig(ctx, input),
+      CONFIG_INPUT,
+      CONFIG_OUTPUT,
+    ),
+    registration(
+      'Runtime',
+      'Running DSH version, the version that plugin engines.dsh ranges and DSH peer dependencies are checked against.',
+      'getVersion',
+      () => ({ version: getDshRuntimeVersion() }),
+      undefined,
+      RUNTIME_OUTPUT,
+    ),
     {
       manifest: {
         id: 'Tool',
@@ -57,7 +86,7 @@ export function hostInspectProviders(ctx: Context): HostCordisInspectProviderReg
         }],
       },
       query(method, _input, context) {
-        if (method !== 'listTools') throw new Error(`unknown Tool inspect method "${method}"`)
+        if (method !== 'listTools') throw new InspectError(`unknown Tool inspect method "${method}"`, 'INSPECT_METHOD_NOT_FOUND')
         return Promise.resolve({ tools: ctx.tools.schemas(context.agent) } as unknown as JsonValue)
       },
     },
@@ -84,7 +113,7 @@ function registration(
       }],
     },
     async query(requested, input) {
-      if (requested !== method) throw new Error(`unknown ${id} inspect method "${requested}"`)
+      if (requested !== method) throw new InspectError(`unknown ${id} inspect method "${requested}"`, 'INSPECT_METHOD_NOT_FOUND')
       return await query(input)
     },
   }

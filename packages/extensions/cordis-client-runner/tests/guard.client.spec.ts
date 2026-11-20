@@ -8,6 +8,7 @@
  * CALLING fiber, so disposing it must remove them (HMR safety).
  */
 import { Context } from '@deepseek-ai/cordis'
+import { brandString } from '@deepseek-ai/dsh-brand'
 import { describe, expect, it, vi } from 'vitest'
 import type { FC } from 'react'
 import type {
@@ -25,9 +26,9 @@ const C: FC<object> = () => null
 /** The exact running package carried by a Client dispatch. */
 function pkg(): DynamicCordisPackage {
   return {
-    pluginId: 'dyn-1' as CordisDynamicPluginId,
-    packageId: 'pkg-1' as CordisDynamicPackageId,
-    pluginRunId: 'run-1' as CordisDynamicPluginRunId,
+    pluginId: brandString<CordisDynamicPluginId>('dyn-1'),
+    packageId: brandString<CordisDynamicPackageId>('pkg-1'),
+    pluginRunId: brandString<CordisDynamicPluginRunId>('run-1'),
     name: 'demo',
   }
 }
@@ -126,7 +127,7 @@ describe('facade surface', () => {
     expect('slots' in bench.facade).toBe(true)
     expect('registry' in bench.facade).toBe(false)
     expect(Symbol.iterator in bench.facade).toBe(false)
-    expect((bench.facade as unknown as Record<symbol, unknown>)[Symbol.iterator]).toBeUndefined()
+    expect((bench.facade as Record<symbol, unknown>)[Symbol.iterator]).toBeUndefined()
     expect(() => { bench.facade.slots = 1 }).toThrow(/dynamic ctx is read-only/)
   })
 

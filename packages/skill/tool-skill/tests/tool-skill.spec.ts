@@ -1,20 +1,40 @@
+import { executeToolFixture } from '@deepseek-ai/dsh-tool-testkit'
+import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import { afterEach, describe, expect, it } from 'vitest'
+import { unsupportedModel, provideWorkingDirectoryFixture, unsupportedInbox } from '@deepseek-ai/dsh-agent-loop-testkit'
 import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { Context } from '@deepseek-ai/cordis'
-import { createUserMessage, ToolCallId, type Message } from '@deepseek-ai/dsh-llm'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import { createUserMessage, type ToolCallId, type Message } from '@deepseek-ai/dsh-llm'
+import type { ContextFormed, MessageSource } from '@deepseek-ai/dsh-llm'
 import { createScope, type Scope } from '@deepseek-ai/dsh-scope'
 import {
-  SESSION_FORMAT_VERSION, Session, SessionId, type SessionEvent, type UserMessage,
+  SESSION_FORMAT_VERSION, Session, type SessionId, type SessionEvent, type UserMessage,
 } from '@deepseek-ai/dsh-session'
 import SystemPrompt, { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
-import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
+import ToolRuntime from '@deepseek-ai/dsh-tools'
+import { defineContentToolFixture } from '@deepseek-ai/dsh-tool-testkit'
 import AgentRegistry, { agentEvents, type Agent, type PreStepDecision } from '@deepseek-ai/dsh-agent'
 import SkillRegistry from '@deepseek-ai/dsh-skill'
 import * as SkillFileSystem from '@deepseek-ai/dsh-skill-filesystem'
 import * as toolSkill from '@deepseek-ai/dsh-tool-skill'
-import { unsupportedInbox } from '@deepseek-ai/dsh-agent-loop-testkit'
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'dsh-tool-skill': { kind: 'dsh-tool-skill' } & ContextFormed
+    'later-contribution': { kind: 'later-contribution' } & ContextFormed
+  }
+}
+
+type CheckpointSource = Extract<MessageSource, { readonly kind: 'compact-checkpoint' }>
+
+/** Build a typed checkpoint source for a skill projection fixture. */
+function checkpointSource(compactionId: string): CheckpointSource {
+  return { kind: 'compact-checkpoint', compactionId: compactionId as CheckpointSource['compactionId'] }
+}
 
 const testToolSignal = new AbortController().signal
 
@@ -38,8 +58,11 @@ async function writeSkill(root: string, name: string, description: string, body:
 
 async function setup(home: string, config: toolSkill.Config = {}): Promise<Context> {
   const ctx = new Context()
+  provideWorkingDirectoryFixture(ctx, home)
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
+  await ctx.plugin(SessionProjectionRegistry)
+  await ctx.plugin(NativeToolExecutor)
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(SkillRegistry)
   await ctx.plugin(SkillFileSystem, { dshHome: join(home, '.dsh'), agentsHome: join(home, '.agents'), watch: false })
@@ -48,7 +71,7 @@ async function setup(home: string, config: toolSkill.Config = {}): Promise<Conte
 }
 
 function agentForCwd(cwd: string): Agent {
-  const id = SessionId(`tool-skill-${cwd}`)
+  const id = brandString<SessionId>(`tool-skill-${cwd}`)
   const session = Session.create(id, [], {
     version: SESSION_FORMAT_VERSION, id, createdAt: 0, cwd, isSeeded: false,
   })
@@ -57,6 +80,7 @@ function agentForCwd(cwd: string): Agent {
     id,
     options: {},
     session,
+    model: unsupportedModel(),
     inbox: unsupportedInbox(),
     status: 'idle',
     send: () => {},
@@ -71,9 +95,10 @@ function agentForCwd(cwd: string): Agent {
 
 function sessionAgent(session: Session, id = 'tool-skill-agent'): Agent {
   const agent: Agent = {
-    id: SessionId(id),
+    id: brandString<SessionId>(id),
     options: {},
     session,
+    model: unsupportedModel(),
     inbox: unsupportedInbox(),
     status: 'running',
     ctx: new Context(),
@@ -100,7 +125,7 @@ async function fireStep(ctx: Context, agent: Agent, turn: number, step: number):
   const signal = new AbortController().signal
   const decision = await agentEvents(ctx, agent).waterfall(
     'agent/pre-step',
-    { messages: [], turn, step, signal },
+    { modelSelection: { provider: 'mock', model: 'mock' }, messages: [], turn, step, signal },
     () => Promise.resolve({ kind: 'enter' as const, messages: [] }),
   )
   if (decision.kind === 'enter') {
@@ -118,7 +143,7 @@ async function proposeStep(
   const signal = new AbortController().signal
   return await agentEvents(ctx, agent).waterfall(
     'agent/pre-step',
-    { messages, turn: 1, step: 1, signal },
+    { modelSelection: { provider: 'mock', model: 'mock' }, messages, turn: 1, step: 1, signal },
     () => Promise.resolve({ kind: 'enter' as const, messages }),
   )
 }
@@ -150,7 +175,7 @@ async function composePrefix(ctx: Context, cwd: string, signal = new AbortContro
 async function composePrefixForAgent(ctx: Context, agent: Agent, signal = new AbortController().signal): Promise<Message[]> {
   const decision = await agentEvents(ctx, agent).waterfall(
     'agent/pre-step',
-    { messages: [], turn: 1, step: 1, signal },
+    { modelSelection: { provider: 'mock', model: 'mock' }, messages: [], turn: 1, step: 1, signal },
     () => Promise.resolve({ kind: 'enter' as const, messages: [] }),
   )
   if (decision.kind === 'enter') {
@@ -173,8 +198,11 @@ async function mintAgentScope(ctx: Context, subject: string | Agent): Promise<{ 
 describe('dsh-tool-skill', () => {
   it('registers the skill tool schema and removes it on dispose', async () => {
     const ctx = new Context()
+    provideWorkingDirectoryFixture(ctx)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(NativeToolExecutor)
     await ctx.plugin(AgentRegistry)
     const home = await tempDir('tool-schema')
     await ctx.plugin(SkillRegistry)
@@ -261,7 +289,7 @@ describe('dsh-tool-skill', () => {
           ...decision.messages,
           createUserMessage({
             content: [{ type: 'text', text: 'later contribution' }],
-            source: { kind: 'plugin', plugin: 'later-contribution' },
+            source: { kind: 'later-contribution' },
           }),
         ],
       }
@@ -274,7 +302,7 @@ describe('dsh-tool-skill', () => {
         id: expect.any(String) as unknown,
         role: 'user',
         content: [{ type: 'text', text: 'later contribution' }],
-        source: { kind: 'plugin', plugin: 'later-contribution' },
+        source: { kind: 'later-contribution' },
       },
       {
         id: expect.any(String) as unknown,
@@ -332,7 +360,7 @@ describe('dsh-tool-skill', () => {
     expect(await composePrefixForAgent(ctx, agent)).toEqual([])
   })
 
-  it('omits an incomplete initial catalog and retries on a later request boundary', async () => {
+  it('reports incomplete empty discovery and publishes recovery without an entry change', async () => {
     const home = await tempDir('tool-incomplete-prefix')
     const ctx = await setup(home)
     let failing = true
@@ -351,23 +379,70 @@ describe('dsh-tool-skill', () => {
       invalidate = control.invalidate
       return provider
     })
-    const session = Session.create(SessionId('incomplete-prefix'))
+    const session = Session.create(brandString<SessionId>('incomplete-prefix'))
     const agent = sessionAgent(session)
     openMessageTurn(session)
 
     await composePrefixForAgent(ctx, agent)
-    expect(catalogMessages(session)).toEqual([])
+    expect(catalogMessages(session)).toMatchObject([{ data: { source: { entries: [], incomplete: true } } }])
+    const initial = JSON.stringify(catalogMessages(session)[0]?.data.content)
+    expect(initial).toContain('No skills could be confirmed in this discovery attempt.')
+    expect(initial).toContain('Discovery will be retried on the next request.')
+    expect(initial).not.toContain('The following skills are available')
+    expect(initial).not.toContain('If the user names a skill')
+    await fireStep(ctx, agent, 1, 1)
+    expect(catalogMessages(session)).toHaveLength(1)
     failing = false
     invalidate()
     await fireStep(ctx, agent, 1, 1)
 
-    expect(catalogMessages(session)).toEqual([])
+    expect(catalogMessages(session)).toHaveLength(2)
+    expect(catalogMessages(session)[1]?.data.source).toEqual({
+      kind: 'skill-catalog', form: 'catalog', update: true, entries: [],
+    })
+  })
+
+  it('distinguishes an incomplete empty replacement from confirmed removal and republishes recovery', async () => {
+    const home = await tempDir('tool-incomplete-empty-update')
+    const ctx = await setup(home)
+    const definition = { name: 'recovering-skill', description: 'Recovering skill', source: 'runtime' as const, content: 'Recovered body.' }
+    const unregister = ctx.skills.register(definition)
+    const session = Session.create(brandString<SessionId>('incomplete-empty-update'))
+    const agent = sessionAgent(session)
+    openMessageTurn(session)
+    await composePrefixForAgent(ctx, agent)
+    unregister()
+    const unregisterFailure = ctx.skills.registerProvider(() => ({
+      name: 'unavailable',
+      async list() { throw new Error('temporarily unavailable') },
+      async get() { return undefined },
+    }))
+
+    await fireStep(ctx, agent, 1, 1)
+    const update = catalogMessages(session)[1]
+    expect(update?.data.source).toMatchObject({ update: true, incomplete: true, entries: [] })
+    const text = JSON.stringify(update?.data.content)
+    expect(text).toContain('No skills could be confirmed in this discovery attempt.')
+    expect(text).toContain('Discovery will be retried on the next request.')
+    expect(text).toContain('Do not use names from earlier skill catalogs.')
+    expect(text).not.toContain('No skills are currently available')
+    expect(text).not.toContain('Listed skills remain available')
+    await fireStep(ctx, agent, 1, 2)
+    expect(catalogMessages(session)).toHaveLength(2)
+
+    unregisterFailure()
+    ctx.skills.register(definition)
+    await fireStep(ctx, agent, 1, 3)
+    expect(catalogMessages(session)[2]?.data.source).toEqual({
+      kind: 'skill-catalog', form: 'catalog', update: true,
+      entries: [{ name: 'recovering-skill', description: 'Recovering skill' }],
+    })
   })
 
   it('records an empty baseline across repeated step observations', async () => {
     const home = await tempDir('tool-empty-step')
     const ctx = await setup(home)
-    const session = Session.create(SessionId('empty-step'))
+    const session = Session.create(brandString<SessionId>('empty-step'))
     const agent = sessionAgent(session)
     openMessageTurn(session)
 
@@ -386,7 +461,7 @@ describe('dsh-tool-skill', () => {
       source: 'runtime',
       content: 'First body.',
     })
-    const session = Session.create(SessionId('proposed-catalog'))
+    const session = Session.create(brandString<SessionId>('proposed-catalog'))
     const agent = sessionAgent(session)
     openMessageTurn(session)
     await fireStep(ctx, agent, 1, 1)
@@ -420,7 +495,7 @@ describe('dsh-tool-skill', () => {
   it('removes a stale proposed catalog before the first empty baseline', async () => {
     const home = await tempDir('tool-proposed-empty-catalog')
     const ctx = await setup(home)
-    const session = Session.create(SessionId('proposed-empty-catalog'))
+    const session = Session.create(brandString<SessionId>('proposed-empty-catalog'))
     const malformed = createUserMessage({
       content: [{ type: 'text', text: 'preserve unreadable claimed context' }],
       source: { kind: 'skill-catalog', form: 'catalog' } as never,
@@ -448,7 +523,7 @@ describe('dsh-tool-skill', () => {
       source: 'runtime',
       content: 'First body.',
     })
-    const session = Session.create(SessionId('matching-proposal'))
+    const session = Session.create(brandString<SessionId>('matching-proposal'))
     const proposed = createUserMessage({
       content: catalogContent(['- `first-skill`: First skill']),
       source: {
@@ -472,7 +547,7 @@ describe('dsh-tool-skill', () => {
       source: 'runtime',
       content: 'First body.',
     })
-    const session = Session.create(SessionId('dynamic-catalog'))
+    const session = Session.create(brandString<SessionId>('dynamic-catalog'))
     const agent = sessionAgent(session)
     openMessageTurn(session)
 
@@ -521,7 +596,7 @@ describe('dsh-tool-skill', () => {
       source: 'runtime',
       content: 'Resumed body.',
     })
-    const session = Session.create(SessionId('catalog-resume'))
+    const session = Session.create(brandString<SessionId>('catalog-resume'))
     const agent = sessionAgent(session)
     openMessageTurn(session)
     session.append('user/message', createUserMessage({
@@ -534,7 +609,7 @@ describe('dsh-tool-skill', () => {
     }), { surfaceOp: 'append' })
     session.append('user/message', createUserMessage({
       content: catalogContent(['- `resumed-skill`: Resumed skill']),
-      source: { kind: 'plugin', plugin: 'dsh-tool-skill' },
+      source: { kind: 'dsh-tool-skill' },
     }), { surfaceOp: 'append' })
 
     await fireStep(ctx, agent, 1, 1)
@@ -571,7 +646,7 @@ describe('dsh-tool-skill', () => {
       source: 'runtime',
       content: 'Live body.',
     })
-    const session = Session.create(SessionId('catalog-malformed'))
+    const session = Session.create(brandString<SessionId>('catalog-malformed'))
     const agent = sessionAgent(session)
     openMessageTurn(session)
     for (const source of [
@@ -602,7 +677,7 @@ describe('dsh-tool-skill', () => {
   it('rejects a missing event below the current Session length', async () => {
     const home = await tempDir('tool-catalog-missing-event')
     const ctx = await setup(home)
-    const session = Session.create(SessionId('catalog-missing-event'))
+    const session = Session.create(brandString<SessionId>('catalog-missing-event'))
     const agent = sessionAgent(session)
     openMessageTurn(session)
     Object.defineProperty(session, 'eventAt', { value: () => undefined })
@@ -620,7 +695,7 @@ describe('dsh-tool-skill', () => {
       source: 'runtime',
       content: 'First body.',
     })
-    const session = Session.create(SessionId('catalog-compaction'))
+    const session = Session.create(brandString<SessionId>('catalog-compaction'))
     const agent = sessionAgent(session)
     openMessageTurn(session)
     expect(JSON.stringify(await composePrefixForAgent(ctx, agent))).toContain('first-skill')
@@ -628,7 +703,7 @@ describe('dsh-tool-skill', () => {
     if (initial === undefined) throw new Error('expected initial catalog')
     session.append('user/message', createUserMessage({
       content: [{ type: 'text', text: 'compacted history' }],
-      source: { kind: 'plugin', plugin: 'compact' },
+      source: checkpointSource('skill-compaction'),
     }), {
       surfaceOp: { op: 'replace', startSeq: initial.seq, endSeq: initial.seq },
       sourceEventSeqs: [initial.seq],
@@ -645,7 +720,7 @@ describe('dsh-tool-skill', () => {
     const root = join(home, '.dsh/skills')
     await writeSkill(root, 'body-skill', 'Stable description', 'First body.')
     const ctx = await setup(home)
-    const session = Session.create(SessionId('body-refresh'))
+    const session = Session.create(brandString<SessionId>('body-refresh'))
     const agent = sessionAgent(session)
     openMessageTurn(session)
 
@@ -654,9 +729,9 @@ describe('dsh-tool-skill', () => {
     await fireStep(ctx, agent, 1, 1)
     expect(catalogMessages(session)).toHaveLength(1)
 
-    const result = await ctx.tools.execute({
+    const result = await executeToolFixture(ctx, {
       signal: testToolSignal,
-      callId: ToolCallId('body-refresh'),
+      callId: brandString<ToolCallId>('body-refresh'),
       name: 'skill',
       arguments: { name: 'body-skill' },
       agent,
@@ -682,9 +757,9 @@ describe('dsh-tool-skill', () => {
     expect(JSON.stringify(await composePrefixForAgent(ctx, agent))).toContain('preset-only-skill')
     expect(JSON.stringify(await composePrefix(ctx, '/workspace/other'))).not.toContain('preset-only-skill')
 
-    const scoped = await ctx.tools.execute({
+    const scoped = await executeToolFixture(ctx, {
       signal: testToolSignal,
-      callId: ToolCallId('scoped-load'),
+      callId: brandString<ToolCallId>('scoped-load'),
       name: 'skill',
       arguments: { name: 'preset-only-skill' },
       agent,
@@ -692,9 +767,9 @@ describe('dsh-tool-skill', () => {
     expect(scoped.isError).toBe(false)
     expect(JSON.stringify(scoped.content)).toContain('Preset-only body.')
 
-    const foreign = await ctx.tools.execute({
+    const foreign = await executeToolFixture(ctx, {
       signal: testToolSignal,
-      callId: ToolCallId('foreign-load'),
+      callId: brandString<ToolCallId>('foreign-load'),
       name: 'skill',
       arguments: { name: 'preset-only-skill' },
       agent: agentForCwd('/workspace/other'),
@@ -703,7 +778,7 @@ describe('dsh-tool-skill', () => {
     await scope.dispose()
   })
 
-  it('retains the last-good catalog while any provider discovery is incomplete', async () => {
+  it('keeps readable skills loadable and publishes additions during incomplete discovery', async () => {
     const home = await tempDir('tool-incomplete-catalog')
     const ctx = await setup(home)
     const disposeStable = ctx.skills.register({
@@ -712,7 +787,7 @@ describe('dsh-tool-skill', () => {
       source: 'runtime',
       content: 'Stable body.',
     })
-    const session = Session.create(SessionId('incomplete-catalog'))
+    const session = Session.create(brandString<SessionId>('incomplete-catalog'))
     const agent = sessionAgent(session)
     openMessageTurn(session)
     expect(JSON.stringify(await composePrefixForAgent(ctx, agent))).toContain('stable-skill')
@@ -726,17 +801,60 @@ describe('dsh-tool-skill', () => {
         return undefined
       },
     }))
-    disposeStable()
     await fireStep(ctx, agent, 1, 1)
 
+    expect(catalogMessages(session)).toHaveLength(2)
+    expect(catalogMessages(session)[1]?.data.source).toMatchObject({
+      incomplete: true, entries: [{ name: 'stable-skill' }],
+    })
+    expect(JSON.stringify(catalogMessages(session)[1]?.data.content)).toContain('Some skills could not be checked')
+    const result = await executeToolFixture(ctx, {
+      signal: testToolSignal, callId: brandString<ToolCallId>('partial-load'),
+      name: 'skill', arguments: { name: 'stable-skill' }, agent,
+    })
+    expect(result.isError).toBe(false)
+    expect(JSON.stringify(result.content)).toContain('Stable body.')
+    ctx.skills.register({ name: 'new-skill', description: 'New skill', source: 'runtime', content: 'New body.' })
+    disposeStable()
+    await fireStep(ctx, agent, 1, 2)
+    expect(catalogMessages(session)[2]?.data.source).toMatchObject({
+      incomplete: true, entries: [{ name: 'new-skill' }],
+    })
+    await fireStep(ctx, agent, 1, 3)
+    expect(catalogMessages(session)).toHaveLength(3)
+  })
+
+  it('publishes an incomplete initial catalog and clears its notice after recovery', async () => {
+    const home = await tempDir('tool-partial-initial')
+    const ctx = await setup(home)
+    let complete = false
+    ctx.skills.registerProvider(() => ({
+      name: 'partial',
+      async list() { return { candidates: [], complete } },
+      async get() { return undefined },
+    }))
+    ctx.skills.register({ name: 'readable-skill', description: 'Readable', source: 'runtime', content: 'Body.' })
+    const session = Session.create(brandString<SessionId>('partial-initial'))
+    const agent = sessionAgent(session)
+    openMessageTurn(session)
+    await composePrefixForAgent(ctx, agent)
+    expect(catalogMessages(session)[0]?.data.source).toMatchObject({
+      incomplete: true, entries: [{ name: 'readable-skill' }],
+    })
+    await fireStep(ctx, agent, 1, 1)
     expect(catalogMessages(session)).toHaveLength(1)
+    complete = true
+    await fireStep(ctx, agent, 1, 2)
+    expect(catalogMessages(session)).toHaveLength(2)
+    expect(catalogMessages(session)[1]?.data.source).not.toHaveProperty('incomplete')
+    expect(JSON.stringify(catalogMessages(session)[1]?.data.content)).not.toContain('Some skills could not be checked')
   })
 
   it('omits catalog guidance when the calling agent restricts away the shipped skill tool', async () => {
     const home = await tempDir('tool-restricted-catalog')
     const ctx = await setup(home)
     ctx.skills.register({ name: 'listed-skill', description: 'Listed', source: 'runtime', content: 'body' })
-    const session = Session.create(SessionId('restricted-catalog'))
+    const session = Session.create(brandString<SessionId>('restricted-catalog'))
     const agent = sessionAgent(session)
     openMessageTurn(session)
     const { scope } = await mintAgentScope(ctx, agent)
@@ -774,8 +892,11 @@ describe('dsh-tool-skill', () => {
   it('validates the catalog description cap', async () => {
     const home = await tempDir('tool-invalid-catalog-cap')
     const ctx = new Context()
+    provideWorkingDirectoryFixture(ctx, home)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(NativeToolExecutor)
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(SkillRegistry)
     await ctx.plugin(SkillFileSystem, { dshHome: join(home, '.dsh'), agentsHome: join(home, '.agents'), watch: false })
@@ -790,9 +911,9 @@ describe('dsh-tool-skill', () => {
     await writeSkill(join(project, '.dsh/skills'), 'project-skill', 'Project skill', 'Project instructions.')
     const ctx = await setup(home)
 
-    const result = await ctx.tools.execute({
+    const result = await executeToolFixture(ctx, {
       signal: testToolSignal,
-      callId: ToolCallId('c1'),
+      callId: brandString<ToolCallId>('c1'),
       name: 'skill',
       arguments: { name: 'project-skill' },
       agent: { session: { header: { cwd: project } } } as never,
@@ -851,9 +972,9 @@ describe('dsh-tool-skill', () => {
       content: 'Provider instructions.',
     })
 
-    const opaque = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('c2'), name: 'skill', arguments: { name: 'opaque-skill' } })
-    const url = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('c3'), name: 'skill', arguments: { name: 'url-skill' } })
-    const provider = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('c4'), name: 'skill', arguments: { name: 'provider-skill' } })
+    const opaque = await executeToolFixture(ctx, { signal: testToolSignal, callId: brandString<ToolCallId>('c2'), name: 'skill', arguments: { name: 'opaque-skill' } })
+    const url = await executeToolFixture(ctx, { signal: testToolSignal, callId: brandString<ToolCallId>('c3'), name: 'skill', arguments: { name: 'url-skill' } })
+    const provider = await executeToolFixture(ctx, { signal: testToolSignal, callId: brandString<ToolCallId>('c4'), name: 'skill', arguments: { name: 'provider-skill' } })
 
     if (opaque.content[0]?.type !== 'text' || url.content[0]?.type !== 'text' || provider.content[0]?.type !== 'text') {
       throw new Error('expected text tool results')
@@ -875,7 +996,7 @@ describe('dsh-tool-skill', () => {
       content: 'Rogue instructions.',
     })
 
-    const result = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('c5'), name: 'skill', arguments: { name: 'rogue-resource-skill' } })
+    const result = await executeToolFixture(ctx, { signal: testToolSignal, callId: brandString<ToolCallId>('c5'), name: 'skill', arguments: { name: 'rogue-resource-skill' } })
 
     expect(result.isError).toBe(true)
     expect(result.error?.info?.code).toBe('INVALID_TOOL_OUTPUT')
@@ -897,15 +1018,20 @@ describe('dsh-tool-skill', () => {
       content: 'Model-only instructions.',
     })
 
-    const unknown = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('c1'), name: 'skill', arguments: { name: 'missing' } })
-    const invalid = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('c2'), name: 'skill', arguments: { name: 'Bad_Name' } })
-    const disabled = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('c3'), name: 'skill', arguments: { name: 'hidden-skill' } })
-    const modelOnly = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('c4'), name: 'skill', arguments: { name: 'model-only-skill' } })
+    const unknown = await executeToolFixture(ctx, { signal: testToolSignal, callId: brandString<ToolCallId>('c1'), name: 'skill', arguments: { name: 'missing' } })
+    const invalid = await executeToolFixture(ctx, { signal: testToolSignal, callId: brandString<ToolCallId>('c2'), name: 'skill', arguments: { name: 'Bad_Name' } })
+    const disabled = await executeToolFixture(ctx, { signal: testToolSignal, callId: brandString<ToolCallId>('c3'), name: 'skill', arguments: { name: 'hidden-skill' } })
+    const modelOnly = await executeToolFixture(ctx, { signal: testToolSignal, callId: brandString<ToolCallId>('c4'), name: 'skill', arguments: { name: 'model-only-skill' } })
 
     expect(unknown.isError).toBe(true)
     expect(invalid.isError).toBe(true)
     expect(disabled.isError).toBe(true)
     expect(modelOnly.isError).toBe(false)
+    expect(unknown.error?.info).toEqual({ name: 'SkillError', code: 'SKILL_NOT_FOUND' })
+    expect(invalid.error).toEqual({
+      message: 'invalid arguments: invalid skill name "Bad_Name"', info: { name: 'ToolArgsError', code: 'INVALID_ARGS' },
+    })
+    expect(disabled.error?.info).toEqual({ name: 'SkillError', code: 'SKILL_NOT_MODEL_INVOCABLE' })
     const unknownBlock = unknown.content[0]
     if (unknownBlock?.type !== 'text') throw new Error('expected text tool result')
     expect(unknownBlock.text).toContain('skill "missing" is unknown or no longer available')
@@ -959,14 +1085,17 @@ describe('dsh-tool-skill', () => {
       },
     }))
 
-    const denied = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('c6'), name: 'skill', arguments: { name: 'denied-skill' } })
-    const raced = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('c7'), name: 'skill', arguments: { name: 'policy-race-skill' } })
-    const vanished = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('c8'), name: 'skill', arguments: { name: 'vanishing-skill' } })
+    const denied = await executeToolFixture(ctx, { signal: testToolSignal, callId: brandString<ToolCallId>('c6'), name: 'skill', arguments: { name: 'denied-skill' } })
+    const raced = await executeToolFixture(ctx, { signal: testToolSignal, callId: brandString<ToolCallId>('c7'), name: 'skill', arguments: { name: 'policy-race-skill' } })
+    const vanished = await executeToolFixture(ctx, { signal: testToolSignal, callId: brandString<ToolCallId>('c8'), name: 'skill', arguments: { name: 'vanishing-skill' } })
 
     expect(denied.isError).toBe(true)
     expect(raced.isError).toBe(true)
     expect(vanished.isError).toBe(true)
     expect(getCalls).toEqual(['policy-race-skill', 'vanishing-skill'])
+    expect(denied.error?.info).toEqual({ name: 'SkillError', code: 'SKILL_NOT_MODEL_INVOCABLE' })
+    expect(raced.error?.info).toEqual({ name: 'SkillError', code: 'SKILL_NOT_MODEL_INVOCABLE' })
+    expect(vanished.error?.info).toEqual({ name: 'SkillError', code: 'SKILL_NOT_FOUND' })
     for (const result of [denied, raced]) {
       const block = result.content[0]
       if (block?.type !== 'text') throw new Error('expected text tool result')
@@ -1086,7 +1215,7 @@ describe('user-explicit invocation injection', () => {
     const signal = new AbortController().signal
     const decision = await agentEvents(ctx, agent).waterfall(
       'agent/pre-step',
-      { messages: [gesture('/hidden-demo blocked step')], turn: 1, step: 1, signal },
+      { modelSelection: { provider: 'mock', model: 'mock' }, messages: [gesture('/hidden-demo blocked step')], turn: 1, step: 1, signal },
       () => Promise.resolve({ kind: 'reject' as const }),
     )
     expect(decision).toEqual({ kind: 'reject' })

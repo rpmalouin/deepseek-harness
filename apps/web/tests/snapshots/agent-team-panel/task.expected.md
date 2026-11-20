@@ -1,29 +1,19 @@
-- button "Agent Team" [expanded]:
-  - img
-  - text: Agent Team
-- dialog "Agent Team":
-  - strong: Agent Team
-  - button "Refresh Team":
-    - img
-  - button "Close":
-    - img
-  - heading "Members" [level=3]
-  - 'button "lead Idle · Model: deepseek-v4-flash" [disabled]'
-  - heading "Shared tasks" [level=3]
-  - button "New task":
-    - img
-    - text: New task
-  - article:
-    - strong: Browser task
-    - text: Pending
-    - paragraph: Created through the assembled browser
-    - text: "task-1 Ready Write scopes: src/web Owner"
-    - combobox "Owner":
-      - option "Unowned" [selected]
-      - option "lead"
-    - button "Edit":
-      - img
-      - text: Edit
-    - button "Delete":
-      - img
-      - text: Delete
+- complementary "Session panel":
+  - region "Environment":
+    - heading "Environment" [level=2]
+    - text: workspace {{cwd}}
+  - region "Subagents":
+    - heading "Subagents" [level=2]
+    - text: 1 external
+    - tree "Subagent sessions":
+      - 'treeitem "Researcher: investigate the construction and verify every bound before reporting the result. Researcher: investigate the construction and verify every bound before reporting the result. Researcher: investigate the construction and verify every bound before reporting the result. Researcher: investigate the construction and verify every bound before reporting the result. Researcher: investigate the construction and verify every bound before reporting the result. Researcher: investigate the construction and verify every bound before reporting the result. Researcher: investigate the construction and verify every bound before reporting the result. Researcher: investigate the construction and verify every bound before reporting the result. team-panel-researcher · External task" [disabled] [level=1]': "Researcher: investigate the construction and verify every bound before reporting the result. Researcher: investigate the construction and verify every bound before reporting the result. Researcher: investigate the construction and verify every bound before reporting the result. Researcher: investigate the construction and verify every bound before reporting the result. Researcher: investigate the construction and verify every bound before reporting the result. Researcher: investigate the construction and verify every bound before reporting the result. Researcher: investigate the construction and verify every bound before reporting the result. Researcher: investigate the construction and verify every bound before reporting the result."
+  - region "Shared tasks":
+    - heading "Shared tasks" [level=2]
+    - text: 1 in progress
+    - list:
+      - listitem:
+        - button "In progress Agent task" [expanded]:
+          - img "In progress"
+          - text: Agent task
+        - paragraph: Created by the root agent
+        - paragraph: "Owner: lead"

@@ -24,6 +24,7 @@ deliverables 系列把一轮交给用户的内容记录为只有客户端读取�
 
 | 包 | 角色 | ctx key |
 |---|---|---|
+| [`deliverable-file-references`](deliverable-file-references/README.zh.md) | Web 与 SDK 宿主共用的文件链接与结果交付指导 | 注册到 `ctx.systemPrompt` |
 | [`tool-present`](tool-present/README.zh.md) | 通过 `present` 工具把已有文件声明为最终交付物 | 注册到 `ctx.tools` |
 | [`workspace-changes`](workspace-changes/README.zh.md) | 用 git 工作树快照和整文件捕获汇总每个顶层轮次改动的文件，并提供其对比 | 提供 `ctx.workspaceChanges`；监听 `session/event`，追加 `workspace/changes` |
 
@@ -35,7 +36,7 @@ deliverables 系列把一轮交给用户的内容记录为只有客户端读取�
 - [产出物子系统](../../docs/subsystems/deliverables.zh.md)——`PresentedFile` 与 `WorkspaceChangesSummary` 的词汇、两个持久事件和摘要服务。
 - [Web 产出物](../client/ui-deliverables/README.zh.md)——渲染这些事件的轮尾卡片与文件提及。
 - [present 声明工作区源文件](../../.agents/notes/implemented/feature/2026-09-08-present-workspace-source-files.zh.md)——交付决策。
-- [本轮改动文件卡片](../../.agents/notes/implemented/feature/2026-09-11-turn-changed-files-card.zh.md)——快照设计与覆盖规则。
+- [本轮改动文件卡片](workspace-changes/README.zh.md)——快照设计与覆盖规则。
 
 -----
 

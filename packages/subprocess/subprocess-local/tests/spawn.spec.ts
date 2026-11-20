@@ -1,6 +1,6 @@
-import { OutputCollector } from '../src/output.ts'
+import { logSpillFailure, OutputCollector, type SpillOptions } from '../src/output.ts'
 import { spawn as nodeSpawn, spawnSync as nodeSpawnSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync, statSync, unlinkSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterAll, describe, expect, it, vi } from 'vitest'
@@ -64,9 +64,12 @@ function shellArgv(command: string): string[] {
   }
 }
 
-const { failNextClose, failNextUnlink } = vi.hoisted(() => ({
+const { failNextClose, failNextUnlink, failNextWrite, failNextOpen, unlinked } = vi.hoisted(() => ({
   failNextClose: { value: false },
   failNextUnlink: { value: false },
+  failNextWrite: { value: false },
+  failNextOpen: { value: false },
+  unlinked: [] as string[],
 }))
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>()
@@ -80,16 +83,37 @@ vi.mock('node:fs', async (importOriginal) => {
       actual.closeSync(fd)
     },
     unlinkSync(path: Parameters<typeof actual.unlinkSync>[0]): void {
+      unlinked.push(String(path))
       if (failNextUnlink.value) {
         failNextUnlink.value = false
         throw Object.assign(new Error('simulated EIO on unlink'), { code: 'EIO' })
       }
       actual.unlinkSync(path)
     },
+    openSync(...args: Parameters<typeof actual.openSync>): number {
+      if (failNextOpen.value) {
+        failNextOpen.value = false
+        throw Object.assign(new Error('simulated EEXIST on open'), { code: 'EEXIST' })
+      }
+      return actual.openSync(...args)
+    },
+    writeSync(...args: Parameters<typeof actual.writeSync>): number {
+      if (failNextWrite.value) {
+        failNextWrite.value = false
+        throw Object.assign(new Error('simulated ENOSPC on write'), { code: 'ENOSPC' })
+      }
+      return actual.writeSync(...args)
+    },
   }
 })
 
 const spillDir = mkdtempSync(join(tmpdir(), 'dsh-subprocess-spec-'))
+
+/** Spill options for one collector test; failures are collected for assertions. */
+function spillOptions(maxBytes: number, dir = spillDir): { options: SpillOptions; failures: { error: unknown; label: string }[] } {
+  const failures: { error: unknown; label: string }[] = []
+  return { options: { maxBytes, dir, onFailure: (error, label) => { failures.push({ error, label }) } }, failures }
+}
 
 /** The per-process default spill dir captured by the default-spill test. */
 let defaultSpillDir: string | undefined
@@ -168,12 +192,13 @@ async function finish(running: SubprocessHandle) {
 async function waitForPidFile(path: string, timeoutMs = 5_000): Promise<number> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
+    let pid = Number.NaN
     try {
-      const pid = Number(readFileSync(path, 'utf8').trim())
-      if (Number.isSafeInteger(pid) && pid > 0) return pid
-    } catch {
+      pid = Number(readFileSync(path, 'utf8').trim())
+    } catch (_pidFileMissing) {
       // The child shell has not written the pid file yet.
     }
+    if (Number.isSafeInteger(pid) && pid > 0) return pid
     await new Promise(resolve => setTimeout(resolve, 20))
   }
   throw new Error(`pid file ${path} was not written after ${timeoutMs}ms`)
@@ -299,7 +324,7 @@ describe('spawnSubprocess', () => {
       killSpy.mockRestore()
       try {
         process.kill(helper, 'SIGKILL')
-      } catch {
+      } catch (_helperGone) {
         // taskkill already took the helper down on Windows.
       }
       await waitGone(helper)
@@ -328,7 +353,7 @@ describe('spawnSubprocess', () => {
     expect(result.signal).toBe(process.platform === 'win32' ? null : 'SIGTERM')
   })
 
-  it('throws a stable Error when already aborted before spawn', () => {
+  it('throws a stable AbortError when already aborted before spawn', () => {
     for (const [reason, message] of [
       ['too late', 'aborted before spawn: too late'],
       [null, 'aborted before spawn: aborted'],
@@ -336,7 +361,7 @@ describe('spawnSubprocess', () => {
       const controller = new AbortController()
       controller.abort(reason)
       expect(() => { validateSubprocessSpec(spec('echo hi', { signal: controller.signal })) })
-        .toThrow(new Error(message))
+        .toThrow(expect.objectContaining({ name: 'AbortError', message }))
     }
 
     const controller = new AbortController()
@@ -346,7 +371,7 @@ describe('spawnSubprocess', () => {
       },
     })
     expect(() => { validateSubprocessSpec(spec('echo hi', { signal: controller.signal })) })
-      .toThrow(new Error('aborted before spawn: aborted'))
+      .toThrow(expect.objectContaining({ name: 'AbortError', message: 'aborted before spawn: aborted' }))
   })
 
   it('rejects with a spawn error for a nonexistent cwd', async () => {
@@ -366,7 +391,7 @@ describe('spawnSubprocess', () => {
     const pidFile = join(spillDir, `zombie-group-${Date.now()}.pid`)
     const running = spawnSubprocess(spec(`sleep 60 & echo $! > ${pidFile}; echo leader-done`, { graceMs: 100 }), {
       platform: 'linux',
-      linuxProcessGroupHasLiveMembers: () => false,
+      linuxProcessGroupLiveMember: () => false,
     })
     const descendant = await waitForPidFile(pidFile)
     try {
@@ -375,6 +400,28 @@ describe('spawnSubprocess', () => {
     } finally {
       // The confirmed-absent verdict is a permanent no-more-signals boundary,
       // so terminate() must stay inert here; reap the live survivor directly.
+      process.kill(descendant, 'SIGKILL')
+      await waitGone(descendant)
+    }
+  })
+
+  it.skipIf(process.platform === 'win32')('passes the last found Linux group member back to the next probe', async () => {
+    const pidFile = join(spillDir, `known-member-${Date.now()}.pid`)
+    const known: Array<number | undefined> = []
+    const results: Array<number | false | undefined> = [4242, undefined]
+    const running = spawnSubprocess(spec(`sleep 60 & echo $! > ${pidFile}; echo leader-done`, { graceMs: 100 }), {
+      platform: 'linux',
+      linuxProcessGroupLiveMember: (_group, knownMember) => {
+        known.push(knownMember)
+        return known.length <= results.length ? results[known.length - 1] : false
+      },
+    })
+    const descendant = await waitForPidFile(pidFile)
+    try {
+      await running.done
+      await expect(running.waitForExit()).resolves.toBe(true)
+      expect(known).toEqual([undefined, 4242, 4242])
+    } finally {
       process.kill(descendant, 'SIGKILL')
       await waitGone(descendant)
     }
@@ -516,7 +563,7 @@ describe('output truncation and spill', () => {
 
 describe('OutputCollector', () => {
   it('keeps the tail of a single oversized chunk', () => {
-    const collector = new OutputCollector(10, 100, 'test', spillDir)
+    const collector = new OutputCollector(10, 'test', spillOptions(100).options)
     collector.push(Buffer.from('0123456789abcdef'))
     const out = collector.finalize()
     expect(out.text).toBe('6789abcdef')
@@ -527,7 +574,7 @@ describe('OutputCollector', () => {
   it('retains a byte-exact tail across uneven chunk boundaries', () => {
     // A diagnostic tail must be exactly the LAST maxBytes regardless of
     // chunking; dropping only whole chunks would under-retain.
-    const collector = new OutputCollector(10, undefined, 'exact-tail', spillDir)
+    const collector = new OutputCollector(10, 'exact-tail', undefined)
     collector.push(Buffer.from('aaaa'))
     collector.push(Buffer.from('bbbbbb'))
     collector.push(Buffer.from('cc'))
@@ -538,7 +585,7 @@ describe('OutputCollector', () => {
   })
 
   it('readFrom returns increments and flags lossy reads', () => {
-    const collector = new OutputCollector(10, 100, 'test', spillDir)
+    const collector = new OutputCollector(10, 'test', spillOptions(100).options)
     collector.push(Buffer.from('aaaaa'))
     const first = collector.readFrom(0)
     expect(first.text).toBe('aaaaa')
@@ -559,7 +606,7 @@ describe('OutputCollector', () => {
   })
 
   it('contains close failures and drops the spill path', () => {
-    const collector = new OutputCollector(4, 100, 'closefail', spillDir)
+    const collector = new OutputCollector(4, 'closefail', spillOptions(100).options)
     collector.push(Buffer.from('aaaa'))
     collector.push(Buffer.from('bbbb'))
     expect(collector.readFrom(0).spillPath).toBeDefined()
@@ -575,7 +622,7 @@ describe('OutputCollector', () => {
   })
 
   it('discards a spill that exceeds its configured cap', () => {
-    const collector = new OutputCollector(4, 8, 'bounded', spillDir)
+    const collector = new OutputCollector(4, 'bounded', spillOptions(8).options)
     collector.push(Buffer.from('aaaa'))
     collector.push(Buffer.from('bbbb'))
     const spillPath = collector.readFrom(0).spillPath!
@@ -591,7 +638,7 @@ describe('OutputCollector', () => {
   })
 
   it('does not create a spill when the first overflowing chunk exceeds the cap', () => {
-    const collector = new OutputCollector(4, 4, 'no-spill', spillDir)
+    const collector = new OutputCollector(4, 'no-spill', spillOptions(4).options)
     collector.push(Buffer.from('abcdefgh'))
     const out = collector.finalize()
     expect(out.text).toBe('efgh')
@@ -600,7 +647,7 @@ describe('OutputCollector', () => {
   })
 
   it('contains cleanup failures while disabling an oversize spill', () => {
-    const collector = new OutputCollector(4, 8, 'cleanup-fail', spillDir)
+    const collector = new OutputCollector(4, 'cleanup-fail', spillOptions(8).options)
     collector.push(Buffer.from('aaaa'))
     collector.push(Buffer.from('bbbb'))
     const spillPath = collector.readFrom(0).spillPath!
@@ -612,6 +659,126 @@ describe('OutputCollector', () => {
     expect(failNextUnlink.value).toBe(false)
     expect(collector.finalize().spillPath).toBeUndefined()
     unlinkSync(spillPath)
+  })
+
+  it('keeps collecting when the spill directory has been removed (ENOENT on open)', () => {
+    const removedDir = mkdtempSync(join(tmpdir(), 'dsh-subprocess-removed-'))
+    rmSync(removedDir, { recursive: true, force: true })
+    const { options, failures } = spillOptions(100, removedDir)
+    const collector = new OutputCollector(4, 'enoent', options)
+    collector.push(Buffer.from('aaaa'))
+    expect(() => { collector.push(Buffer.from('bbbb')) }).not.toThrow()
+    collector.push(Buffer.from('cc'))
+    expect(failures).toHaveLength(1)
+    expect((failures[0]!.error as NodeJS.ErrnoException).code).toBe('ENOENT')
+    expect(failures[0]!.label).toBe('enoent')
+    const out = collector.finalize()
+    expect(out.text).toBe('bbcc')
+    expect(out.truncated).toBe(true)
+    expect(out.spillPath).toBeUndefined()
+  })
+
+  it('keeps collecting when the spill directory is a file (ENOTDIR on open)', () => {
+    const fileAsDir = join(spillDir, `not-a-dir-${Date.now()}`)
+    writeFileSync(fileAsDir, '')
+    const { options, failures } = spillOptions(100, fileAsDir)
+    const collector = new OutputCollector(4, 'enotdir', options)
+    collector.push(Buffer.from('aaaa'))
+    expect(() => { collector.push(Buffer.from('bbbb')) }).not.toThrow()
+    expect(failures).toHaveLength(1)
+    expect(['ENOTDIR', 'ENOENT']).toContain((failures[0]!.error as NodeJS.ErrnoException).code)
+    expect(collector.finalize()).toEqual({ text: 'bbbb', truncated: true })
+  })
+
+  it('withdraws a spill whose append fails after the file exists (ENOSPC on write)', () => {
+    const { options, failures } = spillOptions(100)
+    const collector = new OutputCollector(4, 'enospc', options)
+    collector.push(Buffer.from('aaaa'))
+    collector.push(Buffer.from('bbbb'))
+    const spillPath = collector.readFrom(0).spillPath!
+    expect(readFileSync(spillPath, 'utf8')).toBe('aaaabbbb')
+
+    failNextWrite.value = true
+    expect(() => { collector.push(Buffer.from('cccc')) }).not.toThrow()
+    expect(failNextWrite.value).toBe(false)
+    expect(failures).toHaveLength(1)
+    expect((failures[0]!.error as NodeJS.ErrnoException).code).toBe('ENOSPC')
+    expect(() => readFileSync(spillPath)).toThrow()
+
+    collector.push(Buffer.from('dd'))
+    expect(failures).toHaveLength(1)
+    const out = collector.finalize()
+    expect(out.text).toBe('ccdd')
+    expect(out.truncated).toBe(true)
+    expect(out.spillPath).toBeUndefined()
+  })
+
+  it('does not unlink a path it never created when the exclusive open fails (EEXIST)', () => {
+    const { options, failures } = spillOptions(100)
+    const collector = new OutputCollector(4, 'eexist', options)
+    collector.push(Buffer.from('aaaa'))
+    unlinked.length = 0
+    failNextOpen.value = true
+    expect(() => { collector.push(Buffer.from('bbbb')) }).not.toThrow()
+    expect(failNextOpen.value).toBe(false)
+    expect((failures[0]!.error as NodeJS.ErrnoException).code).toBe('EEXIST')
+    expect(unlinked).toEqual([])
+    expect(collector.finalize()).toEqual({ text: 'bbbb', truncated: true })
+  })
+
+  it('contains a reporter that throws and keeps collecting', () => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+    try {
+      const collector = new OutputCollector(4, 'loud-reporter', {
+        maxBytes: 100, dir: join(spillDir, `absent-${Date.now()}`), onFailure: () => { throw new Error('logger down') },
+      })
+      collector.push(Buffer.from('aaaa'))
+      expect(() => { collector.push(Buffer.from('bbbb')) }).not.toThrow()
+      collector.push(Buffer.from('cc'))
+      expect(stderr).toHaveBeenCalledOnce()
+      expect(String(stderr.mock.calls[0]![0])).toContain('spill failure reporter threw: Error: logger down')
+      expect(collector.finalize()).toEqual({ text: 'bbcc', truncated: true })
+    } finally {
+      stderr.mockRestore()
+    }
+  })
+})
+
+describe('logSpillFailure', () => {
+  it('names the removed directory only for ENOENT and appends the error for every code', () => {
+    const lines: unknown[][] = []
+    const report = logSpillFailure({ error: (...detail: unknown[]) => { lines.push(detail) } }, 'test owner')
+    report(Object.assign(new Error('gone'), { code: 'ENOENT' }), 'stdout')
+    report(Object.assign(new Error('full'), { code: 'ENOSPC' }), 'stderr')
+    expect(lines[0]![0]).toContain('test owner could not write the complete stdout stream')
+    expect(lines[0]![0]).toContain('temporary-file cleaner')
+    expect(lines[1]![0]).toContain('complete stderr stream')
+    expect(lines[1]![0]).not.toContain('temporary-file cleaner')
+    expect((lines[1]![1] as NodeJS.ErrnoException).code).toBe('ENOSPC')
+  })
+})
+
+describe('spill failure reporting without an owner logger', () => {
+  it('writes one stderr line for a bare spawn whose spill directory is gone', async () => {
+    const removedDir = mkdtempSync(join(tmpdir(), 'dsh-subprocess-removed-'))
+    rmSync(removedDir, { recursive: true, force: true })
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+    try {
+      const result = await finish(spawnSubprocess(
+        spec('for i in $(seq 1 200); do printf "line-%04d\\n" $i; done', { stdoutMaxBytes: 500, stderrMaxBytes: 500 }),
+        { spillDir: removedDir },
+      ))
+      expect(result.exitCode).toBe(0)
+      expect(result.stdout.truncated).toBe(true)
+      expect(result.stdout.text).toContain('line-0200')
+      expect(result.stdout.spillPath).toBeUndefined()
+      const lines = stderr.mock.calls.map(call => String(call[0])).filter(line => line.includes('dsh-subprocess-local:'))
+      expect(lines).toHaveLength(1)
+      expect(lines[0]).toContain('stdout spill failed; only the in-memory tail is retained')
+      expect(lines[0]).toContain('ENOENT')
+    } finally {
+      stderr.mockRestore()
+    }
   })
 })
 
@@ -696,7 +863,7 @@ describe('windows tree semantics (injected platform)', () => {
         killed.push(pid)
         try {
           process.kill(pid, 'SIGKILL')
-        } catch {
+        } catch (_childGone) {
           // Already gone — matches taskkill's tolerated not-found status.
         }
       },
@@ -717,7 +884,7 @@ describe('windows tree semantics (injected platform)', () => {
         // Simulate the forced tree termination taskkill performs.
         try {
           process.kill(pid, 'SIGKILL')
-        } catch {
+        } catch (_childGone) {
           // Already gone — matches taskkill's tolerated not-found status.
         }
       },
@@ -1026,7 +1193,7 @@ describe('coverage seams', () => {
     // terminates the direct child when the escalation tier delivers SIGKILL.
     const running = spawnSubprocess(spec('sleep 60', { graceMs: 100 }), {
       platform: 'linux',
-      linuxProcessGroupHasLiveMembers: () => false,
+      linuxProcessGroupLiveMember: () => false,
     })
     const realKill = process.kill.bind(process)
     let rootPid: number | undefined
@@ -1130,7 +1297,7 @@ describe('coverage seams', () => {
     expect(Date.now() - started).toBeGreaterThanOrEqual(90)
     try {
       process.kill(helper, 'SIGKILL')
-    } catch {
+    } catch (_helperGone) {
       // Already gone; the drain bound is the point under test.
     }
     await waitGone(helper)
@@ -1227,8 +1394,8 @@ describe('coverage seams 2', () => {
         killedPid = pid
         try {
           process.kill(pid, 'SIGKILL')
-        } catch {
-          // Already gone.
+        } catch (_childGone) {
+          // The child already exited; taskkill tolerates a missing process the same way.
         }
       },
     })
@@ -1280,7 +1447,8 @@ describe('coverage seams 2', () => {
 
 describe('argv validation', () => {
   it('rejects an empty argv before spawning', () => {
-    expect(() => { validateSubprocessSpec({ ...spec('true'), argv: [] }) }).toThrow(/non-empty program name/)
+    expect(() => { validateSubprocessSpec({ ...spec('true'), argv: [] }) })
+      .toThrow(expect.objectContaining({ name: 'SubprocessError', code: 'SUBPROCESS_INVALID_ARGV' }))
   })
 
   it('rejects an empty program name before spawning', () => {
@@ -1302,7 +1470,7 @@ describe('abort edge cases', () => {
       removeEventListener() {},
     } as unknown as AbortSignal
     expect(() => { validateSubprocessSpec(spec('echo hi', { signal: bare })) })
-      .toThrow(new Error('aborted before spawn: aborted'))
+      .toThrow(expect.objectContaining({ name: 'AbortError', message: 'aborted before spawn: aborted' }))
   })
 
   it.skipIf(process.platform === 'win32')('reports the terminating signal of an externally self-killed command', async () => {

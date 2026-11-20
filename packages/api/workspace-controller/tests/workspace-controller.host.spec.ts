@@ -1,18 +1,29 @@
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
+import SessionStore, { type SessionId } from '@deepseek-ai/dsh-session'
 import Storage from '@deepseek-ai/dsh-storage'
 import { DomainFacility } from '@deepseek-ai/dsh-storage-domain'
-import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
+import { RemoteError, type PeerId, type Principal, type RemoteInvocation } from '@deepseek-ai/dsh-typert-protocol'
 import WorkspaceRegistry from '@deepseek-ai/dsh-workspace'
 import type { WorkspaceId } from '@deepseek-ai/dsh-workspace/types'
+import RemoteAccessService, { type RemoteAccessCondition, type RemoteAccessRole } from '@deepseek-ai/dsh-api-remote-access'
 import WorkspaceController from '../src/index.ts'
+import { DEFAULT_WORKSPACE_DIRECTORY } from '../src/default-workspace.ts'
 import { WorkspaceFeed } from '../src/feed.ts'
 import type { WorkspaceFollowFrame } from '../src/types.ts'
 import { MemoryStorageBackend } from '../../../storage/storage-domain/tests/helpers/memory-backend.ts'
+import { brandString } from '@deepseek-ai/dsh-brand'
+
+// The controller relays whatever families the providers report; this suite merges its own.
+declare module '@deepseek-ai/dsh-workspace/types' {
+  interface SessionActivityKindMap {
+    probe: true
+    'probe-items': true
+  }
+}
 
 declare module '@deepseek-ai/dsh-typert-protocol' {
   interface RemoteErrorDetailsMap {
@@ -41,7 +52,7 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve }
 }
 
-async function harness() {
+async function harness(options: { systemDocuments?: boolean } = {}) {
   const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-workspace-controller-')))
   tempDirs.push(root)
   const ctx = new Context()
@@ -58,9 +69,37 @@ async function harness() {
   ctx.provide('typert', {
     lookups: { configure: () => dispose },
     contexts: { configureHost: () => dispose },
+    resources: { register: vi.fn(() => dispose) },
   } as never)
-  const controller = new WorkspaceController(ctx)
+  new RemoteAccessService(ctx)
+  const controller = new WorkspaceController(ctx, options.systemDocuments === true ? {} : { documentsDirectory: root })
   return { controller, ctx, root, storageDomain }
+}
+
+declare module '@deepseek-ai/dsh-typert-protocol' {
+  interface PrincipalMap {
+    /** Test-only non-owner caller shared by the access specs. */
+    'test-guest': { readonly kind: 'test-guest'; readonly guest: string }
+  }
+}
+
+/** Opens the Workspace follow stream; each Workspace and Session in it still needs its own role. */
+const FOLLOWER: RemoteAccessRole<'global'> = { name: 'test:workspace-follower', resource: 'global', actions: ['workspace/follow'] }
+/** Shows one Workspace in the follow stream. */
+const WORKSPACE_VIEWER: RemoteAccessRole<'workspace'> = { name: 'test:workspace-viewer', resource: 'workspace', actions: ['workspace/follow'] }
+/** Shows one Session id in the follow stream. */
+const SESSION_VIEWER: RemoteAccessRole<'session'> = { name: 'test:session-viewer', resource: 'session', actions: ['workspace/follow'] }
+
+/** The Context a Gateway dispatch of `workspace/follow` binds for `principal`. */
+function followerContext(ctx: Context, principal: Principal): Context {
+  const invocation: RemoteInvocation = {
+    request: { namespace: 'workspace', method: 'follow', args: {} },
+    service: 'workspaceController',
+    peer: { id: 'workspace-access-peer' as PeerId, ctx, principal, interactions: 'answer', signal: new AbortController().signal, dispose: async () => {} },
+    signal: new AbortController().signal,
+    uplink: <In>(): AsyncIterable<In> => ({ [Symbol.asyncIterator]: () => ({ next: async () => ({ done: true, value: undefined }) }) }),
+  }
+  return ctx.extend({ invocation })
 }
 
 function stageDir(root: string, name: string): string {
@@ -144,18 +183,28 @@ describe('WorkspaceController commands', () => {
     vi.spyOn(workspace, 'insertSessionBefore').mockRejectedValueOnce(moveFailure)
     await expect(controller.insertSessionBefore({
       workspaceId: created.workspace.workspaceId,
-      sessionId: SessionId('session'),
+      sessionId: brandString<SessionId>('session'),
     })).rejects.toBe(moveFailure)
 
     const archiveFailure = new Error('archive storage failed')
     vi.spyOn(ctx.workspaceRegistry, 'archiveSession').mockRejectedValueOnce(archiveFailure)
-    await expect(controller.archiveSession({ sessionId: SessionId('session') }))
+    await expect(controller.archiveSession({ sessionId: brandString<SessionId>('session') }))
       .rejects.toBe(archiveFailure)
 
     const unarchiveFailure = new Error('unarchive storage failed')
     vi.spyOn(ctx.workspaceRegistry, 'unarchiveSession').mockRejectedValueOnce(unarchiveFailure)
-    await expect(controller.unarchiveSession({ sessionId: SessionId('session') }))
+    await expect(controller.unarchiveSession({ sessionId: brandString<SessionId>('session') }))
       .rejects.toBe(unarchiveFailure)
+
+    const pinFailure = new Error('pin storage failed')
+    vi.spyOn(ctx.workspaceRegistry, 'pinSession').mockRejectedValueOnce(pinFailure)
+    await expect(controller.pinSession({ sessionId: brandString<SessionId>('session') }))
+      .rejects.toBe(pinFailure)
+
+    const unpinFailure = new Error('unpin storage failed')
+    vi.spyOn(ctx.workspaceRegistry, 'unpinSession').mockRejectedValueOnce(unpinFailure)
+    await expect(controller.unpinSession({ sessionId: brandString<SessionId>('session') }))
+      .rejects.toBe(unpinFailure)
   })
 
   it('resolves queued Workspace identities when their operation starts', async () => {
@@ -195,7 +244,7 @@ describe('WorkspaceController commands', () => {
     await expect(controller.insertBefore({ workspaceId: 'missing' as WorkspaceId }))
       .rejects.toMatchObject({ code: 'workspace/not-found' })
 
-    const session = ctx.sessions.create(SessionId('session-one'), {
+    const session = ctx.sessions.create(brandString<SessionId>('session-one'), {
       meta: { cwd: first.workspace.path },
     })
     const workspace = ctx.workspaceRegistry.get(first.workspace.workspaceId)
@@ -207,12 +256,12 @@ describe('WorkspaceController commands', () => {
     })).resolves.toMatchObject({ workspace: { sessionIds: [session.id] } })
     await expect(controller.insertSessionBefore({
       workspaceId: first.workspace.workspaceId,
-      sessionId: SessionId('missing-session'),
+      sessionId: brandString<SessionId>('missing-session'),
     })).rejects.toMatchObject({ code: 'workspace/move-invalid' })
     await expect(controller.insertSessionBefore({
       workspaceId: first.workspace.workspaceId,
       sessionId: session.id,
-      beforeSessionId: SessionId('missing-anchor'),
+      beforeSessionId: brandString<SessionId>('missing-anchor'),
     })).rejects.toMatchObject({
       code: 'workspace/move-invalid',
       details: { beforeSessionId: 'missing-anchor' },
@@ -222,15 +271,64 @@ describe('WorkspaceController commands', () => {
       sessionId: session.id,
     })).rejects.toMatchObject({ code: 'workspace/not-found' })
 
+    // A session reported active by the registry's activity waterfall is a
+    // stable business failure carrying what still runs, and nothing is written.
+    const activity = [{ kind: 'probe' as const }, { kind: 'probe-items' as const, items: [{ id: 'item-1', label: 'build' }] }]
+    const stopReporting = ctx.on('workspace/session-activity', async ({ sessionId }, next) =>
+      sessionId === session.id ? [...activity, ...(await next())] : next())
+    await expect(controller.archiveSession({ sessionId: session.id })).rejects.toMatchObject({
+      code: 'workspace/session-active',
+      details: { sessionId: session.id, activity },
+    })
+    expect([...ctx.workspaceRegistry.archivedSessionIds]).toEqual([])
+    // Asking to stop the work archives the still-active Session and reaches
+    // the stop providers first.
+    const stops: string[] = []
+    const stopListening = ctx.on('workspace/session-stop', ({ sessionId }) => { stops.push(String(sessionId)) })
+    await expect(controller.archiveSession({ sessionId: session.id, stopActivity: true }))
+      .resolves.toEqual({ archivedSessionIds: [session.id] })
+    expect(stops).toEqual([String(session.id)])
+    stopListening()
+    await expect(controller.unarchiveSession({ sessionId: session.id }))
+      .resolves.toEqual({ archivedSessionIds: [] })
+    stopReporting()
+
     await expect(controller.archiveSession({ sessionId: session.id }))
       .resolves.toEqual({ archivedSessionIds: [session.id] })
-    await expect(controller.archiveSession({ sessionId: SessionId('unknown') }))
+    await expect(controller.archiveSession({ sessionId: brandString<SessionId>('unknown') }))
       .rejects.toMatchObject({ code: 'session/not-found' })
     await expect(controller.unarchiveSession({ sessionId: session.id }))
       .resolves.toEqual({ archivedSessionIds: [] })
     // Unarchive is idempotent: an id that is not archived is not an error.
     await expect(controller.unarchiveSession({ sessionId: session.id }))
       .resolves.toEqual({ archivedSessionIds: [] })
+  })
+
+  it('pins only known unarchived Sessions and unpins idempotently', async () => {
+    const { controller, ctx, root } = await harness()
+    const created = await controller.create({ path: stageDir(root, 'pins') })
+    const session = ctx.sessions.create(brandString<SessionId>('pin-me'), {
+      meta: { cwd: created.workspace.path },
+    })
+
+    await expect(controller.pinSession({ sessionId: session.id }))
+      .resolves.toEqual({ pinnedSessionIds: [session.id] })
+    await expect(controller.pinSession({ sessionId: brandString<SessionId>('unknown') }))
+      .rejects.toMatchObject({ code: 'session/not-found' })
+
+    // Pinning an archived Session is a caller error, not a missing session.
+    const archived = ctx.sessions.create(brandString<SessionId>('stored'), {
+      meta: { cwd: created.workspace.path },
+    })
+    await controller.archiveSession({ sessionId: archived.id })
+    await expect(controller.pinSession({ sessionId: archived.id }))
+      .rejects.toMatchObject({ code: 'gateway/bad-request' })
+
+    await expect(controller.unpinSession({ sessionId: session.id }))
+      .resolves.toEqual({ pinnedSessionIds: [] })
+    // Unpin is idempotent: an id that is not pinned is not an error.
+    await expect(controller.unpinSession({ sessionId: session.id }))
+      .resolves.toEqual({ pinnedSessionIds: [] })
   })
 })
 
@@ -253,9 +351,29 @@ describe('WorkspaceController follow', () => {
           initialized: true,
           workspaceIds: ['missing'],
           archivedSessionIds: [],
+          pinnedSessionIds: [],
         },
       })
     }).toThrow('references missing Workspace "missing"')
+  })
+
+  it('starts a fresh feed with existing pins and follows their removal', async () => {
+    const { controller, ctx, root } = await harness()
+    const session = ctx.sessions.create(brandString<SessionId>('already-pinned'), { meta: { cwd: root } })
+    await controller.pinSession({ sessionId: session.id })
+    const feed = new WorkspaceFeed(ctx)
+    const abort = new AbortController()
+    const iterator = feed.follow(abort.signal)[Symbol.asyncIterator]()
+    try {
+      await expect(nextFrame(iterator)).resolves.toMatchObject({
+        type: 'baseline', value: { pinnedSessionIds: [session.id] },
+      })
+      await controller.unpinSession({ sessionId: session.id })
+      await expect(nextFrame(iterator)).resolves.toEqual({ type: 'pinned', pinnedSessionIds: [] })
+    } finally {
+      abort.abort()
+      await iterator.return?.()
+    }
   })
 
   it('starts with a complete baseline and emits committed increments in domain order', async () => {
@@ -264,7 +382,7 @@ describe('WorkspaceController follow', () => {
     const iterator = controller.follow(abort.signal)[Symbol.asyncIterator]()
     await expect(nextFrame(iterator)).resolves.toEqual({
       type: 'baseline',
-      value: { items: [], archivedSessionIds: [] },
+      value: { items: [], archivedSessionIds: [], pinnedSessionIds: [] },
     })
 
     const first = await controller.create({ path: stageDir(root, 'first') })
@@ -295,7 +413,7 @@ describe('WorkspaceController follow', () => {
       workspaceIds: [first.workspace.workspaceId, second.workspace.workspaceId],
     })
 
-    const session = ctx.sessions.create(SessionId('archived'), {
+    const session = ctx.sessions.create(brandString<SessionId>('archived'), {
       meta: { cwd: first.workspace.path },
     })
     await controller.archiveSession({ sessionId: session.id })
@@ -307,6 +425,15 @@ describe('WorkspaceController follow', () => {
     await expect(nextFrame(iterator)).resolves.toEqual({
       type: 'archived', archivedSessionIds: [],
     })
+    await controller.pinSession({ sessionId: session.id })
+    await expect(nextFrame(iterator)).resolves.toEqual({
+      type: 'pinned', pinnedSessionIds: [session.id],
+    })
+    // Unpin rides the same complete-set increment: no new frame type.
+    await controller.unpinSession({ sessionId: session.id })
+    await expect(nextFrame(iterator)).resolves.toEqual({
+      type: 'pinned', pinnedSessionIds: [],
+    })
     await controller.delete({ workspaceId: second.workspace.workspaceId })
     await expect(nextFrame(iterator)).resolves.toEqual({
       type: 'order', workspaceIds: [first.workspace.workspaceId],
@@ -314,6 +441,110 @@ describe('WorkspaceController follow', () => {
     await expect(nextFrame(iterator)).resolves.toEqual({
       type: 'remove', workspaceId: second.workspace.workspaceId,
     })
+
+    abort.abort()
+    await expect(iterator.next()).resolves.toEqual({ done: true, value: undefined })
+  })
+
+  it('follows only the Workspaces and Sessions a non-owner may follow', async () => {
+    const { controller, ctx, root } = await harness()
+    // oxlint-disable-next-line typescript/unbound-method -- the assertion inspects the spy and never calls it.
+    expect(ctx.typert.resources.register).toHaveBeenCalledWith('workspace', { field: 'workspaceId' })
+    const shown = await controller.create({ path: stageDir(root, 'shown') })
+    const hiddenWorkspace = await controller.create({ path: stageDir(root, 'hidden') })
+    const shownId = shown.workspace.workspaceId
+    const hiddenId = hiddenWorkspace.workspace.workspaceId
+    const shared = ctx.sessions.create(brandString<SessionId>('shared'), { meta: { cwd: shown.workspace.path } })
+    const secret = ctx.sessions.create(brandString<SessionId>('secret'), { meta: { cwd: shown.workspace.path } })
+    const workspace = ctx.workspaceRegistry.get(shownId)
+    if (workspace === undefined) throw new Error('fixture Workspace disappeared')
+    await workspace.attachSession(shared.id)
+    await workspace.attachSession(secret.id)
+    await controller.pinSession({ sessionId: shared.id })
+    await controller.pinSession({ sessionId: secret.id })
+    ctx.remoteAccess.registerPolicy('test-guest', {
+      bindings: () => [
+        { role: FOLLOWER, resource: { kind: 'global' } },
+        { role: WORKSPACE_VIEWER, resource: { kind: 'workspace', id: shownId } },
+        { role: SESSION_VIEWER, resource: { kind: 'session', id: shared.id } },
+      ],
+    })
+    const guest: Principal = { kind: 'test-guest', guest: 'workspace-controller' }
+    const abort = new AbortController()
+    const iterator = followerContext(ctx, guest).workspaceController.follow(abort.signal)[Symbol.asyncIterator]()
+    await expect(nextFrame(iterator)).resolves.toEqual({
+      type: 'baseline',
+      value: {
+        items: [expect.objectContaining({ workspaceId: shownId, sessionIds: [shared.id] })],
+        archivedSessionIds: [],
+        pinnedSessionIds: [shared.id],
+      },
+    })
+
+    await controller.rename({ workspaceId: hiddenId, title: 'still hidden' })
+    await controller.rename({ workspaceId: shownId, title: 'renamed' })
+    await expect(nextFrame(iterator)).resolves.toMatchObject({
+      type: 'upsert', workspace: { workspaceId: shownId, title: 'renamed', sessionIds: [shared.id] },
+    })
+    await controller.unpinSession({ sessionId: secret.id })
+    await expect(nextFrame(iterator)).resolves.toEqual({ type: 'pinned', pinnedSessionIds: [shared.id] })
+    await controller.unpinSession({ sessionId: shared.id })
+    await controller.archiveSession({ sessionId: secret.id })
+    await controller.archiveSession({ sessionId: shared.id })
+    await expect(nextFrame(iterator)).resolves.toEqual({ type: 'pinned', pinnedSessionIds: [] })
+    await expect(nextFrame(iterator)).resolves.toEqual({ type: 'archived', archivedSessionIds: [] })
+    await expect(nextFrame(iterator)).resolves.toEqual({ type: 'archived', archivedSessionIds: [shared.id] })
+    await controller.delete({ workspaceId: hiddenId })
+    await expect(nextFrame(iterator)).resolves.toEqual({ type: 'order', workspaceIds: [shownId] })
+    await controller.delete({ workspaceId: shownId })
+    await expect(nextFrame(iterator)).resolves.toEqual({ type: 'order', workspaceIds: [] })
+    await expect(nextFrame(iterator)).resolves.toEqual({ type: 'remove', workspaceId: shownId })
+
+    abort.abort()
+    await expect(iterator.next()).resolves.toEqual({ done: true, value: undefined })
+  })
+
+  it('sends a non-owner a replace increment when a delivered Workspace loses visibility, so it can reappear', async () => {
+    const { controller, ctx, root } = await harness()
+    const first = (await controller.create({ path: stageDir(root, 'first') })).workspace.workspaceId
+    const second = (await controller.create({ path: stageDir(root, 'second') })).workspace.workspaceId
+    // One Remote call reads its bindings once, so visibility changes during the stream come from the condition.
+    const allowedWorkspaces = new Set<string>([first, second])
+    const stillShared: RemoteAccessCondition<'workspace'> = ({ resource }) =>
+      allowedWorkspaces.has(resource.id) ? { kind: 'allow' } : { kind: 'deny', reason: 'test:unshared' }
+    ctx.remoteAccess.registerPolicy('test-guest', {
+      bindings: () => [
+        { role: FOLLOWER, resource: { kind: 'global' } },
+        ...[first, second].map(id => ({ role: WORKSPACE_VIEWER, resource: { kind: 'workspace', id } as const, condition: stillShared })),
+      ],
+    })
+    const abort = new AbortController()
+    const iterator = followerContext(ctx, { kind: 'test-guest', guest: 'withdrawn' }).workspaceController.follow(abort.signal)[Symbol.asyncIterator]()
+    const ids = (frame: WorkspaceFollowFrame): string[] =>
+      frame.type === 'baseline' || frame.type === 'replace' ? frame.value.items.map(item => item.workspaceId).sort() : []
+    const opening = await nextFrame(iterator)
+    expect(opening.type).toBe('baseline')
+    expect(ids(opening)).toEqual([first, second].sort())
+
+    // Revoked: the next change replaces the state instead of sending a `remove` the Client would never undo.
+    allowedWorkspaces.delete(first)
+    await controller.rename({ workspaceId: first, title: 'revoked' })
+    const withoutFirst = await nextFrame(iterator)
+    expect(withoutFirst.type).toBe('replace')
+    expect(ids(withoutFirst)).toEqual([second])
+    allowedWorkspaces.delete(second)
+    const third = (await controller.create({ path: stageDir(root, 'third') })).workspace.workspaceId
+    const empty = await nextFrame(iterator)
+    expect(empty.type).toBe('replace')
+    expect(ids(empty)).toEqual([])
+    // A deletion reaches only a Client that received the Workspace.
+    await controller.delete({ workspaceId: third })
+    await expect(nextFrame(iterator)).resolves.toEqual({ type: 'order', workspaceIds: [] })
+
+    // Restored: the Workspace reappears through an ordinary upsert.
+    allowedWorkspaces.add(first)
+    await controller.rename({ workspaceId: first, title: 'restored' })
+    await expect(nextFrame(iterator)).resolves.toMatchObject({ type: 'upsert', workspace: { workspaceId: first, title: 'restored' } })
 
     abort.abort()
     await expect(iterator.next()).resolves.toEqual({ done: true, value: undefined })
@@ -348,5 +579,36 @@ describe('WorkspaceController follow', () => {
     await ctx.fiber.dispose()
     roots.splice(roots.indexOf(ctx), 1)
     await expect(closing).resolves.toEqual({ done: true, value: undefined })
+  })
+})
+
+describe('first-use Remote', () => {
+  it('reuses an initialized Workspace without looking up system Documents', async () => {
+    const { controller, ctx, root } = await harness({ systemDocuments: true })
+    const workspace = await ctx.workspaceRegistry.initializeDefault(async () => root)
+    const signal = AbortSignal.abort()
+    await expect(controller.initializeDefault(signal))
+      .resolves.toMatchObject({ workspace: { workspaceId: workspace!.id, path: root, title: basename(root) } })
+  })
+
+  it('returns a durable Workspace named after its fixed directory without allocating a Session', async () => {
+    const { controller, ctx, root } = await harness()
+    const signal = new AbortController().signal
+    const result = await controller.initializeDefault(signal)
+    expect(result!.workspace.path).toBe(join(root, 'deepseek-harness', DEFAULT_WORKSPACE_DIRECTORY))
+    expect(result!.workspace.title).toBe(DEFAULT_WORKSPACE_DIRECTORY)
+    expect(existsSync(result!.workspace.path)).toBe(true)
+    expect(ctx.sessions.list()).toEqual([])
+    expect(await controller.initializeDefault(signal)).toEqual(result)
+  })
+
+  it('skips ineligible first use and propagates preparation failures', async () => {
+    const { controller, ctx, root } = await harness()
+    await ctx.workspaceRegistry.create(root)
+    await expect(controller.initializeDefault(new AbortController().signal))
+      .resolves.toBeUndefined()
+    vi.spyOn(ctx.workspaceRegistry, 'initializeDefault').mockRejectedValueOnce(new Error('permission denied'))
+    await expect(controller.initializeDefault(new AbortController().signal))
+      .rejects.toThrow('permission denied')
   })
 })

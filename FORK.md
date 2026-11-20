@@ -33,7 +33,7 @@ hundreds of surfaces so that agent user-facing rules tell every agent to use the
 graph before touching the filesystem.
 
 - **`.mcp.json`** — standard MCP registration (`python3 -m code_review_graph serve`).
-- **`opencode.jsonc`** — OpenCode MCP registration.
+- **`opencode.jsonc`** — dropped 2026-10-17, when OpenCode was retired from this workstation.
 - **`.qoder/mcp.json`** — Qoder MCP registration.
 - **`.cursorrules`, `.windsurfrules`, `GEMINI.md`, `QODER.md`, `CODEBUDDY.md`** —
   per-tool Agent rules that instruct the agent to use the graph tools first.
@@ -317,8 +317,10 @@ git push origin master
 
 Upstream tracking: this fork started from the upstream `master` line that later
 shipped as the `dsh-v0.1.0-rc.7` tag (2026-08-13) and was last synced to the
-`dsh-v0.1.6-alpha.2` tag (2026-09-17) on 2026-09-19. Add new upstream work by
-merging forward from `deepseek-ai/deepseek-harness`.
+`dsh-v0.2.2-rc.5` tag (2026-11-18, upstream `2e39e70496`) on 2026-11-20 — 10,205
+upstream commits and 18,688 files from base `dsh-v0.1.6-alpha.2`. The pre-sync
+fork tip stays reachable as tag `fork-presync-2026-11-20`. Add new upstream work
+by merging forward from `deepseek-ai/deepseek-harness`.
 
 The checkout uses the conventional remote names the commands above assume:
 `upstream` = `deepseek-ai/deepseek-harness` and `origin` = the `rpmalouin` fork, so
@@ -337,14 +339,23 @@ commit:
    `README.i18n.yaml`) under `verify-translation-pairing`. Editing the English
    side alone goes red: bring the Chinese side along in one terminology-guided
    pass, then re-record with
-   `pnpm run verify-translation-pairing --write README.md`.
+   `pnpm run verify-translation-pairing --write README.md`. Since the
+   `dsh-v0.2.2-rc.5` sync this paired record is the merge's only conflict: the
+   English and Chinese sections auto-merge (the fork's `Why This Fork Exists`
+   block survives at the top of both), while `README.i18n.yaml` changes format
+   upstream — take upstream's file (`git checkout upstream/master --
+   README.i18n.yaml`) and re-record the pair, which re-adds the fork's
+   `/why-this-fork-exists` entry and leaves every upstream section hash intact.
 3. `verify-md-wrap` requires **one physical line per prose paragraph**, in the
    fork's additions to `README.md` and `AGENTS.md` as much as anywhere else. A
    paragraph or list item continued on its next source line is a violation.
-4. `verify-doc-budgets` caps `AGENTS.md` at 1950 words, so the fork's
-   code-review-graph section stays a compact pointer at the top of the file
-   rather than a tool catalog; the per-tool detail lives under `.agents/skills/`,
-   which is outside the gated corpora.
+4. `verify-doc-budgets` caps root `AGENTS.md` at 2100 words (2080 upstream).
+   Upstream's own file sits exactly at its 2080 target, so the fork's graph-first
+   standing order has no room inside it: that order stays a single sentence plus
+   a link to [`.agents/skills/explore-codebase`](.agents/skills/explore-codebase/SKILL.md),
+   and the manifest carries the extra words. `scripts/doc-budgets.manifest.json`
+   is now the second recurring conflict risk, alongside `.gitignore` — keep both
+   sides and re-apply the 2100 with its justification.
 5. `pnpm run doc-quick` is the build-free gate aggregate worth running after
    resolving doc-level conflicts, and `pnpm run build` verifies the merged tree
    after `pnpm install`.

@@ -5,6 +5,7 @@ import { spawnSync } from 'node:child_process'
 import { runInNewContext } from 'node:vm'
 import * as yaml from 'js-yaml'
 import { describe, expect, it } from 'vitest'
+import { BUILD_BACKED_NODE_COMPAT_VERSION } from './run-gates.ts'
 
 interface Step {
   name?: string
@@ -24,7 +25,11 @@ interface CompatibilityJob {
 }
 
 const workflow = yaml.load(readFileSync(resolve(import.meta.dirname, '../.github/workflows/ci.yml'), 'utf8')) as {
-  jobs: { 'node-compat': CompatibilityJob; 'python-sdk': { 'runs-on': string } }
+  jobs: { 'node-compat': CompatibilityJob }
+}
+// Python keeps its own required verdict in ci-python.yml.
+const pythonWorkflow = yaml.load(readFileSync(resolve(import.meta.dirname, '../.github/workflows/ci-python.yml'), 'utf8')) as {
+  jobs: { 'python-sdk': { 'runs-on': string } }
 }
 const job = workflow.jobs['node-compat']
 const labels = ['self-hosted', 'linux', 'x64', 'vm-backup']
@@ -35,7 +40,7 @@ function evaluate(expression: string, context: Record<string, unknown>): unknown
   const body = expression.trim().slice(3, -2)
   return runInNewContext(body, {
     ...context, fromJSON: JSON.parse,
-  }, { timeout: 1000 }) as unknown
+  }, { timeout: 1000 })
 }
 
 function route(options: { mode?: string; author?: string; repository?: string; fork?: boolean; actor?: string } = {}): unknown {
@@ -54,6 +59,14 @@ function route(options: { mode?: string; author?: string; repository?: string; f
 }
 
 describe('Node compatibility self-hosted routing', () => {
+  it('runs the build-backed compatibility minor and declares it for installed CLI users', () => {
+    expect(job.strategy.matrix.include.filter(entry => String(entry.node) === BUILD_BACKED_NODE_COMPAT_VERSION)).toHaveLength(1)
+    for (const manifest of ['package.json', 'apps/cli/package.json']) {
+      const pkg = JSON.parse(readFileSync(resolve(import.meta.dirname, '..', manifest), 'utf8')) as { engines: { node: string } }
+      expect(pkg.engines.node).toBe(`>=${BUILD_BACKED_NODE_COMPAT_VERSION}.0`)
+    }
+  })
+
   it('uses the Linux pool only for opted-in repository-owned PRs', () => {
     expect(route()).toEqual(labels)
     for (const mode of ['', 'hosted', 'unexpected']) expect(route({ mode })).toBe('ubuntu-latest')
@@ -67,22 +80,21 @@ describe('Node compatibility self-hosted routing', () => {
     expect(route({ repository: '' })).toBe('ubuntu-latest')
   })
 
-  it('preserves all three required version jobs and their concurrency', () => {
+  it('preserves the supported version jobs and their concurrency', () => {
     expect(job.if).toBe("github.event_name == 'pull_request'")
     expect(job.strategy['fail-fast']).toBe(false)
     expect(job.strategy.matrix.include).toEqual([
-      { node: '22.19', name: 'node 22.19', runner: 'ubuntu-latest', gate_concurrency: '1' },
       { node: '24.9', name: 'node 24.9', runner: 'ubuntu-latest', gate_concurrency: '1' },
       { node: 26, name: 'node 26', runner: 'ubuntu-latest', gate_concurrency: '1' },
     ])
     expect(job.env.DSH_GATE_CONCURRENCY).toBe('${{ matrix.gate_concurrency }}')
     expect(job.steps.map(step => step.run)).toContain('pnpm run check:node-compat')
     expect(job.steps.map(step => step.run)).toContain('pnpm exec vitest run packages/boot/app-boot/tests/loader-shape.compat.spec.ts')
-    expect(workflow.jobs['python-sdk']['runs-on']).toBe('ubuntu-latest')
+    expect(pythonWorkflow.jobs['python-sdk']['runs-on']).toBe('ubuntu-latest')
   })
 
   it('isolates version installs and enables hosted package caching only on hosted runners', () => {
-    const setup = job.steps.find(step => step.uses === 'actions/setup-node@v6')!
+    const setup = job.steps.find(step => step.uses === 'actions/setup-node@v7.0.0')!
     expect(setup.env).toEqual({
       NODE_OPTIONS: "${{ runner.environment == 'self-hosted' && '--import=./scripts/ci-compatible-toolcache.mjs' || '' }}",
     })
@@ -96,11 +108,15 @@ describe('Node compatibility self-hosted routing', () => {
       )
     }
     expect(job.steps[0]?.with).toEqual({ 'persist-credentials': false })
-    expect(job.steps.some(step => step.uses?.startsWith('actions/cache/'))).toBe(false)
+    // The verified bubblewrap archive is the one remote cache this job restores
+    // and saves; it must stay excluded from the persistent self-hosted pool.
+    const remoteCaches = job.steps.filter(step => step.uses?.startsWith('actions/cache/'))
+    expect(remoteCaches.length).toBeGreaterThan(0)
+    for (const step of remoteCaches) expect(step.if).toContain("vars.DSH_CI_FAILOVER_LINUX != 'selfhosted'")
   })
 
   it('overrides runner exports inside setup-node without affecting later Node processes', () => {
-    const setup = job.steps.find(step => step.uses === 'actions/setup-node@v6')!
+    const setup = job.steps.find(step => step.uses === 'actions/setup-node@v7.0.0')!
     const nodeOptions = evaluate(setup.env!.NODE_OPTIONS!, { runner: { environment: 'self-hosted' } }) as string
     const root = mkdtempSync(join(tmpdir(), 'ci-compatible preload-'))
     try {
@@ -150,7 +166,7 @@ describe('Node compatibility self-hosted routing', () => {
     const index = job.steps.findIndex(step => step.name === 'Isolate compatibility caches')
     const step = job.steps[index]!
     expect(index).toBeGreaterThan(0)
-    expect(index).toBeLessThan(job.steps.findIndex(candidate => candidate.uses === 'pnpm/action-setup@v4'))
+    expect(index).toBeLessThan(job.steps.findIndex(candidate => candidate.uses === 'pnpm/action-setup@v5.0.0'))
     expect(step.if).toBe("runner.environment == 'self-hosted'")
     const root = mkdtempSync(join(tmpdir(), 'ci-compatible-selfhosted-'))
     try {

@@ -20,9 +20,9 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
      */
     'settings/conflict': { readonly ns: string; readonly expected: number; readonly actual: number }
     /**
-     * The provider refused a valid credential write, for example because a
-     * read-only source shadows the reference. The details name only the
-     * reference, never the value.
+     * The provider refused a valid credential write, for example because the
+     * stored document no longer parses. The details name only the reference,
+     * never the value.
      */
     'credential/rejected': { readonly ref: string }
   }
@@ -32,8 +32,3 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
 export interface SettingsDocumentOpenValue {
   readonly opened: true
 }
-
-/** Result of opening or revealing one locally authored Agent preset directory. */
-export type AgentPresetDirectoryOpenValue =
-  | { readonly opened: true }
-  | { readonly opened: false; readonly path: string }

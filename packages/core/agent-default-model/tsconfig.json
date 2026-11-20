@@ -9,6 +9,9 @@
   ],
   "references": [
     {
+      "path": "../../util/brand"
+    },
+    {
       "path": "../../../vendor/cordis"
     },
     {
@@ -19,6 +22,9 @@
     },
     {
       "path": "../../llm/llm"
+    },
+    {
+      "path": "../../boot/config-editor"
     },
     {
       "path": "../../settings/settings"

@@ -314,8 +314,8 @@ export class LocalPtySession implements TerminalBackendSession {
     try {
       const operation = this.startSend({ text: '', submit: false, ...signal !== undefined ? { signal } : {} })
       const result = await operation.done
-      if (result.waitReason === 'session_exit') throw new Error('PTY shell exited during startup')
-      if (result.waitReason === 'timeout') throw new Error('PTY shell did not reach readiness before startup timeout')
+      if (result.waitReason === 'session_exit') throw new TerminalError('PTY shell exited during startup', 'STARTUP_EXITED')
+      if (result.waitReason === 'timeout') throw new TerminalError('PTY shell did not reach readiness before startup timeout', 'STARTUP_TIMEOUT')
       this.motd = result.viewport
     } catch (error: unknown) {
       signal?.throwIfAborted()
@@ -326,8 +326,8 @@ export class LocalPtySession implements TerminalBackendSession {
   }
 
   startSend(request: TerminalSendRequest): TerminalSendOperation {
-    if (this.closing) throw new Error('PTY session is closing')
-    if (this.statusValue.kind === 'exited') throw new Error('PTY session has exited')
+    if (this.closing) throw new TerminalError('PTY session is closing', 'SESSION_CLOSING')
+    if (this.statusValue.kind === 'exited') throw new TerminalError('PTY session has exited', 'SESSION_EXITED')
     if (this.active !== undefined) {
       const draining = this.activeWrite !== undefined
         ? ' or draining provider write'
@@ -336,7 +336,12 @@ export class LocalPtySession implements TerminalBackendSession {
           : ''
       throw new TerminalError(`PTY session already has an active send${draining}`, 'SEND_ACTIVE')
     }
-    if (request.signal?.aborted === true) throw new Error('PTY send aborted before write')
+    if (request.signal?.aborted === true) {
+      // Named as a cancellation so the tool registry classifies it as the caller's abort.
+      const aborted = new Error('PTY send aborted before write')
+      aborted.name = 'AbortError'
+      throw aborted
+    }
 
     const operation = new LocalSendOperation(
       this.config.maxReadBytes,
@@ -452,7 +457,7 @@ export class LocalPtySession implements TerminalBackendSession {
   }
 
   async signal(signal: TerminalSignal): Promise<TerminalSignalResult> {
-    if (this.closing) throw new Error('PTY session is closing')
+    if (this.closing) throw new TerminalError('PTY session is closing', 'SESSION_CLOSING')
     const targetPgid = await this.terminal.signalForeground(signal)
     return { delivered: true, targetPgid }
   }
@@ -584,7 +589,15 @@ export class LocalPtySession implements TerminalBackendSession {
       // on waiting for shell ownership instead of letting a child marker suppress
       // readiness until the absolute timeout.
       const handoffGrace = this.promptSeen ? this.config.handoffGraceMs : 0
-      if (startupHasOutput && idleFor >= this.config.idleSilenceMs + handoffGrace) {
+      // A seen marker whose printable tail has not arrived yet is the prompt function's own
+      // evidence that the shell reached its prompt: the tail is written by the same render, so
+      // its absence within the bound is a delivery delay rather than an absent prompt. The
+      // configured tolerance holds the send on the exact path for that state alone: a tail that
+      // arrived and was then invalidated by later output can no longer complete, so it keeps the
+      // plain bound. Zero leaves the bound at `idleSilenceMs + handoffGraceMs`.
+      const tailPending = this.promptSeen && !this.promptTextSeen && CONTROLLED_PROMPT.startsWith(this.promptTail)
+      const tailGrace = tailPending ? this.config.promptTailGraceMs : 0
+      if (startupHasOutput && idleFor >= this.config.idleSilenceMs + handoffGrace + tailGrace) {
         this.settleActive('inferred_idle')
       }
     } catch (error: unknown) {

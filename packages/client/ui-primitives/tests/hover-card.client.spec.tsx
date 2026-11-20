@@ -1,12 +1,15 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { HoverCard } from '@deepseek-ai/dsh-client-ui-primitives'
+import { HoverCard, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 import { POINTER_GRACE_MS } from '../src/pointer-grace.ts'
 
 afterEach(cleanup)
-beforeEach(() => { vi.useFakeTimers() })
-afterEach(() => { vi.useRealTimers() })
+beforeEach(() => {
+  vi.useFakeTimers()
+  vi.stubGlobal('matchMedia', (query: string) => ({ matches: query === '(any-hover: hover)' }))
+})
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
 
 /** Anchor wrapper rect: the card positions from this (jsdom rects are all-zero by default). */
 function stubAnchorRect(anchor: HTMLElement, rect: { top: number; right: number }): void {
@@ -18,6 +21,8 @@ function stubAnchorRect(anchor: HTMLElement, rect: { top: number; right: number 
 }
 
 function mount(props: {
+  widthAnchorRef?: { current: HTMLElement | null }
+  variant?: 'compact' | 'preview'
   openDelayMs?: number
   disabled?: boolean
   copyText?: string
@@ -52,17 +57,203 @@ function installClipboard(writeText: (text: string) => Promise<void>): () => voi
 }
 
 describe('HoverCard', () => {
-  it('opens after the dwell delay, positioned right of the anchor', () => {
+  it.each([false, true])('opens mouse previews only when a pointer can hover: %s', (canHover) => {
+    vi.stubGlobal('matchMedia', () => ({ matches: canHover }))
     const { wrapper } = mount()
+    const event = new Event('pointerover', { bubbles: true })
+    Object.defineProperty(event, 'pointerType', { value: 'mouse' })
+    fireEvent(wrapper, event)
+    act(() => { vi.advanceTimersByTime(1000) })
+    expect(screen.queryByText('card body') !== null).toBe(canHover)
+  })
+
+  it.each(['compact', 'preview'] as const)('does not open a %s card when a touch enters the anchor', (variant) => {
+    const { wrapper } = mount({ variant })
+    const event = new Event('pointerover', { bubbles: true })
+    Object.defineProperty(event, 'pointerType', { value: 'touch' })
+    fireEvent(wrapper, event)
+    act(() => { vi.advanceTimersByTime(1000) })
+    expect(screen.queryByText('card body')).toBeNull()
+    fireEvent.pointerEnter(wrapper)
+    act(() => { vi.advanceTimersByTime(500) })
+    expect(screen.getByText('card body')).toBeTruthy()
+  })
+
+  it.each(['disabled', 'unmounted'] as const)('keeps its preview mounted while a nested tooltip shows and is then %s', (released) => {
+    const markup = (state: 'active' | 'disabled' | 'unmounted') => (
+      <HoverCard
+        anchor={<div>row{state !== 'unmounted' && (
+          <Tooltip label="Create" disabled={state === 'disabled'}><button type="button">action</button></Tooltip>
+        )}</div>}
+        content={<div>card body</div>}
+        copyLabel="Copy"
+        copiedLabel="Copied"
+      />
+    )
+    const view = render(markup('active'))
+    fireEvent.pointerEnter(screen.getByText('row').parentElement as HTMLElement)
+    act(() => { vi.advanceTimersByTime(500) })
+    fireEvent.pointerEnter(screen.getByRole('button', { name: 'action' }))
+    expect(screen.getByRole('tooltip').textContent).toBe('Create')
+    const card = screen.getByText('card body')
+    expect(card.isConnected).toBe(true)
+
+    view.rerender(markup(released))
+    expect(screen.queryByRole('tooltip')).toBeNull()
+    expect(screen.getByText('card body')).toBe(card)
+  })
+
+  it('keeps card content mounted while its own tooltip is visible', () => {
+    render(<HoverCard
+      anchor={<span>row</span>}
+      content={<div>card body<Tooltip label="Details"><button type="button">card action</button></Tooltip></div>}
+      copyLabel="Copy"
+      copiedLabel="Copied"
+    />)
+    fireEvent.pointerEnter(screen.getByText('row').parentElement as HTMLElement)
+    act(() => { vi.advanceTimersByTime(500) })
+    const card = screen.getByText('card body')
+    fireEvent.pointerEnter(screen.getByRole('button', { name: 'card action' }))
+    expect(card.isConnected).toBe(true)
+    expect(screen.getByRole('tooltip').textContent).toBe('Details')
+    act(() => { vi.advanceTimersByTime(1000) })
+    expect(card.isConnected).toBe(true)
+    expect(screen.getByRole('tooltip').textContent).toBe('Details')
+  })
+
+  it.each(['inert', 'hidden'])('dismisses a portal when its retained anchor ancestor becomes %s', async (attribute) => {
+    const view = render(<section><HoverCard anchor={<span>row</span>} content={<div>card body</div>} /></section>)
+    const row = screen.getByText('row')
+    const wrapper = row.parentElement!
+    fireEvent.pointerEnter(wrapper)
+    act(() => { vi.advanceTimersByTime(500) })
+    expect(screen.getByText('card body')).toBeTruthy()
+    await act(async () => { view.container.firstElementChild!.setAttribute(attribute, '') })
+    expect(screen.queryByText('card body')).toBeNull()
+    expect(screen.getByText('row')).toBe(row)
+    view.container.firstElementChild!.removeAttribute(attribute)
+    fireEvent.pointerEnter(wrapper)
+    act(() => { vi.advanceTimersByTime(500) })
+    expect(screen.getByText('card body')).toBeTruthy()
+  })
+
+  it('opens after the dwell delay, anchored to its wrapper by name for the stylesheet to place', () => {
+    const { wrapper } = mount()
+    expect(wrapper.style.anchorName).toBe('')
     fireEvent.pointerEnter(wrapper)
     expect(screen.queryByText('card body')).toBeNull()
     act(() => { vi.advanceTimersByTime(499) })
     expect(screen.queryByText('card body')).toBeNull()
     act(() => { vi.advanceTimersByTime(1) })
     const card = screen.getByText('card body').parentElement as HTMLElement
-    expect(card.parentElement).toBe(document.body)
-    expect(card.style.left).toBe('208px')
-    expect(card.style.top).toBe('40px')
+    expect(card.parentElement?.parentElement).toBe(document.body)
+    // The stylesheet places a compact card against the named anchor, so the script gives it no coordinates.
+    expect(wrapper.style.anchorName).toMatch(/^--dsh-hover-card-/)
+    expect(card.style.positionAnchor).toBe(wrapper.style.anchorName)
+    expect([card.style.left, card.style.top]).toEqual(['', ''])
+    // The name lasts as long as the card.
+    fireEvent.pointerLeave(wrapper)
+    act(() => { vi.advanceTimersByTime(POINTER_GRACE_MS) })
+    expect(wrapper.style.anchorName).toBe('')
+  })
+
+  it('gives each compact card its own anchor name', () => {
+    render(
+      <>
+        <HoverCard anchor={<span>first</span>} content={<div>first body</div>} />
+        <HoverCard anchor={<span>second</span>} content={<div>second body</div>} />
+      </>,
+    )
+    const wrappers = ['first', 'second'].map(text => screen.getByText(text).parentElement as HTMLElement)
+    for (const wrapper of wrappers) fireEvent.pointerEnter(wrapper)
+    act(() => { vi.advanceTimersByTime(500) })
+    const names = wrappers.map(wrapper => wrapper.style.anchorName)
+    expect(new Set(names).size).toBe(2)
+    expect(['first body', 'second body'].map(text => (screen.getByText(text).parentElement as HTMLElement).style.positionAnchor)).toEqual(names)
+  })
+
+  it('insets a preview by 24px on each side and follows anchor resizing', () => {
+    const { wrapper } = mount({ variant: 'preview' })
+    wrapper.getBoundingClientRect = () => DOMRect.fromRect({ x: 100, y: 600, width: 600, height: 32 })
+    fireEvent.pointerEnter(wrapper)
+    act(() => { vi.advanceTimersByTime(500) })
+    const card = screen.getByText('card body').parentElement as HTMLElement
+    expect(card.style.width).toBe('552px')
+    expect(card.style.left).toBe('124px')
+    expect(card.style.maxHeight).toBe('420px')
+    wrapper.getBoundingClientRect = () => DOMRect.fromRect({ x: 100, y: 600, width: 400, height: 32 })
+    fireEvent(window, new Event('resize'))
+    expect(card.style.width).toBe('352px')
+    fireEvent.keyDown(wrapper, { key: 'Escape' })
+    act(() => { vi.advanceTimersByTime(100) })
+    expect(screen.queryByText('card body')).toBeNull()
+  })
+
+  it('places previews below rows near the top and dismisses without anchor focus', () => {
+    const { wrapper } = mount({ variant: 'preview' })
+    fireEvent.pointerEnter(wrapper)
+    act(() => { vi.advanceTimersByTime(500) })
+    const card = screen.getByText('card body').parentElement as HTMLElement
+    expect(card.style.top).toBe('82px')
+    expect(card.style.maxHeight).toBe('420px')
+    fireEvent.keyDown(document.body, { key: 'a' })
+    expect(screen.queryByText('card body')).not.toBeNull()
+    fireEvent.keyDown(document.body, { key: 'Escape' })
+    act(() => { vi.advanceTimersByTime(100) })
+    expect(screen.queryByText('card body')).toBeNull()
+  })
+
+  it('observes preview and container sizes until dismissal', () => {
+    let resize = () => {}
+    const observe = vi.fn()
+    const disconnect = vi.fn()
+    vi.stubGlobal('ResizeObserver', class {
+      constructor(callback: () => void) { resize = callback }
+      observe = observe
+      disconnect = disconnect
+    })
+    const container = document.createElement('div')
+    container.getBoundingClientRect = () => DOMRect.fromRect({ x: 10, width: 700 })
+    const { wrapper, view } = mount({ variant: 'preview', widthAnchorRef: { current: container } })
+    fireEvent.pointerEnter(wrapper)
+    act(() => { vi.advanceTimersByTime(500) })
+    const card = screen.getByText('card body').parentElement as HTMLElement
+    expect(observe).toHaveBeenCalledWith(card)
+    expect(observe).toHaveBeenCalledWith(container)
+    expect(card.style.width).toBe('652px')
+    expect(card.style.left).toBe('34px')
+    container.getBoundingClientRect = () => DOMRect.fromRect({ x: 10, width: 500 })
+    act(() => { resize() })
+    expect(card.style.width).toBe('452px')
+    const previousDisconnects = disconnect.mock.calls.length
+    view.unmount()
+    expect(disconnect.mock.calls.length).toBe(previousDisconnects + 1)
+  })
+
+  it('retains a dismissing preview for 100ms and cancels dismissal on re-entry', () => {
+    const { wrapper, view } = mount({ variant: 'preview' })
+    fireEvent.pointerEnter(wrapper)
+    act(() => { vi.advanceTimersByTime(500) })
+    const card = screen.getByText('card body').parentElement as HTMLElement
+    fireEvent.pointerLeave(wrapper)
+    act(() => { vi.advanceTimersByTime(POINTER_GRACE_MS) })
+    expect(card.hasAttribute('data-closing')).toBe(true)
+    act(() => { vi.advanceTimersByTime(99) })
+    expect(screen.queryByText('card body')).not.toBeNull()
+    fireEvent.pointerEnter(wrapper)
+    expect(card.hasAttribute('data-closing')).toBe(false)
+    act(() => { vi.advanceTimersByTime(100) })
+    expect(screen.queryByText('card body')).not.toBeNull()
+    fireEvent.keyDown(document.body, { key: 'Escape' })
+    act(() => { vi.advanceTimersByTime(100) })
+    expect(screen.queryByText('card body')).toBeNull()
+    fireEvent.pointerDown(wrapper)
+    expect(vi.getTimerCount()).toBe(0)
+    fireEvent.pointerEnter(wrapper)
+    act(() => { vi.advanceTimersByTime(500) })
+    fireEvent.keyDown(document.body, { key: 'Escape' })
+    view.unmount()
+    expect(vi.getTimerCount()).toBe(0)
   })
 
   it('honors a custom openDelayMs', () => {
@@ -70,6 +261,49 @@ describe('HoverCard', () => {
     fireEvent.pointerEnter(wrapper)
     act(() => { vi.advanceTimersByTime(50) })
     expect(screen.getByText('card body')).toBeTruthy()
+  })
+
+  it('dismisses on keyboard clicks and cancels a pending hover', () => {
+    const { anchor, wrapper } = mount({ variant: 'preview' })
+    fireEvent.pointerEnter(wrapper)
+    act(() => { vi.advanceTimersByTime(499) })
+    fireEvent.click(anchor, { detail: 0 })
+    act(() => { vi.advanceTimersByTime(1) })
+    expect(screen.queryByText('card body')).toBeNull()
+    fireEvent.pointerEnter(wrapper)
+    act(() => { vi.advanceTimersByTime(500) })
+    fireEvent.click(screen.getByText('card body'))
+    expect(screen.getByText('card body').parentElement?.hasAttribute('data-closing')).toBe(false)
+    fireEvent.click(anchor, { detail: 0 })
+    expect(screen.getByText('card body').parentElement?.hasAttribute('data-closing')).toBe(true)
+    act(() => { vi.advanceTimersByTime(100) })
+    expect(screen.queryByText('card body')).toBeNull()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('keeps previews clear of the frame top strip except below an anchor inside it', () => {
+    const prior = document.documentElement.style.getPropertyValue('--dsh-frame-top-clearance')
+    const priority = document.documentElement.style.getPropertyPriority('--dsh-frame-top-clearance')
+    document.documentElement.style.setProperty('--dsh-frame-top-clearance', '100px')
+    try {
+      const { wrapper } = mount({ variant: 'preview' })
+      wrapper.getBoundingClientRect = () => DOMRect.fromRect({ x: 100, y: 600, width: 600, height: 32 })
+      fireEvent.pointerEnter(wrapper)
+      act(() => { vi.advanceTimersByTime(500) })
+      const card = screen.getByText('card body').parentElement as HTMLElement
+      Object.defineProperty(card, 'offsetHeight', { configurable: true, value: 420 })
+      wrapper.getBoundingClientRect = () => DOMRect.fromRect({ x: 100, y: 450, width: 600, height: 32 })
+      fireEvent(window, new Event('resize'))
+      expect(card.style.top).toBe('120px')
+      expect(card.style.maxHeight).toBe('322px')
+      // An anchor inside the top strip keeps its preview directly below it.
+      wrapper.getBoundingClientRect = () => DOMRect.fromRect({ x: 100, y: 10, width: 600, height: 32 })
+      fireEvent(window, new Event('resize'))
+      expect(card.style.top).toBe('50px')
+    } finally {
+      if (prior === '') document.documentElement.style.removeProperty('--dsh-frame-top-clearance')
+      else document.documentElement.style.setProperty('--dsh-frame-top-clearance', prior, priority)
+    }
   })
 
   it('pointerleave before the delay cancels the pending open', () => {
@@ -388,46 +622,18 @@ describe('HoverCard', () => {
     expect(screen.queryByText('card body')).toBeNull()
   })
 
-  it('corrects the bottom-edge clamp once the mounted card height is measurable', () => {
-    // First placement reads height 0 (card not yet mounted) and keeps the
-    // anchor top; the post-mount correction re-clamps with the real height.
-    window.innerHeight = 300
-    const offsetHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetHeight')!
-    Object.defineProperty(HTMLElement.prototype, 'offsetHeight', { configurable: true, get: () => 120 })
-    try {
-      const { wrapper } = mount()
-      stubAnchorRect(screen.getByText('row'), { top: 280, right: 200 })
-      fireEvent.pointerEnter(wrapper)
-      act(() => { vi.advanceTimersByTime(500) })
-      const card = screen.getByText('card body').parentElement as HTMLElement
-      // 300 - 120 - 8 = 172, instead of the anchor top 280.
-      expect(card.style.top).toBe('172px')
-    } finally {
-      Object.defineProperty(HTMLElement.prototype, 'offsetHeight', offsetHeight)
-    }
-  })
-
-  it('clamps inside placement itself when the card is already measured (resize path)', () => {
-    window.innerHeight = 300
+  it('measures nothing for a compact card: not at open, on scroll, or on resize', () => {
     const { wrapper } = mount()
-    stubAnchorRect(screen.getByText('row'), { top: 280, right: 200 })
+    const rect = vi.spyOn(wrapper, 'getBoundingClientRect')
+    const listen = vi.spyOn(window, 'addEventListener')
     fireEvent.pointerEnter(wrapper)
     act(() => { vi.advanceTimersByTime(500) })
     const card = screen.getByText('card body').parentElement as HTMLElement
-    Object.defineProperty(card, 'offsetHeight', { value: 120 })
-    act(() => { fireEvent.resize(window) })
-    expect(card.style.top).toBe('172px')
-  })
-
-  it('repositions on capture-phase scroll while open and stops listening after close', () => {
-    const { wrapper } = mount()
-    fireEvent.pointerEnter(wrapper)
-    act(() => { vi.advanceTimersByTime(500) })
-    stubAnchorRect(screen.getByText('row'), { top: 90, right: 300 })
     act(() => { fireEvent.scroll(document) })
-    const card = screen.getByText('card body').parentElement as HTMLElement
-    expect(card.style.left).toBe('308px')
-    expect(card.style.top).toBe('90px')
+    act(() => { fireEvent.resize(window) })
+    expect(rect).not.toHaveBeenCalled()
+    expect(listen.mock.calls.map(([type]) => type).filter(type => type === 'scroll' || type === 'resize')).toEqual([])
+    expect([card.style.left, card.style.top]).toEqual(['', ''])
     fireEvent.pointerLeave(wrapper)
     act(() => { vi.advanceTimersByTime(POINTER_GRACE_MS) })
     expect(screen.queryByText('card body')).toBeNull()
@@ -440,4 +646,77 @@ describe('HoverCard', () => {
     act(() => { vi.advanceTimersByTime(1000) })
     expect(screen.queryByText('card body')).toBeNull()
   })
+})
+
+it('opens inline previews only for keyboard focus and closes when focus leaves the anchor', () => {
+  vi.stubGlobal('matchMedia', () => ({ matches: false }))
+  const anchor = <><button>first</button><button>second</button></>
+  const view = render(<HoverCard inline anchor={anchor} content={<span>thumbnail</span>} />)
+  const first = screen.getByRole('button', { name: 'first' })
+  const second = screen.getByRole('button', { name: 'second' })
+  const matches = vi.spyOn(first, 'matches').mockReturnValue(false)
+  fireEvent.focus(first)
+  expect(screen.queryByText('thumbnail')).toBeNull()
+  matches.mockReturnValue(true)
+  fireEvent.focus(first)
+  expect(screen.getByText('thumbnail')).toBeTruthy()
+  fireEvent.blur(first, { relatedTarget: second })
+  expect(screen.getByText('thumbnail')).toBeTruthy()
+  fireEvent.blur(second, { relatedTarget: document.body })
+  expect(screen.queryByText('thumbnail')).toBeNull()
+  view.rerender(<HoverCard inline disabled anchor={anchor} content={<span>thumbnail</span>} />)
+  fireEvent.focus(first)
+  expect(screen.queryByText('thumbnail')).toBeNull()
+  matches.mockRestore()
+})
+
+it('dismisses an inline hover without anchor focus and lets the next Escape reach the owner', () => {
+  const ownerKey = vi.fn()
+  render(<div onKeyDown={ownerKey}>
+    <button>outside</button>
+    <HoverCard inline anchor={<button>image link</button>} content={<span>thumbnail</span>} />
+  </div>)
+  const outside = screen.getByRole('button', { name: 'outside' })
+  outside.focus()
+  const wrapper = screen.getByRole('button', { name: 'image link' }).parentElement!
+  // jsdom lacks PointerEvent; preserve its pointerType through a regular DOM event.
+  const touch = new Event('pointerover', { bubbles: true })
+  Object.defineProperty(touch, 'pointerType', { value: 'touch' })
+  fireEvent(wrapper, touch)
+  act(() => { vi.advanceTimersByTime(500) })
+  expect(screen.queryByText('thumbnail')).toBeNull()
+  fireEvent.pointerEnter(wrapper)
+  act(() => { vi.advanceTimersByTime(500) })
+  expect(document.activeElement).toBe(outside)
+  fireEvent.keyDown(outside, { key: 'a' })
+  expect(screen.getByText('thumbnail')).toBeTruthy()
+  ownerKey.mockClear()
+  fireEvent.keyDown(outside, { key: 'Escape' })
+  expect(screen.queryByText('thumbnail')).toBeNull()
+  expect(ownerKey).not.toHaveBeenCalled()
+  fireEvent.keyDown(outside, { key: 'Escape' })
+  expect(ownerKey).toHaveBeenCalledOnce()
+})
+
+it('flips inline media above a bottom link and constrains it without covering the anchor', () => {
+  render(<HoverCard inline anchor={<button>image link</button>} content={<span>thumbnail</span>} />)
+  const wrapper = screen.getByRole('button').parentElement!
+  wrapper.getBoundingClientRect = () => DOMRect.fromRect({ x: window.innerWidth - 100, y: window.innerHeight - 60, width: 80, height: 24 })
+  fireEvent.pointerEnter(wrapper)
+  act(() => { vi.advanceTimersByTime(500) })
+  const card = screen.getByText('thumbnail').parentElement!
+  Object.defineProperty(card, 'offsetHeight', { configurable: true, value: 28 })
+  Object.defineProperty(card, 'scrollHeight', { configurable: true, value: 220 })
+  fireEvent.resize(window)
+  expect(Number.parseFloat(card.style.top) + 220).toBe(window.innerHeight - 68)
+  expect(Number.parseFloat(card.style.left) + Number.parseFloat(card.style.width)).toBe(window.innerWidth - 8)
+  // Neither side fits: constrain the larger side and keep the link unobstructed.
+  Object.defineProperty(card, 'offsetHeight', { configurable: true, value: 1000 })
+  fireEvent.resize(window)
+  expect(card.style.top).toBe('8px')
+  expect(Number.parseFloat(card.style.maxHeight)).toBe(window.innerHeight - 76)
+  wrapper.getBoundingClientRect = () => DOMRect.fromRect({ x: 30, y: 10, width: 80, height: 24 })
+  fireEvent.resize(window)
+  expect(card.style.top).toBe('42px')
+  expect(Number.parseFloat(card.style.maxHeight)).toBe(window.innerHeight - 50)
 })

@@ -1,31 +1,32 @@
 /** Application-owned profiles share the named profile launch lifecycle. */
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { createLaunchEnvironmentSnapshot } from '@deepseek-ai/dsh-launch-environment'
 import {
-  boot, composeEntries, createProfileResolutionGeneration, healIsolatedProfileModuleFallback,
+  boot, composeEntries, createRuntimeResolution,
   PluginPackages, type Profile,
 } from '@deepseek-ai/dsh-app-boot'
 import { installProxyFromEnvironment } from '@deepseek-ai/dsh-http-proxy'
-import { afterEach, describe, expect, it, vi } from 'vitest'
-import { runProfile } from '../src/profile-boot.ts'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { runProfile, userAgentProfile } from '../src/profile-boot.ts'
 
 vi.mock('@deepseek-ai/dsh-app-boot', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@deepseek-ai/dsh-app-boot')>()
   return {
     ...actual,
     boot: vi.fn(),
-    createProfileResolutionGeneration: vi.fn(actual.createProfileResolutionGeneration),
-    healIsolatedProfileModuleFallback: vi.fn(actual.healIsolatedProfileModuleFallback),
+    createRuntimeResolution: vi.fn(actual.createRuntimeResolution),
     installFailLoud: vi.fn(),
   }
 })
 vi.mock('@deepseek-ai/dsh-http-proxy', () => ({ installProxyFromEnvironment: vi.fn() }))
 
 const homes: string[] = []
+// runProfile writes the suffix into process.env; stubbing first lets afterEach restore it.
+beforeEach(() => { vi.stubEnv('DSH_USER_AGENT_SUFFIX', undefined) })
 afterEach(() => {
   vi.restoreAllMocks()
   vi.unstubAllEnvs()
@@ -35,10 +36,8 @@ afterEach(() => {
 
 describe('runProfile with an application-owned profile', () => {
   it.each(
-    (['link', 'runtime'] as const).flatMap(resolutionMode =>
-      (['composition', 'boot', 'watch', 'cleanup', 'tree-cleanup', 'both-cleanups'] as const)
-        .map(stage => ({ resolutionMode, stage }))),
-  )('releases startup resources after a $stage failure in $resolutionMode mode', async ({ resolutionMode, stage }) => {
+    ['composition', 'boot', 'watch', 'cleanup', 'tree-cleanup', 'both-cleanups'] as const,
+  )('releases startup resources after a %s failure', async (stage) => {
     const home = mkdtempSync(join(tmpdir(), 'dsh-profile-startup-failure-'))
     homes.push(home)
     mkdirSync(join(home, 'runtime'))
@@ -62,15 +61,14 @@ describe('runProfile with an application-owned profile', () => {
       await setup?.(ctx)
       throw failure
     })
-    if (stage === 'composition') vi.mocked(createProfileResolutionGeneration).mockRejectedValueOnce(failure)
-    const profile: Profile = {
+    if (stage === 'composition') vi.mocked(createRuntimeResolution).mockRejectedValueOnce(failure)
+    const profile: Profile = { skippedBundles: [],
       name: 'desktop', dir: home, patchPath: join(home, 'cordis.patch.yml'),
       patches: [], layers: [],
     }
     try {
       const application = runProfile({
         environment: createLaunchEnvironmentSnapshot([]), profile: 'desktop', patchFiles: [], args: ['--no-open'],
-        resolutionMode,
         resolvedProfile: { profile, installAnchor: join(home, 'runtime/package.json') },
       })
       if (stage === 'both-cleanups') {
@@ -90,12 +88,7 @@ describe('runProfile with an application-owned profile', () => {
     }
   })
 
-  it.each([
-    { selection: 'default', options: {}, mode: 'runtime' },
-    { selection: 'link', options: { resolutionMode: 'link' }, mode: 'link' },
-    { selection: 'dual', options: { resolutionMode: 'dual' }, mode: 'dual' },
-    { selection: 'runtime', options: { resolutionMode: 'runtime' }, mode: 'runtime' },
-  ] as const)('uses shared layers, $selection resolution, and shutdown', async ({ options, mode }) => {
+  it('uses shared layers, runtime resolution, and shutdown', async () => {
     const home = mkdtempSync(join(tmpdir(), 'dsh-resolved-profile-'))
     homes.push(home)
     mkdirSync(join(home, 'runtime'))
@@ -130,11 +123,11 @@ describe('runProfile with an application-owned profile', () => {
     writeFileSync(profilePatch, '- id: target\n  config: { profile: true, priority: profile }\n')
     writeFileSync(overlay, '- id: target\n  config: { overlay: true, priority: overlay }\n')
     writeFileSync(join(home, 'cordis.yml'), '- id: stale\n')
-    const profile: Profile = {
+    const profile: Profile = { skippedBundles: [],
       name: 'desktop', dir: home, patchPath: profilePatch,
       patches: [{ id: 'target', config: { profile: true, priority: 'profile' } }],
       layers: [{
-        packageName: 'test-bundle', packageDir: home, patchPath: join(home, 'bundle.yml'),
+        packageName: 'test-bundle', packageDir: home, patchPaths: [join(home, 'bundle.yml')],
         patches: [{ insert: [
           { id: 'target', name: 'target', config: { bundle: true, priority: 'bundle' } },
           { id: 'session-telemetry-otel', name: 'telemetry' },
@@ -145,25 +138,14 @@ describe('runProfile with an application-owned profile', () => {
     const runtime = { profile, installAnchor: join(home, 'runtime/package.json') }
     try {
       const { shutdown } = await runProfile({
-        environment, profile: 'desktop', resolvedProfile: runtime, ...options,
-        patchFiles: [overlay], args: ['--port', '0', '--no-open'],
+        environment, profile: 'desktop', resolvedProfile: runtime,
+        patchFiles: [relative(process.cwd(), overlay)], args: ['--port', '0', '--no-open'],
       })
       expect(installProxyFromEnvironment).toHaveBeenCalledWith(environment, expect.any(Function))
-      if (mode !== 'runtime') {
-        expect(healIsolatedProfileModuleFallback).toHaveBeenCalledWith({ profile, installAnchor: runtime.installAnchor })
-      } else {
-        expect(healIsolatedProfileModuleFallback).not.toHaveBeenCalled()
-      }
-      const generation = vi.mocked(createProfileResolutionGeneration).mock.settledResults
+      const resolution = vi.mocked(createRuntimeResolution).mock.settledResults
         .find(result => result.type === 'fulfilled')?.value
-      expect(generation?.profileDir).toBe(home)
-      expect(plugin).toHaveBeenCalledWith(PluginPackages, mode === 'link' ? {} : {
-        generation,
-        behavior: mode === 'dual' ? 'verify' : 'enforce',
-      })
-      expect(existsSync(join(home, 'profiles/node_modules'))).toBe(false)
-      expect(existsSync(join(home, '.dsh-module-fallback'))).toBe(mode !== 'runtime')
-      expect(existsSync(join(home, 'node_modules/test-runtime'))).toBe(mode !== 'runtime')
+      expect(resolution?.profileDir).toBe(home)
+      expect(plugin).toHaveBeenCalledWith(PluginPackages, { resolution })
       expect(lstatSync(localPackageDir).isDirectory()).toBe(true)
       expect(readFileSync(join(localPackageDir, 'package.json'), 'utf8')).toBe(localManifest)
       const requireFromProfile = createRequire(join(home, 'package.json'))
@@ -183,7 +165,9 @@ describe('runProfile with an application-owned profile', () => {
       ])
       expect(rows.find(row => row.id === 'target')?.config).toEqual({ overlay: true, priority: 'overlay' })
       expect(rows.find(row => row.id === 'session-telemetry-otel')?.disabled).toBe(true)
-      expect(ctx.profileContext).toMatchObject({ dir: home, patchPath: profilePatch, installAnchor: runtime.installAnchor })
+      expect(ctx.profileContext).toMatchObject({
+        dir: home, patchPath: profilePatch, installAnchor: runtime.installAnchor, overlayPaths: [overlay],
+      })
       await shutdown.shutdown(0)
       expect(dispose).toHaveBeenCalledOnce()
       expect(disposeProxy).toHaveBeenCalledOnce()
@@ -191,5 +175,42 @@ describe('runProfile with an application-owned profile', () => {
       await ctx.fiber.dispose()
       process.exitCode = oldExitCode
     }
+  })
+})
+
+describe('profile User-Agent suffix', () => {
+  it.each([
+    ['web', 'web'],
+    ['sdk-minimal', 'sdk-minimal'],
+    ['my web/v2', 'my%20web%2Fv2'],
+    ['工作', '%E5%B7%A5%E4%BD%9C'],
+    ['a(b)%', 'a%28b%29%25'],
+  ])('encodes %j as %j', (name, encoded) => {
+    expect(userAgentProfile(name)).toBe(encoded)
+  })
+
+  it('names the profile before any plugin loads', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-profile-user-agent-'))
+    homes.push(home)
+    mkdirSync(join(home, 'runtime'))
+    writeFileSync(join(home, 'runtime/package.json'), '{"name":"test-runtime","version":"1.0.0"}')
+    writeFileSync(join(home, 'package.json'), '{"name":"test-bundle","version":"1.0.0"}')
+    vi.stubEnv('DSH_HOME', home)
+    vi.spyOn(process, 'on').mockReturnValue(process)
+    vi.mocked(installProxyFromEnvironment).mockResolvedValue(async () => {})
+    const failure = new Error('stop after observing the environment')
+    let seen: string | undefined
+    vi.mocked(boot).mockImplementation(() => {
+      seen = process.env.DSH_USER_AGENT_SUFFIX
+      return Promise.reject(failure)
+    })
+    const profile: Profile = { skippedBundles: [],
+      name: 'my web', dir: home, patchPath: join(home, 'cordis.patch.yml'), patches: [], layers: [],
+    }
+    await expect(runProfile({
+      environment: createLaunchEnvironmentSnapshot([]), profile: 'my web', patchFiles: [], args: [],
+      resolvedProfile: { profile, installAnchor: join(home, 'runtime/package.json') },
+    })).rejects.toBe(failure)
+    expect(seen).toBe('dsh-profile/my%20web')
   })
 })

@@ -4,6 +4,7 @@ import { FiberState } from '@deepseek-ai/cordis'
 import type { Context, Plugin, RegistryService } from '@deepseek-ai/cordis'
 import type { ClientModuleLoader, ClientModuleLoaderTarget } from '@deepseek-ai/dsh-client-modules/client'
 import { chromium } from 'playwright'
+import { hasExperimentalPackageReference } from '../../../scripts/experimental-package-policy.ts'
 import { expect, it } from 'vitest'
 import { withDefaultWeb } from '../../cli/tests/profiles/web/tests/default-web-process.ts'
 import { newEnglishPage } from './support.ts'
@@ -44,7 +45,7 @@ function experimentalClientReferences(roster: Awaited<ReturnType<typeof readClie
     ...roster.entries.map(entry => entry.name),
     ...roster.plugins.flatMap(plugin => [plugin.owner ?? '', ...plugin.modules]),
     ...roster.modules,
-  ].filter(name => name.startsWith('@deepseek-ai/dsh-experimental-'))
+  ].filter(hasExperimentalPackageReference)
 }
 
 it('activates the actual default Client registry without experimental packages', async (test) => {
@@ -65,19 +66,35 @@ it('activates the actual default Client registry without experimental packages',
             Object.defineProperty(globalThis, '__ModuleLoader__', { configurable: true, writable: true, value: target })
             const create = target.create.bind(target)
             target.create = function (options) {
-              const cordis = options.staticModules['@deepseek-ai/cordis'] as { RegistryService: typeof RegistryService }
-              const prototype = cordis.RegistryService.prototype
+              const cordis = options.staticModules.find(module => module.id === '@deepseek-ai/cordis')
+              if (cordis === undefined) throw new Error('Cordis platform module is missing from the static seed')
+              const forbidRequire = (specifier: string): never => {
+                throw new Error(`Cordis platform adapter unexpectedly requested ${specifier}`)
+              }
+              const require: Parameters<typeof cordis.factory>[0] = Object.assign(forbidRequire, {
+                async: async (specifier: string): Promise<never> => forbidRequire(specifier),
+                asset: forbidRequire,
+              })
+              const Registry = cordis.factory(require).RegistryService
+              if (typeof Registry !== 'function') throw new Error('Cordis platform adapter did not export RegistryService')
+              const prototype = (Registry as typeof RegistryService).prototype
               // eslint-disable-next-line @typescript-eslint/unbound-method -- apply() preserves the runtime registry receiver.
               const plugin = prototype.plugin
               // Capture the first real root and immediately restore the registry method.
               prototype.plugin = function (...args: Parameters<RegistryService['plugin']>) {
                 prototype.plugin = plugin
-                observation.ctx = this.ctx.root
+                // This init script runs in the page, where the test's `Context` import is unavailable.
+                observation.ctx = this.ctx[Symbol.for('cordis.root') as typeof Context.root]
                 return plugin.apply(this, args)
               }
-              const modules = create(options)
-              observation.modules = modules
-              return modules
+              try {
+                const modules = create(options)
+                observation.modules = modules
+                return modules
+              } catch (error) {
+                prototype.plugin = plugin
+                throw error
+              }
             }
           },
         })
@@ -93,7 +110,7 @@ it('activates the actual default Client registry without experimental packages',
       expect(roster.plugins.some(plugin => plugin.modules.includes('@deepseek-ai/dsh-client-ui-layout'))).toBe(true)
       expect(experimentalClientReferences(roster)).toEqual([])
       const contaminatedHost = await request('mount-experimental-entry')
-      const experimentalName = '@deepseek-ai/dsh-experimental-client-ui-agent-team'
+      const experimentalName = '@deepseek-ai/dsh-experimental-client-ui-voice-input'
       expect(contaminatedHost.client.entries.map(entry => entry.id)).toContain(experimentalName)
       await page.reload()
       await expect.poll(async () => {

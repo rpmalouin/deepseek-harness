@@ -1,24 +1,23 @@
-// Session stats under the composer, split into two icon pills: a gauge pill
-// (turn/step counts + output speed) opening the time-and-speed dialog, and a
-// database pill (total tokens + cache hit) opening the token-usage dialog.
-// Settled-node identity prevents stream-delta updates from rerendering the row.
-// Mounted on 'conversation.composer.dock' so it sticks with the composer in the
-// active conversation scrollport (see ConversationRoot data-conversation-scroll).
+// Composer statistics pills, each its own 'conversation.composer.dock' list
+// entry (activity, usage) so a plugin can replace or add one pill by id.
+// Compact keeps speed and cache hit as plain readings; Detailed adds counts,
+// token totals, and click-open dialogs. Settled-node identity prevents
+// stream-delta updates from rerendering the pills.
 
-import { memo, useMemo, useState } from 'react'
+import { memo, useMemo, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import { IconDatabaseOutline16, IconGaugeOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconDatabaseOutlineRegular, IconGaugeOutlineRegular, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { UseProjection } from '@deepseek-ai/dsh-api-session-controller/client'
-import type { SnapshotSelectorHook } from '@deepseek-ai/dsh-client-ui-slots'
+import type { InjectFace, SnapshotSelectorHook } from '@deepseek-ai/dsh-client-ui-slots'
 // Type-only: merges the sessionStats key into SessionProjectionMap for useProjection.
 import type {} from '@deepseek-ai/dsh-session-stats/client'
 import type { TokenUsageProjection } from '@deepseek-ai/dsh-token-meter/client'
-import type { ChatViewSlotProps } from '../contract/slots.ts'
+import type { ChatViewSlotProps, PerformanceUsageInjected } from '../contract/slots.ts'
 import type { ChatSnapshot } from '../contract/snapshot.ts'
 import { formatTokensPerSecond } from './message-chrome.ts'
 import { assistantStepReading } from '../contract/turn-metrics.ts'
 import { formatCacheHitPercent, formatExactTokens, formatTokens } from './token-format.ts'
-import { MEASURE_STYLE, useStatDialog } from './stat-dialog.ts'
+import { useStatDialog } from './stat-dialog.ts'
 import css from './StatsPills.module.css'
 import dialogCss from './stat-dialog.module.css'
 
@@ -120,112 +119,124 @@ export function billedInputTokens(usage: TokenUsageProjection): number {
   return usage.uncachedInputTokens + usage.cacheReadTokens + usage.cacheWriteTokens
 }
 
-/** Props: the conversation-snapshot selector plus the projection read seat. */
-export interface StatsPillsProps {
+type Translate = ChatViewSlotProps['t']
+
+/** Props shared by every composer stats pill: the conversation-snapshot selector plus the projection read seat. */
+export interface StatPillProps extends InjectFace<PerformanceUsageInjected> {
   useChat: SnapshotSelectorHook<ChatSnapshot>
   useProjection: UseProjection
   /** The owning dock's locale seat. */
-  t: ChatViewSlotProps['t']
+  t: Translate
 }
 
-function exactCount(value: number, t: ChatViewSlotProps['t']): string {
+/** Dock entry id carried as `data-composer-stat` on each pill. */
+type StatId = 'activity' | 'usage'
+
+interface PillContent {
+  stat: StatId
+  icon: ReactNode
+  label: ReactNode
+  /** The full reading as plain text: the accessible name and the tooltip shown while the label is cut off. */
+  text: string
+}
+
+function exactCount(value: number, t: Translate): string {
   return t('message.turnUsage.count', { count: formatExactTokens(value, t) })
 }
 
-/** External open state one pill's dialog reads and writes (the row's exclusive slot). */
-type PillDialog = Pick<ReturnType<typeof useStatDialog>, 'open' | 'setOpen'>
+/** One or two reading segments, visually joined by a separator glyph. */
+function reading(first: string, second: string | null): Pick<PillContent, 'label' | 'text'> {
+  if (second === null) return { label: first, text: first }
+  return {
+    label: (
+      <>
+        {first}
+        <span className={css.sep} aria-hidden>·</span>
+        {second}
+      </>
+    ),
+    text: `${first} · ${second}`,
+  }
+}
 
-function TimePill({ stats, t, dialog }: {
-  stats: WindowStats
-  t: ChatViewSlotProps['t']
-  dialog: PillDialog
-}) {
-  const { open, setOpen, rootRef, panelRef, pos } = useStatDialog(dialog)
-  const counts = t('stats.counts', { turns: stats.turns, steps: stats.steps })
-  const tps = stats.decodeMs > 0
-    ? t('message.tokensPerSecond', {
-      tps: formatTokensPerSecond(stats.decodeTokens / (stats.decodeMs / 1_000)),
-    })
-    : null
-  const label = (
-    <span className={css.label}>
-      {counts}
-      {tps !== null && (
-        <>
-          <span className={css.sep} aria-hidden>·</span>
-          {tps}
-        </>
-      )}
+// Every figure rides the durable sessionStats projection, so paging and
+// compaction cannot change any of them; an assembly without the unit falls
+// back to the window-scoped fold wholesale (same field names), paid only
+// while no projection value is served.
+function useSessionStats(useChat: StatPillProps['useChat'], useProjection: UseProjection): WindowStats {
+  const settledNodes = useChat(s => s.legacy.nodes)
+  const projected = useProjection('sessionStats')
+  return useMemo(() => projected ?? deriveStats(settledNodes), [projected, settledNodes])
+}
+
+function decodeSpeed(stats: WindowStats, t: Translate): string {
+  return t('message.tokensPerSecond', {
+    tps: formatTokensPerSecond(stats.decodeTokens / (stats.decodeMs / 1_000)),
+  })
+}
+
+/** The full reading above a pill, only while an ellipsis cuts its label; the delay matches the dock's context meter. */
+const FULL_READING_TOOLTIP = { side: 'top', portal: true, delayMs: 200, onlyWhenClipped: true } as const
+
+/** A static reading: used when the pill has no dialog rows or the mode is Compact. */
+function PlainPill({ stat, icon, label, text }: PillContent) {
+  return (
+    <span className={css.anchor} data-composer-stat={stat}>
+      {/* No dialog carries a static reading, so a tap also pins the full text. */}
+      <Tooltip label={text} {...FULL_READING_TOOLTIP} openOnClick>
+        <span className={css.pill}>
+          {icon}
+          <span className={css.label}>{label}</span>
+        </span>
+      </Tooltip>
     </span>
   )
-  // A window without one timed figure has no dialog rows to show, so the pill
-  // stays a plain reading instead of a button opening an empty dialog.
-  if (stats.llmMs <= 0 && stats.toolMs <= 0 && stats.ttftSteps <= 0 && stats.decodeMs <= 0) {
-    return (
-      <span className={css.anchor}>
-        <span className={css.pill}>
-          <IconGaugeOutline16 />
-          {label}
-        </span>
-      </span>
-    )
-  }
+}
+
+/**
+ * A pill button opening its own portaled dialog. Each pill owns its open
+ * state; useStatDialog closes it on Escape or an outside pointerdown or click,
+ * so at most one dialog is open across the dock.
+ */
+function DialogPill({ stat, icon, label, text, title, titleValue, children }: PillContent & {
+  title: string
+  titleValue?: string
+  children: ReactNode
+}) {
+  const { open, setOpen, rootRef, panelRef, anchorName } = useStatDialog()
   return (
-    <span ref={rootRef} className={css.anchor}>
-      <button
-        type="button"
-        className={css.pill}
-        aria-haspopup="dialog"
-        aria-expanded={open}
-        aria-label={tps === null ? counts : `${counts} · ${tps}`}
-        onClick={() => { setOpen(!open) }}
-      >
-        <IconGaugeOutline16 />
-        {label}
-      </button>
+    <span ref={rootRef} style={{ anchorName }} className={css.anchor} data-composer-stat={stat}>
+      {/* The open dialog already shows every figure; a tooltip would cover it. */}
+      <Tooltip label={text} {...FULL_READING_TOOLTIP} disabled={open}>
+        <button
+          type="button"
+          className={css.pill}
+          aria-haspopup="dialog"
+          aria-expanded={open}
+          aria-label={text}
+          onClick={() => { setOpen(!open) }}
+        >
+          {icon}
+          <span className={css.label}>{label}</span>
+        </button>
+      </Tooltip>
       {open && createPortal(
         <div
           ref={panelRef}
           className={dialogCss.panel}
           role="dialog"
-          aria-label={t('stats.dialog.title')}
-          style={pos ?? MEASURE_STYLE}
+          aria-label={title}
+          style={{ positionAnchor: anchorName }}
         >
           <div className={dialogCss.title}>
             <span className={dialogCss.titleLabel}>
-              <IconGaugeOutline16 />
-              {t('stats.dialog.title')}
+              {icon}
+              {title}
             </span>
+            {titleValue !== undefined && <span className={dialogCss.titleValue}>{titleValue}</span>}
           </div>
           <div className={dialogCss.titleRule} aria-hidden />
-          <dl className={dialogCss.details} data-session-stats-details>
-            {stats.llmMs > 0 && (
-              <>
-                <dt>{t('stats.dialog.llmTime')}</dt>
-                <dd>{formatDuration(stats.llmMs, t)}</dd>
-              </>
-            )}
-            {stats.toolMs > 0 && (
-              <>
-                <dt>{t('stats.dialog.toolTime')}</dt>
-                <dd>{formatDuration(stats.toolMs, t)}</dd>
-              </>
-            )}
-            {stats.ttftSteps > 0 && (
-              <>
-                <dt>{t('stats.dialog.ttft')}</dt>
-                <dd>{formatDuration(stats.ttftMs / stats.ttftSteps, t)}</dd>
-              </>
-            )}
-            {stats.decodeMs > 0 && (
-              <>
-                <dt>{t('stats.dialog.speed')}</dt>
-                <dd>{t('message.tokensPerSecond', {
-                  tps: formatTokensPerSecond(stats.decodeTokens / (stats.decodeMs / 1_000)),
-                })}</dd>
-              </>
-            )}
-          </dl>
+          {children}
         </div>,
         document.body,
       )}
@@ -233,125 +244,105 @@ function TimePill({ stats, t, dialog }: {
   )
 }
 
-function UsagePill({ usage, t, dialog }: {
-  usage: TokenUsageProjection
-  t: ChatViewSlotProps['t']
-  dialog: PillDialog
-}) {
-  const { open, setOpen, rootRef, panelRef, pos } = useStatDialog(dialog)
+/**
+ * Turn and step counts with whole-session speed, opening the time and speed
+ * dialog; Compact keeps only the speed reading.
+ */
+export const ActivityPill = memo(function ActivityPill({ useChat, useProjection, usePerformanceUsage, t }: StatPillProps) {
+  const mode = usePerformanceUsage(value => value)
+  const stats = useSessionStats(useChat, useProjection)
+  const speed = stats.decodeMs > 0 ? decodeSpeed(stats, t) : null
+  const icon = <IconGaugeOutlineRegular />
+  if (mode === 'compact') return speed === null ? null : <PlainPill stat="activity" icon={icon} {...reading(speed, null)} />
+  if (stats.steps === 0) return null
+  const counts = t('stats.counts', { turns: stats.turns, steps: stats.steps })
+  const content: PillContent = { stat: 'activity', icon, ...reading(counts, speed) }
+  // A window without one timed figure has no dialog rows to show, so the pill
+  // stays a plain reading instead of a button opening an empty dialog.
+  if (stats.llmMs <= 0 && stats.toolMs <= 0 && stats.ttftSteps <= 0 && speed === null) return <PlainPill {...content} />
+  return (
+    // The counts head the dialog, so a cut-off reading stays complete once the dialog opens.
+    <DialogPill {...content} title={t('stats.dialog.title')} titleValue={counts}>
+      <dl className={dialogCss.details} data-session-stats-details>
+        {stats.llmMs > 0 && (
+          <>
+            <dt>{t('stats.dialog.llmTime')}</dt>
+            <dd>{formatDuration(stats.llmMs, t)}</dd>
+          </>
+        )}
+        {stats.toolMs > 0 && (
+          <>
+            <dt>{t('stats.dialog.toolTime')}</dt>
+            <dd>{formatDuration(stats.toolMs, t)}</dd>
+          </>
+        )}
+        {stats.ttftSteps > 0 && (
+          <>
+            <dt>{t('stats.dialog.ttft')}</dt>
+            <dd>{formatDuration(stats.ttftMs / stats.ttftSteps, t)}</dd>
+          </>
+        )}
+        {speed !== null && (
+          <>
+            <dt>{t('stats.dialog.speed')}</dt>
+            <dd>{speed}</dd>
+          </>
+        )}
+      </dl>
+    </DialogPill>
+  )
+})
+
+/** Whole-log token total and cache hit; Compact keeps only the cache hit. */
+export const UsagePill = memo(function UsagePill({ useProjection, usePerformanceUsage, t }: StatPillProps) {
+  const mode = usePerformanceUsage(value => value)
+  const usage = useProjection('tokenUsage')
+  // Gated on actual token activity: a session whose steps all settled without
+  // billing (e.g. every request failed) shows no usage pill.
+  if (usage === undefined || (billedInputTokens(usage) === 0 && usage.outputTokens === 0)) return null
+  const cacheHit = cacheHitPercent(usage)
+  const cacheHitText = cacheHit !== null ? t('stats.cacheHit', { percent: cacheHit }) : null
+  const icon = <IconDatabaseOutlineRegular />
+  if (mode === 'compact') {
+    return cacheHitText === null ? null : <PlainPill stat="usage" icon={icon} {...reading(cacheHitText, null)} />
+  }
   // Same aggregate as the Turn pill's totalTokens: every prompt-side billing bucket plus output.
   const total = billedInputTokens(usage) + usage.outputTokens
   const totalText = t('message.turnUsage.count', { count: formatTokens(total, t) })
-  const cacheHit = cacheHitPercent(usage)
-  const cacheHitText = cacheHit !== null ? t('stats.cacheHit', { percent: cacheHit }) : null
   return (
-    <span ref={rootRef} className={css.anchor}>
-      <button
-        type="button"
-        className={css.pill}
-        aria-haspopup="dialog"
-        aria-expanded={open}
-        aria-label={cacheHitText === null ? totalText : `${totalText} · ${cacheHitText}`}
-        onClick={() => { setOpen(!open) }}
-      >
-        <IconDatabaseOutline16 />
-        <span className={css.label}>
-          {totalText}
-          {cacheHitText !== null && (
-            <>
-              <span className={css.sep} aria-hidden>·</span>
-              {cacheHitText}
-            </>
-          )}
-        </span>
-      </button>
-      {open && createPortal(
-        <div
-          ref={panelRef}
-          className={dialogCss.panel}
-          role="dialog"
-          aria-label={t('stats.dialog.usageTitle')}
-          style={pos ?? MEASURE_STYLE}
-        >
-          <div className={dialogCss.title}>
-            <span className={dialogCss.titleLabel}>
-              <IconDatabaseOutline16 />
-              {t('stats.dialog.usageTitle')}
-            </span>
-            <span className={dialogCss.titleValue}>{exactCount(total, t)}</span>
-          </div>
-          <div className={dialogCss.titleRule} aria-hidden />
-          {/* jscpd:ignore-start -- the session-total bucket rows deliberately mirror
-              TurnUsagePanel's per-turn dl: same skin, different data contract (the
-              buckets are always present here; per-turn fields are optional). A
-              session that never wrote cache drops the row, as the per-turn panel
-              drops its absent fields. */}
-          <dl className={dialogCss.details} data-session-stats-usage>
-            {cacheHit !== null && (
-              <>
-                <dt>{t('message.turnUsage.cacheHit')}</dt>
-                <dd>{`${cacheHit}%`}</dd>
-              </>
-            )}
-            <dt>{t('message.turnUsage.input')}</dt>
-            <dd>{exactCount(usage.uncachedInputTokens, t)}</dd>
-            <dt>{t('message.turnUsage.cacheRead')}</dt>
-            <dd>{exactCount(usage.cacheReadTokens, t)}</dd>
-            {usage.cacheWriteTokens !== 0 && (
-              <>
-                <dt>{t('message.turnUsage.cacheWrite')}</dt>
-                <dd>{exactCount(usage.cacheWriteTokens, t)}</dd>
-              </>
-            )}
-            <dt>{t('message.turnUsage.output')}</dt>
-            <dd>{exactCount(usage.outputTokens, t)}</dd>
-          </dl>
-          {/* jscpd:ignore-end */}
-        </div>,
-        document.body,
-      )}
-    </span>
-  )
-}
-
-export const StatsPills = memo(function StatsPills({ useChat, useProjection, t }: StatsPillsProps) {
-  const settledNodes = useChat(s => s.legacy.nodes)
-  const usage = useProjection('tokenUsage')
-  // One exclusive slot for both dialogs: opening either pill closes the other.
-  const [openPill, setOpenPill] = useState<'time' | 'usage' | null>(null)
-  // Every figure rides the durable sessionStats projection, so paging and
-  // compaction cannot change any of them; an assembly without the unit falls
-  // back to the window-scoped fold wholesale (same field names), paid only
-  // while no projection value is served.
-  const projected = useProjection('sessionStats')
-  const stats = useMemo(() => projected ?? deriveStats(settledNodes), [projected, settledNodes])
-  // Gated on actual token activity: a session whose steps all settled without
-  // billing (e.g. every request failed) shows its counts without a usage pill.
-  const hasTokens = usage !== undefined
-    && (billedInputTokens(usage) > 0 || usage.outputTokens > 0)
-  if (stats.steps === 0 && !hasTokens) return null
-  return (
-    <div className={css.root}>
-      {stats.steps > 0 && (
-        <TimePill
-          stats={stats}
-          t={t}
-          dialog={{
-            open: openPill === 'time',
-            setOpen: (open) => { setOpenPill(open ? 'time' : null) },
-          }}
-        />
-      )}
-      {hasTokens && (
-        <UsagePill
-          usage={usage}
-          t={t}
-          dialog={{
-            open: openPill === 'usage',
-            setOpen: (open) => { setOpenPill(open ? 'usage' : null) },
-          }}
-        />
-      )}
-    </div>
+    <DialogPill
+      stat="usage"
+      icon={icon}
+      {...reading(totalText, cacheHitText)}
+      title={t('stats.dialog.usageTitle')}
+      titleValue={exactCount(total, t)}
+    >
+      {/* jscpd:ignore-start -- the session-total bucket rows deliberately mirror
+          TurnUsagePanel's per-turn dl: same skin, different data contract (the
+          buckets are always present here; per-turn fields are optional). A
+          session that never wrote cache drops the row, as the per-turn panel
+          drops its absent fields. */}
+      <dl className={dialogCss.details} data-session-stats-usage>
+        {cacheHit !== null && (
+          <>
+            <dt>{t('message.turnUsage.cacheHit')}</dt>
+            <dd>{`${cacheHit}%`}</dd>
+          </>
+        )}
+        <dt>{t('message.turnUsage.input')}</dt>
+        <dd>{exactCount(usage.uncachedInputTokens, t)}</dd>
+        <dt>{t('message.turnUsage.cacheRead')}</dt>
+        <dd>{exactCount(usage.cacheReadTokens, t)}</dd>
+        {usage.cacheWriteTokens !== 0 && (
+          <>
+            <dt>{t('message.turnUsage.cacheWrite')}</dt>
+            <dd>{exactCount(usage.cacheWriteTokens, t)}</dd>
+          </>
+        )}
+        <dt>{t('message.turnUsage.output')}</dt>
+        <dd>{exactCount(usage.outputTokens, t)}</dd>
+      </dl>
+      {/* jscpd:ignore-end */}
+    </DialogPill>
   )
 })

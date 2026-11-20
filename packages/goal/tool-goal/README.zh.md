@@ -37,7 +37,7 @@ kind: "package-reference"
 | `create_goal(objective, max_goal_rounds?)` | 根据人类直接发起的顶层轮次创建一个 goal |
 | `update_goal(goal_id, revision, action, objective?, max_goal_rounds?, blocked_reason?)` | 对精确 goal revision 执行 `edit`、`pause`、`resume`、`complete` 或 `blocked` |
 
-在 `update_goal` 之前调用 `get_goal`，并复制精确的 `goal_id` 与 `revision`；所有调用都互斥，因此模型排序的批次能观察到更早变更及其新 revision。替换值只属于 `edit`；`blocked_reason` 只有在 `blocked` 时才必填，并以稳定代码 `model-reported` 持久化。严格 schema 下的空字符串和零填充值视为省略，而有意义的值仍限定到各自 action。
+在 `update_goal` 之前调用 `get_goal`，并复制精确的 `goal_id` 与 `revision`；所有调用都互斥，因此模型排序的批次能观察到更早变更及其新 revision。`objective` 和 `max_goal_rounds` 仅影响 `edit`，所有其他 action 均忽略它们。`blocked_reason` 在 `blocked` 时必填且非空，并以稳定代码 `model-reported` 持久化，所有其他 action 均忽略它。被忽略的字段不能改变目标、轮数上限或阻塞原因。声明的类型、权限和精确 revision 校验仍然生效。对于 `edit`，目标为空字符串、轮数上限为零时视为省略，且至少需要一个有效替换值。
 
 ### 配置
 
@@ -68,7 +68,7 @@ kind: "package-reference"
 
 ### 设计
 
-- **执行时权限。** 每次调用都解析精确活跃 agent、其继承的 `AgentRegistry` initiator、running 状态与开放轮次；`create`、`edit`、`pause` 和 `resume` 还要求运行时根 agent 的当前轮次中存在已接受的 `{ kind: 'user' }` 消息或 steering 事件。持久的 paused goal 会让 `resume` 以 `GOAL_TOOL_RESUME_PAUSED` 失败；面向用户的命令或 Web 控件拥有该转换。持久 fork 谱系不会降低已恢复根 agent 的等级；活跃 subagent 所有权会降低。
+- **执行时权限。** 插件依赖 `agents`，并通过 `turnBoundaryOf(session)` 读取轮次状态。每次调用都解析精确活跃 agent、其继承的 `AgentRegistry` initiator、running 状态与开放轮次；`create`、`edit`、`pause` 和 `resume` 还要求运行时根 agent 的当前轮次中存在已接受的 `{ kind: 'user' }` 消息或 steering 事件。持久的 paused goal 会让 `resume` 以 `GOAL_TOOL_RESUME_PAUSED` 失败；面向用户的命令或 Web 控件拥有该转换。`origin: 'subagent'` 的 Session 不能提供直接人类权限；带有 `parentSession` 的历史普通 fork 仍可提供。
 - **人类输入的宿主证明。** `Agent.followup()` 与 `steer()` 会在调用方省略 source 时分配 `{ kind: 'user' }`，因此插件、调度器与其他非人类生产方必须传入自己的 source，不能继承人类权限。
 - **带配置阈值的系统提示词指引。** 本包注册一个 `tool:goal` 系统提示词章节，其固定文本插入 `blockedAfterConsecutiveRounds`；同一数值就是执行时强制执行的硬下限。
 - **终局 Round 的结束上下文。** 成功的自主 `complete` 或 `blocked` 会延后一条 `<goal_complete>` 或 `<goal_blocked>` 结束指令，让模型在轮次结束前向用户做一次交代；人类直接变更绝不会延后该上下文。
@@ -80,7 +80,6 @@ kind: "package-reference"
 | [`src/index.ts`](src/index.ts) | 插件入口：工具注册、配置、系统提示词章节、结果渲染 |
 | [`src/authority.ts`](src/authority.ts) | 执行时权限检查与 Goal Round 接受 |
 | [`src/wrapup.ts`](src/wrapup.ts) | 终局自主更新的结束消息指令 |
-| — | 不发布运行时不变式伴生入口；此面向模型的适配器不拥有独立状态或事件协议；已接受的变更由 goal 领域检查，权限行为则由本包测试验证。 |
 
 ### 工具输出
 
@@ -109,12 +108,12 @@ kind: "package-reference"
 
 #### 模型看到的内容
 
-固定 goal 策略说明何种用户语义意图值得创建 goal，要求更新前先精确读取 ref，解释会话 resume／fork 后如何重新启用续行，并限制完成／阻塞声明。持久 paused 的 resume 会在执行时以 `GOAL_TOOL_RESUME_PAUSED` 拒绝；面向用户的 goal 控件拥有该转换。配置的阈值会插入该指引。
+固定 goal 策略允许以任意语言推断 goal 意图，解释会话 resume／fork 后如何重新启用续行，并限制完成／阻塞声明；创建范围和更新前读取 ref 由工具定义说明。持久 paused 的 resume 会在执行时以 `GOAL_TOOL_RESUME_PAUSED` 拒绝；面向用户的 goal 控件拥有该转换。配置的阈值会插入该指引。
 
 ##### Goal 策略
 
 ```markdown
-Use goal tools for one long-running completion objective in the current session. create_goal may infer goal intent from a direct human request in any language; do not create a goal for routine single-turn work. Call get_goal before update_goal and copy its exact goal_id and revision. After session resume or fork, an active goal is disarmed: when a human asks to continue or resume in any wording or language, use update_goal action resume to rearm it. Mark complete only when the objective is actually achieved. Mark blocked only after the same blocking condition persists for at least 3 consecutive goal rounds, and report that concrete condition in blocked_reason; difficulty, uncertainty, or useful remaining work is not blocked.
+create_goal may infer goal intent from a direct human request in any language. After session resume or fork, an active goal is disarmed: when a human asks to continue or resume in any wording or language, use update_goal action resume to rearm it. Mark complete only when the objective is actually achieved. Mark blocked only after the same blocking condition persists for at least 3 consecutive goal rounds, and report that concrete condition in blocked_reason; difficulty, uncertainty, or useful remaining work is not blocked.
 ```
 
 #### Token 影响

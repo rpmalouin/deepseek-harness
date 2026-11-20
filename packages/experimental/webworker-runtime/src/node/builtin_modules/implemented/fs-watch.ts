@@ -1,7 +1,7 @@
 /** Node filesystem watching over the active in-memory VFS. */
 import { Buffer } from 'buffer'
 import { EventEmitter } from './events.ts'
-import { captureAsyncContext, runWithAsyncContext } from './async_hooks.ts'
+import { captureAsyncContext, runAtAsyncContextRoot, runWithAsyncContext } from './async_hooks.ts'
 import { basename, relative, resolve, sep } from './path.ts'
 import { requireActiveVfs } from '../../../storage/active.ts'
 import type { VfsBigIntStats, VfsMutation, VfsStats } from '../../../storage/types.ts'
@@ -83,6 +83,17 @@ const contains = (parent: string, child: string): boolean =>
 
 const overlaps = (left: string, right: string): boolean => contains(left, right) || contains(right, left)
 
+/**
+ * Run a watcher callback in the async context where its watcher was created, as Node delivers watch events from the
+ * watch handle: stores captured at creation apply, and every other store reads `undefined` instead of the store of the
+ * code whose write produced the event.
+ * @param context - Context captured when the watcher was created.
+ * @param callback - Event dispatch.
+ */
+const dispatchInWatcherContext = (context: ReturnType<typeof captureAsyncContext>, callback: () => void): void => {
+  runAtAsyncContextRoot(() => { runWithAsyncContext(context, callback) })
+}
+
 /** `fs.FSWatcher` over VFS mutations. */
 export class FSWatcher extends EventEmitter {
   private readonly disposeMutation: () => void
@@ -109,7 +120,7 @@ export class FSWatcher extends EventEmitter {
       const filename = this.filename(mutation.path)
       queueMicrotask(() => {
         if (this.closed) return
-        runWithAsyncContext(context, () => { this.emit('change', eventType, filename) })
+        dispatchInWatcherContext(context, () => { this.emit('change', eventType, filename) })
       })
     })
     this.signal = options.signal
@@ -228,7 +239,7 @@ export class StatWatcher extends EventEmitter {
       const previous = this.previous
       this.previous = current
       if (initialMissing || statsChanged(current, previous)) {
-        runWithAsyncContext(this.context, () => { this.emit('change', current, previous) })
+        dispatchInWatcherContext(this.context, () => { this.emit('change', current, previous) })
       }
     }, this.interval)
     if (!this.referenced) timerUnref(this.timer)
@@ -283,12 +294,12 @@ type RefTimer = { ref?: () => unknown; unref?: () => unknown }
 
 /** Browser timers are numeric; Node timers expose optional liveness methods. */
 const timerRef = (timer: ReturnType<typeof setTimeout>): void => {
-  ;(timer as unknown as RefTimer).ref?.()
+  ;(timer as RefTimer).ref?.()
 }
 
 /** Browser timers are numeric; Node timers expose optional liveness methods. */
 const timerUnref = (timer: ReturnType<typeof setTimeout>): void => {
-  ;(timer as unknown as RefTimer).unref?.()
+  ;(timer as RefTimer).unref?.()
 }
 
 const statWatchers = new Map<string, StatWatcher>()

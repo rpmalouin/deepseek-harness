@@ -22,7 +22,7 @@ function ctxWith(describeCall: unknown) {
 }
 
 function view(ns: string, revision = 0): SettingsNamespaceView {
-  return { ns, schema: {}, value: { field: ns }, applies: 'live', secrets: [], revision }
+  return { ns, schema: {}, value: { field: ns }, autoGenerate: true, applies: 'live', secrets: [], revision }
 }
 
 function described(namespaces: SettingsNamespaceView[]): Answer<SettingsDescribeView> {
@@ -92,15 +92,6 @@ describe('SettingsDescribeMirror', () => {
     await mirror.ensure()
     await mirror.ensure()
     expect(describeCall).toHaveBeenCalledTimes(1)
-  })
-
-  it('memory persistence is terminally unavailable and never touches the wire', async () => {
-    const describeCall = vi.fn()
-    const mirror = new SettingsDescribeMirror(ctxWith(describeCall), 'memory')
-    await mirror.ensure()
-    await mirror.load()
-    expect(mirror.getSnapshot()).toEqual({ status: 'unavailable', view: undefined, error: null })
-    expect(describeCall).not.toHaveBeenCalled()
   })
 
   it('acceptView folds one write answer into the held view without a wire read', async () => {

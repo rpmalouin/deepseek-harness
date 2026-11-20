@@ -16,18 +16,18 @@ describe('Client Cordis inspect catalog', () => {
         'create(input: { path: string }): Promise<WorkspaceView>',
         'rename(workspaceId: WorkspaceId, title: string): Promise<WorkspaceView>',
         'delete(workspaceId: WorkspaceId): Promise<void>',
-        'archiveSession(sessionId: SessionId): Promise<void>',
+        'archiveSession(sessionId: SessionId, options?: { readonly stopActivity?: boolean }): Promise<void>',
         'unarchiveSession(sessionId: SessionId): Promise<void>',
         'insertSessionBefore( workspaceId: WorkspaceId, sessionId: SessionId, beforeSessionId?: SessionId, ): Promise<WorkspaceView>',
       ])
     expect(SERVICE_API.find(service => service.key === 'uiWorkspace')?.methods.map(method => method.signature))
       .toEqual([
         'openSession(target: SessionTarget): void',
-        'openWorkspace(workspaceId: WorkspaceId, beforeOpen?: (sessionId: SessionId) => void): Promise<void>',
-        'forkSession(sessionId: SessionId): Promise<void>',
-        'connectWorkspace(workspaceId: WorkspaceId): Promise<SessionId>',
-        'startSession(workspaceId?: WorkspaceId): void',
-        'archiveSession(sessionId: SessionId): Promise<void>',
+        'openWorkspace( workspaceId: WorkspaceId, beforeOpen?: (sessionId: SessionId) => void, options?: Pick<StartSessionOptions, \'agentPreset\'>, ): Promise<void>',
+        'forkSession( sessionId: SessionId, onCreated?: (childId: SessionId) => void, options?: Pick<Parameters<ISessions[\'fork\']>[0], \'allowMigration\'>, ): Promise<SessionId>',
+        'connectWorkspace(workspaceId: WorkspaceId, options?: Pick<StartSessionOptions, \'agentPreset\'>): Promise<SessionId>',
+        'startSession(workspaceId?: WorkspaceId, options?: StartSessionOptions): void',
+        'archiveSession(sessionId: SessionId, options?: { readonly stopActivity?: boolean }): Promise<void>',
         'unarchiveSession(sessionId: SessionId): Promise<void>',
         'pickDirectory(): Promise<string | null>',
         'listDirectory(path?: string, signal?: AbortSignal): Promise<DirectoryListing>',
@@ -38,6 +38,21 @@ describe('Client Cordis inspect catalog', () => {
   it('contains one entry per visible Client event', () => {
     const names = EVENT_API.map(event => event.name)
     expect(new Set(names).size).toBe(names.length)
+  })
+
+  it('describes text-only draft initialization in Workspace navigation', () => {
+    const result = queryServiceApi('uiWorkspace') as {
+      referencedTypes: readonly { name: string; declaration: string }[]
+    }
+    expect(result.referencedTypes.find(type => type.name === 'StartSessionOptions')?.declaration)
+      .toContain('DraftInitializationOptions')
+    expect(result.referencedTypes.find(type => type.name === 'DraftInitializationOptions')?.declaration)
+      .toContain('readonly prompt?: string')
+    expect(result.referencedTypes.find(type => type.name === 'DraftInitializationOptions')?.declaration)
+      .toContain('readonly clearPreviousDraft?: boolean')
+    expect(result.referencedTypes.map(type => type.name)).not.toEqual(expect.arrayContaining([
+      'DraftInput', 'DraftSnapshot', 'DraftReference',
+    ]))
   })
 
   it('includes the current referenced type closure for the Sessions service', () => {

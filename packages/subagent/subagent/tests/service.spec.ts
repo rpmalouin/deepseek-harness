@@ -1,8 +1,13 @@
+import { bindSubagentActivation } from './manager-internals.ts'
+import { mountWorkingDirectoryFixture } from './working-directory-fixture.ts'
 import { describe, expect, expectTypeOf, it, onTestFinished, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { type Agent } from '@deepseek-ai/dsh-agent'
+import AgentLoop from '@deepseek-ai/dsh-agent-loop'
+import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
 
-import { HarnessError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import { HarnessError, type ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { carrierKeyOf } from '@deepseek-ai/dsh-scope'
 import SubagentRuntime, {
   foldSubagentDescriptor,
@@ -10,23 +15,30 @@ import SubagentRuntime, {
   SUBAGENT_DESCRIPTOR_VERSION,
   SubagentError,
   assertSubagentMaxDepth,
-  type ResolvedSubagentStartRequest,
   type SubagentCapabilities,
+  type SubagentActivation,
+  type SubagentActivationSpec,
   type SubagentProvider,
   type SubagentResult,
   type SubagentRun,
   type SubagentRunEndInfo,
   type SubagentStartRequest,
 } from '@deepseek-ai/dsh-subagent'
-import { Session, SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
+import { Session, type SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 
 function fakeParent(id = 'parent-1'): Agent {
-  return { id: SessionId(id) } as unknown as Agent
+  return { id: brandString<SessionId>(id) } as Agent
 }
 
-const ALL_CAPS: SubagentCapabilities = { agentOptions: true, outputSchema: true, depthLimit: true, toolFilter: true, persona: true }
-const NO_CAPS: SubagentCapabilities = { agentOptions: false, outputSchema: false, depthLimit: false, toolFilter: false, persona: false }
+const ALL_CAPS: SubagentCapabilities = {
+  agentOptions: true, agentPreset: true, outputSchema: true,
+  depthLimit: true,
+}
+const NO_CAPS: SubagentCapabilities = {
+  agentOptions: false, agentPreset: false, outputSchema: false,
+  depthLimit: false,
+}
 
 function baseRequest(overrides: Partial<SubagentStartRequest> = {}): SubagentStartRequest {
   return {
@@ -40,7 +52,7 @@ function baseRequest(overrides: Partial<SubagentStartRequest> = {}): SubagentSta
 class StubProvider implements SubagentProvider {
   readonly inheritsParentContext = false
   startCount = 0
-  lastRequest: ResolvedSubagentStartRequest | undefined
+  lastRequest: SubagentStartRequest | undefined
 
   constructor(
     readonly name: string,
@@ -51,36 +63,131 @@ class StubProvider implements SubagentProvider {
     },
   ) {}
 
-  async start(request: ResolvedSubagentStartRequest): Promise<SubagentRun> {
+  async start(request: SubagentStartRequest): Promise<SubagentRun> {
     this.startCount += 1
     this.lastRequest = request
     return {
-      id: SessionId(`child:${this.name}:${request.parent.id}`),
-      localAgent: undefined,
+      id: brandString<SessionId>(`child:${this.name}:${request.parent.id}`),
       result: Promise.resolve(this.outcome),
       async dispose() {},
     }
   }
 }
 
-async function service(): Promise<{ ctx: Context; subagents: SubagentRuntime }> {
+const contexts = new WeakMap<SubagentRuntime, Context>()
+
+async function service(withAgents = true): Promise<{ ctx: Context; subagents: SubagentRuntime }> {
   const ctx = new Context()
-  // The registry is a required injection of SubagentRuntime (its projection
-  // units register in the constructor).
-  await ctx.plugin(SessionProjectionRegistry)
+  if (withAgents) {
+    await mountAgentLoopTestDependencies(ctx)
+    await ctx.plugin(AgentLoop, { agents: [] })
+  } else {
+    await ctx.plugin(SessionProjectionRegistry)
+
+  }
+  await mountWorkingDirectoryFixture(ctx)
   await ctx.plugin(SubagentRuntime)
-  return { ctx, subagents: ctx.subagents }
+  const subagents = ctx.subagents
+  contexts.set(subagents, ctx)
+  onTestFinished(() => ctx.fiber.dispose())
+  return { ctx, subagents }
+}
+
+/** Start through the managed API with a real parent owned by the fixture. */
+async function start(subagents: SubagentRuntime, provider: string, request: SubagentStartRequest, delivery: 'parent' | 'caller' = 'caller'): Promise<SubagentActivation> {
+  const ctx = contexts.get(subagents)!
+  const parent = ctx.agents.get(request.parent.id)
+    ?? (await ctx.agents.create({ sessionId: request.parent.id })).agent
+  const { label, signal, ...options } = request
+  return subagents.startActivation({
+    provider, label: label ?? provider, ...options, parent, signal, delivery,
+  })
 }
 
 describe('SubagentRuntime', () => {
+  it('resolves Activation roots only for exact live child and root instances', async () => {
+    const { ctx, subagents } = await service()
+    const root = await ctx.agents.create({ sessionId: brandString<SessionId>('lineage-root') })
+    const child = await ctx.agents.create({ sessionId: brandString<SessionId>('lineage-child'), meta: { origin: 'subagent' } })
+    const fork = await ctx.agents.create({ sessionId: brandString<SessionId>('ordinary-fork'), meta: { parentSession: root.agent.id } })
+    expect(() => subagents.rootOf(child.agent)).toThrow('agent has no active runtime owner')
+    expect(subagents.rootOf(fork.agent)).toBe(fork.agent)
+    bindSubagentActivation(ctx, child.agent, root.agent)
+    expect(subagents.rootOf(child.agent)).toBe(root.agent)
+    expect(() => subagents.rootOf({ ...child.agent })).toThrow('exact live caller')
+    await root.dispose()
+    const replacementRoot = await ctx.agents.create({ sessionId: root.agent.id })
+    expect(() => subagents.rootOf(child.agent)).toThrow('agent has no active runtime owner')
+    await child.dispose()
+    const replacementChild = await ctx.agents.create({ sessionId: child.agent.id, meta: { origin: 'subagent' } })
+    expect(() => subagents.rootOf(child.agent)).toThrow('exact live caller')
+    expect(() => subagents.rootOf(replacementChild.agent)).toThrow('agent has no active runtime owner')
+    bindSubagentActivation(ctx, replacementChild.agent, replacementRoot.agent)
+    expect(subagents.rootOf(replacementChild.agent)).toBe(replacementRoot.agent)
+  })
+
+  it.each([
+    ['external', 'removed'], ['external', 'external'], ['external', 'local'],
+    ['local', 'removed'], ['local', 'external'], ['local', 'local'],
+  ] as const)('rejects a %s provider changed to %s during directory resolution', async (kind, replacementKind) => {
+    const { ctx, subagents } = await service()
+    const external = new StubProvider('changing')
+    const prepare = vi.fn(async () => ({}))
+    const provider: SubagentProvider = kind === 'external' ? external : {
+      name: 'changing', inheritsParentContext: false, capabilities: ALL_CAPS, prepareContinuable: prepare,
+    }
+    const unregister = subagents.registerProvider(provider)
+    const parent = await ctx.agents.create({ sessionId: brandString<SessionId>('provider-owner') })
+    const entered = Promise.withResolvers<undefined>()
+    const release = Promise.withResolvers<undefined>()
+    const ensure = ctx.workingDirectory.ensure.bind(ctx.workingDirectory)
+    const directory = vi.spyOn(ctx.workingDirectory, 'ensure').mockImplementation(async (...args) => {
+      entered.resolve(undefined)
+      await release.promise
+      return ensure(...args)
+    })
+    const replacement = new StubProvider('changing')
+    const replacementPrepare = vi.fn(async () => ({}))
+    const pending = subagents.startActivation({
+      ...baseRequest(), provider: 'changing', parent: parent.agent, label: 'changing', delivery: 'caller',
+    })
+    const rejection = expect(pending).rejects.toMatchObject({ code: 'PROVIDER_CHANGED' })
+    try {
+      await entered.promise
+      unregister()
+      if (replacementKind !== 'removed') subagents.registerProvider(replacementKind === 'external' ? replacement : {
+        name: 'changing', inheritsParentContext: false, capabilities: ALL_CAPS, prepareContinuable: replacementPrepare,
+      })
+      release.resolve(undefined)
+      await rejection
+      expect(external.startCount).toBe(0)
+      expect(prepare).not.toHaveBeenCalled()
+      expect(replacement.startCount).toBe(0)
+      expect(replacementPrepare).not.toHaveBeenCalled()
+      expect(ctx.agents.list()).toEqual([parent.agent])
+      await expect(subagents.waitForTreeWork(parent.agent)).resolves.toBe(false)
+    } finally {
+      release.resolve(undefined)
+      await Promise.allSettled([pending])
+      directory.mockRestore()
+    }
+  })
+
+  it('has no owned child work before the Agent service is mounted', async () => {
+    const { subagents } = await service(false)
+    await expect(subagents.waitForTreeWork(fakeParent())).resolves.toBe(false)
+  })
+
   it('releases its catalog projection binding with the service fiber', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionProjectionRegistry)
+
+    await mountWorkingDirectoryFixture(ctx)
     const fiber = await ctx.plugin(SubagentRuntime)
-    const parent = Session.create(SessionId('catalog-parent'))
+    const parent = Session.create(brandString<SessionId>('catalog-parent'))
     parent.append('subagent/catalog', {
       version: 0,
-      childId: SessionId('catalog-child'),
+      childId: brandString<SessionId>('catalog-child'),
       childCreatedAt: 1,
       mode: 'one-shot',
     })
@@ -88,10 +195,10 @@ describe('SubagentRuntime', () => {
 
     await fiber.dispose()
 
-    expect(ctx.sessionProjections.stateOf(parent, 'subagentCatalog')).toBeUndefined()
+    expect(ctx.sessionProjections.snapshot(parent).values.subagentCatalog).toBeUndefined()
   })
 
-  it('registers, lists, looks up, starts, and removes providers', async () => {
+  it('registers, looks up, starts, and removes providers', async () => {
     const { ctx, subagents } = await service()
     const added: string[] = []
     const removed: string[] = []
@@ -100,9 +207,8 @@ describe('SubagentRuntime', () => {
     const provider = new StubProvider('alpha')
 
     const dispose = subagents.registerProvider(provider)
-    expect(subagents.list()).toEqual(['alpha'])
     expect(subagents.getProvider('alpha')).toBe(provider)
-    const run = await subagents.start('alpha', baseRequest())
+    const run = await start(subagents, 'alpha', baseRequest())
     await expect(run.result).resolves.toMatchObject({ stopReason: 'completed' })
     expect(provider.startCount).toBe(1)
 
@@ -124,93 +230,120 @@ describe('SubagentRuntime', () => {
     subagents.registerProvider(new StubProvider('dup'))
     expect(() => { subagents.registerProvider(new StubProvider('dup')) })
       .toThrow(expect.objectContaining({ code: 'DUPLICATE_PROVIDER' }))
-    await expect(subagents.start('missing', baseRequest()))
+    await expect(start(subagents, 'missing', baseRequest()))
       .rejects.toMatchObject({ code: 'NO_PROVIDER' })
   })
 
-  it('resolves the one-shot descriptor and exposes no provider continuation operations', async () => {
+  it('forwards external execution options and exposes no provider continuation operations', async () => {
     const { subagents } = await service()
     const provider = new StubProvider('one-shot')
     subagents.registerProvider(provider)
     const request = baseRequest()
-    await subagents.start('one-shot', request)
+    await start(subagents, 'one-shot', request)
 
     expect(provider.lastRequest).toEqual({
       ...request,
-      descriptor: {
-        version: SUBAGENT_DESCRIPTOR_VERSION,
-        mode: 'one-shot',
-        provider: 'one-shot',
-      },
+      cwd: process.cwd(),
+      label: 'one-shot',
+      parent: provider.lastRequest!.parent,
+      signal: provider.lastRequest!.signal,
     })
     expect(provider.lastRequest).not.toBe(request)
-    expectTypeOf<Parameters<SubagentRuntime['start']>[1]>().toExtend<SubagentStartRequest>()
+    expectTypeOf<Parameters<SubagentRuntime['startActivation']>[0]>().toEqualTypeOf<SubagentActivationSpec>()
     expect('resume' in subagents).toBe(false)
     expect('resume' in provider).toBe(false)
   })
 
   it('does not expose manager teardown and treats public drains as no-ops when no manager was bound', async () => {
-    const { subagents } = await service()
+    const { subagents } = await service(false)
     // Without `ctx.agents` no manager exists, so nothing was ever materialized.
     expect('drainContinuable' in subagents).toBe(false)
-    await expect(subagents.drainContinuableDescendants([])).resolves.toBeUndefined()
-    await expect(subagents.drainContinuableChildren(fakeParent(), [SessionId('child')])).resolves.toBeUndefined()
+    await expect(subagents.drainDescendants([])).resolves.toBeUndefined()
   })
 
   it('treats interrupt as an accepted no-op when no manager was bound', async () => {
-    const { subagents } = await service()
+    const { subagents } = await service(false)
     // Without a continuation manager no live Activation can exist, so there is
     // nothing to stop and nothing to authorize against.
-    expect(() => { subagents.interrupt(SessionId('child'), {
+    expect(() => { subagents.interrupt(brandString<SessionId>('child'), {
       kind: 'user',
-      parentSessionId: SessionId('parent-1'),
     }) }).not.toThrow()
   })
 
   it('rejects continuable operations when their runtime services are absent', async () => {
-    const { subagents } = await service()
-    await expect(subagents.startContinuable({
+    const { subagents } = await service(false)
+    await expect(subagents.startActivation({
+      delivery: 'parent',
       provider: 'unused',
       label: 'unused child',
-      request: baseRequest(),
+      ...baseRequest(),
       signal: new AbortController().signal,
-    })).rejects.toMatchObject({ code: 'CONTINUATION_UNAVAILABLE' })
+    })).rejects.toMatchObject({ code: 'NO_PROVIDER' })
     await expect(subagents.sendMessage(
       fakeParent(),
-      SessionId('child'),
+      brandString<SessionId>('child'),
       [{ type: 'text', text: 'hello' }],
       { signal: new AbortController().signal },
     )).rejects.toMatchObject({ code: 'CONTINUATION_UNAVAILABLE' })
+  })
+
+  it('reports an unavailable runtime before checking the parent of a registered provider', async () => {
+    const { subagents } = await service(false)
+    const provider = new StubProvider('external')
+    subagents.registerProvider(provider)
+    await expect(subagents.startActivation({
+      provider: provider.name,
+      label: 'Unavailable runtime',
+      ...baseRequest(),
+      signal: new AbortController().signal,
+      delivery: 'caller',
+    })).rejects.toMatchObject({ code: 'CONTINUATION_UNAVAILABLE' })
+    expect(provider.startCount).toBe(0)
   })
 
   it.each([
     ['agentOptions', { agentOptions: { model: 'child-model' } }],
     ['outputSchema', { outputSchema: { type: 'object', properties: {} } }],
     ['depthLimit', { maxDepth: 1 }],
-    ['toolFilter', { toolFilter: { deny: ['bash'] } }],
-    ['persona', { persona: 'reviewer' }],
   ] as const)('rejects unsupported %s before provider startup', async (_capability, override) => {
     const { subagents } = await service()
     const provider = new StubProvider('weak', NO_CAPS)
     subagents.registerProvider(provider)
-    await expect(subagents.start('weak', baseRequest(override)))
+    await expect(start(subagents, 'weak', baseRequest(override)))
       .rejects.toMatchObject({ code: 'UNSUPPORTED_CAPABILITY' })
     expect(provider.startCount).toBe(0)
+  })
+
+  it('rejects a reserved child identity for an external backend before startup', async () => {
+    const { ctx, subagents } = await service()
+    const provider = new StubProvider('external')
+    subagents.registerProvider(provider)
+    const { agent: parent } = await ctx.agents.create({ sessionId: brandString<SessionId>('reserved-parent') })
+    await expect(subagents.startActivation({
+      provider: provider.name,
+      label: 'Reserved team child',
+      childId: brandString<SessionId>('reserved-child'),
+      parent, prompt: [{ type: 'text', text: 'Work' }],
+      signal: new AbortController().signal,
+      delivery: 'caller',
+    })).rejects.toMatchObject({ code: 'UNSUPPORTED_CAPABILITY' })
+    expect(provider.startCount).toBe(0)
+    expect(ctx.agents.get(brandString<SessionId>('reserved-child'))).toBeUndefined()
   })
 
   it('validates depth and schema semantics before provider startup', async () => {
     const { subagents } = await service()
     const provider = new StubProvider('strong')
     subagents.registerProvider(provider)
-    await expect(subagents.start('strong', baseRequest({ maxDepth: -1 })))
+    await expect(start(subagents, 'strong', baseRequest({ maxDepth: -1 })))
       .rejects.toThrow('non-negative safe integer')
-    await expect(subagents.start('strong', baseRequest({ outputSchema: { type: 'string' } as never })))
+    await expect(start(subagents, 'strong', baseRequest({ outputSchema: { type: 'string' } as never })))
       .rejects.toThrow()
     expect(provider.startCount).toBe(0)
     expect(() => { assertSubagentMaxDepth(undefined) }).not.toThrow()
   })
 
-  it('publishes lifecycle only after async provider start and keeps parent scope', async () => {
+  it('publishes lifecycle only after async provider start and keeps root scope', async () => {
     const { ctx, subagents } = await service()
     const ready = Promise.withResolvers<SubagentRun>()
     const result = Promise.withResolvers<SubagentResult>()
@@ -220,23 +353,27 @@ describe('SubagentRuntime', () => {
       inheritsParentContext: false,
       start: () => ready.promise,
     })
-    const parent = fakeParent('delegator')
+    const parent = (await ctx.agents.create({ sessionId: brandString<SessionId>('delegator') })).agent
     const events: string[] = []
+    const scopedEvents: string[] = []
+    parent.ctx.on('subagent/start', () => { scopedEvents.push('start') })
+    parent.ctx.on('subagent/end', () => { scopedEvents.push('end') })
     const keys: unknown[] = []
     const runIds: string[] = []
     ctx.on('subagent/start', function (info) { events.push('start'); keys.push(carrierKeyOf(this)); runIds.push(info.runId) })
     ctx.on('subagent/end', function (info) { events.push('end'); keys.push(carrierKeyOf(this)); runIds.push(info.runId) })
 
-    const starting = subagents.start('deferred', baseRequest({ parent }))
+    const starting = start(subagents, 'deferred', baseRequest({ parent }))
     await Promise.resolve()
     expect(events).toEqual([])
-    ready.resolve({ id: SessionId('child'), localAgent: undefined, result: result.promise, async dispose() {} })
+    ready.resolve({ id: brandString<SessionId>('child'), result: result.promise, async dispose() {} })
     const run = await starting
     expect(events).toEqual(['start'])
     result.resolve({ output: [{ type: 'text', text: 'answer' }], stopReason: 'completed' })
     await run.result
-    await Promise.resolve()
+    await run.dispose()
     expect(events).toEqual(['start', 'end'])
+    expect(scopedEvents).toEqual(['start', 'end'])
     expect(keys).toEqual([parent, parent])
     expect(runIds[0]).toBe(runIds[1])
   })
@@ -247,8 +384,10 @@ describe('SubagentRuntime', () => {
     const runIds: string[] = []
     ctx.on('subagent/start', info => void runIds.push(info.runId))
 
-    const first = await subagents.start('reused', baseRequest())
-    const second = await subagents.start('reused', baseRequest())
+    const first = await start(subagents, 'reused', baseRequest())
+    await first.result
+    await first.dispose()
+    const second = await start(subagents, 'reused', baseRequest())
     await Promise.all([first.result, second.result])
 
     expect(runIds).toHaveLength(2)
@@ -266,17 +405,15 @@ describe('SubagentRuntime', () => {
     const lifecycle = vi.fn()
     ctx.on('subagent/start', lifecycle)
     ctx.on('subagent/end', lifecycle)
-    await expect(subagents.start('failed', baseRequest())).rejects.toThrow('setup rolled back')
+    await expect(start(subagents, 'failed', baseRequest())).rejects.toThrow('setup rolled back')
     expect(lifecycle).not.toHaveBeenCalled()
   })
 
-  it.each([false, true])('handles a rejected local result after catalog failure (disposal fails: %s)', async (failsDisposal) => {
+  it.each([false, true])('handles a rejected external result after catalog failure (disposal fails: %s)', async (failsDisposal) => {
     const { ctx, subagents } = await service()
-    onTestFinished(() => ctx.fiber.dispose())
-    const parentSession = Session.create(SessionId('catalog-parent'))
-    const childSession = Session.create(SessionId('catalog-child'))
-    const parent = { id: parentSession.id, session: parentSession } as Agent
-    const localAgent = { id: childSession.id, session: childSession } as Agent
+    const parent = (await ctx.agents.create({ sessionId: brandString<SessionId>('catalog-parent') })).agent
+    const parentSession = parent.session
+    const childId = brandString<SessionId>('catalog-child')
     const result = Promise.withResolvers<SubagentResult>()
     const cleanupFailure = new Error('dispose also failed')
     const warnings = vi.spyOn(ctx.logger, 'warn')
@@ -291,8 +428,7 @@ describe('SubagentRuntime', () => {
       capabilities: NO_CAPS,
       inheritsParentContext: false,
       start: () => Promise.resolve({
-        id: childSession.id,
-        localAgent,
+        id: childId,
         result: result.promise,
         dispose,
       }),
@@ -302,11 +438,13 @@ describe('SubagentRuntime', () => {
       throw catalogFailure
     })
 
-    await expect(subagents.start('catalog-failure', baseRequest({ parent })))
+    await expect(start(subagents, 'catalog-failure', baseRequest({ parent }), 'parent'))
       .rejects.toBe(catalogFailure)
     expect(append).toHaveBeenCalledOnce()
     expect(dispose).toHaveBeenCalledOnce()
-    expect(warnings).toHaveBeenCalledTimes(failsDisposal ? 1 : 0)
+    expect(warnings).toHaveBeenCalledOnce()
+    expect(warnings.mock.calls[0]![0]).toContain('run infrastructure failed')
+    if (failsDisposal) expect(warnings.mock.calls[0]![0]).toContain('dispose also failed')
   })
 
   it('emits an enriched end event and maps result rejection to error telemetry', async () => {
@@ -318,9 +456,9 @@ describe('SubagentRuntime', () => {
     subagents.registerProvider(completed)
     const ended = vi.fn()
     ctx.on('subagent/end', ended)
-    const run = await subagents.start('completed', baseRequest())
+    const run = await start(subagents, 'completed', baseRequest())
     await run.result
-    await Promise.resolve()
+    await run.dispose()
     expect(ended).toHaveBeenCalledWith(expect.objectContaining({
       provider: 'completed',
       lastAssistantMessage: [{ type: 'text', text: 'answer' }],
@@ -331,9 +469,9 @@ describe('SubagentRuntime', () => {
     // matching the continuable epoch event.
     const silent = new StubProvider('silent', NO_CAPS, { output: [], stopReason: 'completed' })
     subagents.registerProvider(silent)
-    const silentRun = await subagents.start('silent', baseRequest())
+    const silentRun = await start(subagents, 'silent', baseRequest())
     await silentRun.result
-    await Promise.resolve()
+    await silentRun.dispose()
     const silentEnd = ended.mock.calls.map(call => call[0] as SubagentRunEndInfo).find(info => info.provider === 'silent')
     expect(silentEnd).toBeDefined()
     expect('lastAssistantMessage' in silentEnd!).toBe(false)
@@ -344,13 +482,13 @@ describe('SubagentRuntime', () => {
       capabilities: NO_CAPS,
       inheritsParentContext: false,
       async start() {
-        return { id: SessionId('infra-child'), localAgent: undefined, result: failure.promise, async dispose() {} }
+        return { id: brandString<SessionId>('infra-child'), result: failure.promise, async dispose() {} }
       },
     })
-    const failedRun = await subagents.start('infra', baseRequest())
+    const failedRun = await start(subagents, 'infra', baseRequest())
     failure.reject(new Error('transport'))
     await expect(failedRun.result).rejects.toThrow('transport')
-    await Promise.resolve()
+    await expect(failedRun.dispose()).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
     expect(ended).toHaveBeenCalledWith(expect.objectContaining({ provider: 'infra', stopReason: 'error' }))
   })
 
@@ -391,18 +529,17 @@ describe('subagent descriptors', () => {
 
   it('omits absent fields, recovers a complete payload, and rejects unsupported versions', () => {
     expect(foldSubagentDescriptor([])).toBeUndefined()
-    const minimal = snapshotSubagentDescriptor({ mode: 'one-shot', provider: 'spawn' })
-    expect(minimal).toEqual({
+    const minimal = {
       version: SUBAGENT_DESCRIPTOR_VERSION,
-      mode: 'one-shot',
+      mode: 'one-shot' as const,
       provider: 'spawn',
-    })
+    }
     expect(foldSubagentDescriptor([event(minimal)])).toEqual(minimal)
+    expect(foldSubagentDescriptor([event({ ...minimal, label: 'child work' })]))
+      .toEqual({ ...minimal, label: 'child work' })
     expect(snapshotSubagentDescriptor({
-      mode: 'one-shot',
-      provider: 'spawn',
-      label: 'child work',
-    })).toEqual({ ...minimal, label: 'child work' })
+      mode: 'continuable', provider: 'spawn', label: 'child',
+    })).toEqual({ version: SUBAGENT_DESCRIPTOR_VERSION, mode: 'continuable', provider: 'spawn', label: 'child' })
     const complete = {
       version: SUBAGENT_DESCRIPTOR_VERSION,
       mode: 'continuable' as const,
@@ -410,7 +547,7 @@ describe('subagent descriptors', () => {
       label: 'complete child',
       agentProvider: 'deepseek',
       agentModel: 'chat',
-      agentReasoningEffort: ReasoningEffortId('high'),
+      agentReasoningEffort: brandString<ReasoningEffortId>('high'),
       persona: 'reviewer',
       toolFilter: { allow: ['read'], deny: ['bash'] },
     }
@@ -564,4 +701,27 @@ describe('subagent descriptors', () => {
   ])('rejects a malformed persisted descriptor: %s', (_case, data, detail) => {
     expect(() => foldSubagentDescriptor([event(data)])).toThrow(detail)
   })
+})
+
+it('rejects registration when a provider implements neither execution method', async () => {
+  const { ctx, subagents } = await service()
+  const added = vi.fn()
+  ctx.on('subagent/provider-added', added)
+  expect(() => subagents.registerProvider({ name: 'empty', capabilities: NO_CAPS, inheritsParentContext: false }))
+    .toThrow(expect.objectContaining({ code: 'UNSUPPORTED_CAPABILITY' }))
+  expect(subagents.getProvider('empty')).toBeUndefined()
+  expect(added).not.toHaveBeenCalled()
+})
+
+it('rejects a disposed parent before starting provider execution', async () => {
+  const { ctx, subagents } = await service()
+  const provider = new StubProvider('external')
+  subagents.registerProvider(provider)
+  const handle = await ctx.agents.create({ sessionId: brandString<SessionId>('disposed-parent') })
+  await handle.dispose()
+  await expect(subagents.startActivation({
+    provider: provider.name, label: 'work', delivery: 'caller', signal: new AbortController().signal,
+    parent: handle.agent, prompt: [],
+  })).rejects.toMatchObject({ code: 'UNAUTHORIZED' })
+  expect(provider.startCount).toBe(0)
 })

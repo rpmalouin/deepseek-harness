@@ -15,6 +15,7 @@ import { accessZh } from '../src/client/locales.ts'
 afterEach(cleanup)
 
 const CATALOG: PermissionCatalog = {
+  defaultPreset: 'read-only', defaultOptions: [{ value: 'read-only', name: 'read-only' }, { value: 'workspace-write', name: 'workspace-write' }, { value: 'danger-full-access', name: 'danger-full-access' }],
   options: [
     { value: 'read-only', name: 'read-only' },
     { value: 'workspace-write', name: 'workspace-write' },
@@ -80,7 +81,7 @@ describe('PermissionSelect', () => {
 
     fireEvent.click(trigger())
     expect(screen.getAllByRole('menuitem').map(item => item.textContent))
-      .toEqual(['仅可查看', '工作区内修改', '完全权限', 'Auto reviewEXP'])
+      .toEqual(['仅可查看', '工作区内修改', '完全权限', '自动审查EXP'])
     fireEvent.click(screen.getByRole('menuitem', { name: '工作区内修改' }))
 
     expect(select).toHaveBeenCalledExactlyOnceWith('workspace-write')
@@ -93,6 +94,7 @@ describe('PermissionSelect', () => {
 
   it('preserves host labels and ignores the already-current row', () => {
     const catalog: PermissionCatalog = {
+      defaultPreset: 'read-only', defaultOptions: [{ value: 'read-only', name: 'read-only' }, { value: 'workspace-write', name: 'workspace-write' }, { value: 'danger-full-access', name: 'danger-full-access' }],
       options: [
         { value: 'workspace-write', name: 'Project Files' },
         { value: 'danger-full-access', name: 'Operator Mode' },
@@ -141,19 +143,25 @@ describe('PermissionSelect', () => {
   it('marks Auto experimental and uses the current-session risk copy', async () => {
     const { select, selection } = setup()
     fireEvent.click(trigger())
-    fireEvent.click(screen.getByRole('menuitem', { name: 'Auto review EXP' }))
+    const autoOption = screen.getByRole('menuitem', { name: '自动审查 EXP' })
+    const autoGlyph = autoOption.querySelector('svg[aria-hidden="true"]')
+    expect(autoGlyph).not.toBeNull()
+    expect(autoGlyph!.innerHTML)
+      .not.toBe(screen.getByRole('menuitem', { name: '完全权限' }).querySelector('svg')!.innerHTML)
+    fireEvent.click(autoOption)
 
-    const dialog = screen.getByRole('dialog', { name: '确认启用 Auto review（实验）？' })
+    const dialog = screen.getByRole('dialog', { name: '确认启用自动审查（实验）？' })
     expect(dialog.textContent).toContain('不使用沙箱')
     expect(dialog.textContent).toContain('误放行或误拒绝')
     fireEvent.click(screen.getByRole('checkbox', { name: '我已了解这些风险，并愿意继续' }))
-    fireEvent.click(screen.getByRole('button', { name: '启用 Auto review' }))
+    fireEvent.click(screen.getByRole('button', { name: '启用自动审查' }))
     expect(select).toHaveBeenCalledExactlyOnceWith('auto')
     act(() => { selection.set({ value: { currentValue: 'auto' } }) })
     await act(async () => {})
 
-    expect(trigger().getAttribute('aria-label')).toBe('访问模式，当前：Auto review EXP')
-    expect(trigger().querySelector('sup')?.textContent).toBe('EXP')
+    expect(trigger().getAttribute('aria-label')).toBe('访问模式，当前：自动审查')
+    expect(trigger().textContent).toBe('自动审查')
+    expect(trigger().querySelectorAll('svg[aria-hidden="true"]')).toHaveLength(2)
     expect(trigger().getAttribute('title')).toBe('无沙箱运行；每次原生工具调用和 PTC 内层调用前由同一模型进行实验性审查。')
   })
 
@@ -181,10 +189,10 @@ describe('PermissionSelect', () => {
   it('revokes Auto confirmation and its optimistic label when the catalog withdraws it', async () => {
     const submitted = Promise.withResolvers<boolean>()
     const { catalog, select, selection } = setup({ select: () => submitted.promise })
-    const withoutAuto = { options: CATALOG.options.filter(option => option.value !== 'auto') }
+    const withoutAuto = { ...CATALOG, options: CATALOG.options.filter(option => option.value !== 'auto') }
     const chooseAuto = () => {
       fireEvent.click(trigger())
-      fireEvent.click(screen.getByRole('menuitem', { name: 'Auto review EXP' }))
+      fireEvent.click(screen.getByRole('menuitem', { name: '自动审查 EXP' }))
     }
     try {
       chooseAuto()
@@ -199,9 +207,9 @@ describe('PermissionSelect', () => {
       chooseAuto()
       expect(screen.getByRole<HTMLInputElement>('checkbox').checked).toBe(false)
       fireEvent.click(screen.getByRole('checkbox'))
-      fireEvent.click(screen.getByRole('button', { name: '启用 Auto review' }))
+      fireEvent.click(screen.getByRole('button', { name: '启用自动审查' }))
       expect(select).toHaveBeenCalledExactlyOnceWith('auto')
-      expect(trigger().textContent).toBe('Auto reviewEXP')
+      expect(trigger().textContent).toBe('自动审查')
 
       act(() => {
         selection.set({ value: { currentValue: 'danger-full-access' } })

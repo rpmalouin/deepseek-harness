@@ -1,5 +1,5 @@
 .block {
-  --dsl-web-radius: 12px;
+  --dsl-web-radius: var(--dsw-radius-lg);
 
   margin: 16px 0;
   padding: 12px 14px;
@@ -69,10 +69,16 @@
   margin-right: 5px;
 }
 
-.sourceLink:hover,
 .sourceLink:focus-visible {
   text-decoration: underline dotted;
   text-underline-offset: 3px;
+}
+
+@media (hover: hover) {
+  .sourceLink:hover {
+    text-decoration: underline dotted;
+    text-underline-offset: 3px;
+  }
 }
 
 .snippet {
@@ -117,10 +123,16 @@
   text-decoration: none;
 }
 
-.fetchUrl:hover,
 .fetchUrl:focus-visible {
   text-decoration: underline dotted;
   text-underline-offset: 3px;
+}
+
+@media (hover: hover) {
+  .fetchUrl:hover {
+    text-decoration: underline dotted;
+    text-underline-offset: 3px;
+  }
 }
 
 .fetchMeta {

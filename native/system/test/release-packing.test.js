@@ -15,7 +15,7 @@ function fixture(t) {
   t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
   const dir = path.join(workspace, 'native/system');
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(workspace, 'package.json'), `${JSON.stringify({ private: true, packageManager: 'pnpm@11.7.0' })}\n`);
+  fs.writeFileSync(path.join(workspace, 'package.json'), `${JSON.stringify({ private: true, packageManager: 'pnpm@11.28.5' })}\n`);
   fs.writeFileSync(path.join(workspace, 'pnpm-workspace.yaml'), 'packages:\n  - native/system\n  - native/system/packages/*\n');
   fs.writeFileSync(path.join(workspace, 'LICENSE'), workspaceLicense);
   const scratch = path.join(workspace, 'scratch');
@@ -26,7 +26,7 @@ function fixture(t) {
     fs.writeFileSync(path.join(dir, file), `${JSON.stringify(value, null, 2)}\n`);
   };
   const repository = (name) => ({ type: 'git', url: publicRepository, directory: `native/system/packages/${name}` });
-  writeJson('package.json', { name: 'native-packing-fixture', private: true, version: '1.2.3', packageManager: 'pnpm@11.7.0' });
+  writeJson('package.json', { name: 'native-packing-fixture', private: true, version: '1.2.3', packageManager: 'pnpm@11.28.5' });
   writeJson('packages/linux-x64/package.json', {
     name: '@fixture/native-linux-x64', version: '1.2.3', repository: repository('linux-x64'),
     os: ['linux'], cpu: ['x64'], files: ['bin/', 'prebuilds.json'],
@@ -46,7 +46,7 @@ function fixture(t) {
   writeJson('packages/entry/package.json', {
     name: '@fixture/native', version: '1.2.3', type: 'module', repository: repository('entry'),
     exports: { '.': './lib/index.js' }, files: ['lib/'],
-    optionalDependencies: { '@fixture/native-linux-x64': 'workspace:*' },
+    optionalDependencies: { '@fixture/native-linux-x64': 'workspace:~' },
     scripts: { prepack: 'node ../../scripts/verify-entry-lib.mjs' },
   });
   fs.mkdirSync(path.join(dir, 'packages/entry/lib'));
@@ -102,7 +102,7 @@ for (const workflow of [false, true]) {
     }
     assert.equal(manifests[0].repository.directory, 'native/system/packages/linux-x64');
     assert.equal(manifests[1].repository.directory, 'native/system/packages/entry');
-    assert.equal(manifests[1].optionalDependencies['@fixture/native-linux-x64'], '1.2.3');
+    assert.equal(manifests[1].optionalDependencies['@fixture/native-linux-x64'], '~1.2.3');
     assert.equal(tarFile(f.dir, files[1], 'LICENSE').toString(), workspaceLicense);
     assert.deepEqual(tarFile(f.dir, files[0], 'bin/landlock-run'), f.binary);
     const extracted = path.join(f.dir, 'extracted');

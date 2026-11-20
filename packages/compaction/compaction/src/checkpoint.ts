@@ -6,17 +6,16 @@
  * The seam itself lives in `@deepseek-ai/dsh-compaction`, which re-exports these
  * contracts; this module is a pure type/value/predicate outlet (no cordis
  * imports, no module augmentation) so client and wire programs can name the
- * checkpoint source without loading the host plugin's Context merges — the
- * `dsh-commands/brand` shape.
+ * checkpoint source without loading the host plugin's Context merges.
  *
  * @module @deepseek-ai/dsh-compaction/checkpoint
  */
 
 import type { MessageSource } from '@deepseek-ai/dsh-llm/message'
-import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
+import type { CommandId } from '@deepseek-ai/dsh-commands/types'
 import type { CompactionId } from './brand.ts'
 
-const COMPACT_CHECKPOINT_MARKER = Object.freeze({ kind: 'plugin', plugin: 'compact' } as const)
+const COMPACT_CHECKPOINT_MARKER = Object.freeze({ kind: 'compact-checkpoint' } as const)
 
 /** Message source carried by a concrete compaction checkpoint. */
 export type CompactionCheckpointSource = typeof COMPACT_CHECKPOINT_MARKER & {
@@ -46,6 +45,6 @@ export function compactCheckpointSource(
  * @param source - source restored from a surface user message.
  * @returns whether the source carries the backend-independent checkpoint marker.
  */
-export function isCompactCheckpointSource(source: MessageSource): boolean {
-  return source.kind === 'plugin' && source.plugin === COMPACT_CHECKPOINT_MARKER.plugin
+export function isCompactCheckpointSource(source: MessageSource): source is CompactionCheckpointSource {
+  return source.kind === 'compact-checkpoint'
 }

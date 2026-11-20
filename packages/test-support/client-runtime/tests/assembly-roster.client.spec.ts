@@ -11,22 +11,22 @@ const ROWS: readonly ClientRosterRow[] = [
 ]
 
 describe('graphFromRoster', () => {
-  it('synthesizes one application batch over every row with placeholder URLs', () => {
+  it('synthesizes one application batch over every row with placeholder references', () => {
     expect(graphFromRoster(ROWS)).toEqual({
       rev: 'local',
       entries: [
-        { id: MODULES_PACKAGE, url: `/plugins/${MODULES_PACKAGE}/client.js`, rev: 'local', immediately: true },
-        { id: '@x/a', url: '/plugins/@x/a/client.js', rev: 'local' },
-        { id: '@x/b', url: '/plugins/@x/b/client.js', rev: 'local', inject: ['@x/a'], immediately: true },
+        { id: MODULES_PACKAGE, url: `plugins/${MODULES_PACKAGE}/client.js`, rev: 'local', immediately: true },
+        { id: '@x/a', url: 'plugins/@x/a/client.js', rev: 'local' },
+        { id: '@x/b', url: 'plugins/@x/b/client.js', rev: 'local', inject: ['@x/a'], immediately: true },
       ],
-      batches: [{ phase: 'application', url: '/plugins/local.js', rev: 'local', entries: [MODULES_PACKAGE, '@x/a', '@x/b'] }],
+      batches: [{ phase: 'application', url: 'plugins/local.js', rev: 'local', entries: [MODULES_PACKAGE, '@x/a', '@x/b'] }],
     })
   })
 
   it('parses through the production validator to plugin rows that mirror the roster, refusing duplicates and an empty roster', () => {
     const manifest = parseBootManifest(graphFromRoster(ROWS))
     expect(manifest.plugins).toEqual(ROWS.map(row => ({ id: row.name, inject: [...row.inject], immediately: row.immediately })))
-    expect(manifest.modules.map(row => row.initialUrl)).toEqual(['/plugins/local.js', '/plugins/local.js', '/plugins/local.js'])
+    expect(manifest.modules.map(row => row.initialUrl)).toEqual(['plugins/local.js', 'plugins/local.js', 'plugins/local.js'])
     const row = ROWS[1]!
     expect(() => parseBootManifest(graphFromRoster([row, row]))).toThrow('duplicate graph entry "@x/a"')
     expect(() => parseBootManifest(graphFromRoster([]))).toThrow('must be a non-empty string array')
@@ -45,7 +45,10 @@ describe('graphFromRoster', () => {
     const b = { apply() {} }
     const modules = target.create({
       boot: graphFromRoster(ROWS),
-      staticModules: { '@x/a': a, '@x/b': b },
+      staticModules: [
+        { id: '@x/a', factory: () => a },
+        { id: '@x/b', factory: () => b },
+      ],
       loadBundle: async (url) => { loaded.push(url) },
     })
     await expect(modules.import('@x/a')).resolves.toBe(a)

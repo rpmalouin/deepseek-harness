@@ -1,14 +1,14 @@
 // Web e2e scenario: the composer's independent Stop interrupts a running
 // continuable child. The child holds its model turn open through a replay
-// hang entry; the browser proves Send and Stop coexist, the parent-offline
-// disabled-Send-with-Stop composer, the subagents/interruptByParent
+// hang entry; the browser proves Send and Stop coexist regardless of the
+// creator's list availability, the subagents/interruptByUser
 // (never session.cancel) transport, the parked follow-up, and the FIFO resume
 // on a waking send.
 //
 // Replay-binding note: only the PRIMARY script can hang, and scripts bind by
 // first-call order, so the child issues the composition's first model call
 // (claiming the overridden primary) and the parent's one UI prompt — needed
-// so the non-blank parent renders its header catalog — binds to a derived
+// so the non-blank parent lists its subagents in the Session panel — binds to a derived
 // child fixture afterwards.
 import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
@@ -25,12 +25,14 @@ import {
   acknowledgeReloadConnectionLoss, assertFixtureInventory, captureStableAria, compareOrRefreshGolden,
   launchWebScaffold, readPersistedEvents, watchConsole, webSnapshotMode, type WebScaffold,
 } from './scaffold.ts'
-import { connectFreshWorkspace, newEnglishPage, saveFailureShot } from './support.ts'
+import { connectFreshWorkspace, newEnglishPage, saveFailureShot, showSessionPanel } from './support.ts'
 
 const BASE_FIXTURE = fileURLToPath(new URL('../../../snapshots/web/live-interactions/session.v3.jsonl', import.meta.url))
 
 const SNAPSHOT_DIR = fileURLToPath(new URL('../../../snapshots/web/subagent-interrupt', import.meta.url))
 const OFFLINE_COMPOSER_EXPECTED = join(SNAPSHOT_DIR, 'offline-composer.expected.md')
+const IMAGE_QUEUE_EXPECTED = join(SNAPSHOT_DIR, 'image-queue.expected.md')
+const PNG = fileURLToPath(new URL('../../../snapshots/session/read-image/workspace/red.png', import.meta.url))
 const MODE = webSnapshotMode()
 const LABEL = 'event-sourcing researcher'
 const INITIAL = 'Explain event sourcing in one sentence.'
@@ -41,6 +43,7 @@ const EDITED_FOLLOWUP = 'Explain the same idea for a human reader.'
 const WAKING = 'And add one concrete example.'
 const REARMED_ANSWER = 're-armed setup answer'
 const PARKED_ANSWER = 'parked follow-up answer'
+const IMAGE_ANSWER = 'image follow-up answer'
 const WAKING_ANSWER = 'waking answer'
 
 /** Poll a synchronous condition (hook-safe; expect.poll is test-body only). */
@@ -105,6 +108,7 @@ describe.skipIf(MODE === 'record')('web e2e: composer interrupt for a running co
       { kind: 'hang', readyFile: rearmedReadyFile },
       textCompletion(REARMED_ANSWER),
       textCompletion(PARKED_ANSWER),
+      textCompletion(IMAGE_ANSWER),
       textCompletion(WAKING_ANSWER),
     ]))
     await writeFile(
@@ -140,15 +144,16 @@ describe.skipIf(MODE === 'record')('web e2e: composer interrupt for a running co
     await page.waitForSelector('[class*="frame"]', { timeout: 30_000 })
     await connectFreshWorkspace(page, scaffold.workspaceCwd)
 
-    const root = scaffold.ctx.agents.roots()[0]
+    const root = scaffold.ctx.agents.list().filter(agent => agent.session.header.origin !== 'subagent')[0]
     if (root === undefined) throw new Error('fresh workspace did not publish its parent Agent')
     parent = root
     // The child's first model call claims the primary override and holds.
-    const started = await scaffold.ctx.subagents.startContinuable({
+    const started = await scaffold.ctx.subagents.startActivation({
+      delivery: 'parent',
       provider: 'spawn',
       label: LABEL,
       signal: new AbortController().signal,
-      request: { prompt: [{ type: 'text', text: INITIAL }], parent },
+      prompt: [{ type: 'text', text: INITIAL }], parent,
     })
     childId = started.childId
     await waitFor(() => existsSync(readyFile), 'the held child turn to open')
@@ -166,7 +171,7 @@ describe.skipIf(MODE === 'record')('web e2e: composer interrupt for a running co
     const warningStart = tripwire.warnings.length
     await page.reload({ waitUntil: 'load' })
     await page.waitForSelector('[class*="frame"]', { timeout: 30_000 })
-    await page.getByRole('button', { name: /1 subagent/ }).waitFor({ timeout: 15_000 })
+    await (await showSessionPanel(page)).getByRole('treeitem', { name: new RegExp(LABEL) }).waitFor({ timeout: 15_000 })
     acknowledgeReloadConnectionLoss(tripwire, warningStart)
     expect(scaffold.ctx.agents.get(childId)?.status).toBe('running')
   }, 120_000)
@@ -183,48 +188,43 @@ describe.skipIf(MODE === 'record')('web e2e: composer interrupt for a running co
     if (failures.length > 1) throw new AggregateError(failures, 'subagent interrupt UI teardown failed')
   })
 
-  it('interrupts the live child through the parent-offline composer', async () => {
+  it('queues and interrupts the live child despite its creator being listed offline', async () => {
     onTestFailed(() => saveFailureShot(page, 'web-e2e-subagent-interrupt-offline'))
-    // Simulate a parent that went offline: the catalog delivers
-    // parentAvailable: false while the child Activation stays live (the
-    // interrupt RPC itself needs no live parent — covered host-side by
-    // subagent-interrupt.e2e.ts).
-    const pattern = '**/api/subagents/list'
+    // The parent is unavailable in the Session list while the child stays live.
+    const pattern = '**/api/session/list'
     await page.route(pattern, async (route) => {
       const response = await route.fetch()
       const body = await response.json() as {
-        result: { ok: true; value: { parentAvailable: boolean } } | { ok: false }
+        result: { ok: true; value: { items: { sessionId: SessionId; agentAvailable: boolean }[] } } | { ok: false }
       }
-      if (body.result.ok) body.result.value.parentAvailable = false
+      if (body.result.ok) {
+        const summary = body.result.value.items.find(session => session.sessionId === parent.id)
+        if (summary === undefined) throw new Error('parent missing from Session list')
+        summary.agentAvailable = false
+      }
       await route.fulfill({ response, json: body })
     })
     try {
-      await page.getByRole('button', { name: /1 subagent/ }).click()
-      await page.getByRole('treeitem', { name: new RegExp(LABEL) }).click()
-      const input = page.getByRole('textbox', {
-        name: 'Parent session offline; sending is unavailable but you can still stop the run',
-      })
+      const warningStart = tripwire.warnings.length
+      await page.reload({ waitUntil: 'load' })
+      await page.waitForSelector('[class*="frame"]', { timeout: 30_000 })
+      acknowledgeReloadConnectionLoss(tripwire, warningStart)
+      await (await showSessionPanel(page)).getByRole('treeitem', { name: new RegExp(LABEL) }).press('Enter')
+      const input = page.locator('[data-composer-input]').first()
       await input.waitFor({ timeout: 15_000 })
-      await page.getByText(/^Explain event sourcing in one sentence\.Your parent agent id is /)
+      await page.getByRole('button', { name: /^Task message received/ })
         .waitFor({ timeout: 15_000 })
-      expect(await input.isDisabled()).toBe(true)
+      expect(await input.isDisabled()).toBe(false)
       const stop = page.getByRole('button', { name: 'Stop generating' })
       expect(await stop.count()).toBe(1)
       expect(await stop.isEnabled()).toBe(true)
-      const send = page.getByRole('button', { name: 'Send message' })
-      expect(await send.count()).toBe(1)
-      expect(await send.isDisabled()).toBe(true)
-      // Keep the continuable Activation resident after this first abort. The
-      // direct setup queue also proves the ordinary row controls remain
-      // available while this parent-offline composer cannot submit new input.
-      await scaffold.ctx.subagents.prompt({
-        requestId: 'interrupt-ui-rearm' as SubagentPromptRequestId,
-        parentSessionId: parent.id,
-        childSessionId: childId,
-        mode: 'continuable',
-        delivery: 'queue',
-        content: [{ type: 'text', text: REARM }],
-      }, new AbortController().signal)
+      const promptResponse = page.waitForResponse(response =>
+        new URL(response.url()).pathname === '/api/subagents/prompt')
+      await input.fill(REARM)
+      const send = page.getByRole('button', { name: 'Queue message' })
+      expect(await send.isEnabled()).toBe(true)
+      await send.click()
+      expect(((await (await promptResponse).json()) as { result: { ok: boolean } }).result).toMatchObject({ ok: true })
       await page.getByRole('button', { name: 'Edit queued message' }).waitFor({ timeout: 15_000 })
       expect(await page.getByRole('button', { name: 'Remove queued message' }).count()).toBe(1)
       expect(await page.getByRole('button', { name: 'Steer queued message' }).count()).toBe(1)
@@ -236,7 +236,7 @@ describe.skipIf(MODE === 'record')('web e2e: composer interrupt for a running co
 
       const aborted = waitForAbortedTurn(scaffold, childId)
       const interruptResponse = page.waitForResponse(response =>
-        new URL(response.url()).pathname === '/api/subagents/interruptByParent')
+        new URL(response.url()).pathname === '/api/subagents/interruptByUser')
       await stop.click()
       expect(((await (await interruptResponse).json()) as {
         result: { ok: boolean; value?: { accepted: boolean } }
@@ -246,12 +246,10 @@ describe.skipIf(MODE === 'record')('web e2e: composer interrupt for a running co
       await expect.poll(() => scaffold.ctx.agents.get(childId)?.status, { timeout: 15_000 }).toBe('idle')
 
       // Wake the parked setup message only after cancellation converges. A
-      // second hang keeps the parent-available case independent from this stop.
+      // second hang keeps the next interrupt case independent from this stop.
       await scaffold.ctx.subagents.prompt({
         requestId: 'interrupt-ui-rearm-wake' as SubagentPromptRequestId,
-        parentSessionId: parent.id,
         childSessionId: childId,
-        mode: 'continuable',
         delivery: 'queue',
         content: [{ type: 'text', text: REARM_WAKE }],
       }, new AbortController().signal)
@@ -262,13 +260,15 @@ describe.skipIf(MODE === 'record')('web e2e: composer interrupt for a running co
     }
   }, 60_000)
 
-  it('interrupts through subagents/interruptByParent, parks the follow-up, and resumes it FIFO', async () => {
+  it('interrupts through subagents/interruptByUser, parks the follow-up, and resumes it FIFO', async () => {
     onTestFailed(() => saveFailureShot(page, 'web-e2e-subagent-interrupt-flow'))
-    // Reselect the child with the truthful catalog: parent available again.
+    const warningStart = tripwire.warnings.length
+    await page.reload({ waitUntil: 'load' })
+    await page.waitForSelector('[class*="frame"]', { timeout: 30_000 })
+    acknowledgeReloadConnectionLoss(tripwire, warningStart)
     await page.getByRole('navigation', { name: 'Session hierarchy' })
       .getByRole('button').first().click()
-    await page.getByRole('button', { name: /1 subagent/ }).click()
-    await page.getByRole('treeitem', { name: new RegExp(LABEL) }).click()
+    await (await showSessionPanel(page)).getByRole('treeitem', { name: new RegExp(LABEL) }).press('Enter')
     // A live continuable child advertises the ordinary steer-all gesture, so
     // that placeholder is the composer's accessible name in this window. It
     // changes back as the queue drains, so later interactions address the
@@ -301,11 +301,35 @@ describe.skipIf(MODE === 'record')('web e2e: composer interrupt for a running co
     await page.getByText(EDITED_FOLLOWUP, { exact: true }).waitFor()
     expect(apiCalls.filter(path => path === '/api/subagents/updateQueue')).toEqual([])
 
+    // A separate image-only follow-up proves attachment admission without
+    // changing the existing text queue's edit coverage.
+    const imageBytes = [...await readFile(PNG)]
+    await input.evaluate((surface, data) => {
+      const transfer = new DataTransfer()
+      transfer.items.add(new File([new Uint8Array(data)], 'child-followup.png', { type: 'image/png' }))
+      surface.dispatchEvent(new ClipboardEvent('paste', {
+        clipboardData: transfer, bubbles: true, cancelable: true,
+      }))
+    }, imageBytes)
+    await page.getByRole('img', { name: 'child-followup.png', exact: true }).waitFor()
+    const imageResponse = page.waitForResponse(response =>
+      new URL(response.url()).pathname === '/api/subagents/prompt')
+    await page.getByRole('button', { name: 'Queue message' }).click()
+    expect(((await (await imageResponse).json()) as { result: { ok: boolean } }).result).toMatchObject({ ok: true })
+    const thumbnail = page.locator('[data-queue-dock]').getByRole('img', { name: 'Queued message image' })
+    await thumbnail.waitFor()
+    await expect.poll(() => thumbnail.evaluate((image: HTMLImageElement) => image.complete && image.naturalWidth > 0)).toBe(true)
+    await compareOrRefreshGolden(
+      IMAGE_QUEUE_EXPECTED,
+      await captureStableAria(page, '[class*="centerCol"]', scaffold.workspaceCwd),
+      MODE,
+    )
+
     const aborted = waitForAbortedTurn(scaffold, childId)
     const stop = page.getByRole('button', { name: 'Stop generating' })
     expect(await stop.count()).toBe(1)
     const interruptResponse = page.waitForResponse(response =>
-      new URL(response.url()).pathname === '/api/subagents/interruptByParent')
+      new URL(response.url()).pathname === '/api/subagents/interruptByUser')
     await stop.click()
     expect(((await (await interruptResponse).json()) as {
       result: { ok: boolean; value?: { accepted: boolean } }
@@ -319,7 +343,7 @@ describe.skipIf(MODE === 'record')('web e2e: composer interrupt for a running co
     await expect.poll(() => scaffold.ctx.agents.get(childId)?.status, { timeout: 15_000 }).toBe('idle')
     const child = scaffold.ctx.agents.get(childId)
     expect(child).toBeDefined()
-    expect(child!.inbox.nextTurn).toHaveLength(2)
+    expect(child!.inbox.nextTurn).toHaveLength(3)
     expect(child!.session.snapshotEvents().filter(event => event.type === 'turn/start')).toHaveLength(2)
     await page.getByRole('button', { name: 'Send message' }).waitFor({ timeout: 15_000 })
 
@@ -328,6 +352,7 @@ describe.skipIf(MODE === 'record')('web e2e: composer interrupt for a running co
     await input.press('Enter')
     await expect.poll(() => page.getByText(REARMED_ANSWER, { exact: true }).count(), { timeout: 30_000 }).toBe(1)
     await expect.poll(() => page.getByText(PARKED_ANSWER, { exact: true }).count(), { timeout: 30_000 }).toBe(1)
+    await expect.poll(() => page.getByText(IMAGE_ANSWER, { exact: true }).count(), { timeout: 30_000 }).toBe(1)
     await expect.poll(() => page.getByText(WAKING_ANSWER, { exact: true }).count(), { timeout: 30_000 }).toBe(1)
     await expect.poll(() => scaffold.ctx.agents.get(childId), { timeout: 60_000 }).toBeUndefined()
 
@@ -338,17 +363,35 @@ describe.skipIf(MODE === 'record')('web e2e: composer interrupt for a running co
       && event.data.source.kind === 'user'
       ? event.data.content.flatMap(block => block.type === 'text' ? [block.text] : [])
       : [])
-    expect(userTexts[0]).toBe(INITIAL)
-    expect(userTexts[1]).toMatch(/^Your parent agent id is .+send_message\(\{ agent_id: /)
-    expect(userTexts.slice(2)).toEqual([REARM, REARM_WAKE, EDITED_FOLLOWUP, WAKING])
+    expect(userTexts).toEqual([REARM, REARM_WAKE, EDITED_FOLLOWUP, WAKING])
+    const delegatedTask = events.find(event => event.type === 'user/message'
+      && event.data.source.kind === 'agent-message')
+    const taskContent = delegatedTask?.type === 'user/message' ? delegatedTask.data.content : undefined
+    expect(taskContent).toHaveLength(3)
+    expect(taskContent?.slice(0, 2)).toEqual([
+      { type: 'text', text: 'Agent lead sent a message: ' },
+      { type: 'text', text: INITIAL },
+    ])
+    const guidance = taskContent?.[2]
+    expect(guidance?.type === 'text' && guidance.text)
+      .toMatch(/^Your final answer is delivered automatically if your parent is still online\./)
+    const imageMessage = events.find(event => event.type === 'user/message'
+      && event.data.content.some(block => block.type === 'image'))
+    expect(imageMessage?.type === 'user/message' && imageMessage.data.content.map(block => block.type)).toEqual(['image'])
+    const image = imageMessage?.type === 'user/message'
+      ? imageMessage.data.content.find(block => block.type === 'image')
+      : undefined
+    expect(image?.type === 'image' && image.attachment.name).toBe('child-followup.png')
+    expect(JSON.stringify(events)).not.toContain('base64')
+    await page.locator('[class*="userRow"] img').first().waitFor()
     const turnEndKinds = events
       .filter(event => event.type === 'turn/end')
       .map(event => event.data.reason.kind)
-    expect(turnEndKinds).toEqual(['aborted', 'aborted', 'completed', 'completed', 'completed'])
+    expect(turnEndKinds).toEqual(['aborted', 'aborted', 'completed', 'completed', 'completed', 'completed'])
     expect(tripwire.pageErrors).toEqual([])
   }, 120_000)
 
   it('keeps its snapshot inventory closed', async () => {
-    await assertFixtureInventory(SNAPSHOT_DIR, ['offline-composer.expected.md'])
+    await assertFixtureInventory(SNAPSHOT_DIR, ['offline-composer.expected.md', 'image-queue.expected.md'])
   })
 })

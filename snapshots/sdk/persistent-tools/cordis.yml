@@ -9,7 +9,7 @@
         maxOutputChars: 16000
 
 - id: llm-deepseek
-  name: '@deepseek-ai/dsh-llm-deepseek'
+  name: '@deepseek-ai/dsh-llm-deepseek-api-key'
   config:
     apiKeyEnv: DEEPSEEK_API_KEY
     streamIdleTimeoutMs: 172800000
@@ -68,6 +68,10 @@
   name: '@deepseek-ai/dsh-tool-skill'
   disabled: true
 
+- id: upstream-skills
+  name: '@deepseek-ai/dsh-upstream-skills'
+  disabled: true
+
 - id: tool-jobs
   name: '@deepseek-ai/dsh-tool-jobs'
   disabled: true
@@ -82,10 +86,6 @@
 
 - id: tool-subagent-control
   name: '@deepseek-ai/dsh-tool-subagent-control'
-  disabled: true
-
-- id: tool-subagent-list-agents
-  name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
   disabled: true
 
 - id: tool-subagent
@@ -106,10 +106,6 @@
 
 - id: tool-goal
   name: '@deepseek-ai/dsh-tool-goal'
-  disabled: true
-
-- id: tool-ralph
-  name: '@deepseek-ai/dsh-tool-ralph'
   disabled: true
 
 - id: tool-web

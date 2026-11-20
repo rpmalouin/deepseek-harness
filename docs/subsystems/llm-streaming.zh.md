@@ -2,7 +2,7 @@
 
 [English](llm-streaming.md) | 中文
 
-[`packages/llm`](../../packages/llm/README.zh.md) 提供对话与流式输出类型：每个请求和持久历史共用的 `Message`/`ContentBlock` 变体、完整组装的模型请求、原始 `StreamChunk` 协议、每个适配器必须实现的适配器约定（adapter contract），以及共享的 assembler。[核心包](core.zh.md)在每个轮次持有并记录这些值；本页声明它们。
+[`packages/llm`](../../packages/llm/README.zh.md) 提供对话与流式输出类型：持久 `Message` 值、仅供请求使用的 user 输入、共用的 `ContentBlock` 变体、完整组装的模型请求、原始 `StreamChunk` 协议、每个适配器必须实现的适配器约定（adapter contract），以及共享的 assembler。[核心包](core.zh.md)在每个轮次持有并记录这些值；本页声明它们。
 
 源码：[`packages/llm/llm/src/types.ts`](../../packages/llm/llm/src/types.ts)
 
@@ -17,7 +17,8 @@
 ```ts type-equiv
 /**
  * Merge-extensible content blocks keyed by `type`. New core blocks must land
- * with adapter, UI, and compaction support.
+ * with adapter, UI, and compaction support. Tool-change blocks belong to
+ * developer messages; `projectToolUpdates` selects what each route receives.
  */
 interface ContentBlockMap {
   'text': TextBlock
@@ -25,11 +26,12 @@ interface ContentBlockMap {
   'image': ImageBlock
   'file': FileBlock
   'tool-call': ToolCallBlock
-  'tool-result': ToolResultBlock
+  'tool-addition': ToolAdditionBlock
+  'tool-removal': ToolRemovalBlock
 }
 ```
 
-各块接口（完整字段见源码）：`TextBlock`（`text`）、`ReasoningBlock`（thinking，区别于可见文本）、`ImageBlock`（一个持久的[图片附件](attachment.zh.md)）、`FileBlock`（一个持久的原样[文件附件](attachment.zh.md)，请求组装对每条路由都把它投影为 handle 文本）、`ToolCallBlock`（`id: ToolCallId`、`name`、原始 JSON `arguments`），以及 `ToolResultBlock`（`toolCallId`、嵌套 `content: ContentBlock[]`、`isError?`）。`ContentBlock = ContentBlockMap[ContentBlockType]`。仅当适配器、UI、压缩（compaction）和持久回放路径均支持某种新模态时，才将其纳入可合并扩展的 map。
+各块接口（完整字段见源码）：`TextBlock`（`text`）、`ReasoningBlock`（thinking，区别于可见文本）、`ImageBlock`（一个持久的[图片附件](attachment.zh.md)）、`FileBlock`（一个持久的原样[文件附件](attachment.zh.md)，请求组装对每条路由都把它投影为 handle 文本）和 `ToolCallBlock`（`id: ToolCallId`、`name`、原始 JSON `arguments`）。工具结果是一等 `ToolResultMessage`，含有 `toolCallId`、结果 `content` 与可选的 `isError`；它不是内容块。`ContentBlock = ContentBlockMap[ContentBlockType]`。仅当适配器、UI、压缩（compaction）和持久回放路径均支持某种新模态时，才将其纳入可合并扩展的 map。 Developer 工具变更块按已解析路由的能力投影。
 
 图片访问方式属于请求序列化，不属于持久附件或确定性请求图片版本。`resolveImageAttachmentAccess()` 把附件提供方可选的宿主对象路径，与消费方为当前工具执行文件系统提供的映射组合起来。结果只适用于本次请求，不参与 `variantId`。
 
@@ -64,31 +66,27 @@ interface AssistantProviderMetadata {
 ```
 
 ```ts type-equiv
-/** One immutable message representation shared by delivery, durable history, and model requests. */
-interface Message {
-  /** Stable identity preserved across every representation boundary. */
-  readonly id: MessageId
-  /** Provider-neutral conversation role. */
-  readonly role: 'system' | 'user' | 'assistant'
-  /** Exact model-facing blocks. */
-  readonly content: ContentBlock[]
-  /** Required source fields supplied by the producer. */
-  readonly source: MessageSource
-}
+/** Any persisted conversation message, discriminated by its `role`. */
+type Message = MessageRoleMap[keyof MessageRoleMap]
 ```
+
+`DeveloperMessage` 以 `developer` 角色按对话顺序记录增量智能体 Session 变更。`ToolAdditionBlock.toolName` 激活由所在 Session 事件的历史请求头引用所选定的定义；`ToolRemovalBlock.toolName` 移除当前生效的定义。其他消息角色拒绝这两种内容块。`deferLoading` 独立控制工具定义的加载请求，不要求存在添加记录。请求头绑定见 [Session](../../packages/core/session/README.zh.md)，提供方支持限制见 [LLM 包](../../packages/llm/llm/README.zh.md#known-limitations-and-deferred-work)。 已解析和已准备模型元数据中的 `ToolUpdate` 为 `in-history` 或 `addition-only`。`GenerateOptions.toolHistory` 携带 `ToolHistory`：初始 `tools` 和有序 `updates`，每项把 developer `messageId` 绑定到已解析历史定义的 `additions`。运行时将此状态投影为提供方声明，不修改已记录请求头中的有效工具列表。
 
 消息来源本身也是一个可合并扩展的和类型：
 
 ```ts type-equiv
 /**
- * Where a message (or injected content) came from.
- * Merge-extensible sum type — plugins add their own `kind`s.
+ * Where a message (or injected content) came from, in the harness's own
+ * vocabulary. Merge-extensible sum type — each producer declares its own
+ * `kind` in its own module; there is no shared catch-all `plugin` kind.
+ * Model and tool sources answer their role messages; user messages carry any
+ * producer's kind, and consumers fall through unknown kinds.
  */
 interface MessageSourceMap {
   user: { kind: 'user' }
-  plugin: { kind: 'plugin'; plugin: string } & ContextFormed
   model: ModelMessageSource
   tool: ToolMessageSource
+  'system-prompt': SystemPromptMessageSource
 }
 ```
 
@@ -225,7 +223,7 @@ type StreamChunk =
 
 `snapshot()` 返回分离且不可变的 stream。`expandAssistantStream()` 会严格检查 record key、成员数、index、时间戳、tool-call identity 与无损 JSON，再重建精确的带时间 chunk 序列。Session 日志会把该 stream 嵌入作为 surface result 的 `assistant/message`，或嵌入没有 surface message 的 `assistant/attempt`。
 
-进程本地 `agent/assistant-stream` frame 承载实时呈现。持久回放与恢复校验仍会展开内嵌 settlement；遥测、token 记账与 Host 折叠直接读取紧凑记录。记录级读取器（`assistantStreamFirstTokenTime`、`assistantStreamHasVisibleContent`、`assistantStreamHasVisibleText`、`lastAssistantStreamChunk`、`assistantStreamChunks`、`joinAssistantStreamText`、`assembleAssistantStream` 以及按 run 的 `runFirstTokenTime` 与 `runFirstVisibleTime`）以提前退出在一次扫描内回答消费方问题，因此大历史每次结算的代价为 O(records) 而非 O(members) 展开（[折叠决策](../../.agents/notes/implemented/architecture/2026-09-06-embedded-stream-record-readers.zh.md)）。`expandAssistantStream()` 仍是持久边界读取记录与需要每个成员的消费方的校验路径。
+进程本地 `agent/assistant-stream` frame 承载实时呈现。持久回放与恢复校验仍会展开内嵌 settlement；遥测、token 记账与 Host 折叠直接读取紧凑记录。记录级读取器（`assistantStreamFirstTokenTime`、`assistantStreamHasVisibleContent`、`assistantStreamHasVisibleText`、`lastAssistantStreamChunk`、`assistantStreamChunks`、`joinAssistantStreamText`、`assembleAssistantStream` 以及按 run 的 `runFirstTokenTime` 与 `runFirstVisibleTime`）以提前退出在一次扫描内回答消费方问题，因此大历史每次结算的代价为 O(records) 而非 O(members) 展开（[折叠参考](../../packages/llm/llm/README.zh.md)）。`expandAssistantStream()` 仍是持久边界读取记录与需要每个成员的消费方的校验路径。
 
 <a id="llmfailure"></a>
 
@@ -315,7 +313,7 @@ interface LlmImageRequestPricing {
 
 ## `AppIdentity`：应用归属
 
-每个适配器都会向提供方发送的静态公开应用标识（[`packages/llm/llm/src/attribution.ts`](../../packages/llm/llm/src/attribution.ts)）。`attributionHeaders(identity?)` 只把它映射到标准 `User-Agent` header；该约定有意不支持 OpenRouter 特有的应用归属 header。默认 `APP_IDENTITY` 从包 manifest（元数据清单）获取版本；每个字段都是公开产品事实——不含 secret、路径、会话 id 或逐用户标识，且任何逐请求信息都不得影响这些值。设计理由见[强制 `User-Agent` 归属](../../.agents/notes/implemented/architecture/2026-06-21-mandatory-app-attribution-headers.zh.md)。
+每个适配器都会向提供方发送的静态公开应用标识（[`packages/llm/llm/src/attribution.ts`](../../packages/llm/llm/src/attribution.ts)）。`attributionHeaders(identity?)` 只把它映射到标准 `User-Agent` header；该约定有意不支持 OpenRouter 特有的应用归属 header。默认 `APP_IDENTITY` 从包 manifest（元数据清单）获取版本；每个字段都是公开产品事实——不含 secret、路径、会话 id 或逐用户标识，且任何逐请求信息都不得影响这些值。`APP_IDENTITY.suffix` 在每次使用时读取 `DSH_USER_AGENT_SUFFIX`，`userAgent()` 将其追加在注释之后；不是 RFC 9110 product token 的值使请求失败。`dsh` 启动器在任何插件加载前将其设为 `dsh-profile/<profile>`，并对 profile 名中 `tchar` 以外的字节及 `%` 本身做百分号编码，因此 Desktop 发送 `deepseek-harness/<version> (+<url>) dsh-profile/desktop`，名为 `my web` 的 profile 发送 `dsh-profile/my%20web`。dsh 子代理子进程报告自己的 profile，因为子进程不继承 `DSH_*` 变量。
 
 ```ts type-equiv
 /**
@@ -332,6 +330,8 @@ interface AppIdentity {
   version: string
   /** Repository home URL of the app, used as the `User-Agent` comment. */
   url: string
+  /** RFC 9110 product token appended after the comment, such as `dsh-profile/web`. */
+  suffix?: string | undefined
 }
 ```
 
@@ -421,10 +421,10 @@ declare class BlockAssembler {
   get replayState(): ReplayEnvelope | undefined;
   /**
    * The assembled assistant message.
-   * @param source - producer attribution for the assembled message.
+   * @param source - provider/model attribution (without the `kind` tag) for the assembled message.
    * @returns a frozen assistant-role message over `blocks()` (same open-block assembly rules).
    */
-  message(source: MessageSource = { kind: 'plugin', plugin: 'dsh-llm/assembler' }): Message;
+  message(source: Omit<ModelMessageSource, 'kind'>): AssistantMessage;
 }
 ```
 
@@ -506,8 +506,50 @@ interface LlmConfigurableProvider {
    * from outside.
    */
   declared?: boolean
+  /**
+   * Route endpoint the adapter uses when the profile sets no `baseURL`; the
+   * adapter may still send an individual model to that model's own endpoint.
+   * Absent when the route has no fixed endpoint.
+   */
+  defaultBaseURL?: string
+  /** Environment variables used to construct a provider endpoint; absent when none are reported. */
+  baseURLEnv?: readonly string[]
+  /** Authentication the adapter performs when the profile names no credential reference; absent when it reports none. */
+  nativeAuth?: LlmNativeAuth
   /** Configuration diagnostic for repair; unaffected models may remain serviceable. */
   error?: string
+}
+```
+
+设置编辑器在提供方配置未设置端点或凭据引用时显示 `defaultBaseURL`、`baseURLEnv` 中的端点配置变量，以及 `nativeAuth`。两个变量列表都只包含名称，不包含值。
+
+```ts type-equiv
+/** Authentication a provider route performs without a credential reference in its profile. */
+interface LlmNativeAuth {
+  /** Environment variables the route's authentication reads, in lookup order; empty when it reads none. */
+  env: readonly string[]
+  /** Whether a stored OAuth sign-in can authenticate the route. */
+  oauth: boolean
+}
+```
+
+目录条目可以携带提供方编写的 `badge`，供选择器显示在模型名称旁。它只是展示数据：`resolveModelInfo` 不返回它，模型请求也不携带它。
+
+```ts type-equiv
+/**
+ * Emphasis of a model badge: `neutral` states a plain fact, `info` highlights
+ * the model, `success` marks a benefit, and `warning` asks for attention.
+ */
+type LlmModelBadgeTone = 'neutral' | 'info' | 'success' | 'warning'
+```
+
+```ts type-equiv
+/** Short provider-authored label a selector shows beside one advertised model name. */
+interface LlmModelBadge {
+  /** One literal, or translations keyed by lowercase language id with a required English entry. */
+  text: LocalizedText
+  /** Emphasis of the label. */
+  tone: LlmModelBadgeTone
 }
 ```
 
@@ -524,6 +566,11 @@ interface LlmModelInfo {
   description?: string
   /** Accepted request modalities; absent means unknown, while an explicit omission is negative capability. */
   inputModalities?: readonly ModelModality[]
+  /**
+   * Selector label advertised by catalog discovery; exact-route resolution
+   * omits it, and no model request or Session event carries it.
+   */
+  badge?: LlmModelBadge
 }
 ```
 
@@ -537,7 +584,7 @@ interface LlmModelContext {
 }
 ```
 
-推理强度是另一项针对确切路由的能力。核心为标识符添加品牌类型，但不枚举其值；有序集合、展示名称和可选的部署默认值均由各适配器持有。
+推理强度是另一项确切路由能力。核心为标识符添加品牌类型，但不枚举其值；每个适配器负责按强度递增排列的选项、显示名称与可选部署默认值。该顺序比较可选控制，不预测 token 用量、成本或延迟。
 
 ```ts type-equiv
 /** Adapter-owned identifier for one model's selectable reasoning effort. */
@@ -559,7 +606,7 @@ interface LlmReasoningEffortInfo {
 ```ts type-equiv
 /** Selectable reasoning efforts for one exact provider/model route. */
 interface LlmModelReasoningInfo {
-  /** Supported efforts in adapter-preferred display order. */
+  /** Supported efforts from least to greatest selectable reasoning effort, not predicted token use or latency. */
   efforts: readonly LlmReasoningEffortInfo[]
   /**
    * Adapter-configured default materialized into requests when callers omit
@@ -580,12 +627,44 @@ interface LlmResolvedModelInfo extends LlmModelInfo {
   reasoning?: LlmModelReasoningInfo
   /** Declared mid-conversation system prompt handling; absent means only a leading system message is read. */
   systemPromptUpdate?: SystemPromptUpdate
+  /** Declared mid-conversation tool declaration handling; absent means every request declares the complete tool list. */
+  toolUpdate?: ToolUpdate
+}
+```
+
+辅助调用方可以提供不含持久身份或来源的 user 内容。既有 `Message[]` 历史仍然是有效的请求输入。Session 写入、Agent 投递和已记录的标题请求仍然要求持久消息。
+
+```ts type-equiv
+/** User input for one LLM request; it has no durable Session identity or source. */
+interface RequestUserInput {
+  readonly role: 'user'
+  readonly content: UserMessage['content']
+  readonly id?: never
+  readonly source?: never
 }
 ```
 
 ```ts type-equiv
-/** A single model request, fully assembled. */
-interface GenerateOptions {
+/** A durable conversation message or a user input used only for one request. */
+type RequestMessage = Message | RequestUserInput
+```
+
+```ts type-equiv
+/** Auxiliary request purposes declared by their producer packages. */
+interface LlmRequestPurposeMap {}
+```
+
+```ts type-equiv
+/** Declared auxiliary request purpose; ordinary conversation requests leave it absent. */
+type LlmRequestPurpose = Extract<keyof LlmRequestPurposeMap, string>
+```
+
+```ts type-equiv
+/**
+ * A single model request, fully assembled.
+ * @typeParam Purpose - declared purpose keys for callers; forwarding adapters may accept `string`.
+ */
+interface GenerateOptions<Purpose extends string = LlmRequestPurpose> {
   /** Registered provider route selecting the adapter instance. */
   provider: string
   model: string
@@ -595,9 +674,9 @@ interface GenerateOptions {
    * Ordered conversation messages, exactly as the provider sees them. A
    * loop-built request passes the derived history (dsh-agent-loop), whose
    * leading system-role message carries the system prompt; a hand-built
-   * one-shot passes any list.
+   * one-shot may include identity-free user inputs.
    */
-  messages: Message[]
+  messages: RequestMessage[]
   /**
    * System prompt text for one-shot callers; adapters map it to the provider's
    * system slot ahead of `messages`. Loop-built requests leave it undefined.
@@ -605,6 +684,8 @@ interface GenerateOptions {
   system?: string
   /** Tool schemas (adapters map to the provider's `tools` field). */
   tools?: ToolSchema[]
+  /** Session-folded tool history used for route projection; omission sends complete declarations without tool updates. */
+  toolHistory?: ToolHistory
   temperature?: number
   maxTokens?: number
   /**
@@ -621,10 +702,10 @@ interface GenerateOptions {
   sessionId?: Branded<'SessionId'>
   /**
    * Provider-neutral classification for an auxiliary model call. Adapters may
-   * map the purpose to model-hidden transport metadata or purpose-specific
-   * generation policy. Ordinary conversation requests leave it unset.
+   * map the purpose to model-hidden transport metadata. Ordinary conversation
+   * requests leave it unset.
    */
-  purpose?: 'compaction' | 'session-title'
+  purpose?: Purpose
 }
 ```
 
@@ -657,6 +738,12 @@ interface FinishReasonMap {
  * it from this package.
  */
 interface ToolSchema {
+  /**
+   * Requests deferred loading of the tool definition into model context,
+   * independently of whether a tool-addition block records the tool.
+   * Uses Anthropic's defer_loading terminology.
+   */
+  deferLoading?: true
   name: string
   description: string
   /** JSON Schema object for the arguments. */
@@ -719,11 +806,21 @@ interface LlmDiscoveredModel {
 
 循环从已记录状态构建每个请求。`EpochHeader` 记录调用配置，标记由适配器默认值提供的字段，并通过完整的 `request/header` 快照记录权威返回工具顺序（由 `toolOrder` 配置；未配置时按字典序）。渲染后的提示词是派生历史——surface 第 0 号节点上的 `system/message`，加上 `in-history` 路由追加的任何后续系统节点——因此请求头与派生历史共同使请求可由会话日志重建。见 [session.md](session.zh.md#the-request-header-event-requestheader) 与[可重建性 Agent Note](../../.agents/notes/implemented/architecture/2026-07-05-reconstructable-requests.zh.md)。
 
-`agent/request` 接收冻结的调用配置种子，并可返回替代值以切换提供方、模型、推理强度或采样参数。waterfall（瀑布式事件）开始前，循环会移除标记为适配器默认值的值，使确切模型准备过程填入所选路由的当前值；未带标记的显式设置仍保留在提议中。waterfall 结束后，准备过程会在轮次信号控制下拒绝显式指定但不受支持的推理强度 ID（不自动调整），并记录生效配置以及由适配器默认值提供的字段。步骤准入时，该 waterfall 与准备过程在组装和 `step/start` 之后、系统提示词与已接纳用户批次提交之前运行；在任一阶段取消都不会提交这两者。已准备调用的能力决定提示词协调，调用直至分派完成始终持有同一项适配器注册。到达 `llm/stream` 的请求会被深度冻结，因此变更会抛异常；请求还携带进程本地循环标识，使观察者不会把单独记录的冻结辅助调用误认成对话请求。
+已弃用的 `agent/request` hook 仍可供现有监听器使用。新代码通过 [Session 模型选择](../../packages/core/agent/README.zh.md#use-this-package) 设置模型与推理强度。该 hook 收到基于步骤已捕获模型选择的冻结调用配置初值，可以替换采样等控制参数。替换值必须保留提供方、模型及可选的显式推理强度；要改变这些选择，需在下一个步骤之前记录新的 Session 选择。waterfall（瀑布式事件）开始前，循环会移除标记为适配器默认值的值，使确切模型准备过程填入所选路由的当前值；未带标记的显式设置仍保留在提议中。waterfall 结束后，准备过程会在轮次信号控制下拒绝显式指定但不受支持的推理强度 ID（不自动调整），并记录生效配置以及由适配器默认值提供的字段。步骤准入时，该 waterfall 与准备过程在组装和 `step/start` 之后、系统提示词与已接纳用户批次提交之前运行；在任一阶段取消都不会提交这两者。已准备调用的能力决定提示词协调，调用直至分派完成始终持有同一项适配器注册。到达 `llm/stream` 的请求会被深度冻结，因此变更会抛异常；请求还携带进程本地循环标识，使观察者不会把单独记录的冻结辅助调用误认成对话请求。
 
-在协议中，循环构建的请求只有派生历史：渲染后的提示词作为开头的 `system` 角色消息（surface 第 0 号节点，即一个 `system/message` 事件）传输，并且当已准备调用声明 `systemPromptUpdate: 'in-history'` 时，变化后的非空提示词可以作为后续的 `system` 角色消息跟在已缓存历史之后，由模型读作有效提示词；请求的 `system` 字段不设置——`GenerateOptions.system` 服务于标题提供方等直接单次调用方。空渲染文本使派生历史不包含任何系统消息，即使先前请求保留了多个提示词版本。已记录的请求会以最新的 `user/message`（轮次首步）或上一步的工具结果（后续步骤）结尾。开发不变式针对每个循环构建的请求精确重算此等式，并拒绝携带 `system` 字段的循环请求。
+在协议中，循环构建的请求只有派生历史：渲染后的提示词作为开头的 `system` 角色消息（surface 第 0 号节点，即一个 `system/message` 事件）传输，并且当已准备调用声明 `systemPromptUpdate: 'in-history'` 时，变化后的非空提示词可以作为后续的 `system` 角色消息跟在已缓存历史之后，由模型读作有效提示词；请求的 `system` 字段不设置——`GenerateOptions.system` 服务于标题提供方等直接单次调用方。空渲染文本使派生历史不包含任何系统消息，即使先前请求保留了多个提示词版本。已记录的请求会以最新的 `user/message`（轮次首步）或上一步的工具结果（后续步骤）结尾。
 
 FIXME(call-config-shape)：重新审视其余哪些字段出于缓存目的确实属于 epoch 层级（`model` 和模型持有的推理强度已明确属于；采样标量目前出于谨慎保留在此）。
+
+```ts type-equiv
+/** Concrete generation settings; omitted controls use the selected route's defaults. */
+interface LlmCallControls {
+  reasoningEffort?: ReasoningEffortId
+  temperature?: number
+  maxTokens?: number
+  stop?: string[]
+}
+```
 
 ```ts type-equiv
 /**
@@ -732,14 +829,26 @@ FIXME(call-config-shape)：重新审视其余哪些字段出于缓存目的确�
  * the loop builds requests from the logged header rather than accepting these
  * per call.
  */
-interface LlmCallConfig {
+interface LlmCallConfig extends LlmCallControls {
   provider: string
   model: string
-  reasoningEffort?: ReasoningEffortId
-  temperature?: number
-  maxTokens?: number
-  stop?: string[]
 }
+```
+
+```ts type-equiv
+/**
+ * Synchronous, pure configuration of one call before defaults and validation.
+ * Compose functions in the desired order; later writes replace earlier ones.
+ * The returned controls cannot change the captured route. Errors reject
+ * preparation before dispatch; only the resolved configuration is recordable.
+ * @param controls - detached, deeply frozen proposed controls, without defaults.
+ * @param model - detached, deeply frozen metadata from the captured adapter generation.
+ * @returns concrete controls; omitted fields receive the route's defaults.
+ */
+type ConfigureCall = (
+  controls: Readonly<LlmCallControls>,
+  model: Readonly<LlmResolvedModelInfo>,
+) => LlmCallControls
 ```
 
 ```ts type-equiv
@@ -755,9 +864,13 @@ interface LlmCallConfigAdapterDefaults {
 
 ## DeepSeek 官方请求扩展
 
-`ctx.deepseekLlmApiExtensions` 是用于向 `deepseek-official` 请求添加顶层字段的提供方特定注册表。贡献插件通过 `register(field, provider)` 认领一个字段；适配器在序列化基础正文后调用 `prepare(request)`，并在 HTTP 前合并返回字段。已准备的 `accept()` 事务会在 2xx 后运行，因此贡献方可以提交交付状态，而不会把传输失败或提供方拒绝当作接受。准备、冲突与接受失败会使用 `REQUEST_EXTENSION`，并使模型请求失败。
+`ctx.deepseekLlmApiExtensions` 是用于向 `deepseek-official` 请求添加顶层字段的提供方特定注册表。贡献插件通过 `register(field, provider)` 认领一个字段；适配器在序列化基础正文后调用 `prepare(request)`，并在 HTTP 前合并返回字段。已准备的 `accept()` 事务会在 2xx 后运行，因此贡献方可以提交交付状态，而不会把传输失败或提供方拒绝当作接受。贡献方准备时抛错会被记录并在该次请求中省略，接受失败只记录告警而不使请求失败；与基础字段冲突时使用 `REQUEST_EXTENSION` 并使模型请求失败。合并后的正文无法序列化时，请求不带扩展字段发出，跳过接受，并由提供方插件记录被省略的字段名。
 
 [协议参考](../deepseek-llm-api-wire-extensions.zh.md)定义确切的请求标头、扩展事务、字段版本和接收方义务。随附组合会将 [`dsh_session_log`](../../packages/session/session-log-deepseek/README.zh.md) 注册为无损增量权威日志后缀，并将 [`dsh_plugin_packages`](../../packages/llm/plugin-package-inventory-deepseek/README.zh.md) 注册为完整存活 Loader 包集合。这些字段仍位于模型消息之外，也不会进入 pi-ai 适配器路径。
+
+## Pi-ai 请求头
+
+`PiAiRequestHeaderContext` 包含已准备调用的 provider、model、解析后的模型 `baseURL`，以及可选 Session id 和辅助用途。它不可变且不含消息或认证字段，与本次请求独有的 `Headers` 一起传入同步的 `llm-pi-ai/request-headers` waterfall。[适配器的请求头文档](../../packages/llm/llm-pi-ai/README.zh.md#request-headers)定义贡献的所有权、应用标识的优先级与失败行为。此扩展点仅适用于 pi-ai 推理请求。
 
 ## 服务与提供方约定
 
@@ -776,6 +889,8 @@ interface PreparedLlmCall {
   readonly inputModalities?: readonly ModelModality[]
   /** Exact model system prompt update mode captured with the adapter dispatch generation. */
   readonly systemPromptUpdate?: SystemPromptUpdate
+  /** Exact model tool update mode captured with the adapter dispatch generation. */
+  readonly toolUpdate?: ToolUpdate
   /** Config fields materialized by the captured adapter rather than proposed by the caller. */
   readonly adapterDefaults: LlmCallConfigAdapterDefaults
   /**
@@ -820,9 +935,19 @@ declare abstract class LlmAdapter {
    */
   imageRequestPricing(_provider: string, _model: string): LlmImageRequestPricing | undefined;
   /**
+   * Resolve the image dimensions and byte target this adapter sends to the model.
+   * The default preserves normalized images; adapters that resize must override it.
+   * @param _provider - registered provider route.
+   * @param _model - exact model id.
+   * @param image - normalized image whose request projection is being resolved.
+   * @returns the same target used by request serialization, before provider-internal processing.
+   */
+  imageRequestTarget(_provider: string, _model: string, image: ImageAttachmentRef): ImageRequestTarget;
+  /**
    * List models this adapter can currently advertise for one owned provider.
-   * The result is advisory: an adapter may accept unlisted model ids, and
-   * consumers must not turn absence into request rejection.
+   * Core routing accepts unlisted model ids; catalog-driven entry points such
+   * as the GUI may require membership. Adapters used there must advertise
+   * their available models; the base empty catalog offers no GUI selection.
    * @param _provider - one provider route owned by this adapter.
    * @returns discoverable models in adapter-preferred order.
    */
@@ -887,8 +1012,9 @@ register<K extends keyof DeepSeekLlmApiExtensionMap>( field: K, provider: DeepSe
 
 /**
  * Prepare every currently registered field from one immutable base request.
- * Preparation failures reject before HTTP dispatch. Field values are cloned and frozen;
- * providers retain no mutable alias to the outgoing request.
+ * A provider whose preparation throws, or whose value cannot be cloned, is omitted
+ * from this request; the first such failure per field is logged. Only cancellation rejects. Field values are cloned
+ * and frozen; providers retain no mutable alias to the outgoing request.
  * @param request - exact serialized request facts before extension fields.
  * @returns detached fields and their idempotent joint acceptance transaction.
  */
@@ -989,6 +1115,15 @@ providerRetryPolicy(provider: string): ResolvedRetryPolicy
 imageRequestPricing(provider: string, model: string): LlmImageRequestPricing | undefined
 
 /**
+ * Resolve the image projection for an exact registered model route.
+ * @param provider - registered provider route.
+ * @param model - exact model id.
+ * @param image - normalized image reference.
+ * @returns dimensions and byte target used by the adapter's request serializer.
+ */
+imageRequestTarget(provider: string, model: string, image: ImageAttachmentRef): ImageRequestTarget
+
+/**
  * Resolve the exact text one durable file occurrence contributes to every
  * provider request in the current execution environment.
  * @param ref - durable verbatim file reference from model history.
@@ -998,7 +1133,8 @@ fileRequestText(ref: FileAttachmentRef): string
 
 /**
  * Discover models advertised by one registered provider. Catalog membership
- * is advisory and never changes routing or request validation.
+ * does not constrain core routing. Catalog-driven entry points may restrict
+ * selection and submission to the advertised models.
  * @param provider - registered provider route to inspect.
  * @returns detached model metadata in adapter-preferred order.
  */
@@ -1031,11 +1167,15 @@ async resolveCallConfig(config: LlmCallConfig, signal?: AbortSignal): Promise<Ll
  * Resolve one call under its current adapter registration. The returned
  * one-shot handle keeps that registration across header logging and dispatch,
  * so HMR cannot combine one adapter's capability result with another adapter.
- * @param config - provider/model route and optional request controls.
+ * An optional synchronous callback selects concrete controls using captured
+ * model metadata. Defaults and validation apply to its result. Callback
+ * failures and cancellation reject preparation before dispatch.
+ * @param config - provider/model route and optional concrete request controls.
  * @param signal - optional cancellation for adapter-owned capability lookup.
+ * @param configure - pure control selection, called once before defaults and validation.
  * @returns a prepared config and its registration-bound stream entry point.
  */
-async prepareCall(config: LlmCallConfig, signal?: AbortSignal): Promise<PreparedLlmCall>
+async prepareCall( config: LlmCallConfig, signal?: AbortSignal, configure?: ConfigureCall, ): Promise<PreparedLlmCall>
 
 /**
  * Stream one model call as raw chunks (token-level deltas). Replay state is
@@ -1051,7 +1191,7 @@ async prepareCall(config: LlmCallConfig, signal?: AbortSignal): Promise<Prepared
 stream(options: GenerateOptions): AsyncIterable<StreamChunk>
 ```
 
-Types: [FileAttachmentRef](attachment.zh.md)
+Types: [FileAttachmentRef](attachment.zh.md) · [ImageAttachmentRef](attachment.zh.md) · [ImageRequestTarget](attachment.zh.md)
 
 Source: [`packages/llm/llm/src/index.ts`](../../packages/llm/llm/src/index.ts)
 
@@ -1080,6 +1220,23 @@ The provider topology changed: an adapter registered or unregistered routes, or 
 
 Source: [`packages/llm/llm/src/types.ts`](../../packages/llm/llm/src/types.ts)
 
+<a id="llmmodels-updated--emit"></a>
+
+#### `llm/models-updated` — emit
+
+A provider's advertised models or display metadata changed; consumers reload `listModels()`.
+
+```ts cordis-catalog
+/**
+ * A provider's advertised models or display metadata changed; consumers reload `listModels()`.
+ * @mode emit
+ * @param provider - route whose model catalog changed.
+ */
+'llm/models-updated'(provider: string): void
+```
+
+Source: [`packages/llm/llm/src/types.ts`](../../packages/llm/llm/src/types.ts)
+
 <a id="llmstream--waterfall"></a>
 
 #### `llm/stream` — waterfall
@@ -1095,12 +1252,41 @@ Waterfall around every streaming model call (retry, replay, routing). Bound to t
  *   process-local {@link markAgentLoopRequest} identity and arrives deep-frozen
  *   (mutation throws): its content is a pure function of the session log (the
  *   reconstructability Agent Note), so listeners read it, never rewrite it.
- *   Hand-built calls do not carry that marker; their messages already obey
- *   the immutable creation contract.
+ *   Hand-built calls do not carry that marker; callers own their request
+ *   inputs and must keep them unchanged until the stream settles.
  * @mode waterfall
  */
 'llm/stream'(this: LlmRuntime, options: GenerateOptions, next: () => AsyncIterable<StreamChunk>): AsyncIterable<StreamChunk>
 ```
 
 Source: [`packages/llm/llm/src/index.ts`](../../packages/llm/llm/src/index.ts)
+
+<a id="llm-pi-ai-events"></a>
+
+### `llm-pi-ai/*` events
+
+<a id="llm-pi-airequest-headers--waterfall"></a>
+
+#### `llm-pi-ai/request-headers` — waterfall
+
+Prepare headers for one pi-ai inference call, excluding model discovery. Listeners run synchronously and must call next(); they may edit only the request-owned headers and must not retain them. Throws fail the call with REQUEST_HEADERS before inference I/O. Harness attribution wins afterward. Non-TypeError messages are user-visible and must exclude secrets. TypeError details and non-Error values are replaced with safe guidance.
+
+```ts cordis-catalog
+/**
+ * Prepare headers for one pi-ai inference call, excluding model discovery.
+ * Listeners run synchronously and must call next(); they may edit only the
+ * request-owned headers and must not retain them. Throws fail the call with
+ * REQUEST_HEADERS before inference I/O. Harness attribution wins afterward.
+ * Non-TypeError messages are user-visible and must exclude secrets. TypeError
+ * details and non-Error values are replaced with safe guidance.
+ * @mode waterfall
+ * @param request - immutable routing metadata from the exact prepared call.
+ * @param headers - fresh profile headers, shared only within this dispatch.
+ * @param next - continue header preparation through the remaining listeners.
+ * @returns headers passed to pi-ai after Harness attribution is applied.
+ */
+'llm-pi-ai/request-headers'(request: PiAiRequestHeaderContext, headers: Headers, next: () => Headers): Headers
+```
+
+Source: [`packages/llm/llm-pi-ai/src/index.ts`](../../packages/llm/llm-pi-ai/src/index.ts)
 <!-- END GENERATED cordis-surface -->

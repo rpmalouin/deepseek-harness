@@ -16,7 +16,20 @@
                 defaultReasoningEffort: high
 
 - insert:
-    - id: office-skills
+    - id: workspace-dependencies
+      name: '@deepseek-ai/dsh-tool-workspace-dependencies'
+      config:
+        source: !!js process.cwd() + '/runtime-source'
+        root: !!js process.cwd() + '/runtime-installed'
+
+    - id: skill-office
       name: '@deepseek-ai/dsh-skill-office'
+      disabled: false
       config:
         assetRoot: !!js process.cwd() + '/office-skills'
+
+- id: tool-bash
+  disabled: true
+
+- id: tool-pwsh
+  disabled: true

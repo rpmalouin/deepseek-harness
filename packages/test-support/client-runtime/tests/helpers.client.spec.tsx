@@ -5,10 +5,12 @@ import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import { EMPTY_CHAT_SNAPSHOT } from '@deepseek-ai/dsh-client-ui-chat/client'
 import { EMPTY_CONVERSATION_SNAPSHOT } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import type { WorkspaceId } from '@deepseek-ai/dsh-api-workspace-controller/client'
 import type { MainPanelId, PanelInfo } from '@deepseek-ai/dsh-client-ui-layout/client'
 import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  allowAllAccess,
   bindSnapshotSelector,
   chatSnapshot,
   conversationSnapshot,
@@ -46,6 +48,26 @@ function entry(seq: number): SessionLiveEventEntry {
 }
 
 describe('fixture helpers', () => {
+  it('allows every action on every resource through the hand-built access Hooks', () => {
+    expect(allowAllAccess.useRemoteAccess('session/list')).toBe(true)
+    expect(allowAllAccess.useAccess('session/fork')).toBe(true)
+    expect(allowAllAccess.useSessionAccess('s1' as SessionId, 'session/fork')).toBe(true)
+    expect(allowAllAccess.useWorkspaceAccess('w1' as WorkspaceId, 'workspace/follow')).toBe(true)
+  })
+
+  it('installs an allow-all remoteAccess service whose sources never change', async () => {
+    const runtime = await SlotTestRuntime.create()
+    try {
+      const source = runtime.ctx.remoteAccess.source('session', 's1', 'session/fork')
+      expect(source.getSnapshot()).toBe(true)
+      const unsubscribe = source.subscribe(() => {})
+      unsubscribe()
+      expect(source.getSnapshot()).toBe(true)
+    } finally {
+      await runtime.dispose()
+    }
+  })
+
   it('retracts default root sources without removing their live replacements', async () => {
     const runtime = await SlotTestRuntime.create()
     const hooks = { workspaces: runtime.workspaces.list, panelInfo: runtime.panelInfo }
@@ -99,9 +121,12 @@ describe('fixture helpers', () => {
     }
   })
 
-  it('rejects an upload until a suite replaces the default stub', async () => {
+  it('rejects uploads and reading marks until a suite replaces their default stubs', async () => {
     const runtime = await SlotTestRuntime.create()
+    expect(runtime.ctx.uiSession.sessionStatus.readingReady.getSnapshot()).toBe(true)
     await expect(runtime.fileUpload.upload('fixture-session' as SessionId)).rejects.toThrow('file upload is not stubbed')
+    await expect(runtime.ctx.uiSession.sessionStatus.mark('fixture-session' as SessionId, true)).rejects.toThrow('reading mark is not stubbed')
+    await expect(runtime.fileUpload.uploadImage('fixture-session' as SessionId)).rejects.toThrow('image upload is not stubbed')
     await runtime.dispose()
   })
 

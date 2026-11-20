@@ -25,6 +25,8 @@ kind: "package-reference"
 <a id="use-this-package"></a>
 ## 使用本包
 
+新 shell 从 Session 的当前工作目录启动。创建后，shell 的目录与环境独立保留，不受后续 Session 目录切换影响。
+
 在 agent 需要在命令之间保持 shell 状态的任何组合中加载本插件——例如长时间构建会话、已激活的环境，或为后续步骤导出变量的脚本。它注册 `bash` 工具，需要 `ctx.tools` 与 `ctx.terminals` 服务，并在执行时需要拥有者 agent 会话。
 
 ### 何时选择
@@ -56,7 +58,7 @@ kind: "package-reference"
 
 ### 可能出什么问题
 
-没有拥有者 agent 会话的调用会以 `bash requires an owning agent session` 失败，没有 PTY 后端的组合会激活该工具，但首次调用以 `no PTY backend registered for "shell"` 失败。交互式前台子进程（例如 REPL）只有在后端证明其 stdin 等待时才提前返回部分输出；否则调用一直运行到 `timeoutMs`，随后关闭不确定的 shell 并报告重置。取消也会重置并丢弃结果，即使完整状态标记已经可观察。
+没有拥有者 agent 会话的调用会以 `bash requires an owning agent session`（`ToolContextUnavailableError`，`TOOL_CONTEXT_UNAVAILABLE`）失败，空白命令以 `ToolArgsError`（`INVALID_ARGS`）失败，不接受回显与历史设置的 shell 以 `persistent bash shell did not accept initialization`（`TerminalError`，`INIT_REJECTED`）失败，没有 PTY 后端的组合会激活该工具，但首次调用以 `no PTY backend registered for "shell"` 失败。交互式前台子进程（例如 REPL）只有在后端证明其 stdin 等待时才提前返回部分输出；否则调用一直运行到 `timeoutMs`，随后关闭不确定的 shell 并报告重置。取消也会重置并丢弃结果，即使完整状态标记已经可观察。清理完成后，ToolRuntime 发布 `Error: tool call aborted`，错误码为 `ABORTED`；取消原因不作为命令输出渲染。排队期间被取消的调用不发送命令。
 
 -----
 
@@ -80,11 +82,10 @@ kind: "package-reference"
 | 文件 | 职责 |
 |---|---|
 | [`src/index.ts`](src/index.ts) | 插件入口：shell 注册表、命令包装、scrollback 轮询、提取与渲染 |
-| — | 不发布运行时不变式伴生入口；适配器私有的 owner-to-shell 缓存没有可观察的事件或数据关系。shell 复用仍可通过工具执行观察。生命周期测试会验证其清理行为，无需仅为不变式增加公共 API。 |
 
 ### 命令流程
 
-首条命令通过 `ctx.terminals.spawn` 生成 shell，禁用输入回显（`stty -echo`），并等待就绪。随后每条命令都包装成一行物理文本——printf 起始标记、用 `$'…'` 转义的命令体、printf 结束标记加 `$?`——因此内嵌换行无法把终端提示符泄漏进结果。工具以 1,000 行一页轮询 scrollback，直到出现结束标记，提取区间并连同任何状态标记一起渲染。超时会中止截止时间、捕获部分输出并重置 shell。
+首条命令通过 `ctx.terminals.spawn` 生成 shell，禁用输入回显和历史展开（`stty -echo; set +H`），并等待就绪。随后每条命令都包装成一行物理文本——printf 起始标记、用 `$'…'` 转义的命令体、printf 结束标记加 `$?`——因此内嵌换行无法把终端提示符泄漏进结果。关闭历史展开后，`!` 序列原样到达 bash，不会被改写，也不会使整行被拒绝。工具以 1,000 行一页轮询 scrollback，直到出现结束标记，提取区间并连同任何状态标记一起渲染。超时会中止截止时间、捕获部分输出并重置 shell。
 
 </details>
 
@@ -98,7 +99,7 @@ kind: "package-reference"
 - [terminal 包映射](../../terminal/README.zh.md)——持久 PTY 能力家族。
 - [terminal seam](../../terminal/terminal/README.zh.md)——工具背后的 `ctx.terminals` 服务。
 - [terminal-bash 后端](../../terminal/terminal-bash/README.zh.md)——默认的 `shell` 后端。
-- [tool-terminal](../../terminal/tool-terminal/README.zh.md)——面向交互工作的六个模型侧 terminal 工具。
+- [tool-terminal](../../experimental/tool-terminal/README.zh.md)——面向交互工作的六个模型侧 terminal 工具。
 - [持久 PTY 会话 Agent Note](../../../.agents/notes/implemented/feature/2026-07-16-persistent-pty-sessions.zh.md)——按所有者会话的设计及其理由。
 - [生成的工具目录](../../../docs/tool-catalog.zh.md#deepseek-aidsh-tool-bash-persistent)——`bash` 参数 schema 的确切内容。
 - [生成的配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-tool-bash-persistent)——每个受支持配置字段及其源声明。
@@ -147,6 +148,7 @@ kind: "package-reference"
 - **交互式前台子进程只在子进程提供方证明其 stdin 等待时才提前返回部分输出**——否则调用一直运行到 `timeoutMs`。
 - **显式 `exit` 与超时会丢弃 shell 状态**——取消同样重置并丢弃结果，即使完整状态标记已经可观察；下一次调用启动全新 shell。
 - **网络访问与包镜像等环境事实属于配置的 `description`**——而不是本包的默认描述。
+- **除换行与回车外，原始控制字符会作为按键到达 readline**——命令中的字面 TAB、ESC 或 DEL 会被当作编辑按键消耗，因此需要这些字符的内容（例如 Makefile heredoc）应通过文件工具写入，或用 `printf` 转义生成。
 
 <a id="dev-note"></a>
 ### 开发备注

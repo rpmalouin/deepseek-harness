@@ -18,6 +18,9 @@ import { registerTrajectoryMessageDefinitions } from '../src/client/trajectory-m
 import { registerTrajectoryRequestHeaderDefinition } from '../src/client/trajectory-request-header-definition.ts'
 import { trajectoryViewDefinition } from '../src/client/trajectory-snapshot-builder.ts'
 import { registerTrajectoryToolDefinition } from '../src/client/trajectory-tool-definition.ts'
+import { deriveTrajectoryLayout } from '../src/client/layout.ts'
+import { deriveTrajectoryTimeline } from '../src/client/timeline.ts'
+import { t } from './locale.client.ts'
 
 const DEFINITIONS: ConversationNodeDefinition[] = []
 const registrationContext = {
@@ -167,11 +170,254 @@ function systemMessage(text: string) {
     id: `system-${text}`,
     role: 'system',
     content: [{ type: 'text', text }],
-    source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt' },
+    source: { kind: 'system-prompt' },
   }
 }
 
 describe('Trajectory conversation Definitions', () => {
+  describe.each([{ turn: 2, step: 1 }, { turn: 1, step: 2 }])(
+    'request prompt ordering in turn $turn, step $step',
+    ({ turn, step }) => {
+      it.each(['waiting', 'streaming', 'settled'] as const)(
+        'keeps tool changes after inputs and before the response (%s)',
+        (phase) => {
+          const events = [
+            at(1, 'turn/start', { turn: 1 }),
+            at(2, 'step/start', { turn: 1, step: 1 }),
+            at(3, 'system/message', { turn: 1, step: 1, message: systemMessage('prompt') }, { surfaceOp: 'append' }),
+            at(4, 'request/header', {
+              reason: 'initial', header: { config: { provider: 'test', model: 'test' }, tools: [] },
+            }),
+            at(5, 'assistant/message', { turn: 1, step: 1, message: assistantMessage('first', 'Earlier response') }),
+            at(6, 'step/end', { turn: 1, step: 1 }),
+          ]
+          if (turn === 2) {
+            events.push(
+              at(7, 'turn/end', { turn: 1, reason: { kind: 'completed' } }),
+              at(8, 'turn/start', { turn }),
+            )
+          }
+          events.push(
+            at(9, 'step/start', { turn, step }),
+            at(10, 'user/message', {
+              id: 'followup', role: 'user', content: [{ type: 'text', text: 'Continue' }], source: { kind: 'user' },
+            }),
+            at(11, 'developer/message', {
+              message: {
+                id: 'tool-update', role: 'developer',
+                content: [{ type: 'tool-addition', toolName: 'search' }],
+                source: { kind: 'tool-registry' },
+              },
+            }),
+            at(12, 'request/header', {
+              reason: 'series',
+              header: {
+                config: { provider: 'test', model: 'test' },
+                tools: [{ name: 'search', description: 'Search', parameters: { type: 'object', properties: {} } }],
+              },
+            }),
+          )
+          if (phase === 'streaming') {
+            events.push(
+              at(13, 'assistant/live-chunk', { turn, step, chunk: { type: 'block-start', index: 0, blockType: 'text' } }),
+              at(14, 'assistant/live-chunk', { turn, step, chunk: { type: 'text-delta', index: 0, text: 'Answer' } }),
+            )
+          } else if (phase === 'settled') {
+            events.push(
+              at(13, 'assistant/message', { turn, step, message: assistantMessage('answer', 'Answer') }),
+              at(14, 'step/end', { turn, step }),
+            )
+          }
+          const current = snapshot(assembler(events))
+          expect(current.requests.at(-1)).toMatchObject({ turn, step, promptChange: { kind: 'tools', seq: 12 } })
+          const turns = deriveTrajectoryLayout({ ...current, nodes: current.eventNodes }, t)
+          const cells = turns.flatMap(value => value.groups.flatMap(group => group.cells))
+          const requestCells = turns.find(value => value.turn === turn)?.groups
+            .filter(group => group.title === `Step ${step}`).flatMap(group => group.cells)
+          expect(requestCells?.map(cell => cell.requestOnly ? '[request]' : cell.previewMarkdown || cell.text)).toEqual([
+            'Continue', 'Tool added: search', 'Tools Updated', phase === 'waiting' ? '[request]' : 'Answer',
+          ])
+          const byIndex = new Map(cells.map(cell => [cell.index, cell]))
+          expect(deriveTrajectoryTimeline(turns)?.spans.map((span) => {
+            const cell = byIndex.get(span.index)!
+            return cell.previewMarkdown || cell.text
+          })).toEqual([
+            'Initial System Prompt', 'Earlier response', 'Continue', 'Tool added: search', 'Tools Updated',
+            ...phase === 'waiting' ? [] : ['Answer'],
+          ])
+        },
+      )
+    },
+  )
+
+  it.each(['waiting', 'streaming', 'settled', 'prepend'] as const)(
+    'keeps retained steering and subsequent inputs before their shared response (%s)',
+    (phase) => {
+      const steer = {
+        id: 'retained-steer', role: 'user',
+        content: [{ type: 'text', text: '你可以直接更新master' }],
+        source: { kind: 'user' },
+      }
+      const followup = {
+        id: 'followup', role: 'user',
+        content: [{ type: 'text', text: '的worktree，不用绕弯子拉snapshot' }],
+        source: { kind: 'user' },
+      }
+      const events = [
+        at(1, 'turn/start', { turn: 1 }),
+        at(2, 'step/start', { turn: 1, step: 1 }),
+        at(3, 'agent/inbox/spliced', { target: 'next-step', start: 0, inserted: [steer] }),
+        at(4, 'step/end', { turn: 1, step: 1 }),
+        at(5, 'turn/end', { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } }),
+        at(6, 'agent/inbox/spliced', { target: 'next-turn', start: 0, inserted: [followup] }),
+        at(7, 'turn/start', { turn: 2 }),
+        at(8, 'agent/inbox/spliced', { target: 'next-step', start: 0, removedCount: 1, inserted: [] }),
+        at(9, 'agent/inbox/spliced', { target: 'next-turn', start: 0, removedCount: 1, inserted: [] }),
+        at(10, 'step/start', { turn: 2, step: 1 }),
+        at(11, 'user/message', steer),
+        at(12, 'user/message', followup),
+        at(13, 'developer/message', {
+          message: {
+            id: 'context', role: 'developer',
+            content: [{ type: 'text', text: 'Current workspace context.' }],
+            source: { kind: 'plugin', plugin: 'test-context' },
+          },
+        }),
+      ]
+      if (phase === 'streaming') {
+        events.push(
+          at(14, 'assistant/live-chunk', {
+            turn: 2, step: 1, chunk: { type: 'block-start', index: 0, blockType: 'text' },
+          }),
+          at(15, 'assistant/live-chunk', {
+            turn: 2, step: 1, chunk: { type: 'text-delta', index: 0, text: 'Both inputs received.' },
+          }),
+        )
+      } else if (phase !== 'waiting') {
+        events.push(
+          at(14, 'assistant/message', {
+            turn: 2, step: 1, message: assistantMessage('response', 'Both inputs received.'),
+          }),
+          at(15, 'step/end', { turn: 2, step: 1 }),
+          at(16, 'turn/end', { turn: 2, reason: { kind: 'completed' } }),
+        )
+      }
+      const value = assembler(phase === 'prepend' ? events.slice(10) : events, phase === 'prepend')
+      const assertOrder = () => {
+        const current = snapshot(value)
+        const turns = deriveTrajectoryLayout({ ...current, nodes: current.eventNodes }, t)
+        expect(turns.find(turn => turn.turn === 2)?.groups.flatMap(group =>
+          group.cells.map(cell => cell.requestOnly ? '[request]' : cell.previewMarkdown).filter(Boolean))).toEqual([
+          '你可以直接更新master',
+          '的worktree，不用绕弯子拉snapshot',
+          'Current workspace context.',
+          phase === 'waiting' ? '[request]' : 'Both inputs received.',
+        ])
+      }
+      assertOrder()
+      if (phase === 'prepend') {
+        value.prepend(events.slice(0, 10), false)
+        value.flush()
+        assertOrder()
+      }
+      expect(snapshot(value).eventNodes.slice(0, 3).map(node => node.kind)).toEqual(['steering', 'user', 'context'])
+    },
+  )
+
+  it('publishes a waiting request before any stream output arrives', () => {
+    const value = assembler([at(1, 'turn/start', { turn: 1 })])
+    expect(value.append(at(2, 'step/start', { turn: 1, step: 1 }))).toBe('immediate')
+    value.flush()
+    expect(snapshot(value)).toMatchObject({
+      eventNodes: [],
+      partial: null,
+      requests: [{ status: 'running', startedAt: 1_700_000_000_002, completedAt: null }],
+    })
+  })
+
+  it('keeps a retrying request running until its response settles', () => {
+    const value = assembler([
+      at(1, 'turn/start', { turn: 1 }),
+      at(2, 'step/start', { turn: 1, step: 1 }),
+      at(3, 'llm/retry', {
+        retryId: 'retry-1', turn: 1, step: 1, provider: 'test', mode: 'normal',
+        policyKey: 'test-normal', retry: 1, maxRetries: 2, delayMs: 25,
+        failure: { code: 'TRANSPORT', message: 'temporary failure' },
+      }),
+    ])
+    expect(snapshot(value).requests).toMatchObject([{
+      status: 'running', completedAt: null, retry: 1,
+      error: 'temporary failure', errorCode: 'TRANSPORT',
+    }])
+    value.append(at(4, 'assistant/live-chunk', {
+      turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'recovered' },
+    }))
+    value.flush()
+    expect(snapshot(value).requests).toMatchObject([{ status: 'running', completedAt: null }])
+    value.append(at(5, 'assistant/message', {
+      turn: 1, step: 1, message: assistantMessage('recovered', 'recovered'),
+    }))
+    value.flush()
+    expect(snapshot(value).requests).toMatchObject([{
+      status: 'complete', completedAt: 1_700_000_000_005, resultSeq: 5,
+      retry: 1, error: 'temporary failure', errorCode: 'TRANSPORT',
+    }])
+  })
+
+  it('retains the waiting request when chunks have no assistant blocks', () => {
+    const current = snapshot(assembler([
+      at(1, 'turn/start', { turn: 1 }),
+      at(2, 'step/start', { turn: 1, step: 1 }),
+      at(3, 'assistant/live-chunk', {
+        turn: 1, step: 1, chunk: { type: 'usage', usage: { inputTokens: 10, outputTokens: 0 } },
+      }),
+    ]))
+    expect(current.partial).toBeNull()
+    expect(current.requests).toMatchObject([{ status: 'running', usage: { inputTokens: 10, outputTokens: 0 } }])
+  })
+
+  it('settles an interrupted response before the step closes', () => {
+    const current = snapshot(assembler([
+      at(1, 'turn/start', { turn: 1 }),
+      at(2, 'step/start', { turn: 1, step: 1 }),
+      at(3, 'assistant/message', {
+        turn: 1, step: 1, message: assistantMessage('interrupted', 'cut short'), interrupted: true,
+      }),
+    ]))
+    expect(current.requests).toMatchObject([{
+      status: 'error', completedAt: 1_700_000_000_003, resultSeq: 3,
+    }])
+  })
+
+  it('addresses tool-call inspection with the persisted call identity', () => {
+    expect(trajectoryViewDefinition.toolCallFocus?.('call-1')).toBe('call-1')
+  })
+
+  it('preserves developer tool-change content', () => {
+    const value = assembler([
+      at(0, 'request/header', { reason: 'initial', header: {
+        config: { provider: 'test', model: 'test' },
+        tools: ['search', 'read_file'].map(name => ({ name, description: '', parameters: {} })),
+      } }),
+      at(1, 'developer/message', { turn: 1, step: 1, message: {
+        id: 'developer', role: 'developer', source: { kind: 'tool-registry' },
+        content: [{ type: 'tool-addition', toolName: 'search' }, { type: 'tool-removal', toolName: 'old_search' }],
+      } }, { surfaceOp: 'append' }),
+      at(2, 'request/header', { reason: 'change', header: { config: { provider: 'test', model: 'test' }, tools: [] } }),
+    ])
+    expect(snapshot(value).eventNodes.find(node => node.kind === 'context')).toMatchObject({
+      kind: 'context', content: [{ type: 'tool-addition', toolName: 'search' }, { type: 'tool-removal', toolName: 'old_search' }],
+    })
+  })
+
+  it('preserves tool removals without a loaded header', () => {
+    const value = assembler([at(1, 'developer/message', { turn: 1, step: 1, message: {
+      id: 'developer', role: 'developer', source: { kind: 'tool-registry' },
+      content: [{ type: 'tool-removal', toolName: 'old_search' }],
+    } }, { surfaceOp: 'append' })], true)
+    expect(snapshot(value).eventNodes.find(node => node.kind === 'context')).toMatchObject({ content: [{ type: 'tool-removal', toolName: 'old_search' }] })
+  })
+
   it('assembles streaming usage, preserves retry facts, and materializes interruption', () => {
     const value = assembler([
       at(1, 'turn/start', { turn: 1 }),
@@ -189,6 +435,10 @@ describe('Trajectory conversation Definitions', () => {
     ])
 
     expect(snapshot(value).partial?.blocks).toEqual([{ kind: 'text', text: 'first attempt' }])
+    expect(snapshot(value).partial?.timing).toEqual({
+      stepStartTime: 1_700_000_000_002,
+      firstTokenTime: 1_700_000_000_003,
+    })
     expect(snapshot(value).requests).toMatchObject([{
       purpose: 'assistant',
       status: 'running',
@@ -437,6 +687,7 @@ describe('Trajectory conversation Definitions', () => {
         name: 'read',
         arguments: { path: 'README.md' },
         content: [{ type: 'text', text: 'contents' }],
+        meta: { cwd: '/selected', path: '/selected/README.md' },
       }),
       at(7, 'tool/ptc-dispatch-start', {
         rootCallId: 'root-a', parentCallId: 'root-b:code:1', subCallId: 'root-b:ptc:2',
@@ -452,14 +703,11 @@ describe('Trajectory conversation Definitions', () => {
         step: 1,
         message: {
           id: 'result-root-a',
-          role: 'user',
+          role: 'tool',
+          toolCallId: 'root-a',
           source: { kind: 'tool', callId: 'root-a' },
-          content: [{
-            type: 'tool-result',
-            toolCallId: 'root-a',
-            content: [{ type: 'text', text: 'root failed' }],
-            isError: true,
-          }],
+          content: [{ type: 'text', text: 'root failed' }],
+          isError: true,
         },
         error: { name: 'ToolError', code: 'failed' },
         meta: { presentation: 'raw' },
@@ -479,6 +727,7 @@ describe('Trajectory conversation Definitions', () => {
       meta: { presentation: 'raw' },
       subCalls: [{
         kind: 'tool-result', callId: 'root-b:code:1', parentCallId: 'root-a', call: { name: 'read' },
+        meta: { cwd: '/selected', path: '/selected/README.md' },
         subCalls: [{
           kind: 'tool-result', callId: 'root-b:ptc:2', parentCallId: 'root-b:code:1',
           callTime: 1_700_000_000_007, content: [{ type: 'text', text: 'not executed' }],
@@ -509,7 +758,7 @@ describe('Trajectory conversation Definitions', () => {
         id: 'checkpoint',
         role: 'user',
         content: [{ type: 'text', text: 'summary checkpoint' }],
-        source: { kind: 'plugin', plugin: 'compact', compactionId: 'complete' },
+        source: { kind: 'compact-checkpoint', compactionId: 'complete' },
       }),
       at(4, 'compaction/end', { compactionId: 'complete', turn: null }),
       at(5, 'compaction/start', { compactionId: 'orphan', turn: null }),
@@ -802,7 +1051,7 @@ describe('Trajectory conversation Definitions', () => {
       at(11, 'step/start', { turn: 1, step: 3 }),
       at(12, 'user/message', {
         turn: 1, step: 3, id: 'summary', role: 'user',
-        content: [{ type: 'text', text: 'summary' }], source: { kind: 'plugin', plugin: 'compaction' },
+        content: [{ type: 'text', text: 'summary' }], source: { kind: 'compact-checkpoint', compactionId: 'compaction-1' },
       }, { surfaceOp: { op: 'replace', startSeq: 5, endSeq: 9 }, sourceEventSeqs: [5, 8, 9] }),
       at(13, 'request/header', {
         reason: 'series', header: { config: { provider: 'test', model: 'test' }, tools: [] },
@@ -855,7 +1104,7 @@ describe('Trajectory conversation Definitions', () => {
       at(6, 'system/message', { turn: 1, step: 1, message: systemMessage('B') }, { surfaceOp: 'append' }),
       at(7, 'request/header', { reason: 'resume', header: { config: { provider: 'test', model: 'test' } } }),
       at(8, 'user/message', {
-        ...systemMessage('summary'), role: 'user', source: { kind: 'plugin', plugin: 'compaction' },
+        ...systemMessage('summary'), role: 'user', source: { kind: 'compact-checkpoint', compactionId: 'compaction-1' },
       }, { surfaceOp: { op: 'replace', startSeq: 2, endSeq: 6 } }),
       at(9, 'assistant/message', { turn: 1, step: 1, message: assistantMessage('reply', 'reply') }),
     ])

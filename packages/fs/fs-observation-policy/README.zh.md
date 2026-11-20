@@ -25,7 +25,9 @@ kind: "package-reference"
 <a id="use-this-package"></a>
 ## 使用本包
 
-当部署希望模型在覆盖或编辑文件之前先读取该文件时，把本插件与 `ctx.fs` 后端及 `dsh-tool-fs` 工具一起加载。插件无需配置，也不注入任何服务；它只监听工具分派的 `fs/*` 事件。
+`fs/delete-intent` 与 `fs/edit-intent` 要求相同的存在观察：未见源以 `FS_NOT_OBSERVED` 失败，确认缺失的源以 `FS_NOT_FOUND` 失败，存在源提供观察到的版本。补丁和移动源复用 `fs/edit-intent`；移动目标复用 `fs/write-intent`。
+
+当部署希望模型在覆盖或编辑文件之前先读取该文件时，把本插件与 `ctx.fs` 后端及 `dsh-tool-fs` 工具一起加载。插件无需配置，也不注入任何服务；它只监听工具分派的 `fs/*` 事件。随发行版交付的组合默认不启用它：[`dsh-base`](../../bundle/base/cordis.patch.yml) 中的 `fs-observation-policy` 行写着 `disabled: true`；把该行改为 `disabled: false` 即可为所有修改工具恢复防护。原因见[默认值 Agent Note](../../../.agents/notes/implemented/feature/2026-10-29-shipped-fs-mutation-defaults.zh.md)。
 
 ### 最小组合
 
@@ -66,12 +68,12 @@ kind: "package-reference"
 
 | 文件 | 职责 |
 |---|---|
-| [`src/index.ts`](src/index.ts) | 三个 `fs/*` 监听器与已观察状态门禁 |
+| [`src/index.ts`](src/index.ts) | 四个 `fs/*` 监听器与已观察状态门禁 |
 | [`src/types.ts`](src/types.ts) | 不透明事件参与者形态，从中派生所有者会话 |
 
 ### 决策流程
 
-`fs/write-intent` 把未见或确认缺失解析为 `{ kind: 'createIfAbsent' }`，把已观测存在解析为 `{ kind: 'replaceIfVersion', version: vObserved }`。`fs/edit-intent` 以 `FS_NOT_OBSERVED` 拒绝未见目标，以 `FS_NOT_FOUND` 拒绝确认缺失的目标，否则提供观察到的版本作为比较并交换的基础。`fs/observed` 为该所有者与目标记录 `{ kind: 'present', version }` 或 `{ kind: 'absent' }`——同步、只有副作用的 `WeakMap.set`，因为成功的变更已经提交。
+`fs/write-intent` 把未见或缺失状态映射为防护创建，把存在状态映射为防护替换。`fs/edit-intent` 与 `fs/delete-intent` 共享存在状态检查。`fs/observed` 为不透明所有者和目标同步记录存在/版本或缺失。四个监听器及记录状态都会在卸载时释放。
 
 ### 单 slot、先到者胜
 
@@ -95,7 +97,7 @@ kind: "package-reference"
 - [tool-fs](../tool-fs/README.zh.md)——分派 `fs/*` 事件的面向模型工具。
 - [fs-local](../fs-local/README.zh.md)——本策略所防护的宿主文件系统后端。
 - [fs-sandbox](../fs-sandbox/README.zh.md)——与本策略组合的沙箱强制后端。
-- [Fsspec 风格 seam 拆分 Agent Note](../../../.agents/notes/implemented/simplification/2026-06-26-fsspec-style-fs-seam.zh.md)——策略为何是事件插件而非提供方方法。
+- [Fsspec 风格 seam 拆分 参考说明](../fs/README.zh.md)——策略为何是事件插件而非提供方方法。
 
 -----
 
@@ -126,7 +128,7 @@ kind: "package-reference"
 - **已观察状态无法在会话恢复后保留**：该记录的持久化工作延期处理，因此恢复的会话必须重新读取文件，才能执行防护写入与编辑。
 - **没有 agent 会话的参与者绝无法满足策略**：它们的编辑会抛出 `FS_NOT_OBSERVED`，写入总会解析为 `createIfAbsent`，因此非 agent 调用方无法通过门禁覆盖现有文件。
 - **直接 `ctx.fs` 读取不会发出 `fs/observed`**：在 `read` 工具之外读取的文件仍未观察；后续防护编辑会以 `FS_NOT_OBSERVED` 拒绝，直到工具读取该文件。
-- **授权依据是版本新鲜度，而非视图完整性**：任何窗口读取都会授权对未变文件执行全文件覆盖，这有意弱于完整视图规则（见[seam 拆分 Agent Note](../../../.agents/notes/implemented/simplification/2026-06-26-fsspec-style-fs-seam.zh.md)）。
+- **授权依据是版本新鲜度，而非视图完整性**：任何窗口读取都会授权对未变文件执行全文件覆盖，这有意弱于完整视图规则（见[seam 拆分 参考说明](../fs/README.zh.md)）。
 
 <a id="dev-note"></a>
 ### 开发备注
@@ -137,5 +139,3 @@ kind: "package-reference"
 无。
 
 </details>
-
-**运行时不变式：** 不发布伴生入口。本包没有独立事件序列或可变数据关系，相关约定在所属 seam 强制执行。

@@ -1,5 +1,5 @@
 /**
- * Shared service mounting, real AgentLoop drivers, and structural Inbox stubs
+ * Shared service mounting, real AgentLoop drivers, and structural Agent stubs
  * for agent-loop tests. Callers retain ownership of their contexts, adapters,
  * optional plugins, agents, and teardown.
  * @module @deepseek-ai/dsh-agent-loop-testkit
@@ -16,9 +16,14 @@ import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import type { Config as SystemPromptConfig } from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
-import type { Config as ToolRuntimeConfig } from '@deepseek-ai/dsh-tools'
+import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
+import * as PtcToolExecutor from '@deepseek-ai/dsh-tool-executor-ptc'
+import FsLocal from '@deepseek-ai/dsh-fs-local'
+import WorkingDirectory from '@deepseek-ai/dsh-working-directory'
 
 export { createInboxStub, unsupportedInbox } from './inbox.ts'
+export { unsupportedModel } from './model.ts'
+export { provideWorkingDirectoryFixture } from './working-directory-fixture.ts'
 
 interface DriverInbox extends Inbox {
   claim(target: InboxTarget, turn: number): UserMessage[]
@@ -46,10 +51,12 @@ export interface AgentLoopTestHarness {
 
 /** Configuration forwarded to the prerequisite service plugins. */
 export interface AgentLoopTestDependenciesOptions {
+  /** Mount the real directory owner and a local filesystem for directory-aware tests. */
+  readonly workingDirectory?: boolean
   /** Configuration for the system-prompt registry. */
   readonly systemPrompt?: SystemPromptConfig
   /** Configuration for the tool registry. */
-  readonly tools?: ToolRuntimeConfig
+  readonly tools?: { mode?: 'native' | 'ptc'; maxParallelSubCalls?: number }
 }
 
 /**
@@ -72,7 +79,13 @@ export async function mountAgentLoopTestDependencies(
   await ctx.plugin(SessionStore)
   await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(SystemPrompt, options.systemPrompt ?? {})
-  await ctx.plugin(ToolRuntime, options.tools ?? {})
+  if (options.workingDirectory) {
+    if (ctx.get('fs') === undefined) await ctx.plugin(FsLocal)
+    await ctx.plugin(WorkingDirectory)
+  }
+  await ctx.plugin(ToolRuntime)
+  if (options.tools?.mode === 'ptc') await ctx.plugin(PtcToolExecutor, { ...options.tools.maxParallelSubCalls !== undefined ? { maxParallelSubCalls: options.tools.maxParallelSubCalls } : {} })
+  else await ctx.plugin(NativeToolExecutor)
   await ctx.plugin(AgentRegistry)
 }
 

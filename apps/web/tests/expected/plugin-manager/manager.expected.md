@@ -1,36 +1,55 @@
 - heading "插件" [level=1]
-- paragraph: 添加和管理插件
+- text: 安装、启用和配置插件
+- button "插件说明"
 - button "刷新"
-- button "添加插件":
-  - img
-  - text: 添加插件
-- heading "官方" [level=3]
-- text: "6"
+- group "添加插件":
+  - button "添加插件"
+  - button "选择添加插件方式"
+- heading "内置插件配置" [level=3]
 - list:
   - listitem:
-    - button "查看 智能体团队": 智能体团队
-    - text: Beta 启用智能体团队协作与团队工具。
-    - switch "启用 智能体团队"
+    - button "查看 子智能体": 子智能体
+    - text: 设置子智能体的递归层级、数量和模型。
   - listitem:
-    - button "查看 智能体团队 Web 界面": 智能体团队 Web 界面
-    - text: Beta 在浏览器中查看团队成员、任务看板和成员会话。
-    - switch "启用 智能体团队 Web 界面"
-  - listitem:
-    - button "查看 终端": 终端
-    - text: 限制 agent 运行的每一条命令。
+    - button "查看 网页搜索与获取": 网页搜索与获取
+    - text: 选择网页搜索与网页获取使用的提供方。
   - listitem:
     - button "查看 Agent 循环": Agent 循环
-    - text: Agent 如何派发工具调用。
+    - text: 控制 Agent 派发工具调用的方式。
   - listitem:
-    - button "查看 Subagent": Subagent
-    - text: 设置 Subagent 的递归层级、数量和模型。
-  - listitem:
-    - button "查看 网页搜索": 网页搜索
-    - text: DeepSeek 搜索提供方。
-- heading "已安装" [level=3]
-- text: "1"
+    - button "查看 终端": 终端
+    - text: 限制每条命令最多能跑多久、最多输出多少内容。
+- heading "实验性插件" [level=3]
+- button "更多"
 - list:
   - listitem:
-    - button "查看 bundle": bundle
-    - text: "Web e2e fixture: a bundle whose one row is an inert plugin."
-    - switch "启用 bundle"
+    - button "查看 语音输入": 语音输入
+    - text: 实验性 在本机使用 SenseVoice 转写录音，首次使用需安装依赖。
+    - status
+    - switch "启用 语音输入"
+  - listitem:
+    - button "查看 自定义插件索引": 自定义插件索引
+    - text: 实验性 在插件页添加“发现”标签页，从你添加的插件索引中浏览和安装插件。
+    - status
+    - switch "启用 自定义插件索引"
+  - listitem:
+    - button "查看 自动授权审查": 自动授权审查
+    - text: 实验性 提供“自动审查”访问模式：每次工具调用前，由模型对照你的要求检查，获准的调用立即运行，被拒绝的调用等你审批。
+    - status
+    - switch "启用 自动授权审查"
+  - listitem:
+    - button "查看 变更请求与工作树": 变更请求与工作树
+    - text: 实验性 在会话侧栏集中跟踪关联的代码变更请求，支持 GitHub PR 以及 GitLab MR：查看检查状态、评审意见与代码差异，并把修改建议交给智能体继续处理。也可查看本地改动，用独立工作树隔离任务。GitHub 功能需要本机安装 gh 并登录。GitLab 合并请求需要本机安装 glab 并登录。
+    - status
+    - switch "启用 变更请求与工作树"
+- heading "已安装插件" [level=3]
+- list:
+  - listitem:
+    - button "查看 @fixture/bundle": "@fixture/bundle"
+    - text: Registry description for the fixture bundle.
+    - status
+    - switch "启用 @fixture/bundle"
+  - listitem:
+    - button "查看 dsh-web-scaffold-defaults": dsh-web-scaffold-defaults
+    - status
+    - switch "启用 dsh-web-scaffold-defaults" [checked]

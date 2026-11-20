@@ -6,6 +6,8 @@
 
 来源：[`packages/credentials/credentials/src/index.ts`](../../packages/credentials/credentials/src/index.ts)
 
+DeepSeek 账号授权是其中一条记录；其登录、请求凭据和 Platform 会话见 [account.zh.md](account.zh.md)。
+
 ## 标识
 
 引用以 POSIX 风格环境变量名命名一条凭据。brand 防止调用方将凭据引用与在包或进程之间传递的其他字符串混用；构造时校验 shell 标识符语法。
@@ -15,6 +17,7 @@
 type CredentialRef = Branded<'CredentialRef'>
 ```
 
+<a id="resolution"></a>
 ## 解析
 
 `resolve(ref)` 返回值及提供该值的来源层（由提供方定义）；未配置期间返回 `undefined`。消费方在每个操作中重新解析，绝不跨操作缓存——这种按操作进行的读取正是热更新机制。
@@ -31,13 +34,12 @@ interface ResolvedCredential {
 
 ## 描述
 
-`describe(ref)` 在绝不暴露值的前提下回应配置界面：引用当前是否可解析、来自哪一层、`set` 当前能否成功。本地提供方把由当前进程环境供值的引用报告为 `writable: false`——那样的写入会表面成功而解析持续返回遮蔽值，因此 seam 直接拒绝，界面也得以提前把该引用渲染为只读。
+`describe(ref)` 在绝不暴露值的前提下回应配置界面：引用当前是否可解析、来自哪一层、`set` 当前能否成功。可选的 `masked` 字段携带提供方生成的脱敏预览，不包含完整凭据。本地提供方将其管理的文件排在启动环境之前，因此保存值总会成为生效且可写的那一层；移除后会重新使用启动环境或 `.env` 后备值。
 
 ```ts type-equiv
 /**
- * Source and writability facts for one reference, safe for configuration UIs —
- * never the value. The view has no slot a value could ride in, which is what
- * lets the whole read half cross the Remote wire.
+ * Configuration facts and an optional provider-masked preview for one
+ * reference. The full credential is never part of this view.
  */
 interface CredentialInfo {
   /** Whether resolving the reference would currently return a value. */
@@ -46,6 +48,8 @@ interface CredentialInfo {
   source?: string
   /** Whether the active provider can write this reference. */
   writable: boolean
+  /** Provider-generated masked preview of a stored value; never the full value. */
+  masked?: string
 }
 ```
 
@@ -128,7 +132,7 @@ Source: [`packages/credentials/authorization/src/index.ts`](../../packages/crede
 
 Abstract credential service over two key spaces that answer two questions.
 
-A CredentialRef answers "what is behind this environment-variable name", layered over the process environment, the provider-managed store, and `.env` files. One seam-wide rule binds that half: an empty stored value is absent everywhere — `resolve` skips it, `describe` reports it unconfigured — so a blank never masquerades as a configured secret.
+A CredentialRef answers "what is behind this environment-variable name": the provider-managed store first, then ambient fallbacks such as the process environment and `.env` files. One seam-wide rule binds that half: an empty stored value is absent everywhere — `resolve` skips it, `describe` reports it unconfigured — so a blank never masquerades as a configured secret.
 
 A CredentialKey answers "what credential does this plugin hold for this id". Nothing can layer here — an authorization grant has no environment to be read from — so presence of the record is the whole fact, and modifyRecord is the only write path because a correct write depends on the current value (a token refresh is read-decide-replace under one lock).
 
@@ -145,17 +149,16 @@ abstract resolve(ref: CredentialRef): Promise<ResolvedCredential | undefined>
 
 /**
  * Describe one reference for configuration surfaces without exposing the
- * value.
+ * full value.
  * @param ref - the reference to describe.
- * @returns configured state, supplying source, and writability.
+ * @returns configured state, supplying source, writability, and optional masked preview.
  */
 abstract describe(ref: CredentialRef): Promise<CredentialInfo>
 
 /**
- * Durably store one value in the provider-managed writable source. Rejects
- * while a read-only source shadows the reference — the write would appear
- * to succeed while resolution keeps returning the shadowing value — and
- * rejects an empty value (use {@link unset}).
+ * Durably store one value in the provider-managed writable source. The stored
+ * value takes precedence over ambient fallbacks, and empty values are
+ * rejected (use {@link unset}).
  * @param ref - the reference to store.
  * @param value - the non-empty secret value.
  */
@@ -163,8 +166,8 @@ abstract set(ref: CredentialRef, value: string): Promise<void>
 
 /**
  * Remove one reference from the provider-managed writable source; removing
- * an absent reference is a no-op. Rejects while a read-only source shadows
- * the reference, like {@link set}.
+ * an absent reference is a no-op. Ambient fallback layers may become
+ * effective again after removal.
  * @param ref - the reference to remove.
  */
 abstract unset(ref: CredentialRef): Promise<void>
@@ -220,7 +223,7 @@ Source: [`packages/credentials/credentials/src/index.ts`](../../packages/credent
 
 ### `ctx.credentialsController` — `CredentialsController`
 
-Host service backing the generated `ctx.remote.credentials` namespace. It carries every wire obligation the credential seam itself does not: the batch fan-out bound, the field-by-field view projection, the reference-grammar guard, and the refusal mapping. Secret values cross in one direction only — no method here returns one.
+Host service backing the generated `ctx.remote.credentials` namespace. It carries every wire obligation the credential seam itself does not: the batch fan-out bound, the field-by-field view projection, the reference-grammar guard, and the refusal mapping. Full secret values cross in one direction only — no method here returns one.
 
 ```ts cordis-catalog
 /**
@@ -307,7 +310,7 @@ Source: [`packages/credentials/credentials/src/types.ts`](../../packages/credent
 
 #### `credentials/reference-updated` — emit
 
-Committed change to a provider-managed credential source: a `set`, an `unset`, or an external edit observed in storage. Ambient process-environment changes are not observable and never emit. Listener failures are contained and logged — a sync throw and an async rejection alike — without changing the committed operation's outcome, except `INVARIANT`-coded failures, which rethrow after every listener ran; that rethrow reaches the emitter only from synchronous listeners, so invariant checks on this event must not be async functions.
+Committed change to a provider-managed credential source: a `set`, an `unset`, or an external edit observed in storage. Ambient process-environment changes are not observable and never emit. Listener failures are contained and logged — a sync throw and an async rejection alike — without changing the committed operation's outcome.
 
 ```ts cordis-catalog
 /**
@@ -315,10 +318,7 @@ Committed change to a provider-managed credential source: a `set`, an `unset`, o
  * `unset`, or an external edit observed in storage. Ambient
  * process-environment changes are not observable and never emit. Listener
  * failures are contained and logged — a sync throw and an async rejection
- * alike — without changing the committed operation's outcome, except
- * `INVARIANT`-coded failures, which rethrow after every listener ran;
- * that rethrow reaches the emitter only from synchronous listeners, so
- * invariant checks on this event must not be async functions.
+ * alike — without changing the committed operation's outcome.
  * @param ref - the reference whose stored value changed.
  * @mode emit
  */

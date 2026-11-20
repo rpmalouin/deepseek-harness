@@ -38,13 +38,18 @@ async function sessionEvents(log: string): Promise<SessionEvent[]> {
   return lines.slice(1).map(line => JSON.parse(line) as SessionEvent)
 }
 
-function toolResultText(events: SessionEvent[]): string {
+function settlementText(events: SessionEvent[]): string[] {
   const results = events.filter(event => event.type === 'tool/result')
   expect(results).toHaveLength(1)
-  return results[0]!.data.message.content[0].content
-    .filter(block => block.type === 'text')
-    .map(block => block.text)
-    .join('')
+  const notices = events.filter(event => event.type === 'user/message'
+    && event.data.source.kind === 'subagent-settled')
+  expect(notices).toHaveLength(1)
+  const notice = notices[0]!
+  if (notice.type !== 'user/message' || notice.data.source.kind !== 'subagent-settled') throw new Error('missing completion notice')
+  expect(results[0]!.data.message.content).toEqual([
+    { type: 'text', text: 'started subagent agent-1' },
+  ])
+  return notice.data.content.slice(1).filter(block => block.type === 'text').map(block => block.text)
 }
 
 async function childLaunch(failure = false): Promise<{
@@ -86,7 +91,6 @@ describe('SDK subagent routing and diagnostics through the production profile', 
         processTimeoutMs: 120_000,
         env: {
           ...child.env,
-          DSH_TEST_CHILD_DEFAULT_ROUTE: '1',
           DSH_TEST_PARENT_MODEL_RECORD: '.parent-model-routes',
         },
         inspect: async (cwd) => {
@@ -109,16 +113,7 @@ describe('SDK subagent routing and diagnostics through the production profile', 
       })
       expect(stderr).not.toContain('UNHANDLED')
 
-      // The parent's tool result carries the child model's echo of its real
-      // process.cwd() — the parent session's workspace, never the harness
-      // process's launch directory.
-      const results = events.filter(event => event.type === 'tool/result')
-      expect(results).toHaveLength(1)
-      const resultText = results[0]!.data.message.content[0].content
-        .filter(block => block.type === 'text')
-        .map(block => block.text)
-        .join('')
-      expect(resultText).toBe(`child route: mock/mock-routed/max/777; cwd: ${workspace}`)
+      expect(settlementText(events)).toEqual(['Its closing message:', `child route: mock/mock-routed/max/777; cwd: ${workspace}`])
       expect(parentResolvedRoutes).toContain('mock/mock-routed')
 
       // The child ran a real turn with the model-selected route and tool-configured cap.
@@ -141,6 +136,39 @@ describe('SDK subagent routing and diagnostics through the production profile', 
     // LOADER_SMOKE_TEST_TIMEOUT_MS's margin over the default window.
   }, 135_000)
 
+  it('rejects effort-only delegation before launching an SDK child', async () => {
+    const child = await childLaunch()
+    try {
+      await runLoaderSmoke({
+        label: 'dsh-sdk-subagent effort-only rejection',
+        tempDirPrefix: 'dsh-sdk-subagent-effort-only-',
+        binScript: driver,
+        libBinScript: driver,
+        configPath,
+        tsconfigPath: repoTsconfig,
+        processTimeoutMs: 120_000,
+        env: { ...child.env, DSH_TEST_CHILD_EFFORT_ONLY: '1' },
+        inspect: async (cwd) => {
+          const logs = await jsonlFiles(join(cwd, '.sessions'))
+          expect(logs).toHaveLength(1)
+          const events = await sessionEvents(logs[0]!)
+          const results = events.filter(event => event.type === 'tool/result')
+          expect(results).toHaveLength(1)
+          expect(results[0]!.data.message.isError).toBe(true)
+          expect(results[0]!.data.message.content).toEqual([{
+            type: 'text',
+            text: 'Error: invalid arguments: child LLM `reasoning_effort` requires both `provider` and `model`; supply both or omit all three fields. Call `list_subagent_models` to see the routes you may select.',
+          }])
+          expect(results[0]!.data.error).toEqual({ name: 'ToolArgsError', code: 'INVALID_ARGS' })
+          expect(events.some(event => event.type === 'subagent/catalog')).toBe(false)
+          expect(existsSync(join(child.childHome, 'sessions'))).toBe(false)
+        },
+      })
+    } finally {
+      await rm(child.childHome, { recursive: true, force: true })
+    }
+  }, 135_000)
+
   it('presents the child error diagnostic separately from partial output', async () => {
     const child = await childLaunch(true)
     let events: SessionEvent[] = []
@@ -161,11 +189,11 @@ describe('SDK subagent routing and diagnostics through the production profile', 
         },
       })
       expect(stderr).not.toContain('UNHANDLED')
-      expect(toolResultText(events)).toBe(
-        'Error: subagent run failed\n'
-        + 'Diagnostic: Subagent failure (provider: DSH SDK; stage: session-run; category: child-error)\n'
-        + 'Partial output before the run ended:\npartial child loader answer',
-      )
+      expect(settlementText(events)).toEqual([
+        'Its closing message:',
+        'partial child loader answer',
+        'Subagent failure (provider: DSH SDK; stage: session-run; category: child-error)',
+      ])
     } finally {
       await rm(child.childHome, { recursive: true, force: true })
     }

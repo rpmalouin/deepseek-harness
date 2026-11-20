@@ -3,40 +3,31 @@
     - button "Ask a research subagent to"
     - text: /
     - 'button "Switch subagent: event-sourcing researcher"': event-sourcing researcher
-  - img
   - text: Standard mode
-  - button "More actions":
-    - img
-  - button "Open right sidebar":
-    - img
+  - button "Session panel"
+  - button "More actions"
+  - button "Open right sidebar"
   - tablist:
     - tab "Chat" [selected]
     - tab "Trajectory"
-- button "System prompt":
-  - img
-  - img
-  - text: System prompt
-- text: "Explain event sourcing in one sentence.Your parent agent id is \"session-{{uuid}}\". Before you finish, send your result to that agent with send_message({ agent_id: \"session-{{uuid}}\", message: \"<self-contained result>\" }). The parent shares your workspace but does not automatically receive your transcript, tool output, or reasoning. Send earlier messages as well when a finding changes what the parent should do next; sending a message does not end your turn. {{clock}}"
-- button "Copy":
-  - img
-- button "Context injection @deepseek-ai/dsh-system-prompt":
-  - img
-  - img
-  - text: Context injection @deepseek-ai/dsh-system-prompt
+  - button "More conversation views"
+- button "Task message received {{clock}}":
+  - text: Task message received
+  - time: {{clock}}
+- button "Context injection runtime-context"
+- button "Context injection skill-catalog"
+- button "Context injection time-context"
 - paragraph: partial
-- status: Deep diving...
+- status: Deep diving
+- text: Deep diving for {{duration}} ···
 - list:
   - listitem:
     - text: Keep working until I stop you again.
-    - button "Edit queued message":
-      - img
-    - button "Remove queued message":
-      - img
-    - button "Steer queued message":
-      - img
-- textbox "Parent session offline; sending is unavailable but you can still stop the run" [disabled]
-- button "Add files or run commands" [disabled]:
-  - img
-- 'button "Access mode, current: Custom" [disabled]': Custom
+    - button "Edit queued message"
+    - button "Remove queued message"
+    - button "Steer queued message"
+- textbox "Cmd/Ctrl+Enter steers all queued messages"
+- button "Add files or run commands"
+- 'button "Access mode, current: Custom"': Custom
 - button "Stop generating"
 - button "Send message" [disabled]

@@ -63,7 +63,7 @@ kind: "package-reference"
 
 ### 可观察的成功与失败
 
-任意提供方报告的 skill 都会出现在合并目录中，按其精确 kebab-case 名称加载即可返回正文；无效名称返回无结果而非抛错。发现失败的提供方会被记录并跳过，观测被标记为不完整，因此消费方保留其最后一份可用目录；显式的不完整观测仍会贡献其候选项。格式错误的候选项会快速失败——注册表在缓存或返回任何内容之前，会先验证名称、描述、调用布尔值与提供方归属。
+任意提供方报告的 skill 都会出现在合并目录中，按其精确 kebab-case 名称加载即可返回正文；无效名称返回无结果而非抛错。发现失败的提供方会被记录并跳过，观测被标记为不完整，因此消费方可区分发现失败与已确认的缺失；显式的不完整观测仍会贡献其候选项。格式错误的候选项、目录观测或已加载定义会以带 `SKILL_INVALID_DEFINITION` 的 `SkillError` 快速失败——注册表在缓存或返回任何内容之前，会先验证名称、描述、调用布尔值与提供方归属。`SkillError` 也承载 `skill` 工具的 `SKILL_NOT_FOUND`、`SKILL_NOT_MODEL_INVOCABLE` 失败与提供方的 `SKILL_READ_FAILED`。
 
 Skill 摘要保留胜出提供方可选的指令文件 `path`，供提供文件预览的发现消费者使用。列举仍不读取 skill 正文；面向模型的目录继续仅选择其负责的路由字段。
 
@@ -88,7 +88,6 @@ Skill 摘要保留胜出提供方可选的指令文件 `path`，供提供文件�
 | 文件 | 职责 |
 |---|---|
 | [`src/index.ts`](src/index.ts) | 插件入口、`SkillRegistry` 服务、候选项与定义验证、共享的面向模型渲染 |
-| — | 不发布运行时不变式伴生入口；提供方／运行时 map 与带 revision 的 cache 在注册表内原子变更，且没有独立变更事件或快照可供交叉核对。 |
 
 ### 目录收集
 
@@ -115,7 +114,7 @@ Skill 摘要保留胜出提供方可选的指令文件 `path`，供提供文件�
 - [skill-filesystem 包](../skill-filesystem/README.zh.md)——从磁盘发现 skill 的随附本地提供方。
 - [tool-skill 包](../tool-skill/README.zh.md)——渲染会话目录与 `skill` 工具的消费方。
 - [生成配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-skill)——每个配置字段及其源声明。
-- [skill 调用策略 Agent Note](../../../.agents/notes/implemented/feature/2026-07-28-skill-invocation-policy.zh.md)——模型与用户调用控制的依据。
+- [历史skill 调用策略 Agent Note](../../../.agents/notes/archived/feature/2026-07-28-skill-invocation-policy.md)——模型与用户调用控制的依据。
 
 -----
 

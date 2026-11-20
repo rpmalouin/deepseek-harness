@@ -25,13 +25,14 @@ English | [中文](README.zh.md)
 <a id="use-this-package"></a>
 ## Use this package
 
-Use `ctx.sessionQuery` from application code when you need to read or search session history without touching the session service or a storage backend directly. The service is provided by a concrete backend plugin — the shipped composition mounts `@deepseek-ai/dsh-session-query-sqlite` ([README](../session-query-sqlite/README.md)) — so this package is never mounted alone. Everything below is available on `ctx.sessionQuery` once a backend is composed.
+Use `ctx.sessionQuery` from application code when you need to read or search session history without touching the session service or a storage backend directly. The service is provided by a concrete backend plugin — the shipped composition mounts `@deepseek-ai/dsh-session-query-sqlite` ([README](../session-query-sqlite/README.md)) — so this package is never mounted alone. The query operations below are available on `ctx.sessionQuery` once a backend is composed.
 
 ### What you can do
 
 | Operation | What you get |
 |---|---|
-| `listSessions()` | Every logical session, newest first, with `live` and `persisted` availability flags |
+| `listSessions()` | Every logical session, newest first, with `live` and `persisted` availability flags and optional `formatStatus` |
+| `getListMetadata(session)` | Whether a live or prepared Session has no turn, and its latest human-authored prompt time |
 | `readSession(id)` | The complete replay-validated raw event log, without making the session live |
 | `filterSessions(filters)` | Sessions matching ANDed metadata and availability predicates |
 | `filterEvents(id, filters)` | Semantic event documents matching metadata and literal-text predicates |
@@ -62,7 +63,7 @@ The inherited knobs are set through the mounted backend's config:
 
 ### Failures and recovery
 
-Failures are typed with a stable `SessionQueryError.code`. The ones you will meet: `SESSION_QUERY_SESSION_NOT_FOUND` when an id is absent; `SESSION_QUERY_SOURCE_CONFLICT` when live and persisted observations of one session disagree on immutable headers; `SESSION_QUERY_PERSISTENCE_FAILED` when mounted persistence is unreadable; `SESSION_QUERY_CORRUPT_SESSION` when a durable record fails Session validation; and `SESSION_QUERY_INVALID_SURFACE` when a loaded log breaks the surface contract. Reads targeting a known live session never consult persistence, so a failing backend cannot make current in-memory history unreadable.
+Failures are typed with a stable `SessionQueryError.code`. The ones you will meet: `SESSION_QUERY_SESSION_NOT_FOUND` when an id is absent; `SESSION_QUERY_SOURCE_CONFLICT` when live and persisted observations of one session disagree on immutable headers; `SESSION_QUERY_PERSISTENCE_FAILED` when mounted persistence is unreadable; `SESSION_QUERY_CORRUPT_SESSION` when a durable record fails Session validation or a live or prepared observation fails projection computation; and `SESSION_QUERY_INVALID_SURFACE` when a loaded log breaks the surface contract. Projection failures retain the original error as `cause`. Reads targeting a known live session never consult persistence, so a failing backend cannot make current in-memory history unreadable.
 
 -----
 
@@ -92,6 +93,7 @@ The decision history lives in the [unified service decision](../../../.agents/no
 | [`src/index.ts`](src/index.ts) | Service definition: the abstract `SessionQueryEngine`, concrete reads, config validation |
 | [`src/corpus.ts`](src/corpus.ts) | Live-preferred corpus resolution, optional persistence binding, batch projections |
 | [`src/observation.ts`](src/observation.ts) | Live-preferred point observations with a bounded revision-keyed prepared-Session cache |
+| [`src/list-metadata.ts`](src/list-metadata.ts) | Session-list blankness and human-prompt recency projection definition |
 | [`src/cold-read.ts`](src/cold-read.ts) | Handle-based cold log read with in-memory interrupted-turn closers |
 | [`src/types.ts`](src/types.ts) | Public records, filters, requests, and page types |
 | [`src/config.ts`](src/config.ts) | Inherited config and the closed `SessionQueryError` taxonomy |
@@ -100,15 +102,23 @@ The decision history lives in the [unified service decision](../../../.agents/no
 | [`src/documents.ts`](src/documents.ts) | Surface-aware semantic document projection |
 | [`src/tracing.ts`](src/tracing.ts) | One-shot session-lineage and event-relationship tracing |
 | [`src/sources.ts`](src/sources.ts) | Immutable-header compatibility check |
-| — | No runtime invariant companion is published; query results are immutable per-call projections whose lineage and event relations are validated while they are built; the service retains no observable result state. |
 
 ### Corpus resolution
 
 `SessionCorpus` binds optional `ctx.sessionPersistence` through a fiber and resolves each read live-first: a known live target is snapshotted without consulting persistence; otherwise the session is listed, read completely through a short-lived read handle, and re-checked for a live attachment before cloning. A cold log whose writer crashed mid-turn is balanced in memory with `interruptedTurnClosers` — persistence is never mutated by a read. Header compatibility is asserted between listed and loaded observations. Batch title reads run one metadata listing and bounded-concurrency reads, isolating per-session failures while cancellation rejects the whole batch.
 
+<a id="session-list-metadata"></a>
+### Session-list metadata
+
+The service registers the `sessionListMetadata` projection for Session blankness and the latest human-authored prompt time when it starts, and its disposal releases that registration; it therefore requires `sessionProjections`. `getListMetadata(session)` reads the projection synchronously for a live or prepared Session. The Session API and optional [listing tools](../tool-session-list/README.md) read it through `ctx.sessionQuery`.
+
 ### Observation cache
 
 `observeSession` builds point observations without a listing preflight. A live observation fixes its cut as the current log length and materializes `events` on first read, so header-, cursor-, or projection-only consumers never copy the log; the log only appends, so a late first read still yields exactly that prefix. The cold path stats the stored session first and consults its own bounded cache keyed by the persistence instance and the `stat` revision: an unchanged revision reuses the restored unpublished Session without re-reading the log; a changed revision, or a replaced persistence instance, reloads through the handle seam and replaces the entry. The cache holds `preparedSessionCacheSize` entries with least-recently-used eviction, entries pinned by active observation leases are never evicted, and a session that goes live mid-read retries the live path.
+
+A cold `SessionObservation` reports `persistedEventCount` to separate the stored prefix from the in-memory interrupted-turn repairs in `events`. Fork callers keep those repairs in the child's suffix. A live observation omits the field, since a live log carries no read-time repairs.
+
+`inspectSession(id, read, signal?)` prepares a cold Session without publishing or resuming it and calls a synchronous domain getter at a fresh live or prepared cut. The getter may read its owned projection or resolve policy; it must not mutate or retain the Session. The observation is released after the getter returns or throws; callers retain only the returned data. Preparation uses the observation cache and validates persisted history.
 
 ### Reads and traces
 
@@ -125,7 +135,7 @@ Read these pages when the package-level contract is not enough. They move from t
 
 - [Session Query subsystem reference](../../../docs/subsystems/session-query.md) — the full type-level contract: records, filters, search pages, lineage, bounded reads, and errors.
 - [dsh-session-query-sqlite](../session-query-sqlite/README.md) — the shipped full-text backend and its index lifecycle.
-- [dsh-tool-session-query](../tool-session-query/README.md) — the model-facing consumer built on this service.
+- [dsh-tool-session-query](../../experimental/tool-session-query/README.md) — the model-facing consumer built on this service.
 - [Session query relationship tracing](../../../.agents/notes/archived/feature/2026-07-13-session-query-tracing.md) — trace semantics and the validation boundary.
 - [SQLite FTS5 session search](../../../.agents/notes/archived/feature/2026-07-10-sqlite-session-query-provider.md) — how the search surface is implemented and reconciled.
 
@@ -162,6 +172,6 @@ This Dev Note is working context for maintainers: open design questions and dire
 
 #### Future: extractor and search-provider registries
 
-Recursive traversal through cited source events, extractor and search-provider registries, and additional model-facing surfaces are deferred; the [tool-session-query README](../tool-session-query/README.md) documents the current consumer surface.
+Recursive traversal through cited source events, extractor and search-provider registries, and additional model-facing surfaces are deferred; the [tool-session-query README](../../experimental/tool-session-query/README.md) documents the current consumer surface.
 
 </details>

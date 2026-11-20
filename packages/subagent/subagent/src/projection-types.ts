@@ -6,6 +6,31 @@
 
 import type { SessionId, SessionSeq } from '@deepseek-ai/dsh-session/types'
 
+/** Known child modes with their creation labels and names, shared by catalog views. */
+export type KnownSubagentCatalogFields =
+  | {
+    /** A terminal one-shot child. */
+    readonly mode: 'one-shot'
+    /** Optional durable creation label from the parent catalog. */
+    readonly label?: string
+  }
+  | {
+    /** An external execution without a local child Session. */
+    readonly mode: 'external'
+    /** Optional durable creation label from the parent catalog. */
+    readonly label?: string
+    /** Name unique among the parent's children; absent on historical entries. */
+    readonly name?: string
+  }
+  | {
+    /** A resumable conversation. */
+    readonly mode: 'continuable'
+    /** Durable creation label from the parent catalog. */
+    readonly label: string
+    /** Name unique among the parent's children; absent on historical entries. */
+    readonly name?: string
+  }
+
 /** One current direct-child discovery row materialized from parent facts. */
 export type SubagentCatalogEntry =
   & {
@@ -13,8 +38,8 @@ export type SubagentCatalogEntry =
     readonly createdAt: number
   }
   & (
-    | { readonly mode: 'one-shot'; readonly label?: string }
-    | { readonly mode: 'continuable'; readonly label: string }
+    | KnownSubagentCatalogFields
+    | { readonly mode: 'unknown'; readonly label?: string }
   )
 
 /** Durable active-turn timing for one descriptor-backed child session. */
@@ -28,6 +53,11 @@ export interface SubagentTimingProjection {
     /** Latest event time folded into this projection cut. */
     through: number
   }
+  /**
+   * Whether the latest closed turn after the child's own descriptor completed
+   * normally; absent while a turn is open or before one closes.
+   */
+  lastTurnCompleted?: boolean
 }
 
 /**
@@ -63,7 +93,7 @@ declare module '@deepseek-ai/dsh-session-projection/types' {
   interface SessionProjectionMap {
     /** Direct children in parent catalog event order, excluding fork-inherited facts. */
     subagentCatalog: SubagentCatalogEntry[]
-    /** Active-turn duration for a descriptor-backed subagent session. */
+    /** Active-turn duration and latest closed-turn completion for a descriptor-backed subagent session. */
     subagentTiming: SubagentTimingProjection
     /**
      * Identity of a descriptor-backed subagent session. `null` ⟺ no valid

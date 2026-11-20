@@ -1,6 +1,58 @@
-# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
-# side as of the last confirmed-consistent state. Both languages carry equal authority;
-# after editing either side, bring the other along and re-record with:
+# Bilingual-pair consistency record for README.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write packages/client/ui-theme/README.md
-README.md: a25f0202d278d52448d52a22f451612295325f87
-README.zh.md: 08a0c37dc3c80b4385173e6ca74bb9254b4870ea
+/:
+  en: e9c14ae3732deb3a
+  zh: fee230def9844d2d
+/deepseek-ai-dsh-client-ui-theme:
+  en: 06c7d7624947a72a
+  zh: ac4ca82984564825
+/deepseek-ai-dsh-client-ui-theme/summary:
+  en: d9832b31c4cb3ca4
+  zh: f2ec42bb5ae66188
+/deepseek-ai-dsh-client-ui-theme/table-of-contents:
+  en: d152484eb41ac6b4
+  zh: 09388d293f9be9cb
+/deepseek-ai-dsh-client-ui-theme/use-this-package:
+  en: 5a279269e31713c1
+  zh: dcd5c31fbdfd63e2
+/deepseek-ai-dsh-client-ui-theme/use-this-package/appearance-and-font-size:
+  en: 7dff01929847efd1
+  zh: ec04b4c4485aba96
+/deepseek-ai-dsh-client-ui-theme/use-this-package/fonts:
+  en: b45d5b48ca799c3a
+  zh: af65514b3759204f
+/deepseek-ai-dsh-client-ui-theme/use-this-package/registering-a-theme:
+  en: 5244fc168d0a03f8
+  zh: c7ab12fdf8c6c55b
+/deepseek-ai-dsh-client-ui-theme/use-this-package/pre-plugin-palette:
+  en: 18f62cd5e6d32570
+  zh: 728ddd17d7610470
+/deepseek-ai-dsh-client-ui-theme/understand-the-implementation:
+  en: 875bd262240187c1
+  zh: 32ffb98f502ed042
+/deepseek-ai-dsh-client-ui-theme/understand-the-implementation/stylesheets:
+  en: 148903d8cd6580f5
+  zh: 7ff2ff90954798b8
+/deepseek-ai-dsh-client-ui-theme/understand-the-implementation/scrollbar-rebinding:
+  en: 3448f0857e398018
+  zh: 0b5078286134b8e9
+/deepseek-ai-dsh-client-ui-theme/understand-the-implementation/preference-persistence:
+  en: b1f0b0bce5e53bae
+  zh: 26ded298f85834ae
+/deepseek-ai-dsh-client-ui-theme/further-exploration:
+  en: 7d5b953aaeeaf591
+  zh: ff4bccb0f196f2b9
+/deepseek-ai-dsh-client-ui-theme/model-experience:
+  en: 3120df665299c634
+  zh: 1d9f365d091d0d2a
+/deepseek-ai-dsh-client-ui-theme/model-experience/kv-cache-effect:
+  en: ca75c51c89c2c9b0
+  zh: de54f3467ef3b9be
+/deepseek-ai-dsh-client-ui-theme/known-limitations-and-deferred-work:
+  en: 2388061abb1dd40f
+  zh: 1a4ad9a8e12472df
+/deepseek-ai-dsh-client-ui-theme/known-limitations-and-deferred-work/dev-note:
+  en: e67f633dc6fe7773
+  zh: 3bb0c20c93f16f98

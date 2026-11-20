@@ -72,20 +72,36 @@ export function varReferences(value: string): string[] {
 }
 
 /**
- * Every CSS file shipped as package source, excluding build output and
- * installed dependencies.
- * @returns absolute paths of the stylesheets under packages/.
+ * Every file shipped as package source whose name the predicate accepts,
+ * excluding build output, installed dependencies, and dot directories.
+ * Dot directories hold VCS metadata and per-test temporary roots rather than
+ * shipped source, and their owner can remove one while a scan reads it.
+ * @param accepts - filename predicate.
+ * @param root - tree to walk, the packages directory by default.
+ * @returns absolute paths under `root`, `/`-separated on every platform so
+ *   specs can match repo-relative suffixes verbatim.
  */
-export function packageStylesheets(): string[] {
+export function packageFiles(accepts: (name: string) => boolean, root: string = PACKAGES_DIR): string[] {
   const found: string[] = []
   const walk = (dir: string): void => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const path = join(dir, entry.name)
       if (entry.isDirectory()) {
-        if (entry.name !== 'node_modules' && entry.name !== 'lib' && entry.name !== 'dist') walk(path)
-      } else if (entry.name.endsWith('.css')) found.push(path)
+        // Dot directories hold VCS metadata and the temporary roots each spec
+        // creates inside the package tree, never shipped package source; a
+        // concurrent owner can remove one while a scan reads it.
+        if (!entry.name.startsWith('.') && entry.name !== 'node_modules' && entry.name !== 'lib' && entry.name !== 'dist') walk(path)
+      } else if (accepts(entry.name)) found.push(path.replaceAll('\\', '/'))
     }
   }
-  walk(PACKAGES_DIR)
+  walk(root)
   return found
+}
+
+/**
+ * Every CSS file shipped as package source.
+ * @returns absolute stylesheet paths, `/`-separated on every platform.
+ */
+export function packageStylesheets(): string[] {
+  return packageFiles(name => name.endsWith('.css'))
 }

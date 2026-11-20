@@ -1,9 +1,9 @@
 /** Keep LibreOffice workers, prebuilt engines, and their dependencies on the real filesystem. */
-import { existsSync } from 'node:fs'
-import { cp, mkdir, readFile, rm } from 'node:fs/promises'
-import { createRequire } from 'node:module'
+import { readFile } from 'node:fs/promises'
 import { isAbsolute, join, relative, sep } from 'node:path'
-import { selectOfficeEngine } from './libreoffice-engine.ts'
+import { downloadRuntimeNpmPackage, type RuntimeNpmArchive } from './primary-runtime/prepare.ts'
+import { load as parseYaml } from 'js-yaml'
+import { officePackageDirectories } from './libreoffice-packages.mjs'
 
 /** pkg applies these exclusions to dependency `files` as well as root asset globs. */
 export const OFFICE_ASSET_IGNORES = [
@@ -11,87 +11,53 @@ export const OFFICE_ASSET_IGNORES = [
   '**/node_modules/@deepseek-ai/libreoffice-kit-*/**',
 ]
 
-interface PackageManifest {
-  name: string
-  dependencies?: Record<string, string>
-  optionalDependencies?: Record<string, string>
-  peerDependencies?: Record<string, string>
-  peerDependenciesMeta?: Record<string, { optional?: boolean }>
-  os?: string[]
-  cpu?: string[]
+/** One npm package at its existing sidecar dependency location. */
+export interface OfficePackageArchive extends RuntimeNpmArchive {
+  /** Relative package directory inside the sidecar. */
+  readonly directory: string
 }
 
 /**
- * Copy the installed Office dependency tree without changing package contents or executable modes.
- * Harness sidecars require the kit's declared target native engine, or WASM for other targets.
- * Missing target engines fail with their package name; missing required dependencies or paths outside the deployed closure also fail.
- * @param staging - Symlink-free deployed Node closure.
- * @param destination - Target-specific Office directory beside the executable; replaced when present.
- * @param target - Node platform and CPU of the executable.
- * @returns Relative package directories included in the sidecar.
+ * Resolve one installed npm version against its reviewed workspace lock integrity.
+ * @param name - Published package name.
+ * @param version - Exact installed version.
+ * @param lockfile - Workspace lock recording the exact published archive.
+ * @returns Locked npm tarball identity; rejects versions without SHA-512 integrity.
  */
-export async function copyOfficeSidecar(
-  staging: string,
-  destination: string,
-  target: { platform: string; arch: string },
-): Promise<string[]> {
-  const entry = join(staging, 'node_modules', '@deepseek-ai', 'libreoffice-kit')
-  const manifest = JSON.parse(await readFile(join(entry, 'package.json'), 'utf8')) as PackageManifest
-  const engineName = `@deepseek-ai/libreoffice-kit-${selectOfficeEngine(manifest, target)}`
-  const packages = new Set<string>()
-
-  async function visit(packageDirectory: string): Promise<void> {
-    if (packages.has(packageDirectory)) return
-    const relativeDirectory = relative(staging, packageDirectory)
-    if (isAbsolute(relativeDirectory) || relativeDirectory === '..' || relativeDirectory.startsWith(`..${sep}`)) {
-      throw new Error(`Python Office dependency is outside the deployed closure: ${packageDirectory}`)
-    }
-    const manifestPath = join(packageDirectory, 'package.json')
-    const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as PackageManifest
-    packages.add(packageDirectory)
-    const require = createRequire(manifestPath)
-    const dependencies = new Set([
-      ...Object.keys(manifest.dependencies ?? {}),
-      ...Object.keys(manifest.optionalDependencies ?? {}),
-      ...Object.keys(manifest.peerDependencies ?? {}),
-    ])
-    for (const name of dependencies) {
-      if (name.startsWith('@deepseek-ai/libreoffice-kit-')) continue
-      const optional = manifest.optionalDependencies?.[name] !== undefined
-        || manifest.peerDependenciesMeta?.[name]?.optional === true
-      const dependencyDirectory = (require.resolve.paths(name) ?? [])
-        .map(directory => join(directory, name))
-        .find(directory => existsSync(directory))
-      if (dependencyDirectory === undefined) {
-        if (optional) continue
-        throw new Error(`Python Office dependency ${name} required by ${manifest.name} is missing.`)
-      }
-      if (optional) {
-        const dependency = JSON.parse(await readFile(join(dependencyDirectory, 'package.json'), 'utf8')) as PackageManifest
-        if (!supports(dependency.os, target.platform) || !supports(dependency.cpu, target.arch)) continue
-      }
-      await visit(dependencyDirectory)
-    }
+export async function runtimeNpmArchive(name: string, version: string, lockfile = join(import.meta.dirname, '../pnpm-lock.yaml')): Promise<RuntimeNpmArchive> {
+  const lock = parseYaml(await readFile(lockfile, 'utf8')) as { packages?: Record<string, { resolution?: { integrity?: string } }> }
+  const integrity = lock.packages?.[`${name}@${version}`]?.resolution?.integrity
+  if (typeof integrity !== 'string' || !/^sha512-[A-Za-z0-9+/]+={0,2}$/u.test(integrity)) {
+    throw new Error(`runtime npm lock: missing SHA-512 integrity for ${name}@${version}`)
   }
-
-  await visit(entry)
-  const engineDirectory = join(staging, 'node_modules', engineName)
-  if (!existsSync(engineDirectory)) throw new Error(`Python Office engine ${engineName} required for ${target.platform}/${target.arch} is missing.`)
-  await visit(engineDirectory)
-  await rm(destination, { recursive: true, force: true })
-  await mkdir(destination, { recursive: true })
-  const directories = [...packages].sort()
-  for (const source of directories) {
-    const nestedModules = join(source, 'node_modules')
-    await cp(source, join(destination, relative(staging, source)), {
-      recursive: true,
-      filter: path => path !== nestedModules && !path.startsWith(nestedModules + sep),
-    })
-  }
-  return directories.map(directory => relative(staging, directory))
+  return { name, version, url: `https://registry.npmjs.org/${name}/-/${name.split('/').at(-1)}-${version}.tgz`, integrity }
 }
 
-function supports(values: string[] | undefined, value: string): boolean {
-  return values === undefined || (!values.includes(`!${value}`)
-    && (values.every(item => item.startsWith('!')) || values.includes(value) || values.includes('any')))
+/**
+ * Lock the installed Office closure to published npm tarballs, preserving nested dependency locations.
+ * @param staging - Complete installed Node closure.
+ * @param target - Sidecar platform and CPU.
+ * @returns Download records for the selected engine and all dependencies.
+ */
+export async function officeSidecarArchives(staging: string, target: { platform: string; arch: string }): Promise<OfficePackageArchive[]> {
+  const directories = await officePackageDirectories(staging, target)
+  return Promise.all(directories.map(async (directory) => {
+    const manifest = JSON.parse(await readFile(join(directory, 'package.json'), 'utf8')) as { name: string; version: string }
+    return { ...await runtimeNpmArchive(manifest.name, manifest.version), directory: relative(staging, directory).split(sep).join('/') }
+  }))
+}
+
+/**
+ * Download the complete pinned Office sidecar without npm or package lifecycle scripts.
+ * @param packages - Build-locked npm packages and dependency locations.
+ * @param destination - Empty sidecar directory.
+ * @param cache - Verified archive cache.
+ * @returns Resolves after all packages are unpacked and checked.
+ */
+export async function downloadOfficeSidecar(packages: readonly OfficePackageArchive[], destination: string, cache: string): Promise<void> {
+  for (const artifact of packages) {
+    if (isAbsolute(artifact.directory) || artifact.directory.split(/[\\/]/u).some(part => part === '..')
+      || !artifact.directory.startsWith('node_modules/')) throw new Error(`Office download: invalid package directory ${artifact.directory}`)
+    await downloadRuntimeNpmPackage(artifact, join(destination, artifact.directory), cache)
+  }
 }

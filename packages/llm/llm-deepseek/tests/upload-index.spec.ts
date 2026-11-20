@@ -2,12 +2,13 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { AttachmentId, ImageVariantId } from '@deepseek-ai/dsh-attachment'
-import { DeepSeekFileId } from '../src/common/file-id.ts'
-import { deepSeekFileScope, DeepSeekUploadIndex } from '../src/common/upload-index.ts'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { AttachmentId, ImageVariantId } from '@deepseek-ai/dsh-attachment/types'
+import type { DeepSeekFileId } from '../src/file-id.ts'
+import { deepSeekFileScope, DeepSeekUploadIndex } from '../src/upload-index.ts'
 
-const ATTACHMENT = AttachmentId(`sha256:${'a'.repeat(64)}`)
-const VARIANT = ImageVariantId(`sha256:${'b'.repeat(64)}`)
+const ATTACHMENT = brandString<AttachmentId>(`sha256:${'a'.repeat(64)}`)
+const VARIANT = brandString<ImageVariantId>(`sha256:${'b'.repeat(64)}`)
 
 /** Every temp index root created by this file, removed after each test. */
 const roots: string[] = []
@@ -31,7 +32,7 @@ describe('DeepSeekUploadIndex', () => {
       scope: first,
       attachmentId: ATTACHMENT,
       variantId: VARIANT,
-      fileId: DeepSeekFileId('file-api-one'),
+      fileId: brandString<DeepSeekFileId>('file-api-one'),
       bytes: 3,
       createdAt: 1_000,
       expiresAt: 10_000,
@@ -50,16 +51,40 @@ describe('DeepSeekUploadIndex', () => {
     const scope = deepSeekFileScope('https://api.deepseek.com', 'key')
     const first = {
       scope, attachmentId: ATTACHMENT, variantId: VARIANT,
-      fileId: DeepSeekFileId('file-api-first'), bytes: 3, createdAt: 1, expiresAt: 10_000,
+      fileId: brandString<DeepSeekFileId>('file-api-first'), bytes: 3, createdAt: 1, expiresAt: 10_000,
     }
-    const duplicate = { ...first, fileId: DeepSeekFileId('file-api-duplicate') }
+    const duplicate = { ...first, fileId: brandString<DeepSeekFileId>('file-api-duplicate') }
     await index.commit(first, 1, 1)
 
     await expect(index.commit(duplicate, 2, 1)).resolves.toEqual({ record: first, accepted: false })
-    await index.remove(scope, VARIANT, duplicate.fileId)
+    await index.remove(scope, [{ variantId: VARIANT, fileId: duplicate.fileId }])
     await expect(index.get(scope, VARIANT, 2, 1)).resolves.toEqual(first)
-    await index.remove(scope, VARIANT, first.fileId)
+    await index.remove(scope, [{ variantId: VARIANT, fileId: first.fileId }])
     await expect(index.get(scope, VARIANT, 2, 1)).resolves.toBeUndefined()
+  })
+
+  it('removes several exact generations in one update and keeps unlisted mappings', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-upload-index-'))
+    roots.push(dir)
+    const index = new DeepSeekUploadIndex(join(dir, 'index.json'))
+    const scope = deepSeekFileScope('https://api.deepseek.com', 'key')
+    const record = (digest: string) => ({
+      scope, attachmentId: ATTACHMENT, variantId: brandString<ImageVariantId>(`sha256:${digest.repeat(64)}`),
+      fileId: brandString<DeepSeekFileId>(`file-api-${digest}`), bytes: 3, createdAt: 1, expiresAt: 10_000,
+    })
+    const first = record('b')
+    const second = record('c')
+    const third = record('d')
+    for (const entry of [first, second, third]) await index.commit(entry, 1, 1)
+
+    await index.remove(scope, [
+      { variantId: first.variantId, fileId: first.fileId },
+      { variantId: second.variantId, fileId: second.fileId },
+      { variantId: third.variantId, fileId: brandString<DeepSeekFileId>('file-api-superseded') },
+    ])
+    await expect(index.get(scope, first.variantId, 2, 1)).resolves.toBeUndefined()
+    await expect(index.get(scope, second.variantId, 2, 1)).resolves.toBeUndefined()
+    await expect(index.get(scope, third.variantId, 2, 1)).resolves.toEqual(third)
   })
 
   it('treats a corrupt upload cache as empty and repairs it on the next commit', async () => {
@@ -73,7 +98,7 @@ describe('DeepSeekUploadIndex', () => {
       scope,
       attachmentId: ATTACHMENT,
       variantId: VARIANT,
-      fileId: DeepSeekFileId('file-api-repaired'),
+      fileId: brandString<DeepSeekFileId>('file-api-repaired'),
       bytes: 3,
       createdAt: 1,
       expiresAt: 10_000,
@@ -153,7 +178,7 @@ describe('DeepSeekUploadIndex', () => {
     const scope = deepSeekFileScope('https://api.deepseek.com', 'key')
     const record = {
       scope, attachmentId: ATTACHMENT, variantId: VARIANT,
-      fileId: DeepSeekFileId('file-api-one'), bytes: 3, createdAt: 1, expiresAt: 10_000,
+      fileId: brandString<DeepSeekFileId>('file-api-one'), bytes: 3, createdAt: 1, expiresAt: 10_000,
     }
     await writeFile(path, JSON.stringify({ formatVersion: 3, records: [record, record] }), 'utf8')
     const index = new DeepSeekUploadIndex(path)
@@ -168,10 +193,10 @@ describe('DeepSeekUploadIndex', () => {
     const second = deepSeekFileScope('https://api.deepseek.com', 'second')
     const expired = {
       scope: first, attachmentId: ATTACHMENT, variantId: VARIANT,
-      fileId: DeepSeekFileId('file-api-expired'), bytes: 3, createdAt: 1, expiresAt: 2,
+      fileId: brandString<DeepSeekFileId>('file-api-expired'), bytes: 3, createdAt: 1, expiresAt: 2,
     }
     const live = {
-      ...expired, scope: second, fileId: DeepSeekFileId('file-api-live'), expiresAt: 10_000,
+      ...expired, scope: second, fileId: brandString<DeepSeekFileId>('file-api-live'), expiresAt: 10_000,
     }
     await index.commit(expired, 0, 0)
     await index.commit(live, 3, 1)

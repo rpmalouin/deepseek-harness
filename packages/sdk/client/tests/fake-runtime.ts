@@ -8,6 +8,8 @@
  *
  * Script vocabulary (all optional):
  * - `FAKE_TEXT`: assistant text for each turn (default `hello from fake runtime`).
+ * - `FAKE_SESSION_EVENT`: one JSON event forwarded after the assistant with owned seq/time.
+ * - `FAKE_SESSION_EVENTS`: JSON event array forwarded in order after the assistant with owned seq/time.
  * - `FAKE_STATUS`: the `session.finished` status (default `ok`).
  * - `FAKE_REASON_KIND`: the `session.finished` reason kind (default `completed`; `none` omits the reason).
  * - `FAKE_ABORT_REASON_KIND`: nested cause for an `aborted` turn (default `user`).
@@ -46,11 +48,13 @@
  * - `FAKE_EXIT_BEFORE_INIT`: exit 3 immediately (spawn-then-die probe).
  * - `FAKE_STDERR`: write this line to stderr at boot (diagnostics-tail probe).
  * - `FAKE_STDERR_NO_NEWLINE`: write this to stderr WITHOUT a newline (buffer-flush probe).
+ * - `FAKE_APPROVAL`: send one server approval request after initialization and echo its response as a notification.
  * - `FAKE_RECORD_INIT`: append each `initialize` params JSON to this file (handshake probe).
  */
 
 import { appendFileSync, existsSync, writeFileSync } from 'node:fs'
 import process from 'node:process'
+import { resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 
 const env = process.env
@@ -79,6 +83,8 @@ function notify(method: string, params: object): void {
 }
 
 let seq = 0
+let originCwd = process.cwd()
+const workingDirectories = new Map<string, string>()
 function event(sessionId: string, type: string, data: object): void {
   notify('session.event', { sessionId, event: { type, seq: seq++, time: 0, data } })
 }
@@ -163,6 +169,22 @@ function runTurn(sessionId: string): void {
     },
     stream: env.FAKE_EMPTY_MESSAGE !== undefined ? usageOnlyStream() : textStream(text),
   })
+  if (env.FAKE_SESSION_EVENT !== undefined) {
+    const scripted: unknown = JSON.parse(env.FAKE_SESSION_EVENT)
+    if (scripted === null || typeof scripted !== 'object' || Array.isArray(scripted)) {
+      throw new Error('FAKE_SESSION_EVENT must be a JSON event object')
+    }
+    notify('session.event', { sessionId, event: { ...scripted, seq: seq++, time: 0 } })
+  }
+  if (env.FAKE_SESSION_EVENTS !== undefined) {
+    const scripted: unknown = JSON.parse(env.FAKE_SESSION_EVENTS)
+    if (!Array.isArray(scripted)) throw new Error('FAKE_SESSION_EVENTS must be a JSON event array')
+    const events: unknown[] = scripted
+    for (const value of events) {
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('FAKE_SESSION_EVENTS contains a non-object event')
+      notify('session.event', { sessionId, event: { ...value, seq: seq++, time: 0 } })
+    }
+  }
   const reasonKind = env.FAKE_REASON_KIND ?? 'completed'
   if (reasonKind !== 'none') {
     if (env.FAKE_MALFORMED_REASON === 'no-data') {
@@ -221,13 +243,25 @@ function sessionIdOf(params: Record<string, unknown> | undefined): string {
 }
 
 const reader = createInterface({ input: process.stdin })
+const settledSessions = new Set<string>()
 reader.on('line', (line) => {
   if (line.trim().length === 0) return
-  const frame = JSON.parse(line) as { id?: string | number; method?: string; params?: Record<string, unknown> }
+  const frame = JSON.parse(line) as {
+    id?: string | number
+    method?: string
+    params?: Record<string, unknown>
+    result?: unknown
+    error?: unknown
+  }
+  if (frame.id === 'approval-client-test') {
+    notify('approval/response', { result: frame.result, error: frame.error })
+    return
+  }
   if (frame.method === undefined || frame.id === undefined) return
-  const respond = (result: object): void => { write({ jsonrpc: '2.0', id: frame.id, result }) }
+  const respond = (result: unknown): void => { write({ jsonrpc: '2.0', id: frame.id, result }) }
   switch (frame.method) {
     case 'initialize':
+      if (typeof frame.params?.cwd === 'string') originCwd = frame.params.cwd
       if (env.FAKE_RECORD_INIT !== undefined) appendFileSync(env.FAKE_RECORD_INIT, `${JSON.stringify(frame.params)}\n`)
       if (env.FAKE_HANG_INIT !== undefined) return
       if (env.FAKE_INIT_READY !== undefined && env.FAKE_INIT_GO !== undefined) {
@@ -259,8 +293,46 @@ reader.on('line', (line) => {
         return
       }
       respond({ serverInfo: { name: 'deepseek-harness-sdk-runtime', version: '0.0.1' } })
+      if (env.FAKE_APPROVAL !== undefined) write({ jsonrpc: '2.0', id: 'approval-client-test', method: 'approval/request', params: { sessionId: 'main', toolName: 'bash' } })
       return
+    case 'session/resume':
+      if (env.FAKE_RESUME_ERROR !== undefined) {
+        write({ jsonrpc: '2.0', id: frame.id, error: { code: -32603, message: 'session not found' } })
+      } else {
+        respond({})
+      }
+      return
+    case 'session/working-directory/get':
+    case 'session/working-directory/set': {
+      if (env.FAKE_MALFORMED_DIRECTORY !== undefined) {
+        respond({ cwd: 17 })
+        return
+      }
+      const sessionId = sessionIdOf(frame.params)
+      const previous = workingDirectories.get(sessionId) ?? originCwd
+      const cwd = frame.method === 'session/working-directory/set'
+        ? resolve(previous, String(frame.params?.path))
+        : previous
+      workingDirectories.set(sessionId, cwd)
+      respond({ cwd })
+      return
+    }
+    case 'session/query':
     case 'session/prompt': {
+      const blocks = frame.params?.contentBlocks as { type: string; text?: string }[]
+      const text = blocks.filter(block => block.type === 'text').map(block => block.text).join('\n')
+      if (frame.method === 'session/query' && text === '/compact') {
+        const execution = { commandId: 'command-1', result: { kind: 'success', text: '/compact' } }
+        const completed = execution
+        event(sessionIdOf(frame.params), 'command/run', { commandId: completed.commandId })
+        event(sessionIdOf(frame.params), 'command/done', { commandId: completed.commandId, ...completed.result })
+        notify('session.query.completed', { sessionId: frame.params?.sessionId, commandId: completed.commandId,
+          finalResponse: completed.result?.text ?? '', finishReason: completed.result?.kind === 'error' ? 'error' : 'completed' })
+        respond({ kind: 'command', execution })
+        return
+      }
+      const promptResult = (messageId: string): object => frame.method === 'session/query'
+        ? { kind: 'prompt', messageId } : { messageId }
       const sessionId = sessionIdOf(frame.params)
       const messageId = `fake-user-${seq}`
       event(sessionId, 'agent/inbox/spliced', {
@@ -285,7 +357,7 @@ reader.on('line', (line) => {
       }
       if (env.FAKE_EXIT_DURING_PROMPT !== undefined) {
         const partial = env.FAKE_TEXT ?? 'partial before exit'
-        respond({ messageId })
+        respond(promptResult(messageId))
         event(sessionId, 'assistant/message', {
           turn: 0,
           step: 0,
@@ -308,9 +380,13 @@ reader.on('line', (line) => {
       }
       runTurn(sessionId)
       notify('session.status', { sessionId, status: 'idle' })
-      respond({ messageId })
+      settledSessions.add(sessionId)
+      respond(promptResult(messageId))
       return
     }
+    case 'session/wait':
+      if (settledSessions.has(sessionIdOf(frame.params))) respond({})
+      return
     case 'shutdown':
       respond({})
       // An EOF-ignoring fake also refuses the protocol exit, so the client's

@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-Use `ctx.tokenMeter` to estimate a session's current request and context pressure or price one message. Measurements replay the durable session log, remain deterministic, and make no model calls, so compaction, occupancy displays, and telemetry can share one result. When session projections are available, consumers can read `tokenUsage`, `contextPressure`, and `contextBreakdown`; text and routes without image pricing use an approximate fixed heuristic, declared visual-token pricing applies when available, and files are priced as model-visible handle text. Provider-reported usage is reused only for an identical request envelope; the package adds no model-visible content and makes no loop decisions.
+Use `ctx.tokenMeter` to estimate a session's current request and context pressure or price one message. Measurements replay the durable session log, remain deterministic, and make no model calls, so compaction, occupancy displays, and telemetry can share one result. The service requires session projections; consumers can read `tokenUsage`, `contextPressure`, and `contextBreakdown`; text and routes without image pricing use an approximate fixed heuristic, declared visual-token pricing applies when available, and files are priced as model-visible handle text. Provider-reported usage is reused only for an identical request envelope; the package adds no model-visible content and makes no loop decisions.
 
 ## Table of Contents
 
@@ -46,11 +46,11 @@ The measurement anchor includes the priced surface immediately before the succes
 
 ### Session projections
 
-When the composition provides `ctx.sessionProjections`, token-meter registers three projection units. `tokenUsage` carries the complete durable log's `uncachedInputTokens`, `outputTokens`, `cacheReadTokens`, and `cacheWriteTokens`. A final assistant-message sample replaces streaming usage from the same attempt; `llm/retry-started` ends that replacement scope, so a retry in the same step contributes another billed attempt. `contextPressure` carries optional `pressureTokens` (the newest provider-reported prompt size), optional `projectedTokens` (what the next request's prompt would cost), and optional `contextWindow` from the newest `request/context` record. `contextBreakdown` carries heuristic `systemTokens`, `toolsTokens`, and `messageTokens` — the context's composition, not its provider-billed size. Unloading the plugin removes all three keys.
+Token-meter registers three client-view projection units and one host-only unit through its required `ctx.sessionProjections` service. Host consumers call `ctx.tokenMeter.contextPressure(session)` to read the latest provider-reported prompt size and route capacity synchronously; the registration handle stays private. `tokenUsage` carries the complete durable log's `uncachedInputTokens`, `outputTokens`, `cacheReadTokens`, and `cacheWriteTokens`. A final assistant-message sample replaces streaming usage from the same attempt; `llm/retry-started` ends that replacement scope, so a retry in the same step contributes another billed attempt. `contextPressure` carries optional `pressureTokens` (the newest provider-reported prompt size), optional `projectedTokens` (what the next request's prompt would cost), and optional `contextWindow` from the newest `request/context` record. `contextBreakdown` carries heuristic `systemTokens`, `toolsTokens`, and `messageTokens` — the context's composition, not its provider-billed size. Unloading the plugin removes all four keys. The host-only `tokenMeasurement` state saves header references, the open step, and the latest successful call's usage and output price. It contains no message arrays, tool schemas, attachment data, or price caches. Invalid measurement history records only its first failed position; unrelated projection updates and checkpoints continue. `measure()` reports the original error at that event, before committing prices or advancing its cursor. State version 2 discards older measurement rows and rebuilds from the journal.
 
 Image offload reprices existing node identities while preserving prior usage anchors. The fixed reference heuristic excludes `offloaded` metadata, so an offload decision does not change `contextBreakdown` or the scalar heuristic total; route-aware measurement replaces the selected visual prices with placeholder text.
 
-`contextBreakdown` classifies the last nonempty surviving `system/message` in surface order as `systemTokens`; empty dormant nodes contribute nothing, and no nonempty system means zero. `messageTokens` includes every other visible node, including superseded prompts. Their sum always equals `measure().nodes[].heuristicTokens`, including after unmetered replacements, compaction, and per-node prompt clearing. `toolsTokens` follows the latest `request/header`. All three use the fixed heuristic, not route image pricing or file-handle projection; they are approximate composition, not billing or `projectedTokens`.
+`contextBreakdown` classifies the last nonempty surviving `system/message` in surface order as `systemTokens`; empty dormant nodes contribute nothing, and no nonempty system means zero. `messageTokens` includes every other visible node, including superseded prompts. Their sum equals `measure().nodes[].heuristicTokens` after appends, metered compaction and pruning, and system-prompt rewrites or clearing; an unmetered replacement of a non-system range folds at zero delta, like `contextPressure`. `toolsTokens` follows the latest `request/header`. All three use the fixed heuristic, not route image pricing or file-handle projection; they are approximate composition, not billing or `projectedTokens`.
 
 `deriveTurnTokenUsage(events)` folds one complete turn into exact per-attempt and whole-turn usage for browser consumers. It returns no result when lifecycle evidence is missing, counts are unsafe, or exact totals conflict; each corresponding aggregate appears only when every participating attempt reports its optional cache, reasoning, or route value.
 
@@ -79,7 +79,9 @@ This section explains the design behind the service; the observable behavior is 
 
 ### Design philosophy
 
-The service is built on one fold and one anchor. Each session gets an isolated replay state — consumed-event cursor, canonical request header, priced surface, step boundary, and measurement anchor — advanced by folding the durable log. Provider usage anchors a measurement only when its canonical envelope matches and its total is no lower than the full route-priced cost of the same call; otherwise the complete envelope and surface are estimated. The route-independent `heuristicTokens` field keeps replacement shadow-price projections deterministic. The fold is total and allocation-fresh: a malformed event throws before any mutation, so the same log fails identically on every retry.
+The service separates fixed-size recovery facts from rebuildable positional prices. `tokenMeasurement` preserves one current header reference, one step boundary, and one usage anchor. The private price cache retains the current and pre-assistant node prices and their two header payloads. Restoring the projection folds only later events; a cold price cache can still scan the complete log. Synchronous reads before plugin activation use the same pure metadata fold locally.
+
+Provider usage anchors a measurement only when its canonical envelope matches and its total is no lower than the full route-priced cost of the same call; otherwise the complete envelope and surface are estimated. Both surfaces are repriced per measurement, including current image prices and file-handle text. No projection fold performs I/O or invokes runtime hooks.
 
 ### Source map
 
@@ -87,6 +89,7 @@ The service is built on one fold and one anchor. Each session gets an isolated r
 |---|---|
 | [`src/index.ts`](src/index.ts) | The `TokenMeter` service: replay state, fold, `measure()` and `estimateMessage()` |
 | [`src/estimate.ts`](src/estimate.ts) | The fixed heuristic: four characters per token plus block and role overhead |
+| [`src/measurement-projection.ts`](src/measurement-projection.ts) | Fixed-size host recovery facts; no positional caches |
 | [`src/surface-fold.ts`](src/surface-fold.ts) | The positional surface fold shared with `measure()` |
 | [`src/surface-projection.ts`](src/surface-projection.ts) | Shadow-price protocol for the O(1) projection units |
 | [`src/usage-projection.ts`](src/usage-projection.ts) | `tokenUsage` and `contextPressure` projection definitions |
@@ -100,7 +103,9 @@ Each `measure()` call synchronizes the fold to the current durable tail, then re
 
 ### Projection semantics
 
-`contextBreakdown` retains plain-JSON `{ seq, heuristicTokens, system }` entries in surface order and reuses the measurement plan/commit fold. Its state and surface transitions are O(current retained surface), not O(1) and not O(total historical log); replaced entries and message bodies are not retained. State version 5 invalidates checkpoints priced with offload metadata. `contextPressure` remains the scalar shadow-price consumer: replacements without adjacent claims contribute zero delta. The usage fold retains one last-sample slot because legal logs never report usage for an earlier step after a later step reports usage.
+`contextBreakdown` retains only the surviving `system/message` nodes with their heuristic prices, one running surface total, and at most one armed shadow-price claim; a replacement subtracts the adjacent claim, whose `shadowedSeqs` also name the system prompts it removes, or the retained price of the one system prompt it rewrites ([decision](../../../.agents/notes/implemented/architecture/2026-10-13-context-breakdown-system-prompt-state.md)). Its state follows the number of surviving system prompts, not the message count; state version 6 invalidates positional checkpoints. `contextPressure` is the other scalar shadow-price consumer: replacements without adjacent claims contribute zero delta. The usage fold retains one last-sample slot because legal logs never report usage for an earlier step after a later step reports usage.
+
+`./estimate` exports the stateless text/content estimators used by tool-result retention. Model adapters supply request-image costs through `imageRequestPricing`.
 
 </details>
 
@@ -136,6 +141,7 @@ No direct invalidation; the named consumer owns any request-prefix changes.
 These limits define where the measurement stops and future work begins. They are current package constraints, not a general token-accounting comparison or a task backlog.
 
 - **The fixed heuristic is approximate** — text without reusable provider usage is priced by character count plus structural overhead, not an exact provider tokenizer or request serializer; only image occurrences on routes with declared pricing carry provider-exact visual tokens.
+- **A cold price cache can scan the complete log** — the fixed-size checkpoint restores measurement facts, not positional prices or the old anchor's messages. Header payloads are rebuilt with the price cache; warm reads need no new history access. Measurement recovery can still read the log prefix. A header reference that does not match the rebuilt journal cache discards that cache and repeats the original calculation from the beginning.
 - **Every measurement clones the current surface** — coherent immutable snapshots make reads O(surface), including below-threshold pressure checks.
 - **Provider usage is only reusable for an identical canonical envelope** — tools, provider, model, or call-config changes deliberately fall back to full heuristic estimation; system-prompt changes are signed surface deltas until the next successful call.
 - **A system-prompt rewrite carries no shadow price** — the loop replaces a system node without an adjacent metering event, so `contextPressure.projectedTokens` folds that replacement at zero delta until the next usage sample; `contextBreakdown.systemTokens` and `measure()` reprice the new prompt immediately.
@@ -154,4 +160,4 @@ This Dev Note is non-authoritative working context: notes for maintainers and op
 
 </details>
 
-**Runtime invariant:** No companion is published. Usage folds replace samples within each attempt; totals need not be monotone. Composition and measurement share the positional replacement planner and fixed estimator, so their heuristic surface totals agree by construction rather than through independent mutable observations. Route-priced totals deliberately differ.
+Usage folds replace samples within each attempt; totals need not be monotone. Composition and measurement share the positional replacement planner and fixed estimator, so their heuristic surface totals agree by construction. Route-priced totals deliberately differ.

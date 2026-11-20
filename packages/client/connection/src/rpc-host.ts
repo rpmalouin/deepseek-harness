@@ -2,19 +2,18 @@
 
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
-import {
-  RpcId,
-  type ClientRequest,
-  type RpcId as RpcIdType,
-} from './rpc.ts'
+import type { PeerScope, Principal } from '@deepseek-ai/dsh-typert-protocol'
+import type { ConnectionInteractions } from './connect-protocol.ts'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { ClientRequest, RpcId as RpcIdType } from './rpc.ts'
 import { clientRequestSchema } from './rpc-schema.ts'
 import { bridge } from './http-bridge.ts'
-import { isTrustedApiRequest } from './api-request-trust.ts'
+import { isRemoteAuthority, isTrustedApiRequest } from './api-request-trust.ts'
 import { API_PATH } from './api-path.ts'
-import type { BrowserAuth } from './browser-auth.ts'
+import { Peer } from './peer.ts'
+import type { ConnectionAuthentication } from './authentication.ts'
 import type {
-  ConnectionIndexRequest,
-  ConnectionIndexResponse,
+  PeerAdmission,
   ConnectionFetchRoute,
   ConnectionFetchHandler,
   HostConnectionFetch,
@@ -22,13 +21,12 @@ import type {
   ConnectionRpcFailure,
   ConnectionRpcHandler,
   ConnectionRpcResult,
-  ConnectionRequestRejection,
   ConnectionTrustRequest,
   HostConnectionHandle,
   HostConnectionRpc,
 } from './rpc.ts'
 
-const INVALID_REQUEST_RPC_ID = RpcId('invalid-request')
+const INVALID_REQUEST_RPC_ID = brandString<RpcIdType>('invalid-request')
 const CHANNEL_PATTERN = /^\/[A-Za-z0-9._~-]+$/
 const ENDPOINT_SEGMENT_PATTERN = /^[A-Za-z0-9_$.-]+$/
 
@@ -58,21 +56,43 @@ declare module '@deepseek-ai/cordis' {
 
 /** Host Connection service whose channel registrations belong to the caller fiber. */
 export class HostConnectionService extends Service implements HostConnectionHandle {
+  /** Connection-owned Peer for trusted in-process callers, not network authentication. */
+  readonly browserPeer: PeerScope
+  readonly authentication: ConnectionAuthentication
+  private readonly owner: Context
+  private disposed = false
   private readonly interceptors = new Map<string, ConnectionRpcInterceptor>()
   private readonly fetchRoutes = new Map<string, RegisteredFetchRoute>()
+
+  readonly allowsRemoteAuthorities: boolean
 
   /**
    * Provide the Host half over the active HTTP server.
    * @param ctx - owning Connection plugin context.
    * @param trustedHosts - deployment authorities accepted by the Host/Origin fence.
-   * @param browserAuth - process token and persistent browser-session owner.
    */
   constructor(
     ctx: Context,
     private readonly trustedHosts: readonly string[],
-    private readonly browserAuth: BrowserAuth,
   ) {
     super(ctx, 'connection')
+    this.owner = ctx
+    this.authentication = ctx['connection.authentication']
+    this.browserPeer = new Peer(ctx, { principal: { kind: 'owner' } })
+    ctx.effect(() => async () => {
+      this.disposed = true
+      await this.browserPeer.dispose()
+    }, 'client-connection: Peer scopes')
+    this.allowsRemoteAuthorities = trustedHosts.some(isRemoteAuthority)
+    ctx.on('webserver/authorize', (request, policy) => {
+      const facts = { ...request, url: request.url.href }
+      if (!this.isTrustedRequest(facts)) return { kind: 'deny', status: 403 }
+      if (policy === 'anonymous') return { kind: 'allow' }
+      const admission = this.authentication.authenticate(facts)
+      return 'rejection' in admission
+        ? { kind: 'deny', status: admission.rejection }
+        : { kind: 'allow', peer: admission.peer }
+    })
   }
 
   /** Generic channel registry scoped to the Context reading this service. */
@@ -93,20 +113,26 @@ export class HostConnectionService extends Service implements HostConnectionHand
     }
   }
 
-  /** Apply the configured Host/Origin fence, then browser authentication. */
-  requestRejection(request: ConnectionTrustRequest): ConnectionRequestRejection {
-    if (!isTrustedApiRequest(request, this.trustedHosts)) return 403
-    return this.browserAuth.isAuthenticated(request) ? undefined : 401
+  /** Apply the carrier source policy and accept the first successful provider. */
+  admit(request: ConnectionTrustRequest): PeerAdmission {
+    if (!this.isTrustedRequest(request)) return { rejection: 403 }
+    if (this.disposed) return { rejection: 401 }
+    return this.authentication.authenticate(request)
   }
 
-  /** Authenticate an index request through the process-token exchange or cookie. */
-  authorizeIndex(request: ConnectionIndexRequest, response: ConnectionIndexResponse): boolean {
-    return this.browserAuth.authorizeIndex(request, response)
+  /** Create one in-process Peer owned by the Context that read this service. */
+  createPeer(options: {
+    readonly principal: Principal
+    readonly interactions?: ConnectionInteractions
+  }): PeerScope {
+    if (this.disposed) throw new Error('connection: cannot create a Peer after disposal')
+    return new Peer(this.ctx, options)
   }
 
-  /** Add this process's launch token to the clean application URL. */
-  authenticatedUrl(baseUrl: string): string {
-    return this.browserAuth.authenticatedUrl(baseUrl)
+  /** Check the deployment's request-source policy without credential verification. */
+  private isTrustedRequest(request: ConnectionTrustRequest): boolean {
+    const carrier = this.owner.get('webServer')
+    return isTrustedApiRequest(request, this.trustedHosts, carrier?.host, carrier?.protocol ?? 'http:')
   }
 
   /**
@@ -122,16 +148,21 @@ export class HostConnectionService extends Service implements HostConnectionHand
         const route = this.fetchRoutes.get(url.pathname)
         return route?.methods.has(method) === true ? route.requestBody : 'buffered'
       },
-      fetch: (request) => {
+      fetch: (request, peer) => {
         const pathname = new URL(request.url).pathname
         const route = this.fetchRoutes.get(pathname)
-        if (route?.methods.has(request.method) === true) return route.fetch(request)
+        if (route?.methods.has(request.method) === true) {
+          // Exact routes bypass Gateway access checks, so only the owner reaches them.
+          // oxlint-disable-next-line typescript/no-unnecessary-condition -- other packages merge non-owner kinds into PrincipalMap.
+          if (peer.principal.kind !== 'owner') return Promise.resolve(new Response('forbidden', { status: 403 }))
+          return route.fetch(request)
+        }
         const endpoint = endpointFromPath(channel, pathname)
         const interceptor = this.interceptors.get(channel)
         if (endpoint === undefined || interceptor === undefined || !interceptor.matches(endpoint)) {
           return Promise.resolve(new Response('not found', { status: 404 }))
         }
-        return interceptor.fetchHandler.fetch(request)
+        return interceptor.fetchHandler.fetch(request, peer)
       },
     }
   }
@@ -165,20 +196,17 @@ export class HostConnectionService extends Service implements HostConnectionHand
     const route: WebRoute = {
       kind: 'prefix',
       path: channel,
-      handler: async (req, res) => {
-        const rejection = this.requestRejection(req)
-        if (rejection !== undefined) {
-          res.writeHead(rejection)
-          res.end(rejection === 401 ? 'unauthorized' : 'forbidden')
-          return
-        }
-        await bridge(req, res, fetchHandler)
+      auth: 'required',
+      handler: async (req, res, peer) => {
+        if (peer === undefined || res.destroyed) return
+        await bridge(req, res, fetchHandler, peer)
       },
     }
-    return owner.effect(
-      () => owner.webServer.register(route),
-      `client-connection: ${channel} rpc channel`,
-    )
+    return owner.effect(() => {
+      const webServer = owner.get('webServer')
+      if (webServer === undefined) throw new Error('connection: RPC channels require a WebServer')
+      return webServer.register(route)
+    }, `client-connection: ${channel} rpc channel`)
   }
 
   private registerInterceptor(
@@ -212,7 +240,7 @@ function rpcFetchHandler(
 ): ConnectionFetchHandler {
   return {
     requestBodyMode: () => 'buffered',
-    async fetch(request: Request): Promise<Response> {
+    async fetch(request: Request, peer: PeerScope): Promise<Response> {
       const endpoint = endpointFromPath(channel, new URL(request.url).pathname)
       if (request.method !== 'POST' || endpoint === undefined) {
         return new Response('not found', { status: 404 })
@@ -244,7 +272,7 @@ function rpcFetchHandler(
       }
 
       try {
-        const result = await handler(endpoint, message.payload, request.signal)
+        const result = await handler(endpoint, message.payload, request.signal, peer)
         return fullResponse(message.rpcId, result)
       } catch (error) {
         return new Response(`handler failure: ${String(error)}`, { status: 500 })
@@ -255,7 +283,7 @@ function rpcFetchHandler(
 
 function invalidEnvelopeResponse(body: unknown, issues: readonly object[]): Response {
   const rawId = (body as { rpcId?: unknown } | null)?.rpcId
-  const rpcId = typeof rawId === 'string' ? RpcId(rawId) : INVALID_REQUEST_RPC_ID
+  const rpcId = typeof rawId === 'string' ? brandString<RpcIdType>(rawId) : INVALID_REQUEST_RPC_ID
   return errorResponse(rpcId, {
     code: 'gateway/bad-request',
     message: 'invalid client-request message',
@@ -278,9 +306,23 @@ function errorResponse(rpcId: RpcIdType, error: ConnectionRpcFailure): Response 
   return fullResponse(rpcId, { ok: false, error })
 }
 
-function fullResponse(rpcId: RpcIdType, result: ConnectionRpcResult<unknown>): Response {
-  const body: ConnectionServerResponse = { type: 'server-response', rpcId, result }
-  return Response.json(body)
+function fullResponse(rpcId: RpcIdType, result: Awaited<ReturnType<ConnectionRpcHandler>>): Response {
+  if (!result.ok) {
+    const body: ConnectionServerResponse = { type: 'server-response', rpcId, result }
+    return Response.json(body)
+  }
+  const { attachments, ...success } = result
+  const body: ConnectionServerResponse = { type: 'server-response', rpcId, result: success }
+  if (attachments === undefined || attachments.length === 0) return Response.json(body)
+  const parts = new FormData()
+  const attachmentMetadata = attachments.map((attachment, index) => {
+    const part = `bytes-${index}`
+    // FileSystem bytes may have SharedArrayBuffer backing, which BlobPart excludes.
+    parts.set(part, new Blob([new Uint8Array(attachment.bytes)]))
+    return { path: [...attachment.path], codec: 'bytes' as const, part }
+  })
+  parts.set('metadata', JSON.stringify({ ...body, attachments: attachmentMetadata }))
+  return new Response(parts)
 }
 
 function assertChannel(channel: string): void {

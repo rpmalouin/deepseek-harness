@@ -5,15 +5,15 @@ import { join } from 'node:path'
 import { LocalFileSystem } from '@deepseek-ai/dsh-fs-local'
 import { WorkspaceFiles } from '@deepseek-ai/dsh-api-workspace-files'
 import { Context } from '@deepseek-ai/cordis'
-import { HostConnectionService } from '@deepseek-ai/dsh-client-connection'
-import type { BrowserAuth } from '@deepseek-ai/dsh-client-connection/src/browser-auth.ts'
-import { SessionId } from '@deepseek-ai/dsh-session'
+import { ConnectionAuthentication, HostConnectionService } from '@deepseek-ai/dsh-client-connection'
+import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { SessionQueryError } from '@deepseek-ai/dsh-session-query'
 import type { SessionEventReadRequest } from '@deepseek-ai/dsh-session-query'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { registerPresentOpen } from '../src/present-open.ts'
 import { presentedFileUrl, PRESENT_OPEN_PATH } from '../src/presented.ts'
+import { brandString } from '@deepseek-ai/dsh-brand'
 
 const cleanups: Array<() => Promise<unknown>> = []
 afterEach(async () => {
@@ -33,10 +33,20 @@ async function fixture() {
   cleanups.push(() => ctx.fiber.dispose())
   const session: { cwd?: string } = { cwd }
   await ctx.plugin(LocalFileSystem, { cwd })
-  ctx.provide('sandboxPolicy', { workspaceRoot: cwd } as never)
+  // The workspace scope asks the policy for a live Session's root; this one applies the header directory, then the deployment root.
+  const resolvePolicy = ({ session: live }: { session: { header: { cwd?: string } } }) => ({ mode: 'read-only', workspaceRoot: live.header.cwd ?? cwd })
+  ctx.provide('sandboxPolicy', { workspaceRoot: cwd, resolve: resolvePolicy } as never)
   await ctx.plugin({
     inject: ['fs', 'sandboxPolicy'],
-    apply: (scope) => { new WorkspaceFiles(scope, { maxBytes: 1024, maxFileBytes: 1024, maxLines: 100, maxEntries: 100 }) },
+    apply: (scope) => {
+      new WorkspaceFiles(scope, {
+        maxBytes: 1024,
+        maxFileBytes: 1024,
+        maxLines: 100,
+        maxEntries: 100,
+        search: { maxResults: 100, maxEntries: 1000, graceMs: 3000, timeoutMs: 30000, stderrMaxBytes: 65536 },
+      })
+    },
   })
   const resolveAgent = vi.fn<Context['sessionController']['resolveAgent']>(() => { throw new Error('Agent activation is unavailable') })
   const readEvent = vi.fn(async (request: SessionEventReadRequest) => {
@@ -45,25 +55,33 @@ async function fixture() {
     return { session, target: { type: 'deliverables/presented', data: { turn: 1, callId: 'present-call', files: [file] } } as SessionEvent }
   })
   ctx.provide('sessionQuery', { readEvent } as never)
+  // Every viewed Session is live with that header, so the workspace scope reads its original project without an Agent.
+  const live = vi.fn((id: SessionId) => ({ id, header: session }))
+  ctx.provide('sessions', { get: live } as never)
   const opener = vi.fn(async (_request: { path: string; action?: 'reveal' }, _signal: AbortSignal) => ({ opened: true as const }))
-  ctx.provide('sessionController', { resolveAgent, openWorkspacePath: opener, workspaceDesktop: () => ({ name: 'desktop', available: true, fileManager: 'finder' }) } as never)
-  const connection = new HostConnectionService(ctx, [], {} as BrowserAuth)
+  const applications = vi.fn(async () => [{ id: 'player', name: 'Player', default: true, icon: null }])
+  ctx.provide('sessionController', { workspacePathApplications: applications, resolveAgent, openWorkspacePath: opener, workspaceDesktop: () => ({ name: 'desktop', available: true, fileManager: 'finder' }) } as never)
+  new ConnectionAuthentication(ctx)
+  const connection = new HostConnectionService(ctx, [])
   const fiber = ctx.plugin({ inject: ['connection', 'sessionQuery', 'sessionController', 'workspaceFiles', 'fs', 'sandboxPolicy'], apply: registerPresentOpen })
   await fiber
   const handler = connection.createSharedFetchHandler('/api')
   const open = (query = '?sessionId=owner&seq=7&index=0', signal?: AbortSignal) => handler.fetch(new Request(
     `http://localhost${PRESENT_OPEN_PATH}${query}`, { method: 'POST', signal: signal ?? null },
-  ))
-  return { root, cwd, ctx, fiber, file, session, readEvent, open, opener, handler, resolveAgent }
+  ), connection.browserPeer)
+  return {
+    browserPeer: connection.browserPeer, applications, root, cwd, ctx, fiber, file, session, readEvent, open, opener, handler,
+    resolveAgent, live,
+  }
 }
 
 describe('Presented workspace file native open route', () => {
   it('opens the source itself with current bytes and leaves it intact at disposal', async () => {
-    const { cwd, open, file, fiber, opener, handler, ctx } = await fixture()
+    const { browserPeer, cwd, open, file, fiber, opener, handler, ctx } = await fixture()
     const source = await realpath(join(cwd, file.path))
-    expect(presentedFileUrl(SessionId('owner'), 7, 0)).toBe(`${PRESENT_OPEN_PATH}?sessionId=owner&seq=7&index=0`)
-    expect((await handler.fetch(new Request(`http://localhost${PRESENT_OPEN_PATH}`))).status).toBe(404)
-    expect((await handler.fetch(new Request('http://localhost/api/present.download?sessionId=owner&seq=7&index=0'))).status).toBe(404)
+    expect(presentedFileUrl(brandString<SessionId>('owner'), 7, 0)).toBe('api/present.open?sessionId=owner&seq=7&index=0')
+    expect((await handler.fetch(new Request(`http://localhost${PRESENT_OPEN_PATH}`), browserPeer)).status).toBe(400)
+    expect((await handler.fetch(new Request('http://localhost/api/present.download?sessionId=owner&seq=7&index=0'), browserPeer)).status).toBe(404)
     for (const contents of ['current source', 'edited source']) {
       await writeFile(source, contents)
       const response = await open()
@@ -188,8 +206,8 @@ describe('Presented workspace file native open route', () => {
 
 
 it('reports the serving desktop and reveals only an authorized declared source', async () => {
-  const { cwd, file, open, opener, handler } = await fixture()
-  const info = await handler.fetch(new Request('http://localhost/api/present.host'))
+  const { browserPeer, cwd, file, open, opener, handler } = await fixture()
+  const info = await handler.fetch(new Request('http://localhost/api/present.host'), browserPeer)
   expect(await info.json()).toEqual({ name: 'desktop', available: true, fileManager: 'finder' })
   expect((await open('?sessionId=owner&seq=7&index=0&action=reveal')).status).toBe(204)
   expect(opener).toHaveBeenCalledWith({ path: await realpath(join(cwd, file.path)), action: 'reveal' }, expect.any(AbortSignal))
@@ -200,9 +218,9 @@ it('reports the serving desktop and reveals only an authorized declared source',
 })
 
 it('refuses native actions when the configured Host desktop is unavailable', async () => {
-  const { ctx, open, opener, handler } = await fixture()
+  const { browserPeer, ctx, open, opener, handler } = await fixture()
   vi.spyOn(ctx.sessionController, 'workspaceDesktop').mockReturnValue({ name: 'desktop', available: false, fileManager: 'finder' })
-  expect(await (await handler.fetch(new Request('http://localhost/api/present.host'))).json()).toMatchObject({ available: false })
+  expect(await (await handler.fetch(new Request('http://localhost/api/present.host'), browserPeer)).json()).toMatchObject({ available: false })
   for (const action of ['open', 'reveal']) {
     expect((await open(`?sessionId=owner&seq=7&index=0&action=${action}`)).status).toBe(409)
   }
@@ -227,9 +245,33 @@ it('opens a viewed child Session without activating an Agent', async () => {
   expect(resolveAgent).not.toHaveBeenCalled()
 })
 
+it('refuses a presented file whose Session is neither live nor stored once its event was read', async () => {
+  const { session, readEvent, live, open, opener } = await fixture()
+  readEvent.mockResolvedValueOnce({ session, target: { type: 'deliverables/presented', data: { turn: 1, callId: 'gone', files: [{ path: '日记模板.docx' }] } } as SessionEvent })
+  live.mockReturnValueOnce(undefined as never)
+  expect((await open('?sessionId=gone&seq=7&index=0')).status).toBe(404)
+  expect(opener).not.toHaveBeenCalled()
+})
+
 it('uses the deployment workspace root when the viewed Session has no cwd', async () => {
   const { session, open, cwd, file, opener } = await fixture()
   delete session.cwd
   expect((await open()).status).toBe(204)
   expect(opener.mock.lastCall?.[0].path).toBe(await realpath(join(cwd, file.path)))
+})
+
+
+it('queries handlers only after file authorization and forwards explicit application choices', async () => {
+  const { browserPeer, handler, applications, opener, open, ctx } = await fixture()
+  const url = 'http://localhost/api/present.open?sessionId=owner&seq=7&index=0'
+  const response = await handler.fetch(new Request(url), browserPeer)
+  expect(response.status).toBe(200)
+  expect(await response.json()).toEqual([{ id: 'player', name: 'Player', default: true, icon: null }])
+  expect(opener).not.toHaveBeenCalled()
+  expect((await open('?sessionId=owner&seq=7&index=0&application=player')).status).toBe(204)
+  expect(opener.mock.lastCall?.[0]).toMatchObject({ application: 'player' })
+  expect((await handler.fetch(new Request(url.replace('index=0', 'index=999')), browserPeer)).status).toBe(404)
+  vi.spyOn(ctx.fs, 'processPathFromHostPath').mockReturnValue(undefined)
+  expect((await handler.fetch(new Request(url), browserPeer)).status).toBe(422)
+  expect(applications).toHaveBeenCalledOnce()
 })

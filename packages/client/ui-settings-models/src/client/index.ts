@@ -1,12 +1,15 @@
 /**
  * Models settings and product-onboarding plugin, browser half. It registers
- * the Models page plus the ordered internal-testing and official-DeepSeek
+ * the Models page plus the ordered preview-notice and official-DeepSeek
  * onboarding dialogs, whose UI shares this package's modal wrapper. The Host
  * settings and credential contracts stay behind their existing wire APIs.
  * Export discipline:
  * packages/client/AGENTS.md.
  */
+import type {} from '@deepseek-ai/dsh-client-product-analytics/client'
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
+import type { SyncedConfig } from '@deepseek-ai/dsh-client-config/types'
+import type { ObservableSnapshot } from '@deepseek-ai/dsh-client-store'
 // Type-only: pulls the shell's SlotMap merge (the 'settings.section' entry).
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 // Type-only: pulls the locale plugin's Context merge (ctx.locale).
@@ -21,12 +24,13 @@ import { DeepSeekOnboardingDialog } from './DeepSeekOnboardingDialog.tsx'
 import type { DeepSeekOnboardingInjected } from './DeepSeekOnboardingDialog.tsx'
 import { WelcomeNotice } from './WelcomeNotice.tsx'
 import type { WelcomeNoticeInjected } from './WelcomeNotice.tsx'
-import { decodeWelcomeSection, WelcomeNoticeStore } from './welcome-store.ts'
+import { WelcomeNoticeStore } from './welcome-store.ts'
 import { ModelsSettingsStore } from './store.ts'
 import { createModelsOperations } from './operations.ts'
 import { createSettingsSchemaOperations } from './schema-operations.ts'
-import { en, zh, type ModelsKey } from './locales.ts'
+import { en, ja, es, fr, de, ru, pt, zh, type ModelsKey } from './locales.ts'
 import { WELCOME_NOTICE_SETTINGS_NAMESPACE } from '../onboarding-copy.ts'
+import type { ModelsConfig } from '../types.ts'
 
 export type { ModelsSectionInjected, ModelsSectionProps } from './ModelsSection.tsx'
 export type { ModelsFooterOwnerProps, ProviderCardExtrasOwnerProps } from './slot-contract.ts'
@@ -41,6 +45,10 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 
 /** Dictionary namespace owned by this plugin. */
 const NS = 'settings.models'
+
+/** Credential-onboarding choice while the Host sends none; the Host schema default. */
+const ABSENT_CREDENTIAL_ONBOARDING = true
+
 export type {
   ModelsSettingsState, ProviderDirectoryEntry, ProviderRow,
 } from './store.ts'
@@ -62,8 +70,8 @@ export function refreshIfLoaded(controller: ModelsSettingsStore): void {
  * constrained; registration depends on each slot through `slots.inject()`.
  */
 export const inject = [
-  'slots', 'locale', 'remote', 'remote.credentials', 'remote.llm', 'remote.settings',
-  'settingsScope', 'settingsSchema',
+  'slots', 'locale', 'remote', 'remote.credentials', 'remote.llm', 'remote.settings', 'remote.session',
+  'configForms', 'settingsSchema',
 ]
 
 /**
@@ -71,15 +79,22 @@ export const inject = [
  * the ledger, wire its store to the connection, and keep it fresh on every
  * pushed invalidation (settings, credentials, or provider topology).
  * @param ctx - client root context.
+ * @param config - Host-synced credential-onboarding choice, followed live until the official-DeepSeek step mounts.
  */
-export function apply(ctx: ClientContext): void {
-  ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'ui-settings-models: copy dictionaries')
+export function apply(ctx: ClientContext, config: SyncedConfig<ModelsConfig>): void {
+  const nativeShell = 'dshDesktop' in globalThis
+  // Whether the official-DeepSeek step opens on its own; the native shell owns its own onboarding.
+  const automatic: ObservableSnapshot<boolean> = {
+    getSnapshot: () => !nativeShell && (config.credentialOnboarding.get() ?? ABSENT_CREDENTIAL_ONBOARDING),
+    subscribe: listener => config.credentialOnboarding.subscribe(listener),
+  }
+  ctx.effect(() => ctx.locale.register(NS, { zh, en, ja, es, fr, de, ru, pt }), 'ui-settings-models: copy dictionaries')
 
   const schema = createSettingsSchemaOperations(ctx.settingsSchema)
   // Bound once here, where the Remote namespaces are declared in this plugin's
   // own `inject`; the cards receive callbacks and never a context.
   const operations = createModelsOperations(ctx)
-  const controller = new ModelsSettingsStore(ctx, schema, ctx.settingsScope.describe())
+  const controller = new ModelsSettingsStore(ctx, schema, ctx.configForms.describe())
   // Registration-time text (the nav label thunk) and the inject faces share
   // one bound translate; copy freshness rides the locale revision.
   const t = ctx.locale.bind(NS) as ModelsSectionInjected['t']
@@ -91,18 +106,14 @@ export function apply(ctx: ClientContext): void {
     t,
   })
   const deepSeekOnboardingInjected = (): DeepSeekOnboardingInjected => ({
+    track: (name, attributes) => ctx.get('productAnalytics')?.track(name, attributes),
     controller,
-    hooks: { models: controller.store },
+    hooks: { models: controller.store, automatic },
     operations,
     schema,
     t,
   })
-  // The scope's own memory mode is what keeps a remote browser process-local,
-  // so the store needs no isLoopback branch of its own.
-  const welcomeController = new WelcomeNoticeStore(ctx.settingsScope.bind({
-    namespace: WELCOME_NOTICE_SETTINGS_NAMESPACE,
-    decode: decodeWelcomeSection,
-  }))
+  const welcomeController = new WelcomeNoticeStore(ctx.configForms.get<Record<string, unknown>>(WELCOME_NOTICE_SETTINGS_NAMESPACE))
   const welcomeInjected = (): WelcomeNoticeInjected => ({
     controller: welcomeController,
     hooks: { welcome: welcomeController.store },
@@ -110,7 +121,7 @@ export function apply(ctx: ClientContext): void {
   })
 
   // Pushed invalidations converge every open surface without polling. The
-  // settingsScope injection makes ui-settings activate first, and remote
+  // configForms injection makes ui-settings activate first, and remote
   // dispatch preserves listener order; its listener therefore starts the
   // mirror refresh before this store joins that refresh. The welcome notice
   // follows its settings scope, so it needs no subscription here.
@@ -118,6 +129,7 @@ export function apply(ctx: ClientContext): void {
     const refreshModels = (): void => { refreshIfLoaded(controller) }
     const disposers = [
       ctx.remote.$on('settings/document-updated', () => { refreshModels() }),
+      ctx.remote.$on('credentials/record-updated', refreshModels),
       ctx.remote.$on('credentials/reference-updated', refreshModels),
       ctx.remote.$on('llm/adapters-updated', refreshModels),
       ctx.on('connection/reset', refreshModels),
@@ -139,7 +151,7 @@ export function apply(ctx: ClientContext): void {
       'settings.models.footer': { kind: 'list', scope: 'root' },
     },
   }, ModelsSection))
-  ctx.slots.inject('settings.onboarding', () => ctx.slots.register({
+  if (!nativeShell) ctx.slots.inject('settings.onboarding', () => ctx.slots.register({
     name: 'settings.onboarding',
     id: 'welcome-notice',
     order: -100,
@@ -148,6 +160,7 @@ export function apply(ctx: ClientContext): void {
   ctx.slots.inject('settings.onboarding', () => ctx.slots.register({
     name: 'settings.onboarding',
     id: 'deepseek-official',
+    children: { 'settings.models.sign-in': { kind: 'single', scope: 'root' } },
     order: 0,
     inject: deepSeekOnboardingInjected,
   }, DeepSeekOnboardingDialog))

@@ -1,6 +1,28 @@
-# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
-# side as of the last confirmed-consistent state. Both languages carry equal authority;
-# after editing either side, bring the other along and re-record with:
+# Bilingual-pair consistency record for README.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write python/sdk/README.md
-README.md: bfca3b0dda6c97bbef255815f33ca81121832f4e
-README.zh.md: a10f1f501357e4a9f5c8eaf9aca9f8b408803e80
+/deepseek-harness-python-sdk:
+  en: 43f7de064985e731
+  zh: 9ad59629660b1f13
+/deepseek-harness-python-sdk/optional-office-operations:
+  en: ddf4dabea526cef1
+  zh: 6e31cab10d2f3ed8
+/deepseek-harness-python-sdk/start-a-runtime:
+  en: 05298d7872586fcf
+  zh: 9262ee9b2a8dee7d
+/deepseek-harness-python-sdk/run-text-and-commands:
+  en: b2c847c1452e137d
+  zh: c595c5e82151d0cb
+/deepseek-harness-python-sdk/client-approvals:
+  en: 1d18c09832dd4a42
+  zh: 6e7260b650a1f987
+/deepseek-harness-python-sdk/customize-plugins:
+  en: 5d91d1905add265f
+  zh: ecec2471aba1d2ad
+/deepseek-harness-python-sdk/native-user-questions:
+  en: 979ad00fe498b2be
+  zh: 4b656bd268292a13
+/deepseek-harness-python-sdk/results-and-notifications:
+  en: 26dcdc193e82adb5
+  zh: 5d4075ff9859b0ce

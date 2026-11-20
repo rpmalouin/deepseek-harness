@@ -15,9 +15,9 @@ import { delimiter, extname, isAbsolute, resolve } from 'node:path'
 import type { Duplex } from 'node:stream'
 import { Context } from '@deepseek-ai/cordis'
 import type * as NodePty from 'node-pty'
-import type { IPtyForkOptions } from 'node-pty'
+import type { IPtyForkOptions, IWindowsPtyForkOptions } from 'node-pty'
 import { createLazyRequire } from '@deepseek-ai/dsh-lazy-require'
-import { SubprocessRuntime, SubprocessExecutableNotFoundError } from '@deepseek-ai/dsh-subprocess'
+import { SubprocessRuntime, SubprocessError, SubprocessExecutableNotFoundError } from '@deepseek-ai/dsh-subprocess'
 import type {
   SubprocessHandle,
   SubprocessSpawnSpec,
@@ -31,15 +31,20 @@ import {
   spawnSubprocess,
   validateSubprocessSpec,
 } from './spawn.ts'
-import { prepareManagedProcessBinding } from './output.ts'
+import { logSpillFailure, prepareManagedProcessBinding } from './output.ts'
 import type { LocalSubprocessHandle, SpawnInternals } from './spawn.ts'
 import {
+  confirmLinuxManager,
+  LinuxScopeNotStartedError,
   launchLinuxScope,
+  linuxManagerListener,
   prepareLinuxTerminalScope,
-  probeLinuxManager,
   probeLinuxNative,
   signalLinuxDirectProcess,
+  systemdRunIdentity,
 } from './linux-scope.ts'
+import { LinuxScopeSelector } from './linux-scope-selector.ts'
+import type { LinuxScopeDecision } from './linux-scope-selector.ts'
 import { launchWindowsJob, probeWindowsJob } from './windows-job.ts'
 import { targetEnvironment } from './runner-launch.ts'
 import { createProcessInspector } from './process-inspector.ts'
@@ -48,6 +53,19 @@ import { LocalTerminalHandle } from './terminal.ts'
 import { prepareShellActivity } from './shell-activity.ts'
 
 const requireNodePty = createLazyRequire<typeof NodePty>('node-pty', import.meta.url)
+
+/** Load node-pty, reporting a missing or unloadable native module as `SUBPROCESS_PTY_UNAVAILABLE`. */
+function loadNodePty(): typeof NodePty {
+  try {
+    return requireNodePty()
+  } catch (error) {
+    throw new SubprocessError(
+      `subprocess-local: terminals are unavailable because node-pty cannot be loaded: ${String(error)}`,
+      'SUBPROCESS_PTY_UNAVAILABLE',
+      { cause: error },
+    )
+  }
+}
 
 /**
  * Local subprocess service: platform-selected managed ranges, Node-shaped stdio
@@ -67,8 +85,18 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   internals: SpawnInternals = {}
   /** Provider-lifetime latch suppressing repeated weaker-containment warnings. */
   private fallbackWarningIssued = false
-  /** Positive-only cache for the expensive Linux bootstrap and scope probe. */
-  private linuxDeepProbePassed = false
+  /**
+   * Linux native containment decisions. Each probe is a spawnSync that blocks the event loop and forks the
+   * host, so the selector reruns it only after an event invalidates the previous verdict.
+   */
+  private readonly linuxScope = new LinuxScopeSelector({
+    probe: () => probeLinuxNative(),
+    managerListener: () => linuxManagerListener(),
+    confirmManager: () => confirmLinuxManager(),
+    launcherIdentity: () => systemdRunIdentity(),
+  })
+  /** Scope decision of the launch in progress; selectContainmentMode sets it immediately before the launch reads it. */
+  private linuxScopeDecision: Extract<LinuxScopeDecision, { kind: 'scope' }> | undefined
   /** Test hook for platform process inspection; production resolves lazily on terminal spawn. */
   terminalInspector: ProcessInspector | undefined
 
@@ -83,6 +111,9 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
       }
     }, 'local subprocess teardown')
   }
+
+  /** Spill failures reach the plugin logger; the log line is the only trace of why a result has no spill path. */
+  private readonly reportSpillFailure = logSpillFailure(this.ctx.logger, 'subprocess-local')
 
   private terminateForHostExit(): void {
     for (const handle of this.live) {
@@ -151,15 +182,15 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     const candidates = absolute ? [command] : this.executableCandidates(command, environment)
     for (const candidate of candidates) {
       signal?.throwIfAborted()
+      let executable = false
       try {
-        const info = await stat(candidate)
-        if (!info.isFile()) continue
-        await access(candidate, constants.X_OK)
-        signal?.throwIfAborted()
-        return candidate
-      } catch {
-        // Try the next PATH candidate; the final miss receives one stable error.
+        executable = await isExecutableFile(candidate)
+      } catch (_unusableCandidate) {
+        // A missing or inaccessible candidate leaves the next PATH candidate to try;
+        // the final miss receives one stable error.
       }
+      signal?.throwIfAborted()
+      if (executable) return candidate
     }
     signal?.throwIfAborted()
     throw new SubprocessExecutableNotFoundError(absolute
@@ -181,14 +212,17 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     const env = targetEnvironment(spec)
     const containmentMode = this.selectContainmentMode('ordinary')
     let handle: LocalSubprocessHandle
+    const internals: SpawnInternals = { ...this.internals, onSpillFailure: this.reportSpillFailure }
     if (containmentMode === 'fallback') {
-      handle = spawnSubprocess(spec, this.internals)
+      handle = spawnSubprocess(spec, internals)
     } else {
-      const binding = prepareManagedProcessBinding(this.internals)
-      const launch = containmentMode === 'linux-scope'
-        ? launchLinuxScope(spec, env)
-        : launchWindowsJob(spec, env)
+      const binding = prepareManagedProcessBinding(internals)
+      const linuxScope = containmentMode === 'linux-scope' ? this.linuxScopeDecision : undefined
+      const launch = linuxScope === undefined
+        ? launchWindowsJob(spec, env)
+        : launchLinuxScope(spec, env, linuxScope.literalArgv)
       handle = bindManagedProcess(spec, launch, binding)
+      if (linuxScope !== undefined) this.watchLinuxScopeStart(handle.done, linuxScope.generation)
     }
     this.live.add(handle)
     const control = handle.control
@@ -206,17 +240,26 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     return handle
   }
 
+  /** Probe again before the next launch when a scope launched under generation never started its target. */
+  private watchLinuxScopeStart(done: Promise<unknown>, generation: number): void {
+    void done.catch((error: unknown) => {
+      if (error instanceof LinuxScopeNotStartedError) this.linuxScope.scopeNotStarted(generation)
+    })
+  }
+
   private selectContainmentMode(
     kind: 'ordinary' | 'terminal',
   ): 'linux-scope' | 'windows-job' | 'fallback' {
     const platform = this.internals.platform ?? process.platform
     let fallbackReason: string | undefined
     if (platform === 'linux') {
-      const available = this.linuxDeepProbePassed
-        ? probeLinuxManager()
-        : probeLinuxNative()
-      if (available) this.linuxDeepProbePassed = true
-      if (available) return 'linux-scope'
+      const decision = this.linuxScope.select()
+      const probe = decision.probe === undefined ? '' : `, probed after ${decision.probe}`
+      this.ctx.logger.debug(`linux native containment: ${decision.kind} (${decision.reason}${probe})`)
+      if (decision.kind === 'scope') {
+        this.linuxScopeDecision = decision
+        return 'linux-scope'
+      }
       fallbackReason = 'the current user-systemd scope or private bootstrap is unavailable'
     }
     if (kind === 'ordinary' && platform === 'win32') {
@@ -260,29 +303,36 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   async spawnTerminal(spec: SubprocessTerminalSpawnSpec): Promise<SubprocessTerminalHandle> {
     const file = spec.argv[0]
     if (file === undefined || file.length === 0) {
-      throw new Error('subprocess-local: terminal argv must contain a program')
+      throw new SubprocessError('subprocess-local: terminal argv must contain a program', 'SUBPROCESS_INVALID_ARGV')
     }
     spec.signal?.throwIfAborted()
     const inspector = this.terminalInspector ?? createProcessInspector()
     const containmentMode = this.selectContainmentMode('terminal')
     const env = targetEnvironment(spec)
-    const activity = prepareShellActivity(spec, env, this.internals.platform ?? process.platform)
+    const platform = this.internals.platform ?? process.platform
+    const activity = prepareShellActivity(spec, env, platform)
     const launch = activity === undefined ? spec : { ...spec, argv: activity.argv, env: activity.env }
-    const options: IPtyForkOptions = {
+    const options: IPtyForkOptions | IWindowsPtyForkOptions = {
       name: spec.terminalType,
       rows: spec.rows,
       cols: spec.cols,
       cwd: spec.cwd,
       env: { ...activity?.env ?? env, TERM: spec.terminalType },
+      // Windows' own console host (the standby pool runs Server 2022 and
+      // Windows 10 22H2) renders the persistent-pwsh prompt tail in a form the
+      // readiness path cannot match; the console host node-pty ships emits it
+      // verbatim, see [Agent Note](../../../../.agents/notes/implemented/bug-fix/2026-09-28-pty-bundled-console-host.md).
+      ...(platform === 'win32' ? { useConptyDll: true } : {}),
     }
+    const linuxScope = containmentMode === 'linux-scope' ? this.linuxScopeDecision : undefined
     let scope: ReturnType<typeof prepareLinuxTerminalScope> | undefined
     let terminal: NodePty.IPty
     try {
-      scope = containmentMode === 'linux-scope'
-        ? prepareLinuxTerminalScope(launch, { ...activity?.env ?? env, PWD: spec.cwd, TERM: spec.terminalType })
-        : undefined
+      scope = linuxScope === undefined
+        ? undefined
+        : prepareLinuxTerminalScope(launch, { ...activity?.env ?? env, PWD: spec.cwd, TERM: spec.terminalType }, linuxScope.literalArgv)
       if (scope !== undefined) { options.cwd = scope.cwd; options.env = scope.env }
-      terminal = requireNodePty().spawn(
+      terminal = loadNodePty().spawn(
         scope?.command ?? file,
         scope?.args ?? [...launch.argv.slice(1)],
         options,
@@ -305,7 +355,7 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
       terminal,
       inspector,
       spec.graceMs,
-      this.internals.platform ?? process.platform,
+      platform,
       owner,
       scope?.resolveOutcome,
       activity,
@@ -313,6 +363,7 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
       spec.shellActivity === true,
     )
     this.terminals.add(handle)
+    if (linuxScope !== undefined) this.watchLinuxScopeStart(handle.done, linuxScope.generation)
     const release = async (): Promise<void> => {
       // terminate() can wait on this direct-exit promise.
       directSettlement.resolve()
@@ -323,6 +374,13 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     void handle.done.then(release, release).catch(() => {})
     return handle
   }
+}
+
+/** Whether `path` is a regular file the current user may execute; rejects when `path` cannot be inspected. */
+async function isExecutableFile(path: string): Promise<boolean> {
+  if (!(await stat(path)).isFile()) return false
+  await access(path, constants.X_OK)
+  return true
 }
 
 /** Read a Windows environment key using the platform's case-insensitive semantics. */

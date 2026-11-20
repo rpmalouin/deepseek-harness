@@ -15,15 +15,16 @@ import {
   type WebScaffold,
 } from './scaffold.ts'
 import {
-  connectFreshWorkspace, expandTurnProcesses, newEnglishPage, REPO_ROOT, saveFailureShot,
+  connectFreshWorkspace, expandOwningTurnProcess, expandTurnProcesses, newEnglishPage, REPO_ROOT, saveFailureShot,
+  showSessionPanel,
 } from './support.ts'
 
 const MODE = webSnapshotMode()
 const SNAPSHOT_DIR = fileURLToPath(new URL('../../../snapshots/web/workflow-run', import.meta.url))
 const UI_LIVE_EXPECTED = join(SNAPSHOT_DIR, 'ui-live.expected.md')
 const UI_EXPECTED = join(SNAPSHOT_DIR, 'ui.expected.md')
-const PARENT_FIXTURE = join(REPO_ROOT, 'snapshots/session/workflow-run/session.v3.jsonl')
-const CHILD_FIXTURE = join(REPO_ROOT, 'snapshots/session/workflow-run/session.1.v3.jsonl')
+const PARENT_FIXTURE = join(REPO_ROOT, 'snapshots/session/workflow-run/session.v4.jsonl')
+const CHILD_FIXTURE = join(REPO_ROOT, 'snapshots/session/workflow-run/session.1.v4.jsonl')
 const CHILD_PROMPT = 'Reply with exactly the word WF_CHILD_OK and nothing else.'
 
 describe.skipIf(MODE === 'record')('web e2e: durable workflow run in Chat', () => {
@@ -90,6 +91,7 @@ describe.skipIf(MODE === 'record')('web e2e: durable workflow run in Chat', () =
     await input.press('Enter')
 
     const workflow = page.locator('[data-workflow-run][data-run-status="running"]')
+    await expandOwningTurnProcess(page, workflow)
     await workflow.waitFor({ timeout: 30_000 })
     const disclosures = workflow.locator('[data-disclosure-row]')
     await disclosures.nth(1).waitFor({ timeout: 15_000 })
@@ -133,7 +135,7 @@ describe.skipIf(MODE === 'record')('web e2e: durable workflow run in Chat', () =
       const disclosures = element.querySelectorAll('[data-disclosure-row]')
       const runHeader = disclosures[0]
       const phaseHeader = disclosures[1]
-      const phaseTitle = phaseHeader?.children.item(1) as HTMLElement | null
+      const phaseTitle = phaseHeader?.querySelector('[class*="phaseTitle"]') as HTMLElement | null
       const phaseStatus = element.querySelector('[data-phase-status-text]')
       const originalPhaseTitle = phaseTitle?.textContent ?? ''
       if (phaseTitle !== null) phaseTitle.textContent = 'A phase name long enough to require ellipsis in the narrow layout'
@@ -171,7 +173,8 @@ describe.skipIf(MODE === 'record')('web e2e: durable workflow run in Chat', () =
     await page.setViewportSize({ width: 1280, height: 800 })
 
     await member.click()
-    await page.getByText(CHILD_PROMPT, { exact: true }).waitFor({ timeout: 15_000 })
+    await page.getByRole('button', { name: /^Task message received/ }).click()
+    await page.getByText(`Agent lead sent a message: ${CHILD_PROMPT}`, { exact: true }).waitFor({ timeout: 15_000 })
 
     const sessions = page.getByRole('tree', { name: 'Sessions' })
     await sessions.getByRole('treeitem', { name: /Use the workflow tool exactly/ }).click()
@@ -187,7 +190,7 @@ describe.skipIf(MODE === 'record')('web e2e: durable workflow run in Chat', () =
     expect(await terminalWorkflow.getAttribute('aria-expanded')).toBe('false')
     expect(await terminalWorkflow.evaluate(element => getComputedStyle(element).cursor)).toBe('pointer')
     await terminalWorkflow.click()
-    const terminalPhase = page.getByRole('button', { name: /^Run/ })
+    const terminalPhase = page.locator('[data-workflow-run][data-run-status="completed"] [data-disclosure-row]').nth(1)
     await terminalPhase.waitFor()
     expect(await terminalPhase.getAttribute('aria-expanded')).toBe('false')
     expect(await terminalPhase.evaluate(element => getComputedStyle(element).cursor)).toBe('pointer')
@@ -210,13 +213,18 @@ describe.skipIf(MODE === 'record')('web e2e: durable workflow run in Chat', () =
     const snapshot = await captureStableAria(page, '[data-chat-flow]', scaffold.workspaceCwd)
     await compareOrRefreshGolden(UI_EXPECTED, snapshot, MODE)
     await workflow.click()
-    const phase = page.getByRole('button', { name: /^Run/ })
+    const phase = page.locator('[data-workflow-run][data-run-status="completed"] [data-disclosure-row]').nth(1)
     await phase.waitFor()
     expect(await phase.getAttribute('aria-expanded')).toBe('false')
     await phase.click()
     await page.getByText(CHILD_PROMPT, { exact: false }).waitFor()
     expect(await page.getByRole('button', { name: /^Open Reply with exactly the word/ }).count()).toBe(0)
 
+    const catalog = (await showSessionPanel(page)).getByRole('tree', { name: 'Subagent sessions' })
+    await catalog.getByRole('treeitem', { name: /snapshot-flow child 1/ }).press('Enter')
+    await page.getByRole('button', { name: /^Task message received/ }).click()
+    await page.getByText(`Agent lead sent a message: ${CHILD_PROMPT}`, { exact: true }).waitFor({ timeout: 15_000 })
+    expect(await page.locator('[data-composer-input][contenteditable="true"]').count()).toBe(1)
   }, 60_000)
 
   it('stays clean and owns only its one golden', async () => {

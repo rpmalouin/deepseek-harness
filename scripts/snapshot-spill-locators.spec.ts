@@ -1,8 +1,9 @@
 import { Context } from '@deepseek-ai/cordis'
 import { LocalSpillStore } from '@deepseek-ai/dsh-spill-local'
 import { LocalFileSystem } from '@deepseek-ai/dsh-fs-local'
-import { SessionId } from '@deepseek-ai/dsh-session'
-import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import type { SessionId } from '@deepseek-ai/dsh-session'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { ToolCallId } from '@deepseek-ai/dsh-llm/types'
 import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -34,8 +35,8 @@ it.each([false, true])('keeps concurrent physical spill files private while reta
       await fork
       const content = `physical UTF-8 内容 ${index}`
       const ref = await ctx.spillStore.saveText({
-        owner: { sessionId: SessionId('same-session') },
-        source: { kind: 'tool', toolName: 'bash', callId: ToolCallId('same-call'), label: 'result' },
+        owner: { sessionId: brandString<SessionId>('same-session') },
+        source: { kind: 'tool', toolName: 'bash', callId: brandString<ToolCallId>('same-call'), label: 'result' },
         suggestedName: 'bash.txt', content,
       })
       expect(ref.bytes).toBe(Buffer.byteLength(content))
@@ -44,15 +45,19 @@ it.each([false, true])('keeps concurrent physical spill files private while reta
       expect(target.displayPath).toBe(ref.locator)
       const physicalPath = ctx.fs.processPath(target)
       expect(physicalPath.startsWith(await realpath(root))).toBe(true)
+      expect(await realpath(ctx.fs.processPathFromHostPath(ref.locator)!)).toBe(physicalPath)
       expect(await readFile(physicalPath, 'utf8')).toBe(content)
       expect(await ctx.fs.readText(target)).toBe(content)
       await expect(ctx.fs.resolve(join(locatorRoot, 'missing.txt'))).rejects.toThrow('not saved by this run')
+      expect(() => ctx.fs.processPathFromHostPath(join(locatorRoot, 'missing.txt'))).toThrow('not saved by this run')
       const ordinary = join(root, 'ordinary.txt')
       await writeFile(ordinary, 'ordinary')
+      expect(ctx.fs.processPathFromHostPath(ordinary)).toBe(ordinary)
       expect(await ctx.fs.readText(await ctx.fs.resolve(ordinary))).toBe('ordinary')
       await fork.dispose()
       const restored = await ctx.fs.resolve(ref.locator)
       expect(ctx.fs.processPath(restored)).not.toBe(physicalPath)
+      expect(ctx.fs.processPathFromHostPath(ref.locator)).toBe(ref.locator)
       expect(await ctx.fs.stat(restored)).toBeUndefined()
       return { root, physicalPath, locator: ref.locator, content }
     }))

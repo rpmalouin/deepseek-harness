@@ -1,22 +1,38 @@
 // @vitest-environment jsdom
+import { contextMenuHook } from '@deepseek-ai/dsh-client-test-runtime'
+import type { ShortcutCatalogEntry, ShortcutCommandId } from '@deepseek-ai/dsh-client-shortcuts/client'
 import type { GlobalStandardProps } from '@deepseek-ai/dsh-client-ui-slots'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useEffect, useState } from 'react'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { makeTranslate } from '@deepseek-ai/dsh-client-test-runtime'
+import { createSettingsShellStore } from '../src/client/shell-store.ts'
+import { allowAllAccess, bindSnapshotSelector, makeTranslate } from '@deepseek-ai/dsh-client-test-runtime'
 import type { SessionListState } from '@deepseek-ai/dsh-api-session-controller/client'
-import { SessionId } from '@deepseek-ai/dsh-session/types'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { SettingsRootComponentProps } from '../src/client/shell-contract.ts'
 import { SettingsRoot } from '../src/client/SettingsRoot.tsx'
 import { en, zh } from '../src/client/locales.ts'
-import type { DesktopUpdateView } from '../src/client/desktop-update-bridge.ts'
+import type { DesktopUpdateView } from '../src/types.ts'
+import { Modal } from '@deepseek-ai/dsh-client-ui-primitives'
+import { brandString } from '@deepseek-ai/dsh-brand'
 
 // Every fixture carries the resource hook the resources plugin merges into GlobalStandardProps.
 const useResource = (() => ({ status: 'none' as const, value: undefined, failure: undefined, reload: () => {} })) as GlobalStandardProps['useResource']
 const usePanelInfo: GlobalStandardProps['usePanelInfo'] = selector => selector({ activePanelId: null })
 
+const scrollIntoView = vi.fn()
+let scrollIntoViewDescriptor: PropertyDescriptor | undefined
+
+beforeEach(() => {
+  scrollIntoViewDescriptor = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollIntoView')
+  Object.defineProperty(Element.prototype, 'scrollIntoView', { configurable: true, value: scrollIntoView })
+  scrollIntoView.mockClear()
+})
+
 afterEach(() => {
   cleanup()
+  if (scrollIntoViewDescriptor === undefined) Reflect.deleteProperty(Element.prototype, 'scrollIntoView')
+  else Object.defineProperty(Element.prototype, 'scrollIntoView', scrollIntoViewDescriptor)
   vi.useRealTimers()
 })
 
@@ -26,6 +42,7 @@ type Step = { id: string; order: number }
 /** Slot-content stand-ins: the shell renders whatever the seats contribute. */
 const SEAT_CONTENT: Record<string, string> = {
   'settings.trigger': 'Settings',
+  'settings.notice': 'Account notice',
   'settings.header': 'Settings Title',
   'settings.action': 'Open configuration file',
   'settings.close': 'Close',
@@ -37,6 +54,7 @@ const noAttention: AttentionSnapshot = new Map()
 const useSessionStatus: SettingsRootComponentProps['useSessionStatus'] = selector => selector(noAttention)
 
 function mount({
+  shortcuts = [],
   wide = true,
   dictionary = en,
   connectionState = 'connected',
@@ -53,6 +71,7 @@ function mount({
     { id: 'credential', order: 0 },
   ],
 }: {
+  shortcuts?: readonly ShortcutCatalogEntry[]
   wide?: boolean
   dictionary?: typeof en | typeof zh
   connectionState?: ConnectionSnapshot
@@ -70,12 +89,14 @@ function mount({
   const connectionListeners = new Set<() => void>()
   const reconnect = vi.fn()
   const renderSlot = vi.fn(
-    ((key: string, _owner: unknown, opts?: { only?: string }) => {
-      if (key === 'settings.section') return <div data-testid={`section-${opts?.only ?? 'all'}`} />
-      return SEAT_CONTENT[key]
-    }) as SettingsRootComponentProps['renderSlot'],
+    ((key: string, _owner: unknown, opts?: { only?: string; fallback?: import('react').ReactNode }) =>
+      SEAT_CONTENT[key] ?? opts?.fallback) as SettingsRootComponentProps['renderSlot'],
   )
-  const activeId = SessionId('active-session')
+  const renderFactorySlot = vi.fn(
+    ((name: string, factoryProps: { id: string }) =>
+      name === 'settings.section.view' ? <div data-testid={`section-${factoryProps.id}`} /> : null) as SettingsRootComponentProps['renderFactorySlot'],
+  )
+  const activeId = brandString<SessionId>('active-session')
   const sessions: SessionListState = {
     ids: [activeId],
     byId: {
@@ -88,14 +109,19 @@ function mount({
         updatedAt: 0,
       },
     },
-    phase: 'ready', subagentsByParent: {}, jobsBySession: {},
+    phase: 'ready', projectionsBySession: {},
   }
   const unusedHook = (() => { throw new Error('unused by SettingsRoot') }) as never
+  const shell = createSettingsShellStore().create()
   const props: SettingsRootComponentProps = {
+    useStore: bindSnapshotSelector(shell), actions: shell.actions,
+    useShortcuts: select => select(shortcuts),
     useSessions: select => select(sessions),
     useSessionStatus,
     usePanelInfo, useSessionRetainInfo: () => undefined, useResource,
     useWorkspaces: unusedHook,
+    ...allowAllAccess,
+    useContextMenu: contextMenuHook(),
     wide,
     reconnect,
     openDesktopUpdate: () => {},
@@ -121,6 +147,7 @@ function mount({
       return select(current)
     },
     renderSlot,
+    renderFactorySlot,
   }
   const view = render(<SettingsRoot {...props} />)
   const bump = (next: Row[]) => {
@@ -139,7 +166,22 @@ function mount({
     desktopUpdate = next
     view.rerender(<SettingsRoot {...props} />)
   }
-  return { view, renderSlot, bump, listeners, reconnect, setConnectionState, setDesktopUpdate }
+  const setWide = (next: boolean) => { view.rerender(<SettingsRoot {...props} wide={next} />) }
+  const setShortcuts = (next: readonly ShortcutCatalogEntry[]) => {
+    shortcuts = next
+    view.rerender(<SettingsRoot {...props} />)
+  }
+  /** Turn the mounted Session blank, which is what makes an onboarding step appear. */
+  const setOnboardingActive = (next: boolean) => {
+    const session = sessions.byId[activeId]
+    if (session === undefined) throw new Error('expected the mounted Session')
+    act(() => { sessions.byId[activeId] = { ...session, blank: next } })
+    view.rerender(<SettingsRoot {...props} />)
+  }
+  return {
+    view, renderSlot, renderFactorySlot, bump, listeners, reconnect,
+    setConnectionState, setDesktopUpdate, setShortcuts, setOnboardingActive, setWide,
+  }
 }
 
 function openPanel() {
@@ -314,10 +356,29 @@ describe('SettingsPanel close paths', () => {
     expect(screen.getByRole('dialog')).toBeTruthy()
   })
 
-  it('lands focus on the close button when the dialog opens', () => {
+  it('lands focus on the active section when the dialog opens', () => {
     mount()
     openPanel()
-    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Close' }))
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'General' }))
+  })
+
+  it('opens above an existing body modal and gives the visible settings panel keyboard ownership', () => {
+    mount()
+    const closeReference = vi.fn()
+    render(<Modal open title="Keyboard reference" closeLabel="Close reference" onClose={closeReference}>
+      <button data-modal-autofocus>Reference control</button>
+    </Modal>)
+    const reference = screen.getByRole('dialog', { name: 'Keyboard reference' })
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Reference control' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    const settings = screen.getByRole('dialog', { name: 'Settings Title' })
+    expect(settings.parentElement?.parentElement).toBe(document.body)
+    expect(reference.parentElement!.compareDocumentPosition(settings.parentElement!)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'General' }))
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.queryByRole('dialog', { name: 'Settings Title' })).toBeNull()
+    expect(closeReference).not.toHaveBeenCalled()
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Reference control' }))
   })
 })
 
@@ -342,9 +403,9 @@ describe('SettingsPanel navigation', () => {
       ],
     })
     openPanel()
-    // Glyphs carry no id of their own, so the drawn paths are what tells them apart.
+    // Each product glyph names its sprite symbol id in data-icon.
     const glyphs = ['General', 'Models', 'Agent presets', 'Plugins', 'Archived sessions', 'Contributed']
-      .map(name => screen.getByRole('button', { name }).querySelector('svg')?.innerHTML)
+      .map(name => screen.getByRole('button', { name }).querySelector('svg')?.getAttribute('data-icon'))
 
     expect(glyphs.every(glyph => glyph !== undefined && glyph !== '')).toBe(true)
     // The four ids the shell names get their own glyph; every other section —
@@ -381,11 +442,24 @@ describe('SettingsPanel navigation', () => {
     })
     expect(screen.getByRole('dialog')).toBeTruthy()
     expect(screen.getByTestId('section-models')).toBeTruthy()
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Models' }))
+    expect(scrollIntoView).toHaveBeenLastCalledWith({ block: 'nearest', inline: 'nearest' })
+    expect(scrollIntoView.mock.instances.at(-1)).toBe(document.activeElement)
 
     cleanup()
     const inactive = mount({ onboardingActive: false }).renderSlot.mock.calls
       .filter(call => call[0] === 'settings.onboarding')
     expect(inactive).toHaveLength(0)
+  })
+
+  it('takes the panel down when an onboarding step appears beneath it', () => {
+    const { setOnboardingActive } = mount({ onboardingActive: false })
+    openPanel()
+    expect(screen.getByRole('dialog')).toBeDefined()
+
+    // The step's overlay marks only #root inert, and the panel is portalled beside it.
+    setOnboardingActive(true)
+    expect(screen.queryByRole('dialog')).toBeNull()
   })
 
   it('keeps onboarding active before a main Session is retained', () => {
@@ -419,12 +493,12 @@ describe('SettingsPanel navigation', () => {
     expect(screen.getByTestId('section-general')).toBeTruthy()
   })
 
-  it('renders an empty content column when the ledger is empty', () => {
-    const { renderSlot } = mount({ rows: [] })
+  it('renders an empty content column and focuses the title when the ledger is empty', () => {
+    const { renderFactorySlot } = mount({ rows: [] })
     openPanel()
+    expect(document.activeElement).toBe(screen.getByText('Settings Title'))
     expect(screen.getByRole('dialog')).toBeTruthy()
-    const sectionCalls = renderSlot.mock.calls.filter(c => c[0] === 'settings.section')
-    expect(sectionCalls).toHaveLength(0)
+    expect(renderFactorySlot).not.toHaveBeenCalled()
   })
 
   it('drops the ledger subscription on unmount', () => {
@@ -433,4 +507,77 @@ describe('SettingsPanel navigation', () => {
     view.unmount()
     expect(listeners.size).toBe(0)
   })
+})
+
+it('explicitly reopens one onboarding editor during an existing session', () => {
+  const { renderSlot } = mount({ onboardingActive: false })
+  const launcher = renderSlot.mock.calls.find(call => call[0] === 'settings.launcher')
+  act(() => { (launcher?.[1] as { openOnboarding: (id: string) => void }).openOnboarding('credential') })
+  const call = renderSlot.mock.calls.filter(call => call[0] === 'settings.onboarding').at(-1)
+  expect(call?.[1]).toMatchObject({ stepId: 'credential', explicit: true })
+  act(() => { (call?.[1] as { complete: () => void }).complete() })
+  renderSlot.mockClear()
+  expect(screen.queryByTestId('onboarding')).toBeNull()
+})
+
+it('opens Account from the contributed sidebar launcher', () => {
+  const { renderSlot } = mount({ rows: [{ id: 'account', order: -10, label: 'Account' }] })
+  const launcher = renderSlot.mock.calls.find(call => call[0] === 'settings.launcher')!
+  expect(launcher[1]).toMatchObject({ settingsOpen: false })
+  act(() => { (launcher[1] as { openSettings: () => void }).openSettings() })
+  expect(screen.getByTestId('section-account')).toBeTruthy()
+  expect(screen.getByRole('button', { name: 'Account' }).querySelector('svg')).not.toBeNull()
+  expect(renderSlot.mock.calls.filter(call => call[0] === 'settings.launcher').at(-1)?.[1]).toMatchObject({ settingsOpen: true })
+  fireEvent.keyDown(document, { key: 'Escape' })
+  expect(renderSlot.mock.calls.filter(call => call[0] === 'settings.launcher').at(-1)?.[1]).toMatchObject({ settingsOpen: false })
+})
+
+it('opens the section requested by the contributed sidebar launcher', () => {
+  const { renderSlot } = mount({ rows: [{ id: 'general', order: 0, label: 'General' }, { id: 'account', order: 1, label: 'Account' }] })
+  const launcher = renderSlot.mock.calls.find(call => call[0] === 'settings.launcher')!
+  act(() => { (launcher[1] as { openSettings: (sectionId?: string) => void }).openSettings('account') })
+  expect(screen.getByTestId('section-account')).toBeTruthy()
+  expect(screen.queryByTestId('section-general')).toBeNull()
+})
+
+it('shows the effective settings binding on focus and exposes it to assistive technology', () => {
+  mount({ shortcuts: [{ id: 'settings.open' as ShortcutCommandId, label: 'Open settings', aliases: [], keys: ['⌘', ','], aria: 'Meta+,', binding: { code: 'Comma', modifiers: ['meta'] }, modified: false, conflicts: [], issue: null }] })
+  const trigger = screen.getByRole('button', { name: 'Settings' })
+  expect(trigger.getAttribute('aria-keyshortcuts')).toBe('Meta+,')
+  fireEvent.focus(trigger)
+  expect(screen.getByRole('tooltip').getAttribute('aria-label')).toBe('Settings ⌘ ,')
+})
+
+it('passes current Settings key labels to the launcher and removes them when unbound', () => {
+  const row: ShortcutCatalogEntry = { id: 'settings.open' as ShortcutCommandId, label: 'Open settings', aliases: [], keys: ['⌘', ','], aria: 'Meta+,', binding: { code: 'Comma', modifiers: ['meta'] }, modified: false, conflicts: [], issue: null }
+  const { renderSlot, setShortcuts } = mount({ shortcuts: [row] })
+  const launcher = () => renderSlot.mock.calls.filter(call => call[0] === 'settings.launcher').at(-1)?.[1]
+  expect(launcher()).toMatchObject({ settingsShortcut: { keys: ['⌘', ','], aria: 'Meta+,' } })
+
+  setShortcuts([{ ...row, keys: ['Ctrl', 'Shift', 'S'], aria: 'Control+Shift+S', binding: { code: 'KeyS', modifiers: ['control', 'shift'] }, modified: true }])
+  expect(launcher()).toMatchObject({ settingsShortcut: { keys: ['Ctrl', 'Shift', 'S'], aria: 'Control+Shift+S' } })
+
+  setShortcuts([{ ...row, keys: [], aria: undefined, binding: null, modified: true }])
+  expect(launcher()).not.toHaveProperty('settingsShortcut')
+})
+
+it('renders the notice row before the launcher row and opens the requested section', () => {
+  const { renderSlot } = mount({ rows: [{ id: 'general', order: 0, label: 'General' }, { id: 'account', order: 1, label: 'Account' }] })
+  const notice = screen.getByText('Account notice').parentElement!
+  expect(notice.nextElementSibling?.contains(screen.getByRole('button', { name: 'Settings' }))).toBe(true)
+  const owner = renderSlot.mock.calls.find(call => call[0] === 'settings.notice')!
+  act(() => { (owner[1] as { openSettings: (sectionId?: string) => void }).openSettings('account') })
+  expect(screen.getByTestId('section-account')).toBeTruthy()
+})
+
+it('hides the notice row in the collapsed rail and keeps the same node', () => {
+  const { setWide } = mount()
+  const notice = screen.getByText('Account notice').parentElement!
+  expect(notice.hidden).toBe(false)
+  setWide(false)
+  expect(screen.getByText('Account notice').parentElement).toBe(notice)
+  expect(notice.hidden).toBe(true)
+  setWide(true)
+  expect(screen.getByText('Account notice').parentElement).toBe(notice)
+  expect(notice.hidden).toBe(false)
 })

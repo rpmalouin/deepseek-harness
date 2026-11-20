@@ -8,7 +8,7 @@
 import type { Branded } from '@deepseek-ai/dsh-brand'
 import type { Scoped } from '@deepseek-ai/dsh-scope'
 import type { Agent } from '@deepseek-ai/dsh-agent/types'
-import type { ToolCallId } from '@deepseek-ai/dsh-llm/brand'
+import type { ToolCallId } from '@deepseek-ai/dsh-llm/types'
 
 /**
  * Pairs one `approval/asked` audit event with its `approval/decided`.
@@ -69,6 +69,8 @@ export interface ApprovalRequestEvent {
   readonly callId?: ToolCallId
   /** Human-readable reason supplied by the asker. */
   readonly reason?: string
+  /** Localized presentation only; never persisted in approval audit events. */
+  readonly displayReason?: { readonly en: string; readonly [locale: string]: string }
   /** Cancellation lifetime of the pending request. */
   readonly signal?: AbortSignal
 }

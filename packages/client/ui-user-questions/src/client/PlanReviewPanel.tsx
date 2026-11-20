@@ -1,5 +1,7 @@
 import { useMemo, useState } from 'react'
-import { Button, extractMarkdownPlainText, IconEditOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
+import {
+  Button, extractMarkdownPlainText, IconEditOutlineRegular, StateDot,
+} from '@deepseek-ai/dsh-client-ui-primitives'
 import type { PendingQuestion, PlanReview, QuestionComposerProps } from './contract/slots.ts'
 import css from './PlanReviewPanel.module.css'
 
@@ -25,20 +27,26 @@ function tooltip(description: string | undefined): { title?: string } {
  * @returns The plan-review takeover for this request.
  */
 export function PlanReviewPanel({ pending, review, t, renderSlot }: PlanReviewPanelProps) {
-  // The panel waits for the host's resolved frame before leaving, so repeated
-  // clicks must not resubmit. A failed send re-enables it and shows the error.
+  // Foreground decisions wait for the resolved frame; accepted Remote decisions
+  // hide the panel. A failed send re-enables the buttons and shows the error.
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const settle = (send: () => Promise<void>): void => {
+  const settle = (send: () => Promise<void>, remote = false): void => {
     setBusy(true)
     setError(null)
-    void send().catch((cause: unknown) => {
-      setBusy(false)
-      setError(cause instanceof Error ? cause.message : String(cause))
-    })
+    void send()
+      .then(() => {
+        if (!remote) return
+        setBusy(false)
+        void pending.dismiss().catch(() => { setError(t('status.sent')) })
+      })
+      .catch((cause: unknown) => {
+        setBusy(false)
+        setError(cause instanceof Error ? cause.message : String(cause))
+      })
   }
   const decide = (label: string): void => {
-    settle(() => pending.answer({ answers: [{ id: review.id, selected: [label] }] }))
+    settle(() => pending.answer({ answers: [{ id: review.id, selected: [label] }] }), pending.snapshot().channel === 'rpc')
   }
   const summary = useMemo(() => {
     const title = extractMarkdownPlainText(review.plan, { mode: 'first-line' })
@@ -48,9 +56,9 @@ export function PlanReviewPanel({ pending, review, t, renderSlot }: PlanReviewPa
 
   return (
     <div className={css.frame} data-plan-review-key={pending.key}>
-      <section className={css.card} aria-label={review.question}>
+      <section className={css.card} aria-label={review.question} aria-busy={busy}>
         <div className={css.strip}>
-          <span className={css.dot} />
+          <StateDot state={busy ? 'ongoing' : 'warning'} />
           {t('plan.header')}
           <div className={css.previewActions}>
             {renderSlot('conversation.plan-review.actions', { review, requestKey: pending.key })}
@@ -64,8 +72,8 @@ export function PlanReviewPanel({ pending, review, t, renderSlot }: PlanReviewPa
           <div className={css.feedback} role="status">{error}</div>
           <div className={css.actions}>
             <Button
-              variant="outline" className={css.discuss} icon={<IconEditOutline16 size={14} />}
-              disabled={busy} onClick={() => { settle(() => pending.cancel()) }}
+              variant="outline" className={css.discuss} icon={<IconEditOutlineRegular size={14} />}
+              disabled={busy} onClick={() => { settle(() => pending.dismiss()) }}
             >
               {t('plan.discuss')}
             </Button>

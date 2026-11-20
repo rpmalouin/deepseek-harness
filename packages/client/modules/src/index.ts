@@ -3,42 +3,51 @@
  * the host Loader's entries for packages declaring `dsh.client`, composes the
  * `window.__DSH_BOOT__` entry graph (wire single source: {@link WebBootEntry}
  * in `./client/manifest.ts`) in module-graph order, serves one-or-more-plugin
- * combo scripts plus their source maps,
+ * combo scripts plus their source maps, package-local chunks, and the
+ * content-revisioned `./assets/*` exports of active client packages,
  * contributes the registration facade, application preloads, bootstrap scripts,
  * and graph to the webserver's index injection table, and provides the
  * `clientModules` service (the HMR node half's registration/notification
  * face).
  *
- * Scanning is incremental per package — there is no full-rescan code path.
+ * Package reconciliation is incremental by Loader entry name.
  * Every cordis `internal/plugin` emission (fiber construction/disposal) marks
  * the fiber's entry name dirty; a microtask flush reconciles each dirty name
- * against the live loader entries. The activation pass seeds the same dirty
- * set with all current entries and flushes synchronously, so first scan and
- * steady state share one implementation. Package metadata (including the
- * negative "not a client package" verdict) is cached per Loader specifier and
- * owning-tree base URL until restart. The manifest package name identifies
- * the browser module; distinct active Loader sources for that package are a
- * composition error. Bundle content changes reach the graph only through
- * {@link ClientModuleRegistry.rebuilt}.
+ * against the Loader entries indexed at the start of that flush. Synchronous
+ * package resolution must not add or remove Loader entries during reconciliation.
+ * The activation pass seeds the same pending names and flushes synchronously,
+ * so initial activation and steady state share one implementation. Each
+ * reconciliation reads the package manifest and the bundle metadata again,
+ * so an entry that restarts after its package was reinstalled or moved
+ * publishes them as they are now; an unchanged result publishes nothing and
+ * does not read the bundle. The manifest package name identifies the browser
+ * module; distinct active Loader sources for that package are a composition
+ * error. Bundle rebuilds outside
+ * an entry restart reach the graph through {@link ClientModuleRegistry.rebuilt}.
  * @module @deepseek-ai/dsh-client-modules
  */
 
-import { createHash, randomBytes } from 'node:crypto'
-import { existsSync, readFileSync, statSync } from 'node:fs'
-import type { IncomingMessage, ServerResponse } from 'node:http'
+import { createHash } from 'node:crypto'
+import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { dirname, isAbsolute, join } from 'node:path'
+import { Readable } from 'node:stream'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { isDeepStrictEqual } from 'node:util'
 import { Service } from '@deepseek-ai/cordis'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Entry } from '@deepseek-ai/cordis-plugin-loader'
 import type { IndexInjection } from '@deepseek-ai/dsh-host-webserver'
+import type { Principal } from '@deepseek-ai/dsh-typert-protocol'
+import { PACKAGE_ASSET_SEGMENT, packageAssetMediaType } from './assets.ts'
 import { exactPackageSpecifier, parseDshClient, stripClientSuffix } from './client/manifest.ts'
-import type { WebBootBatch, WebBootBatchPhase, WebBootEntry, WebBootGraph } from './client/manifest.ts'
+import { SyncedConfigPublisher } from './config-sync.ts'
+import type { WebBootBatch, WebBootBatchPhase, WebBootEntry, WebBootGraph, WebBootRelease } from './client/manifest.ts'
 
 export { stripClientSuffix } from './client/manifest.ts'
 export type {
-  BootManifest, BootModuleRow, BootPluginRow, WebBootBatch, WebBootBatchPhase, WebBootEntry, WebBootGraph,
+  BootManifest, BootModuleRow, BootPluginRow, WebBootBatch, WebBootBatchPhase, WebBootEntry, WebBootGraph, WebBootRelease,
 } from './client/manifest.ts'
 
 declare module '@deepseek-ai/cordis' {
@@ -62,13 +71,17 @@ export interface ClientArtifactBaseline {
   readonly path: string
   /** Bundle modification time in milliseconds. */
   readonly mtimeMs: number
+  /** Bundle status-change time in milliseconds, including writes that preserve mtime. */
+  readonly ctimeMs: number
   /** Bundle size in bytes. */
   readonly size: number
 }
 
-/** Resolved metadata cached for one Loader specifier and owning-tree base URL until restart. */
+/** Package metadata read from the manifest of one active Loader source. */
 interface PkgMeta extends WebBootRowFields {
   clientPath: string
+  /** The package's own manifest; package-asset requests resolve against it as a self-reference. */
+  manifestPath: string
 }
 
 interface ResolvedPkgMeta {
@@ -82,7 +95,7 @@ interface ClientPackageSource extends ResolvedPkgMeta {
   loaderName: string
   /** Resolution base of the config tree that owns the row. */
   baseUrl: string
-  /** Stable cache and contribution key for this source. */
+  /** Stable source identity and contribution key. */
   sourceKey: string
 }
 
@@ -158,15 +171,21 @@ interface LazyResponse {
 
 /** Fields shared by every generated combo plan. */
 interface ComboArtifact {
+  /** Absolute route URL of this response. */
   url: string
   rev: string
   entries: string[]
+  /** Absolute route URL of the map response. */
   sourceMapUrl: string
   scriptBody: () => Promise<Buffer>
   sourceMapBody: () => Promise<Buffer>
 }
 
-/** One generated initial-load response and its wire descriptor. */
+/**
+ * One generated initial-load response and its wire descriptor. The descriptor
+ * travels to the browser, so its URL is the document-relative reference while
+ * {@link ComboArtifact.url} is the route key.
+ */
 type BatchArtifact = ComboArtifact & { descriptor: WebBootBatch }
 
 /** Versioned code is immutable; mismatched revisions are rejected instead of serving newer bytes. */
@@ -196,37 +215,99 @@ function clientExportOf(pkgName: string, exportsField: unknown): string | undefi
   throw new Error(`client-modules: ${pkgName} exports["./client"] must be a string or an object with a string default`)
 }
 
-/** sha1 content hash shortened to 12 hex chars (combo / graph / rebuilt-artifact rev). */
-function shortHash(input: string | Buffer): string {
+/** sha1 metadata hash shortened to 12 hex chars. */
+function shortHash(input: string): string {
   return createHash('sha1').update(input).digest('hex').slice(0, HASH_REVISION_LENGTH)
 }
 
 /** Hash several response fields without allowing bytes to move across field boundaries. */
-function framedHash(domain: string, parts: readonly Buffer[]): string {
+function framedHash(domain: string, parts: readonly string[]): string {
   const hash = createHash('sha1').update(domain).update('\0')
-  for (const part of parts) hash.update(`${String(part.byteLength)}:`).update(part)
+  for (const part of parts) hash.update(`${String(Buffer.byteLength(part))}:`).update(part)
   return hash.digest('hex').slice(0, HASH_REVISION_LENGTH)
 }
 
-/** Hash one completed build generation observed through its entry artifact. */
-function artifactRevision(bundle: Buffer, baseline: ClientArtifactBaseline): string {
-  return framedHash('plugin-artifact', [bundle, Buffer.from(String(baseline.mtimeMs))])
+/** Identify an entry's build from filesystem metadata without hashing its contents. */
+function artifactRevision(baseline: ClientArtifactBaseline): string {
+  return framedHash('plugin-artifact', [String(baseline.mtimeMs), String(baseline.ctimeMs), String(baseline.size)])
 }
 
-/** Address one ordered plugin-file list through the shared combo route. */
-function comboUrl(ids: readonly string[], rev: string, sourceMap = false): string {
+/** Absolute route prefix serving every plugin resource. */
+const PLUGIN_ROUTE = '/plugins'
+
+/**
+ * `/plugins/<package>/assets/<path>`. A scoped package name spans two segments
+ * (`@scope/name`); an unscoped name never starts with `@`, so `@scope/assets/…`
+ * stays a chunk request of the package `@scope/assets`.
+ */
+const PACKAGE_ASSET_PATH = /^\/plugins\/(@[^/]+\/[^/]+|[^@/][^/]*)\/assets\/(.*)$/
+
+/** Expose a Node read stream as a shell-carrier Response body; cancelling the body closes the stream. */
+function transforStreamBody(stream: Readable): ReadableStream<Uint8Array> {
+  const chunks: AsyncIterator<Uint8Array> = stream[Symbol.asyncIterator]()
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const next = await chunks.next()
+      if (next.done === true) controller.close()
+      else controller.enqueue(next.value)
+    },
+    async cancel() {
+      await chunks.return?.()
+    },
+  })
+}
+
+/**
+ * Expose a held bundle buffer as a Response body without copying it: the
+ * single chunk is the buffer itself, which readers must not modify.
+ */
+function heldBody(buffer: Buffer): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(buffer)
+      controller.close()
+    },
+  })
+}
+
+/** Combo query addressing one ordered plugin-file list. */
+function comboSearch(ids: readonly string[], rev: string, sourceMap = false): string {
   const resources = ids.map(id => `${id}/client.js${sourceMap ? '.map' : ''}`).join(',')
-  return `/plugins/??${resources}&rev=${rev}`
+  return `??${resources}&rev=${rev}`
 }
 
-/** Address one package-local chunk through the same revision as its entry. */
+/** Absolute route URL for one combo resource. */
+function comboUrl(ids: readonly string[], rev: string, sourceMap = false): string {
+  return `${PLUGIN_ROUTE}/${comboSearch(ids, rev, sourceMap)}`
+}
+
+/**
+ * Browser reference to one combo resource: app-owned browser routes are
+ * document-relative, so the route key's leading slash is stripped here, at the
+ * boundary between the two halves. The rule and its reasons are owned by
+ * .agents/notes/implemented/architecture/2026-09-14-web-document-relative-app-routes.md.
+ */
+function comboReference(ids: readonly string[], rev: string, sourceMap = false): string {
+  return comboUrl(ids, rev, sourceMap).slice(1)
+}
+
+/** Absolute route URL for one package-local chunk. */
 function chunkUrl(id: string, fileName: string, rev: string, sourceMap = false): string {
-  return `/plugins/${id}/${fileName}${sourceMap ? '.map' : ''}?rev=${rev}`
+  return `${PLUGIN_ROUTE}/${id}/${fileName}${sourceMap ? '.map' : ''}?rev=${rev}`
 }
 
-/** Measure the longer map-form URL used to partition a startup resource list. */
+/**
+ * Source-map reference stamped into one chunk script. A script's map reference
+ * resolves against that script's own directory rather than the document, so
+ * this is the bare map file name, not the document-relative route.
+ */
+function chunkMapReference(fileName: string, rev: string): string {
+  return `${fileName}.map?rev=${rev}`
+}
+
+/** Measure the longest browser-facing combo URL used to partition a startup resource list. */
 function projectedComboUrlBytes(records: readonly WebPluginRecord[]): number {
-  return Buffer.byteLength(comboUrl(
+  return Buffer.byteLength(comboReference(
     records.map(record => record.entry.id),
     COMBO_REVISION_PLACEHOLDER,
     true,
@@ -278,7 +359,7 @@ function prepareSource(resource: ComboResource): PreparedSource {
   return { source, fallbackSource }
 }
 
-/** Stamp a combo script's absolute indexed-map URL onto its executable bytes. */
+/** Stamp a combo script's source-map reference onto its executable bytes. */
 function comboScript(input: string, sourceMapUrl?: string): Buffer {
   return Buffer.from(sourceMapUrl === undefined ? input : `${input}//# sourceMappingURL=${sourceMapUrl}\n`)
 }
@@ -292,7 +373,7 @@ function readSourceMap(clientPath: string): Record<string, unknown> | undefined 
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
     throw error
   }
-  const value = JSON.parse(body.toString('utf8')) as unknown
+  const value: unknown = JSON.parse(body.toString('utf8'))
   const parsed = typeof value === 'object' && value !== null ? value as Record<string, unknown> : undefined
   if (
     parsed === undefined
@@ -345,11 +426,17 @@ function identitySectionMap(source: string, sourceUrl: string): Record<string, u
   }
 }
 
-/** Run one producer in the first requester's microtask, not off-thread, and share its settlement. */
-function lazyBody(produce: () => Buffer): () => Promise<Buffer> {
+/**
+ * Run one producer in the first requester's microtask, not off-thread, and share its settlement. A rejected run is
+ * dropped once it settles, so the next request produces again.
+ */
+function lazyBody(produce: () => Buffer | Promise<Buffer>): () => Promise<Buffer> {
   let result: Promise<Buffer> | undefined
   return () => {
-    result ??= Promise.resolve().then(produce)
+    result ??= Promise.resolve().then(produce).catch((error: unknown) => {
+      result = undefined
+      throw error
+    })
     return result
   }
 }
@@ -357,8 +444,8 @@ function lazyBody(produce: () => Buffer): () => Promise<Buffer> {
 /** Derive one combo revision from the ordered immutable row revisions. */
 function comboRevision(resources: readonly ComboResource[]): string {
   return framedHash('combo', resources.flatMap(resource => [
-    Buffer.from(resource.id),
-    Buffer.from(resource.rev),
+    resource.id,
+    resource.rev,
   ]))
 }
 
@@ -384,7 +471,7 @@ function buildComboSourceMap(
     if (sourceMap !== undefined) {
       try {
         section = comboSectionMap(resource, sourceMap)
-      } catch {
+      } catch (_malformedSourceMap) {
         // An invalid authored source URL is a malformed map, so the generated
         // bundle remains debuggable through the same identity fallback.
       }
@@ -412,12 +499,13 @@ function buildCombo(
   const entries = resources.map(resource => resource.id)
   const url = comboUrl(entries, rev)
   const sourceMapUrl = comboUrl(entries, rev, true)
+  // Trailer only: it resolves against this script's own directory, not the document.
   return {
     url,
     rev,
     entries,
     sourceMapUrl,
-    scriptBody: lazyBody(() => buildComboScript(resources, sourceMapUrl)),
+    scriptBody: lazyBody(() => buildComboScript(resources, comboSearch(entries, rev, true))),
     sourceMapBody: lazyBody(() => buildComboSourceMap(resources, sourceMapOf)),
   }
 }
@@ -431,15 +519,20 @@ function buildBatch(
   const artifact = buildCombo(records, sourceMapOf)
   return {
     ...artifact,
-    descriptor: { phase, url: artifact.url, rev: artifact.rev, entries: artifact.entries },
+    descriptor: {
+      phase,
+      url: artifact.url.slice(1),
+      rev: artifact.rev,
+      entries: artifact.entries,
+    },
   }
 }
 
-/** Graph row for one bundle rev (url carries the rev as its cache-busting query). */
+/** Graph row for one bundle rev (the reference carries the rev as its cache-busting query). */
 function graphRow(id: string, rev: string, fields: WebBootRowFields): WebBootEntry {
   return {
     id,
-    url: comboUrl([id], rev),
+    url: comboReference([id], rev),
     rev,
     ...(fields.inject !== undefined ? { inject: fields.inject } : {}),
     ...(fields.immediately ? { immediately: true } : {}),
@@ -547,30 +640,31 @@ window.__ModuleLoader__={
 
 /**
  * The web plugin table service: incremental `dsh.client` scan + wire composition
- * + bundle route + index injection rows. Construction runs the activation scan
- * synchronously — a malformed declaration or missing bundle among the
+ * + bundle and package-asset route + index injection rows. Construction runs
+ * the activation scan synchronously — a malformed declaration or missing bundle among the
  * already-loaded entries aggregates into one loud throw (FAILED fiber; the
  * boot activation audit reports it).
  */
 export class ClientModuleRegistry extends Service {
   static inject = ['loader']
 
+  /**
+   * Host release identity published in every graph: this package's version, which releases share
+   * with the CLI, and the source commit the client build fixes into the built Host artifact.
+   */
+  private readonly release: WebBootRelease
   private readonly table = new Map<string, WebPluginRecord>()
   private readonly sources = new Map<string, ClientPackageSource>()
-  // Resolution is entry-local: the same specifier can resolve differently in
-  // separate config trees. Negative verdicts remain stable until restart.
-  private readonly pkgMeta = new Map<string, ResolvedPkgMeta | null>()
   private readonly rebuildListeners = new Set<(id: string, rev: string) => void>()
   private readonly graphListeners = new Set<() => void>()
   private readonly dirty = new Set<string>()
-  private readonly initialRevisionNonce = randomBytes(8).toString('hex')
-  private nextInitialRevision = 0
   private responses = new Map<string, LazyResponse>()
   private batchResponses = new Map<string, LazyResponse>()
   /** One prior graph generation covers a request racing the HMR recomposition that replaced its URL. */
   private previousBatchResponses = new Map<string, LazyResponse>()
   private flushQueued = false
   private composed: WebBootGraph
+  private readonly syncedConfig: SyncedConfigPublisher
 
   /**
    * Build the service: subscribe, seed, and run the activation flush.
@@ -579,6 +673,10 @@ export class ClientModuleRegistry extends Service {
    */
   constructor(ctx: Context) {
     super(ctx, 'clientModules')
+    const { version } = createRequire(import.meta.url)('../package.json') as { version: string }
+    // The client build fixes this read into the built Host artifact.
+    const commit = process.env.DSH_CLIENT_COMMIT_HASH
+    this.release = commit === undefined ? { version } : { version, commit }
     // Subscribe before seeding so a fiber arriving mid-activation lands in the
     // same dirty set (Set idempotence makes the overlap harmless). An entry-less
     // fiber is a child plugin or a manual mount — never a loader row; O(1) drop.
@@ -597,7 +695,14 @@ export class ClientModuleRegistry extends Service {
     // Activation pass: the initial scan IS the incremental path over the
     // current entries, flushed synchronously (nothing async between subscribe,
     // seed, and flush).
-    for (const entry of ctx.loader.entries()) this.dirty.add(entry.options.name)
+    const entries = [...ctx.loader.entries()]
+    for (const entry of entries) this.dirty.add(entry.options.name)
+    this.syncedConfig = new SyncedConfigPublisher(ctx, entries, () => {
+      // Only rows and rev change: the batch artifacts and the prior batch generation stay.
+      const rows = this.syncedConfig.apply(this.composed.entries, this.table)
+      this.composed = { ...this.composed, entries: rows, rev: shortHash(JSON.stringify({ entries: rows, batches: this.composed.batches })) }
+      this.notifyGraphChanged()
+    })
     this.composed = this.compose()
     const failures: Error[] = []
     this.flush(err => failures.push(err))
@@ -607,22 +712,32 @@ export class ClientModuleRegistry extends Service {
 
     const registerWebCarrier = (webCtx: Context): void => {
       webCtx.effect(
-        () => webCtx.webServer.register({ kind: 'prefix', path: '/plugins', handler: this.serveBundle }),
+        () => webCtx.webServer.register({ kind: 'prefix', path: PLUGIN_ROUTE, auth: 'anonymous', resource: request => this.fetchBundle(request) }),
         'client-modules: bundle route',
       )
     }
     ctx.inject(['webServer'], registerWebCarrier)
-    ctx.on('webserver/index-inject', (table) => {
-      table.push(...bootInjections(this.composed))
+    ctx.on('webserver/index-inject', (table, peer) => {
+      table.push(...bootInjections(this.graphFor(peer.principal)))
     })
   }
 
   /**
-   * Current composed entry graph (stable object between changes).
-   * @returns the graph served as `window.__DSH_BOOT__`.
+   * Current composed entry graph (stable object between changes), carrying the configured synced values.
+   * @returns the graph served as the owner's `window.__DSH_BOOT__`.
    */
   graph(): WebBootGraph {
     return this.composed
+  }
+
+  /**
+   * The current graph as one Peer may see it: the owner receives the configured synced values, and every other Peer
+   * receives each row's schema defaults in their place.
+   * @param principal - the Peer's principal; undefined for the owner or an in-process caller.
+   * @returns the graph served to that Peer at first render and in plugin-events frames.
+   */
+  graphFor(principal: Principal | undefined): WebBootGraph {
+    return this.syncedConfig.graphFor(this.composed, principal)
   }
 
   /**
@@ -635,16 +750,22 @@ export class ClientModuleRegistry extends Service {
   }
 
   /**
-   * Serve an advertised revisioned bundle or source map without a Web server.
-   * Unknown URLs return 404, unsupported methods return 405, and `HEAD`
-   * returns the same immutable headers without materializing a body. Each body
-   * is built once on its first `GET`; script construction never reads maps.
+   * Serve an advertised revisioned bundle, source map, chunk, or package asset
+   * without a Web server. Unknown URLs return 404, unsupported methods return
+   * 405, and `HEAD` returns the same immutable headers without materializing a
+   * body. Each bundle body is built once on its first `GET`; script
+   * construction never reads maps. A package asset is read on every request
+   * and answers 304 without a body when `If-None-Match` equals its entity tag;
+   * its body holds the file open until the caller consumes or cancels it. A
+   * bundle, map, or chunk body is the held buffer itself, not a copy, so a
+   * caller must not modify its bytes.
    * @param request - shell-carrier request for a `/plugins` resource.
    * @returns the exact response also exposed by the optional Web route.
    */
   async fetchBundle(request: Request): Promise<Response> {
-    const resource = await this.bundleResource(request.method, request.url)
-    const body = resource.body === undefined ? null : Uint8Array.from(resource.body)
+    const resource = await this.bundleResource(request.method, request.url, request.headers.get('if-none-match') ?? undefined)
+    const body = resource.body === undefined ? null
+      : resource.body instanceof Readable ? transforStreamBody(resource.body) : heldBody(resource.body)
     return new Response(body, {
       status: resource.status,
       ...(resource.headers === undefined ? {} : { headers: resource.headers }),
@@ -666,18 +787,19 @@ export class ClientModuleRegistry extends Service {
 
   /**
    * Publish one completed bundle generation (the HMR watch's registration
-   * hook — the only entry point through which build changes reach the graph).
+   * hook; an entry restart publishes through reconciliation instead).
+   * Unchanged mtime, ctime and size preserve the graph without reading the bundle.
    * @param id - entry id (package name).
-   * @returns the new rev, or undefined for an unknown id.
+   * @returns the current artifact rev, or undefined for an unknown id.
    */
   rebuilt(id: string): string | undefined {
     const record = this.table.get(id)
     if (record === undefined) return undefined
     const baseline = this.captureArtifactBaseline(record.meta.clientPath)
-    const bundle = readFileSync(record.meta.clientPath)
-    const rev = artifactRevision(bundle, baseline)
-    record.baseline = baseline
+    const rev = artifactRevision(baseline)
     if (rev === record.entry.rev) return rev
+    const bundle = readFileSync(record.meta.clientPath)
+    record.baseline = baseline
     record.entry = graphRow(id, rev, record.meta)
     record.bundle = bundle
     this.composed = this.compose()
@@ -695,7 +817,8 @@ export class ClientModuleRegistry extends Service {
   }
 
   /**
-   * Subscribe to bundle rebuilds; fires only when the re-hash changed the rev.
+   * Subscribe to bundle rebuilds; fires when {@link rebuilt} changes a rev. A rev an
+   * entry restart publishes reaches only {@link onGraphChanged} listeners.
    * @param listener - receives the entry id and its new bundle rev.
    * @returns the unsubscriber.
    */
@@ -705,8 +828,10 @@ export class ClientModuleRegistry extends Service {
   }
 
   /**
-   * Fires after any flush that recomposed the graph (row added/removed, or a
-   * rebuilt rev change). Pull model: listeners re-read {@link graph}.
+   * Fires after the graph's rows or rev change: a flush that recomposed the
+   * graph (row added/removed, or a rebuilt rev change), or a republication of
+   * synced configuration alone, which leaves the batch artifacts unchanged.
+   * Pull model: listeners re-read {@link graph}.
    * @param listener - notified with no payload.
    * @returns the unsubscriber.
    */
@@ -735,7 +860,9 @@ export class ClientModuleRegistry extends Service {
 
     const batchResponses = new Map<string, LazyResponse>()
     for (const artifact of artifacts) {
-      batchResponses.set(artifact.descriptor.url, this.responses.get(artifact.descriptor.url) ?? {
+      // The table is keyed by the absolute route the request arrives on, not by
+      // the document-relative reference the graph and descriptors carry.
+      batchResponses.set(artifact.url, this.responses.get(artifact.url) ?? {
         body: artifact.scriptBody,
         contentType: 'text/javascript; charset=utf-8',
       })
@@ -763,7 +890,13 @@ export class ClientModuleRegistry extends Service {
     this.batchResponses = batchResponses
     this.responses = responses
     const batches = artifacts.map(artifact => artifact.descriptor)
-    return { rev: shortHash(JSON.stringify({ entries, batches })), entries, batches }
+    const rows = this.syncedConfig.apply(entries, this.table)
+    return {
+      rev: shortHash(JSON.stringify({ entries: rows, batches })),
+      release: this.release,
+      entries: rows,
+      batches,
+    }
   }
 
   private notifyGraphChanged(): void {
@@ -779,14 +912,10 @@ export class ClientModuleRegistry extends Service {
   }
 
   private resolveMeta(loaderName: string, baseUrl: string): ResolvedPkgMeta | null {
-    const sourceKey = this.sourceKey(loaderName, baseUrl)
-    const cached = this.pkgMeta.get(sourceKey)
-    if (cached !== undefined) return cached
     const located = this.locatePkgJson(loaderName, baseUrl)
     if (located === undefined) {
       // Not a resolvable package root: loader builtins (cordis:include) and
-      // subpath entries (…/gateway) land here — permanently not a client row.
-      this.pkgMeta.set(sourceKey, null)
+      // subpath entries (…/gateway) land here — not a client row.
       return null
     }
     const { packageName, path: pkgPath } = located
@@ -796,23 +925,19 @@ export class ClientModuleRegistry extends Service {
       packageName,
       dsh !== null && typeof dsh === 'object' ? (dsh as Record<string, unknown>).client : undefined,
     )
-    if (decl === undefined || decl.platform !== 'web') {
-      this.pkgMeta.set(sourceKey, null)
-      return null
-    }
+    if (decl === undefined || decl.platform !== 'web') return null
     const clientRel = clientExportOf(packageName, pkg.exports)
     if (clientRel === undefined) {
       throw new Error(`client-modules: ${packageName} declares dsh.client but exports no "./client" bundle`)
     }
     const meta: PkgMeta = {
       clientPath: join(dirname(pkgPath), clientRel),
+      manifestPath: pkgPath,
       ...(decl.inject !== undefined ? { inject: decl.inject } : {}),
       external: decl.external ?? [],
       immediately: decl.immediately === true,
     }
-    const resolved = { packageName, meta }
-    this.pkgMeta.set(sourceKey, resolved)
-    return resolved
+    return { packageName, meta }
   }
 
   /**
@@ -857,7 +982,7 @@ export class ClientModuleRegistry extends Service {
         : internal.resolveSync(loaderName, baseUrl, {}).url
     } catch {
       // The Loader cannot resolve the name: its row cannot have imported, so
-      // the name is permanently not a client row.
+      // it is not a client row.
       return undefined
     }
     return this.nearestPackage(moduleUrl, expectedPackageName)
@@ -872,14 +997,15 @@ export class ClientModuleRegistry extends Service {
     while (true) {
       const candidate = join(dir, 'package.json')
       if (existsSync(candidate)) {
+        let name: unknown
         try {
-          const name = (JSON.parse(readFileSync(candidate, 'utf8')) as { name?: unknown }).name
-          if (typeof name === 'string' && (expectedPackageName === undefined || name === expectedPackageName)) {
-            return { path: candidate, packageName: name }
-          }
-        } catch {
+          name = (JSON.parse(readFileSync(candidate, 'utf8')) as { name?: unknown }).name
+        } catch (_unreadableManifest) {
           // An unreadable or malformed intermediate manifest cannot own the
           // module; keep walking toward the declaring package root.
+        }
+        if (typeof name === 'string' && (expectedPackageName === undefined || name === expectedPackageName)) {
+          return { path: candidate, packageName: name }
         }
       }
       const parent = dirname(dir)
@@ -899,30 +1025,22 @@ export class ClientModuleRegistry extends Service {
     return {
       path: clientPath,
       mtimeMs: bundle.mtimeMs,
+      ctimeMs: bundle.ctimeMs,
       size: bundle.size,
     }
   }
 
-  /** Allocate an opaque initial row revision without inspecting artifact bytes. */
-  private allocateInitialRevision(): string {
-    return `${this.initialRevisionNonce}-${String(this.nextInitialRevision++)}`
-  }
-
   /**
-   * Read the activation-time bundle snapshot.
+   * Run one filesystem read of a declared client bundle.
    * @param pkgName - package that declares the client bundle.
    * @param clientPath - absolute path of the built client artifact.
-   * @returns the immutable bytes plus the pre-read filesystem baseline.
+   * @param read - the stat or read of `clientPath`.
+   * @returns the read's result.
    * @throws {MissingClientBundleError} when the read fails with `ENOENT`; other filesystem errors are rethrown unchanged.
    */
-  private initialBundleSnapshot(pkgName: string, clientPath: string): {
-    bundle: Buffer
-    baseline: ClientArtifactBaseline
-  } {
+  private readClientBundle<T>(pkgName: string, clientPath: string, read: () => T): T {
     try {
-      const baseline = this.captureArtifactBaseline(clientPath)
-      const bundle = readFileSync(clientPath)
-      return { bundle, baseline }
+      return read()
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
       throw new MissingClientBundleError(pkgName, clientPath, error)
@@ -939,11 +1057,17 @@ export class ClientModuleRegistry extends Service {
     }
   }
 
-  /** Reconcile one entry name against the live Loader sources. @returns whether the table changed. */
-  private processOne(entryName: string, onError: (err: Error) => void): boolean {
+  /**
+   * Reconcile one entry name against its sources at flush start.
+   * @param entryName - Loader entry name being reconciled.
+   * @param entries - same-name entries collected at flush start.
+   * @param onError - receives package reconciliation failures.
+   * @returns whether the table changed.
+   */
+  private processOne(entryName: string, entries: readonly Entry[], onError: (err: Error) => void): boolean {
     const nextSources = new Map<string, ClientPackageSource>()
-    for (const entry of this.ctx.loader.entries()) {
-      if (entry.options.name !== entryName || entry.fiber === undefined || entry.disabled) continue
+    for (const entry of entries) {
+      if (entry.fiber === undefined || entry.disabled) continue
       const source = this.resolveSource(entry)
       if (source !== undefined) nextSources.set(source.sourceKey, source)
     }
@@ -995,28 +1119,47 @@ export class ClientModuleRegistry extends Service {
     }
     const source = sources[0]
     if (source === undefined) return this.table.delete(packageName)
-    if (this.table.get(packageName)?.sourceKey === source.sourceKey) return false
-    // The opaque initial rev rides the row until HMR observes a file change;
-    // a fiber restart from the same source reuses the existing row.
-    const snapshot = this.initialBundleSnapshot(packageName, source.meta.clientPath)
-    const rev = this.allocateInitialRevision()
+    const { clientPath } = source.meta
+    // Startup and HMR share revisions so unchanged artifacts survive a server restart.
+    const baseline = this.readClientBundle(packageName, clientPath, () => this.captureArtifactBaseline(clientPath))
+    const entry = graphRow(packageName, artifactRevision(baseline), source.meta)
+    const current = this.table.get(packageName)
+    // A restart that finds the same manifest and bundle metadata leaves the published graph as it is, unread.
+    const unchanged = current?.sourceKey === source.sourceKey
+      && isDeepStrictEqual(current.meta, source.meta) && isDeepStrictEqual(current.entry, entry)
+    if (unchanged) return false
     this.table.set(packageName, {
-      entry: graphRow(packageName, rev, source.meta),
+      entry,
       loaderName: source.loaderName,
       sourceKey: source.sourceKey,
       meta: source.meta,
-      bundle: snapshot.bundle,
-      baseline: snapshot.baseline,
+      bundle: this.readClientBundle(packageName, clientPath, () => readFileSync(clientPath)),
+      baseline,
     })
     return true
   }
 
   private flush(onError: (err: Error) => void): void {
+    if (this.dirty.size === 0) return
+    const entriesByName = new Map<string, Entry[]>()
+    try {
+      for (const entry of this.ctx.loader.entries()) {
+        const name = entry.options.name
+        const entries = entriesByName.get(name)
+        if (entries) entries.push(entry)
+        else entriesByName.set(name, [entry])
+      }
+    } catch (error) {
+      // No package state changed; consume this failed batch and retain the published graph.
+      this.dirty.clear()
+      onError(error instanceof Error ? error : new Error(String(error)))
+      return
+    }
     let changed = false
     for (const entryName of [...this.dirty]) {
       this.dirty.delete(entryName)
       try {
-        if (this.processOne(entryName, onError)) changed = true
+        if (this.processOne(entryName, entriesByName.get(entryName) ?? [], onError)) changed = true
       } catch (error) {
         // Steady state: one broken package must not poison the others; the
         // activation pass aggregates these into a loud throw instead.
@@ -1053,7 +1196,9 @@ export class ClientModuleRegistry extends Service {
       const requested = requestUrl.pathname.slice(prefix.length)
       const sourceMap = requested.endsWith('.map')
       const fileName = sourceMap ? requested.slice(0, -'.map'.length) : requested
-      if (!CLIENT_CHUNK.test(fileName)) return undefined
+      // The Node Client entry and its split chunks share this directory but
+      // must never be served as browser factory scripts.
+      if (!CLIENT_CHUNK.test(fileName) || fileName === 'client.node.js' || fileName.startsWith('client.node.')) return undefined
       if (resourceUrl !== chunkUrl(record.entry.id, fileName, record.entry.rev, sourceMap)) return undefined
       return { record, fileName, sourceMap, resourceUrl }
     }
@@ -1067,34 +1212,94 @@ export class ClientModuleRegistry extends Service {
     const { record, fileName, sourceMap, resourceUrl } = request
     const clientPath = join(dirname(record.meta.clientPath), fileName)
     if (!existsSync(clientPath)) return undefined
-    const sourceMapUrl = chunkUrl(record.entry.id, fileName, record.entry.rev, true)
-    const resource = (): ComboResource => ({
+    const sourceMapUrl = chunkMapReference(fileName, record.entry.rev)
+    // An on-demand chunk is read asynchronously: a host whose filesystem fetches
+    // lazily requested files on first read can serve it without a blocking read.
+    const resource = async (): Promise<ComboResource> => ({
       id: record.entry.id,
       rev: record.entry.rev,
       clientPath,
       fileName,
-      bundle: readFileSync(clientPath),
+      bundle: await readFile(clientPath),
     })
     const response: LazyResponse = sourceMap
       ? {
-        body: lazyBody(() => buildComboSourceMap([resource()], this.readSourceMap, fileName)),
+        body: lazyBody(async () => buildComboSourceMap([await resource()], this.readSourceMap, fileName)),
         contentType: 'application/json; charset=utf-8',
       }
       : {
-        body: lazyBody(() => buildComboScript([resource()], sourceMapUrl)),
+        body: lazyBody(async () => buildComboScript([await resource()], sourceMapUrl)),
         contentType: 'text/javascript; charset=utf-8',
       }
     this.responses.set(resourceUrl, response)
     return response
   }
 
-  private async bundleResource(method: string | undefined, url: string): Promise<{
+  /**
+   * Answer one package-asset request. Node's `require.resolve` applies the
+   * package's `./assets/*` export as a self-reference, so unexported,
+   * `.`/`..`, missing, and directory paths answer 404. The build writes each
+   * asset's content revision into its file name, so a served path names one
+   * content: the body streams from disk on every request, and the path is the
+   * entity tag.
+   * @param method - request method.
+   * @param record - the active row of the addressed package, or undefined when it is not active.
+   * @param assetPath - percent-encoded path below the package's `assets/` route segment.
+   * @param ifNoneMatch - request `If-None-Match` field.
+   * @returns the route answer.
+   */
+  private assetResponse(
+    method: 'GET' | 'HEAD',
+    record: WebPluginRecord | undefined,
+    assetPath: string,
+    ifNoneMatch: string | undefined,
+  ): {
     status: number
     headers?: Record<string, string>
-    body?: Buffer
+    body?: Readable
+  } {
+    if (record === undefined || assetPath === '') return { status: 404 }
+    let file: string
+    try {
+      file = createRequire(record.meta.manifestPath)
+        .resolve(`${record.entry.id}/${PACKAGE_ASSET_SEGMENT}/${decodeURIComponent(assetPath)}`)
+    } catch {
+      // Unresolvable or malformed paths name no asset.
+      return { status: 404 }
+    }
+    // The resolved file decides the type: Node reads `#` and `?` in the subpath as URL syntax.
+    const mediaType = packageAssetMediaType(file)
+    if (mediaType === undefined) return { status: 404 }
+    const headers: Record<string, string> = {
+      'content-type': mediaType,
+      'cache-control': IMMUTABLE_CACHE,
+      etag: `"${assetPath}"`,
+      'x-content-type-options': 'nosniff',
+      // A directly opened SVG document runs no script.
+      ...(mediaType === 'image/svg+xml' ? { 'content-security-policy': "script-src 'none'" } : {}),
+    }
+    if (ifNoneMatch === headers.etag) return { status: 304, headers }
+    return { status: 200, headers, ...(method === 'HEAD' ? {} : { body: createReadStream(file) }) }
+  }
+
+  /**
+   * Answer one `/plugins` request. A `/plugins/<package>/assets/` path is
+   * answered by the package-asset route alone; any other path is an advertised
+   * combo or its map, a prior startup generation, or a current-revision
+   * package-local chunk, in that order, and otherwise 404.
+   */
+  private async bundleResource(method: string | undefined, url: string, ifNoneMatch: string | undefined): Promise<{
+    status: number
+    headers?: Record<string, string>
+    body?: Buffer | Readable
   }> {
     if (method !== 'GET' && method !== 'HEAD') return { status: 405 }
     const requestUrl = new URL(url, 'http://x')
+    const asset = PACKAGE_ASSET_PATH.exec(requestUrl.pathname)
+    if (asset !== null) {
+      const [, packageName = '', assetPath = ''] = asset
+      return this.assetResponse(method, this.table.get(packageName), assetPath, ifNoneMatch)
+    }
     const resourceUrl = `${requestUrl.pathname}${requestUrl.search}`
     const response = this.responses.get(resourceUrl)
       ?? this.previousBatchResponses.get(resourceUrl)
@@ -1107,16 +1312,10 @@ export class ClientModuleRegistry extends Service {
       }
     }
     // Anything else under /plugins (including unadvertised combinations and
-    // /plugins/events when the HMR row is absent) is an unknown resource.
+    // an unknown path) is an unknown resource.
     return { status: 404 }
   }
 
-  private readonly serveBundle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-    /* v8 ignore next -- `?? '/'` arm: node:http always sets url on server requests. */
-    const response = await this.bundleResource(req.method, req.url ?? '/')
-    res.writeHead(response.status, response.headers)
-    res.end(response.body)
-  }
 }
 
 export default ClientModuleRegistry

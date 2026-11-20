@@ -1,34 +1,30 @@
+import { extractTextContent } from '@deepseek-ai/dsh-llm/message'
 import type { Context } from '@deepseek-ai/cordis'
 import { useEffect, useId, useMemo, useState } from 'react'
 import type { FileAttachmentRef, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
-import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
+import type { PropsLocale, PropsRenderFactories, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import {
-  IconCheckOutline16, IconChevronDownOutline14, IconChevronUpOutline14, IconCloseOutline16,
-  FileTypeIcon, fileSizeText, IconEditOutline16, IconQueueOutline14, IconSendOutline14,
-  IconTrashOutline16, projectUserText, Tooltip,
+  IconCheckOutlineRegular, IconChevronDownOutlineRegular, IconChevronUpOutlineRegular, IconCloseOutlineRegular,
+  FileTypeIcon, fileSizeText, IconEditOutlineRegular, InlineEditor, IconQueueOutlineRegular, IconSendOutlineRegular,
+  IconTrashOutlineRegular, Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { InboxState } from '@deepseek-ai/dsh-agent/types'
 import type { QueueAction } from '@deepseek-ai/dsh-api-session-controller/types'
-import type { MessageId } from '@deepseek-ai/dsh-llm/brand'
+import type { MessageId } from '@deepseek-ai/dsh-llm/types'
+import type { UserTextFacts } from '../index.ts'
 import { NS } from '../locales.ts'
 import css from './QueueDock.module.css'
 
 const EMPTY_QUEUE = [] as const
-const QUEUE_PREVIEW_CHARS = 200
-
-function previewOf(content: InboxState['next-turn'][number]['content']): string {
-  const flat = content
-    .filter(block => block.type !== 'image' && block.type !== 'file')
-    .map(block => (block.type === 'text' ? block.text : `[${block.type}]`))
-    .join(' ').replace(/\s+/g, ' ').trim()
-  const chars = Array.from(flat)
-  return chars.length > QUEUE_PREVIEW_CHARS ? `${chars.slice(0, QUEUE_PREVIEW_CHARS).join('')}…` : flat
+const QUEUE_TEXT_FACTS: Readonly<Partial<UserTextFacts>> = {
+  collapseWhitespace: true,
+  trimWhitespace: true,
 }
 
 function textOf(content: InboxState['next-turn'][number]['content']): string | null {
   if (!content.every(block => block.type === 'text')) return null
-  return content.map(block => block.text).join('')
+  return extractTextContent(content)
 }
 
 /** Queue operations injected by the session-scoped registration. */
@@ -100,16 +96,23 @@ function QueueThumb({ attachment, loadImage, label }: {
 
 /** Full props of a dock entry: InputZone owner share + session standard kit + global seat + the locale seat. */
 export type QueueDockProps = PropsRuntime<'conversation.input.dock'> & QueueDockInjected & PropsLocale<'conversation'>
+  & PropsRenderFactories
 
 /**
  * Queue strip: one item renders directly; multiple items default to a
- * collapsible count header; an empty queue renders nothing. Local submissions
+ * collapsible count header; an empty queue renders nothing. Local queued submissions
  * show sending status and disabled actions until their Host queue rows arrive.
  */
-export function QueueDock({ useSession, useProjection, updateQueue, notify, loadImage, t }: QueueDockProps) {
+export function QueueDock({ useSession, useProjection, updateQueue, notify, loadImage, renderFactorySlot, t }: QueueDockProps) {
   const inbox = useProjection('inbox') as unknown as InboxState | undefined
-  const queue = inbox?.['next-turn'] ?? EMPTY_QUEUE
   const pendingSubmissions = useSession(s => s.pendingSubmissions)
+  const queue = useMemo(() => {
+    const rows = inbox?.['next-turn'] ?? EMPTY_QUEUE
+    const inChat = new Set(pendingSubmissions.filter(item => item.placement === 'transcript').map(item => item.requestId))
+    return inChat.size === 0 ? rows : rows.filter(({ source }) => (
+      source.kind !== 'user' || !('rpcId' in source) || !inChat.has(source.rpcId)
+    ))
+  }, [inbox, pendingSubmissions])
   const pendingQueue = useMemo(() => {
     const admitted = new Set(queue.flatMap(({ source }) => (
       source.kind === 'user' && 'rpcId' in source ? [source.rpcId] : []
@@ -175,13 +178,13 @@ export function QueueDock({ useSession, useProjection, updateQueue, notify, load
             disabled={interactionActive}
             onClick={() => { setCollapsed(value => !value) }}
           >
-            <span className={css.lead} aria-hidden><IconQueueOutline14 /></span>
+            <span className={css.lead} aria-hidden><IconQueueOutlineRegular /></span>
             <span className={css.count}>{t('queue.count', { n: rowCount })}</span>
             {!listVisible && pendingQueue.length > 0 && (
               <span className={css.status} role="status">{t('queue.sending')}</span>
             )}
             <span className={css.chevron} aria-hidden>
-              {expanded ? <IconChevronDownOutline14 /> : <IconChevronUpOutline14 />}
+              {expanded ? <IconChevronDownOutlineRegular /> : <IconChevronUpOutlineRegular />}
             </span>
           </button>
         )}
@@ -192,25 +195,15 @@ export function QueueDock({ useSession, useProjection, updateQueue, notify, load
             return (
               <li key={row.id} className={css.row}>
                 {/* Single-item strip has no count header, so the row itself carries the queue glyph. */}
-                {rowCount === 1 && <span className={css.lead} aria-hidden><IconQueueOutline14 /></span>}
+                {rowCount === 1 && <span className={css.lead} aria-hidden><IconQueueOutlineRegular /></span>}
                 {editing?.id === row.id
                   ? (
-                    <input
-                      autoFocus
-                      className={css.editor}
-                      aria-label={t('queue.edit')}
+                    <InlineEditor
                       value={editing.text}
-                      onChange={(event) => { setEditing({ id: row.id, text: event.currentTarget.value }) }}
-                      onKeyDown={(event) => {
-                        if (event.key === 'Escape') {
-                          setEditing(null)
-                          return
-                        }
-                        if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
-                          event.preventDefault()
-                          void saveEdit()
-                        }
-                      }}
+                      label={t('queue.edit')}
+                      onChange={(text) => { setEditing({ id: row.id, text }) }}
+                      onSave={() => { void saveEdit() }}
+                      onCancel={() => { setEditing(null) }}
                     />
                   )
                   : (
@@ -235,14 +228,18 @@ export function QueueDock({ useSession, useProjection, updateQueue, notify, load
                             ))}
                         </span>
                       )}
-                      <span className={css.preview}>{projectUserText(previewOf(row.content), [])}</span>
+                      <span className={css.preview}>{renderFactorySlot('conversation.user.text', {
+                        text: extractTextContent(row.content),
+                        facts: QUEUE_TEXT_FACTS,
+                        interactive: false, ellipsis: true,
+                      })}</span>
                     </>
                   )}
                 {queueMutable && <div className={css.actions}>
                   {editing?.id === row.id
                     ? (
                       <>
-                        <Tooltip label={t('queue.save')} side="bottom" delayMs={500}>
+                        <Tooltip portal label={t('queue.save')} side="bottom" delayMs={500}>
                           <button
                             type="button"
                             className={css.action}
@@ -250,10 +247,10 @@ export function QueueDock({ useSession, useProjection, updateQueue, notify, load
                             disabled={busy !== null || editing.text.trim() === ''}
                             onClick={() => { void saveEdit() }}
                           >
-                            <IconCheckOutline16 size={14} />
+                            <IconCheckOutlineRegular size={14} />
                           </button>
                         </Tooltip>
-                        <Tooltip label={t('queue.cancelEdit')} side="bottom" delayMs={500}>
+                        <Tooltip portal label={t('queue.cancelEdit')} side="bottom" delayMs={500}>
                           <button
                             type="button"
                             className={css.action}
@@ -261,14 +258,14 @@ export function QueueDock({ useSession, useProjection, updateQueue, notify, load
                             disabled={busy !== null}
                             onClick={() => { setEditing(null) }}
                           >
-                            <IconCloseOutline16 size={14} />
+                            <IconCloseOutlineRegular size={14} />
                           </button>
                         </Tooltip>
                       </>
                     )
                     : (
                       <>
-                        <Tooltip label={t('queue.edit')} side="bottom" delayMs={500} disabled={text === null}>
+                        <Tooltip portal label={t('queue.edit')} side="bottom" delayMs={500} disabled={text === null}>
                           <button
                             type="button"
                             className={css.action}
@@ -281,10 +278,10 @@ export function QueueDock({ useSession, useProjection, updateQueue, notify, load
                               if (text !== null) setEditing({ id: row.id, text: text })
                             }}
                           >
-                            <IconEditOutline16 size={14} />
+                            <IconEditOutlineRegular size={14} />
                           </button>
                         </Tooltip>
-                        <Tooltip label={t('queue.remove')} side="bottom" delayMs={500}>
+                        <Tooltip portal label={t('queue.remove')} side="bottom" delayMs={500}>
                           <button
                             type="button"
                             className={css.action}
@@ -298,10 +295,10 @@ export function QueueDock({ useSession, useProjection, updateQueue, notify, load
                               )
                             }}
                           >
-                            <IconTrashOutline16 size={14} />
+                            <IconTrashOutlineRegular size={14} />
                           </button>
                         </Tooltip>
-                        <Tooltip label={t('queue.steer')} side="bottom" delayMs={500} disabled={!running}>
+                        <Tooltip portal label={t('queue.steer')} side="bottom" delayMs={500} disabled={!running}>
                           <button
                             type="button"
                             className={css.action}
@@ -316,7 +313,7 @@ export function QueueDock({ useSession, useProjection, updateQueue, notify, load
                               )
                             }}
                           >
-                            <IconSendOutline14 />
+                            <IconSendOutlineRegular />
                           </button>
                         </Tooltip>
                       </>
@@ -328,7 +325,7 @@ export function QueueDock({ useSession, useProjection, updateQueue, notify, load
           {listVisible && pendingQueue.map((submission) => {
             return (
               <li key={submission.requestId} className={`${css.row} ${css.pendingRow}`} data-submission-echo="">
-                {rowCount === 1 && <span className={css.lead} aria-hidden><IconQueueOutline14 /></span>}
+                {rowCount === 1 && <span className={css.lead} aria-hidden><IconQueueOutlineRegular /></span>}
                 {submission.attachments.length > 0 && (
                   <span className={css.attachments}>
                     {submission.attachments.map((attachment, index) => attachment.type === 'image'
@@ -349,7 +346,11 @@ export function QueueDock({ useSession, useProjection, updateQueue, notify, load
                       ))}
                   </span>
                 )}
-                <span className={css.preview}>{projectUserText(submission.text, [])}</span>
+                <span className={css.preview}>{renderFactorySlot('conversation.user.text', {
+                  text: submission.text,
+                  facts: QUEUE_TEXT_FACTS,
+                  interactive: false, ellipsis: true,
+                })}</span>
                 <span className={css.status} role="status">{t('queue.sending')}</span>
                 {queueMutable && <div className={css.actions}>
                   <button
@@ -359,7 +360,7 @@ export function QueueDock({ useSession, useProjection, updateQueue, notify, load
                     title={t('queue.sending')}
                     disabled
                   >
-                    <IconEditOutline16 size={14} />
+                    <IconEditOutlineRegular size={14} />
                   </button>
                   <button
                     type="button"
@@ -368,7 +369,7 @@ export function QueueDock({ useSession, useProjection, updateQueue, notify, load
                     title={t('queue.sending')}
                     disabled
                   >
-                    <IconTrashOutline16 size={14} />
+                    <IconTrashOutlineRegular size={14} />
                   </button>
                   <button
                     type="button"
@@ -377,7 +378,7 @@ export function QueueDock({ useSession, useProjection, updateQueue, notify, load
                     title={t('queue.sending')}
                     disabled
                   >
-                    <IconSendOutline14 />
+                    <IconSendOutlineRegular />
                   </button>
                 </div>}
               </li>

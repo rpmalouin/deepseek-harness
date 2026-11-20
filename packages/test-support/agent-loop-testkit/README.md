@@ -1,5 +1,5 @@
 ---
-description: "Prerequisite mounting, production AgentLoop drivers, and explicit Inbox stubs for agent-loop tests."
+description: "Prerequisite mounting, production AgentLoop drivers, and explicit Agent stubs for agent-loop tests."
 kind: "package-library"
 ---
 
@@ -25,6 +25,8 @@ Use `dsh-agent-loop-testkit` to give AgentLoop tests the standard prerequisites 
 <a id="use-this-package"></a>
 ## Use this package
 
+Consumer-only tests with structural Agent stubs can use `provideWorkingDirectoryFixture(ctx, defaultDirectory?)`. It supplies directory values without validating paths, changing directories, or recording events. Tests of directory behavior use `mountAgentLoopTestDependencies(ctx, { workingDirectory: true })` and real temporary directories.
+
 This package gives an AgentLoop test a working service topology and keeps the choice between production Inbox behavior and a structural stub explicit.
 
 ### Drive a production Agent
@@ -33,7 +35,8 @@ Use `mountAgentLoopTestHarness()` when the test covers durable Inbox events, pro
 
 ```ts
 import { Context } from '@deepseek-ai/cordis'
-import { SessionId, type UserMessage } from '@deepseek-ai/dsh-session'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { SessionId, UserMessage } from '@deepseek-ai/dsh-session'
 import {
   mountAgentLoopTestDependencies,
   mountAgentLoopTestHarness,
@@ -44,7 +47,7 @@ const ctx = new Context()
 await mountAgentLoopTestDependencies(ctx)
 // Register the test adapter and any load-order-sensitive plugins here.
 const harness = await mountAgentLoopTestHarness(ctx)
-const agent = await harness.create(SessionId('test-agent'))
+const agent = await harness.create(brandString<SessionId>('test-agent'))
 declare const message: UserMessage
 
 agent.inbox.append('next-turn', message)
@@ -55,14 +58,15 @@ The dependency helper forwards system-prompt and tool-registry configuration thr
 
 ### Build a structural Agent stub
 
-Use `createInboxStub()` when the test subject needs mutable pending lists but does not exercise durability, projection validation, live Inbox notifications, or the driver's claim policy. The stub implements the public queue operations with two process-local arrays and never writes to a Session. Use `unsupportedInbox()` when the test subject must not touch pending input; every mutation throws at the first unexpected dependency.
+Use `createInboxStub()` when the test subject needs mutable pending lists but does not exercise durability, projection validation, live Inbox notifications, or the driver's claim policy. The stub implements the public queue operations with two process-local arrays and never writes to a Session. Use `unsupportedInbox()` when the test subject must not touch pending input; every mutation throws at the first unexpected dependency. Use `unsupportedModel()` when the test does not read or change model selection; all its operations throw.
 
 ```ts
-import { createInboxStub } from '@deepseek-ai/dsh-agent-loop-testkit'
+import { createInboxStub, unsupportedModel } from '@deepseek-ai/dsh-agent-loop-testkit'
 
 const agent = {
   // ...
   inbox: createInboxStub(),
+  model: unsupportedModel(),
 }
 ```
 
@@ -86,7 +90,7 @@ This section explains the design of the test utilities; the observable behavior 
 
 ### Design
 
-`mountAgentLoopTestDependencies` mounts six service plugins in a fixed dependency order — LLM, session, session-projection registry, system-prompt registry, tool registry, then agent registry — and stops before `AgentLoop`, so the caller controls loop load order. `mountAgentLoopTestHarness` mounts the public production plugin, creates Agents through its service, and exposes the production driver's claim operation without exporting the loop's concrete Inbox class or projection definition. [`src/inbox.ts`](src/inbox.ts) contains only the process-local mutable stub and the fail-fast unsupported placeholder; it owns no projection or durable event implementation. The mounting and driver implementation lives in [`src/index.ts`](src/index.ts). No invariant companion is published because the package owns only test helpers and has no independent production observations that can diverge.
+`mountAgentLoopTestDependencies` mounts six service plugins in a fixed dependency order — LLM, session, session-projection registry, system-prompt registry, tool registry, then agent registry — and stops before `AgentLoop`, so the caller controls loop load order. `mountAgentLoopTestHarness` mounts the public production plugin, creates Agents through its service, and exposes the production driver's claim operation without exporting the loop's concrete Inbox class or projection definition. [`src/inbox.ts`](src/inbox.ts) contains only the process-local mutable stub and the fail-fast unsupported placeholder; it owns no projection or durable event implementation. The mounting and driver implementation lives in [`src/index.ts`](src/index.ts).
 
 </details>
 

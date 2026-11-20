@@ -8,7 +8,7 @@ Status: implemented
 
 每一次系统提示词变更都要付出整个提供方前缀缓存的代价。循环在每个步骤渲染提示词；一旦字节不同——plan 模式片段进入或退出、某个 skill 或工具指引片段完成注册、agent 作用域的 persona 遮蔽、`{{model}}` 变量改变——请求的消息 0 随之改变，DeepSeek 上下文缓存从第一个 token 起失效。长时间的 agent 会话反复为此付费，而[运行时上下文快照设计](../../archived/feature/2026-07-30-current-sandbox-policy-context.md)之所以存在，正是因为把会变化的事实移出提示词是保持前缀稳定的唯一办法。
 
-一个 DeepSeek 模型——在此按为本项工作提供的模型事实记录——移除了这一限制：它接受对话任意位置的 `system` 消息，并把最新一条视为完整的有效系统提示词，替换最前面那条。工具 schema 仍属于被缓存的前缀，因此工具集变更仍会使缓存失效。有了这样的模型，harness 可以把新提示词追加到已缓存的历史之后而不是重写消息 0，前缀就能保持热态。
+一个 DeepSeek 模型——在此按为本项工作提供的模型事实记录——移除了这一限制：它接受对话任意位置的 `system` 消息，并把最新一条视为完整的有效系统提示词，替换最前面那条。工具 schema 仍属于被缓存的前缀；[动态工具更新](../architecture/2026-09-20-dynamic-tool-updates.zh.md)可以延迟新增声明，而保留定义的变化仍使复用失效。有了这样的模型，harness 可以把新提示词追加到已缓存的历史之后而不是重写消息 0，前缀就能保持热态。
 
 因为[系统提示词是 surface 第 0 号节点](../architecture/2026-09-02-system-prompt-as-surface-node.zh.md)，harness 拥有实现这一点的表示：提示词变更是对 `system/message` surface 节点的操作，而「替换最新的系统节点」与「追加新节点」之间的选择是逐路由的决定。
 
@@ -24,18 +24,19 @@ Status: implemented
 
 ### 决策规则
 
-`packages/core/agent-loop/src/runtime-context.ts` 中的 `SystemPromptProjection.project(rendered, { inHistory, startsSeries })` 每次调用都扫描当前 surface 上存活的 `system/message` 节点。它返回有序的逐节点提交。没有存活的系统节点时，即使渲染文本为空也预留头节点。有效文本取自最新的非空系统节点，没有时回退到头节点；未生效的空尾节点既不提供有效文本，也无需再次以空内容替换。无论路由或序列状态如何，空渲染文本都会清除每个生效的系统节点。不具备能力的路由或新请求序列面对非空渲染文本时，即使有效文本未变也执行归并。除此之外，有效文本相同时不产生事件。具体操作如下：
+`packages/core/agent-loop/src/runtime-context.ts` 中的 `SystemPromptProjection.project(rendered, { inHistory, startsSeries })` 每次调用都扫描当前 surface 上存活的 `system/message` 节点。它返回有序的逐节点提交。没有存活的系统节点时，即使渲染文本为空也预留头节点。有效文本取自最新的非空系统节点，没有时回退到头节点；未生效的空尾节点既不提供有效文本，也无需再次以空内容替换。无论路由或序列状态如何，空渲染文本都会清除每个生效的系统节点。面对非空渲染文本，不具备能力的路由或有效文本不同的新请求序列执行归并；新序列开始时若最新存活节点已经持有该渲染文本，则不产生事件并保留该节点。除此之外，有效文本相同时不产生事件。有效文本未变的新序列由[系列开始前缀决策](../bug-fix/2026-10-22-series-start-unchanged-prompt-prefix.zh.md)拥有。具体操作如下：
 
 | 路由能力 | 前缀状态 | 操作 |
 |---|---|---|
 | 无 | 非空渲染文本，任意前缀状态 | 为每个非空的后续系统节点记录空内容替换，随后按需用渲染文本重写首个系统节点 |
 | `in-history` | 当前请求序列延续 | 在该步骤的 `user/message` 事件之前追加新的 `system/message`；仅追加本身不需要记录 `request/header` |
-| `in-history` | 非空渲染文本，新序列开始 | 为非空的后续系统节点记录空内容替换，再按需重写首个系统节点，即使最新有效文本未变也执行 |
+| `in-history` | 非空渲染文本，新序列开始且最新有效文本不同 | 为非空的后续系统节点记录空内容替换，再按需重写首个系统节点 |
+| `in-history` | 非空渲染文本，新序列开始但渲染文本已经是当前文本 | 不产生操作：存活节点保持在已缓存历史携带它的位置 |
 | 任意 | 渲染后的提示词为空 | 为非空的后续系统节点记录空内容替换，再按需清空头节点；派生消息中不保留任何提示词版本 |
 
-`startsSeries` 在以下情况为真：`agent/pre-step` 决定声明了 `startsRequestSeries`、surface 的替换代数自上次请求以来发生了移动（压缩或任何其他替换）、可见工具 schema 集合发生了变化。仅 provider 或 model 切换对本规则不算序列开始：目标路由具备能力时，变更后的提示词被追加，这不花任何代价，因为路由变更本身已经使缓存未命中。序列开始已经付出了缓存代价，因此归并让模型历史只保留当前提示词。有日志记录的逐节点空内容替换会从派生消息中移除后续提示词，无需 surface 删除操作，也不替换其间的对话节点。这也使压缩恢复不会在失败尝试已接纳的用户消息之后追加系统更新。
+`startsSeries` 在以下情况为真：`agent/pre-step` 决定声明了 `startsRequestSeries`、surface 的替换代数自上次请求以来发生了移动（压缩或任何其他替换）、不支持 `toolUpdate` 的路由上可见工具 schema 集合发生了变化。受支持的工具添加可以与提示词追加一起发生，无需开启新序列。仅 provider 或 model 切换对本规则不算序列开始：目标路由具备能力时，变更后的提示词被追加，这不花任何代价，因为路由变更本身已经使缓存未命中。序列开始本身并不必然使整段提供方前缀作废：替换或图片省略决定可能只使尾部失效，因此归并会等到有效文本必须移动时才执行；此时借助该序列只保留当前提示词，并避免重试时在已接纳的用户消息之后追加指令。有日志记录的逐节点空内容替换会从派生消息中移除后续提示词，无需 surface 删除操作，也不替换其间的对话节点。这也使压缩恢复不会在失败尝试已接纳的用户消息之后追加系统更新。
 
-首次尝试在组装、被接纳的 `agent/pre-step` 决策、`step/start`、`agent/request` waterfall 与 `prepareCall()` 之后才接纳提示词。被拒绝或为空的首次输入不打开步骤。两个异步请求阶段都不提交待处理的系统提示词与已接纳用户消息，在任一阶段取消都不会提交这两者。每次尝试都在各自的 `agent/request` 与 `prepareCall()` 之后同步协调同一份已渲染组装结果、仅在首次尝试追加已接纳用户批次、按需记录 header/context、派生并冻结请求，再通过同一个已准备调用发起流式请求。重试不重复组装、`agent/pre-step` 或用户消息准入。协调过程可见 pre-step 压缩（`auto: true` 的 `compaction-basic`）与恢复压缩，并在任一种压缩开启新序列时将非空提示词文本归并到头部。恢复属于序列延续——`resume` header 不是序列开始——因此跨重启发生变化的提示词被追加；提供方缓存在进程边界之后可能仍是热的。
+首次尝试在组装、被接纳的 `agent/pre-step` 决策、`step/start`、`agent/request` waterfall 与 `prepareCall()` 之后才接纳提示词。被拒绝或为空的首次输入不打开步骤。两个异步请求阶段都不提交待处理的系统提示词与已接纳用户消息，在任一阶段取消都不会提交这两者。每次尝试都在各自的 `agent/request` 与 `prepareCall()` 之后同步协调同一份已渲染组装结果、仅在首次尝试追加已接纳用户批次、按需记录 header/context、派生并冻结请求，再通过同一个已准备调用发起流式请求。重试不重复组装、`agent/pre-step` 或用户消息准入。协调过程可见 pre-step 压缩（`auto: true` 的 `compaction-basic`）与恢复压缩，并在任一种压缩开启有效文本不同的新序列时将非空提示词文本归并到头部。恢复属于序列延续——`resume` header 不是序列开始——因此跨重启发生变化的提示词被追加；提供方缓存在进程边界之后可能仍是热的。
 
 空头节点且没有生效的后续系统节点表示没有提示词。未生效的空尾节点不提供有效文本，因此重复清除与恢复会话都不会使旧提示词重新生效。重新提供非空文本使用同一准入规则：延续中的具备能力路由可以追加它；不具备能力的路由或新序列则重新填充头节点。清除使用普通的逐节点替换，而非 surface 删除或初次创建空头节点。
 
@@ -43,7 +44,7 @@ Status: implemented
 
 Web 在追加的历史内节点自己的位置呈现它。`SystemPromptNode` 携带 `{ seq, time, turn, step, text, update }`，其中 `update` 对已加载窗口内跟在更早系统节点之后的追加 `system/message` 为真。Chat 把非空的更新渲染为一张折叠的 `system-prompt` 卡片，标题取自 locale 键 `message.systemPromptUpdate`，同一 turn 与 step 内的 `request/header` 不会重复提示词卡片；`inspectRequestPrompt` 对跟在更新之后的 header 不报告系统变更。Trajectory 把跟在已加载请求 header 之后的更新折叠为一条合成的请求 header 事实，`promptChange.kind = 'system'`，因此之后的请求无需真实的 header 变更就能显示有效提示词。已加载窗口缺少更早的系统节点时，更新按初始提示词呈现。转录投影像对待所有 `system/message` 一样跳过它。
 
-`dsh-token-meter` 把 surface 顺序中最后一个非空且存活的系统节点计入 `contextBreakdown.systemTokens`；其余可见节点（包括被取代的提示词）计入 `messageTokens`。休眠空节点被忽略。每次替换后，两者之和都等于固定启发式 surface 总量，无论是否存在影子价 claim。紧凑的保留条目复用测量服务的 surface 规划器：状态和转换成本为 O(当前保留 surface)，不是 O(1) 或 O(完整历史日志)。被替换条目和消息正文被丢弃，状态版本 4 拒绝标量检查点。后续 assistant 用量中的 `cacheReadTokens` 仍是可观察的提供方缓存效果。
+`dsh-token-meter` 把 surface 顺序中最后一个非空且存活的系统节点计入 `contextBreakdown.systemTokens`；其余可见节点（包括被取代的提示词）计入 `messageTokens`。休眠空节点被忽略。该单元只保留存活的系统提示词和一个 surface 运行总量，并依据紧邻的影子价事件为替换定价（[系统提示词状态](../architecture/2026-10-13-context-breakdown-system-prompt-state.zh.md)）。后续 assistant 用量中的 `cacheReadTokens` 仍是可观察的提供方缓存效果。
 
 Trajectory 选择前一条真实 header 与前一条合成系统 header 中较新的一个作为比较状态。真实 header 拥有配置与工具；追加的提示词可以在没有另一条真实 header 时推进该状态。只比较真实 header 会在 A → B → C 序列中把 A 而不是 B 报告为先前提示词。
 
@@ -69,11 +70,11 @@ Chat 与 Trajectory 通过纯操作 `uiConversation.inspectSystemPrompt` 解释�
 
 **用先前的请求上下文决定准入。** 它描述上一次调用，而非请求中间件之后绑定的适配器。在首次调用、恢复之后、路由或能力变更之后，它可能选错提示词表示。在提交提示词与用户消息之前解析，还能防止取消时接纳未发送的内容。被否决。
 
-**把 provider 或 model 切换视为序列开始。** 它会在每次路由变更时把提示词折回第 0 号节点，与 tools 的情形一致。header 已经记录了该变更，缓存无论如何都会未命中，因此这条额外规则除了在循环中多一个特例之外没有任何收益。被否决。
+**把 provider 或 model 切换视为序列开始。** 它会在每次路由变更时把提示词折回第 0 号节点，与不具备能力的路由上的工具变更情形一致。header 已经记录了该变更，缓存无论如何都会未命中，因此这条额外规则除了在循环中多一个特例之外没有任何收益。被否决。
 
 **仅清除最新系统节点。** 空节点不投影为消息，因此更早的提示词会重新生效。清除所有生效版本才能保留空渲染文本的含义，同时不删除对话历史。被否决。
 
-**只保留标量总量或提示词祖先链。** 标量影子价无法判断最新提示词从哪个分类消失，也无法恢复其前一个版本。仅有提示词条目无法定位任意非提示词替换端点；`sourceEventSeqs` 还可能引用存活提示词，改写后的事件序号顺序也不同于 surface 顺序。保留紧凑的当前 surface 条目可以复用现有规划器，无需完整日志访问、第二套验证器或消费方专用持久事件。把所有存活提示词之和归入系统数字会改变有效提示词的含义，而不是修复分类。
+**只保留标量总量。** 标量影子价无法判断最新提示词从哪个分类消失，也无法恢复其前一个版本。把所有存活提示词之和归入系统数字会改变有效提示词的含义，而不是修复分类。保留系统提示词并结合影子价事件的 `shadowedSeqs` 可以回答这两个问题；[系统提示词状态说明](../architecture/2026-10-13-context-breakdown-system-prompt-state.zh.md)记录了为何以这种方式取代位置条目。
 
 ## Consequences
 
@@ -89,7 +90,7 @@ Chat 与 Trajectory 通过纯操作 `uiConversation.inspectSystemPrompt` 解释�
 
 - `packages/core/agent-loop/tests/system-prompt-admission.spec.ts` 覆盖文本变化或未变时从具备能力切换到不具备能力的路由、反向路由切换、恢复时的路由准入、请求中间件或准备阶段取消，以及已准备路由保持绑定时并发选择发生变化。重试压缩用例覆盖遮蔽最新提示词后有或没有更早更新存活的情况，并验证复用已接纳的组装结果、用户消息仅接纳一次，以及未变的后续重试不会多记序列 header。具备和不具备能力路由的清除用例会移除三个生效提示词版本，验证重复请求与带 seed 的恢复保持为空且不多记提示词事件，并仅恢复新文本；日志重建与 pi 转换器都不保留旧指令。`src/agent.ts` 与 `src/runtime-context.ts` 的聚焦覆盖率在语句、分支、函数和行四项均达到 100%。
 - `packages/core/agent-loop/tests/system-prompt-projection.spec.ts` 钉住序列延续时的追加、序列开始时无论是否存在后续存活节点、有效文本是否变化都执行的重新基线化、空提示词对所有生效版本的清除，以及不具备能力时只做替换的行为。
-- `packages/core/agent-loop/tests/request-reconstruction.spec.ts` 钉住继承 header 下追加的节点及携带 `systemPromptUpdate` 的 `request/context`、序列开始时折回第 0 号节点、由压缩驱动的重新基线化，以及在开启序列的 `change` header 下由工具 schema 变更驱动的重新基线化。
+- `packages/core/agent-loop/tests/request-reconstruction.spec.ts` 钉住继承 header 下追加的节点及携带 `systemPromptUpdate` 的 `request/context`、序列开始时折回第 0 号节点、由压缩驱动的重新基线化，以及在不支持 `toolUpdate` 的路由上、开启序列的 `change` header 下由工具 schema 变更驱动的重新基线化。
 - `packages/llm/llm/tests/service.spec.ts`、`packages/llm/llm-deepseek/tests/adapter.spec.ts` 与 `packages/test-support/llm-replay/tests/llm-replay.spec.ts` 钉住已解析模型信息上声明的模式，以及加载时对任何其他值的拒绝。
 - `packages/llm/token-meter/tests/context-breakdown-projection.spec.ts` 钉住最新与中间提示词移除、精确启发式总量、头部改写后的 surface 顺序、额外来源引用、休眠空节点与回退清空、不可变转换、紧凑保留检查点、延迟注册、重放和版本失效。
 - `packages/client/ui-conversation`、`ui-chat` 与 `ui-trajectory` 的客户端测试钉住更新卡片、同一步骤 header 的去重、更新之后不存在系统变更，以及合成的轨迹 header。

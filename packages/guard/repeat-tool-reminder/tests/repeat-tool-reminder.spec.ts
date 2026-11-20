@@ -1,14 +1,25 @@
-import { describe, expect, it } from 'vitest'
+import { executeToolFixture } from '@deepseek-ai/dsh-tool-testkit'
+import { describe, expect, it, onTestFinished } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import { createUserMessage, ToolCallId  } from '@deepseek-ai/dsh-llm'
-import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
-import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { ToolCallId } from '@deepseek-ai/dsh-llm/types'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { ContextFormed } from '@deepseek-ai/dsh-llm'
+import type { SessionId, SessionEvent } from '@deepseek-ai/dsh-session'
+import { defineContentToolFixture } from '@deepseek-ai/dsh-tool-testkit'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
 import * as RepeatToolGuard from '@deepseek-ai/dsh-repeat-tool-reminder'
 import type { Config } from '@deepseek-ai/dsh-repeat-tool-reminder'
 import { MockAdapter, textResponse, toolCallResponse } from '../../../core/agent-loop/tests/mock-adapter.ts'
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'test': { kind: 'test' } & ContextFormed
+  }
+}
 
 const testToolSignal = new AbortController().signal
 
@@ -48,8 +59,7 @@ function reminders(agent: Agent): { text: string; source: unknown }[] {
 // The reminder is a `notice`-form context; its summary names the repeated
 // call so a reader sees it without expanding the row.
 const guardSource = (tool: string, count: number) => ({
-  kind: 'plugin',
-  plugin: 'repeat-tool-reminder',
+  kind: 'repeat-tool-reminder',
   form: 'notice',
   summary: `${tool} × ${count}`,
 })
@@ -62,7 +72,7 @@ describe('threshold escalation', () => {
       textResponse('done'),
     ])
     ctx.llm.registerAdapter(['mock'], adapter)
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await waitForIdle(ctx, agent)
 
@@ -83,7 +93,7 @@ describe('threshold escalation', () => {
       textResponse('done'),
     ])
     ctx.llm.registerAdapter(['mock'], adapter)
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await waitForIdle(ctx, agent)
 
@@ -95,6 +105,70 @@ describe('threshold escalation', () => {
 })
 
 describe('chain semantics', () => {
+  it.each(['composite', 'other'])('nested %s calls neither count nor reset the model-direct chain', async (nestedName) => {
+    const ctx = await harness()
+    onTestFinished(async () => { await ctx.fiber.dispose() })
+    const downstreamContext = createUserMessage({
+      content: [{ type: 'text', text: 'nested policy context' }],
+      source: { kind: 'test' },
+    })
+    let nestedCalls = 0
+    const nestedResults: ToolExecutionResult[] = []
+    ctx.on('tools/post-execute', async (exec, _result, next) => {
+      const decision = await next()
+      if (exec.parent === undefined) return decision
+      nestedCalls += 1
+      return { ...decision, additionalContexts: [downstreamContext] }
+    })
+    ctx.tools.register(defineContentToolFixture({
+      name: 'composite',
+      description: 'Run nested calls.',
+      parameters: {},
+      async execute(_args, exec) {
+        if (exec.parent === undefined) {
+          for (let index = 0; index < 5; index += 1) {
+            const result = await executeToolFixture(ctx, {
+              callId: brandString<ToolCallId>(`${exec.callId}:nested:${index}`),
+              name: nestedName,
+              arguments: {},
+              ...exec.agent === undefined ? {} : { agent: exec.agent },
+              parent: exec.token,
+              signal: exec.signal,
+            })
+            nestedResults.push(result)
+          }
+        }
+        return [{ type: 'text', text: 'ok' }]
+      },
+    }))
+    const adapter = new MockAdapter([
+      ...Array.from({ length: 5 }, (_, index) => toolCallResponse(`c${index}`, 'composite', {})),
+      textResponse('done'),
+    ])
+    ctx.llm.registerAdapter(['mock'], adapter)
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('nested'), { provider: 'mock', model: 'mock' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await waitForIdle(ctx, agent)
+
+    expect(nestedCalls).toBe(25)
+    expect(nestedResults.every(result => !result.isError)).toBe(true)
+    expect(nestedResults.map(result => result.additionalContexts)).toEqual(
+      Array.from({ length: 25 }, () => [downstreamContext]),
+    )
+    expect(reminders(agent).map(message => message.source)).toEqual([
+      guardSource('composite', 3),
+      guardSource('composite', 5),
+    ])
+    expect(adapter.requests.map(request => request.messages
+      .filter(message => message.role === 'user' && message.source?.kind === 'repeat-tool-reminder')
+      .map(message => message.source))).toEqual([
+      [], [], [],
+      [guardSource('composite', 3)],
+      [guardSource('composite', 3)],
+      [guardSource('composite', 3), guardSource('composite', 5)],
+    ])
+  })
+
   it('caps the detailed reminder arguments at argumentsPreviewChars (detection still keys on the full string)', async () => {
     const ctx = await harness({ thresholds: [2, 3], argumentsPreviewChars: 24 })
     const bigPayload = 'x'.repeat(400)
@@ -105,7 +179,7 @@ describe('chain semantics', () => {
       textResponse('done'),
     ])
     ctx.llm.registerAdapter(['mock'], adapter)
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await waitForIdle(ctx, agent)
 
@@ -129,7 +203,7 @@ describe('chain semantics', () => {
       textResponse('done'),
     ])
     ctx.llm.registerAdapter(['mock'], adapter)
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await waitForIdle(ctx, agent)
 
@@ -147,7 +221,7 @@ describe('chain semantics', () => {
       textResponse('done'),
     ])
     ctx.llm.registerAdapter(['mock'], adapter)
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await waitForIdle(ctx, agent)
 
@@ -168,7 +242,7 @@ describe('chain semantics', () => {
       textResponse('done'),
     ])
     ctx.llm.registerAdapter(['mock'], adapter)
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await waitForIdle(ctx, agent)
 
@@ -184,7 +258,7 @@ describe('chain semantics', () => {
       textResponse('done'),
     ])
     ctx.llm.registerAdapter(['mock'], adapter)
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await waitForIdle(ctx, agent)
 
@@ -200,7 +274,7 @@ describe('chain semantics', () => {
       textResponse('done'),
     ])
     ctx.llm.registerAdapter(['mock'], adapter)
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await waitForIdle(ctx, agent)
 
@@ -220,8 +294,8 @@ describe('chain semantics', () => {
       toolCallResponse('b3', 'probe', { q: 1 }),
       textResponse('done'),
     ]))
-    const agentA = await ctx.agentLoop.create(SessionId('a'), { provider: 'mock-a', model: 'model-a' })
-    const agentB = await ctx.agentLoop.create(SessionId('b'), { provider: 'mock-b', model: 'model-b' })
+    const agentA = await ctx.agentLoop.create(brandString<SessionId>('a'), { provider: 'mock-a', model: 'model-a' })
+    const agentB = await ctx.agentLoop.create(brandString<SessionId>('b'), { provider: 'mock-b', model: 'model-b' })
     agentA.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     agentB.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await Promise.all([waitForIdle(ctx, agentA), waitForIdle(ctx, agentB)])
@@ -240,7 +314,7 @@ describe('chain semantics', () => {
       textResponse('turn two done'),
     ])
     ctx.llm.registerAdapter(['mock'], adapter)
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await waitForIdle(ctx, agent)
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'again' }], source: { kind: 'user' } }))
@@ -261,14 +335,14 @@ describe('chain semantics', () => {
     // (the loop.spec pattern): a child plugin fiber owns `first`.
     let first!: Agent
     const fiber = await ctx.plugin(Object.assign(async (inner: Context) => {
-      first = await inner.agentLoop.create(SessionId('reused'), { provider: 'mock', model: 'mock' })
+      first = await inner.agentLoop.create(brandString<SessionId>('reused'), { provider: 'mock', model: 'mock' })
     }, { inject: ['agentLoop'] }))
     first.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await waitForIdle(ctx, first)
     await fiber.dispose()
     await first.whenIdle()
 
-    const second = await ctx.agentLoop.create(SessionId('reused'), { provider: 'mock', model: 'mock' })
+    const second = await ctx.agentLoop.create(brandString<SessionId>('reused'), { provider: 'mock', model: 'mock' })
     second.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await waitForIdle(ctx, second)
 
@@ -284,7 +358,7 @@ describe('chain semantics', () => {
       textResponse('done'),
     ])
     ctx.llm.registerAdapter(['mock'], adapter)
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await waitForIdle(ctx, agent)
 
@@ -293,14 +367,14 @@ describe('chain semantics', () => {
 
   it('ignores direct executes with no agent (they neither crash nor advance any chain)', async () => {
     const ctx = await harness({ thresholds: [2] })
-    const direct = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('d1'), name: 'probe', arguments: { q: 1 } })
+    const direct = await executeToolFixture(ctx, { signal: testToolSignal, callId: brandString<ToolCallId>('d1'), name: 'probe', arguments: { q: 1 } })
     expect(direct.isError).toBe(false)
 
     ctx.llm.registerAdapter(['mock'], new MockAdapter([
       toolCallResponse('c1', 'probe', { q: 1 }), // if the direct call had counted, this would be #2
       textResponse('done'),
     ]))
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await waitForIdle(ctx, agent)
 
@@ -314,8 +388,9 @@ describe('fold onto the downstream decision', () => {
     ctx.on('tools/post-execute', async () => ({
       kind: 'block' as const,
       feedback: [{ type: 'text' as const, text: 'nope' }],
+      info: { name: 'DownstreamPolicyError', code: 'DOWNSTREAM_BLOCKED' },
       additionalContexts: [createUserMessage({
-        content: [{ type: 'text' as const, text: 'downstream-ctx' }], source: { kind: 'plugin' as const, plugin: 'test' },
+        content: [{ type: 'text' as const, text: 'downstream-ctx' }], source: { kind: 'test' as const },
       })],
     }))
     const adapter = new MockAdapter([
@@ -324,7 +399,7 @@ describe('fold onto the downstream decision', () => {
       textResponse('done'),
     ])
     ctx.llm.registerAdapter(['mock'], adapter)
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await waitForIdle(ctx, agent)
 
@@ -332,14 +407,16 @@ describe('fold onto the downstream decision', () => {
     expect(found).toHaveLength(3)
     // Only the repeated call adds guard context; downstream source fields survive.
     expect(found[0]!.text).toBe('downstream-ctx')
-    expect(found[0]!.source).toEqual({ kind: 'plugin', plugin: 'test' })
+    expect(found[0]!.source).toEqual({ kind: 'test' })
     expect(found[1]!.text).toContain('repeating the exact same tool call')
     expect(found[1]!.source).toEqual(guardSource('probe', 2))
-    expect(found[2]).toEqual({ text: 'downstream-ctx', source: { kind: 'plugin', plugin: 'test' } })
+    expect(found[2]).toEqual({ text: 'downstream-ctx', source: { kind: 'test' } })
     // The block's feedback reached the tool result unchanged.
     const results = agent.session.snapshotEvents().filter((e): e is SessionEvent<'tool/result'> => e.type === 'tool/result')
-    expect(results.every(r => r.data.message.content[0].isError)).toBe(true)
-    expect(results[1]!.data.message.content[0].content).toEqual([{ type: 'text', text: 'nope' }])
+    expect(results.every(r => r.data.message.isError)).toBe(true)
+    expect(results[1]!.data.message.content).toEqual([{ type: 'text', text: 'nope' }])
+    // The block's structured error identity survives the reminder fold.
+    expect(results.map(r => r.data.error)).toEqual([0, 1].map(() => ({ name: 'DownstreamPolicyError', code: 'DOWNSTREAM_BLOCKED' })))
   })
 
   it('preserves a downstream canonical value replacement while folding', async () => {
@@ -354,7 +431,7 @@ describe('fold onto the downstream decision', () => {
       textResponse('done'),
     ])
     ctx.llm.registerAdapter(['mock'], adapter)
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await waitForIdle(ctx, agent)
 
@@ -362,7 +439,7 @@ describe('fold onto the downstream decision', () => {
     expect(found).toHaveLength(1)
     expect(found[0]!.text).toContain('repeating the exact same tool call')
     const results = agent.session.snapshotEvents().filter((e): e is SessionEvent<'tool/result'> => e.type === 'tool/result')
-    expect(results[1]!.data.message.content[0].content).toEqual([{ type: 'text', text: 'replaced' }])
+    expect(results[1]!.data.message.content).toEqual([{ type: 'text', text: 'replaced' }])
   })
 })
 

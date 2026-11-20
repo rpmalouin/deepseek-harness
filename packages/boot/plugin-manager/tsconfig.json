@@ -9,6 +9,9 @@
   ],
   "references": [
     {
+      "path": "../../util/package-manifest"
+    },
+    {
       "path": "../../../vendor/cordis"
     },
     {
@@ -21,6 +24,9 @@
       "path": "../app-boot"
     },
     {
+      "path": "../../util/official-bundles"
+    },
+    {
       "path": "../../util/atomic-write"
     },
     {
@@ -31,6 +37,9 @@
     },
     {
       "path": "../../llm/llm"
+    },
+    {
+      "path": "../../util/error"
     },
     {
       "path": "../../subprocess/subprocess"
@@ -61,6 +70,15 @@
     },
     {
       "path": "../../interaction/user-approval"
+    },
+    {
+      "path": "../../util/plugin-detail"
+    },
+    {
+      "path": "../../util/timeout"
+    },
+    {
+      "path": "../../client/connection/tsconfig.host.json"
     }
   ]
 }

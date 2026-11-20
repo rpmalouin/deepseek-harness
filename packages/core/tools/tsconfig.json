@@ -12,13 +12,13 @@
       "path": "../../core/session"
     },
     {
-      "path": "../../ptc-runtime/ptc-runtime"
-    },
-    {
       "path": "../../../vendor/cosmokit"
     },
     {
       "path": "../../../vendor/cordis"
+    },
+    {
+      "path": "../../../vendor/schemastery"
     },
     {
       "path": "../../llm/llm"
@@ -34,15 +34,6 @@
     },
     {
       "path": "../../interaction/user-approval"
-    },
-    {
-      "path": "../../runtime-diagnostics/invariants"
-    },
-    {
-      "path": "../../sandbox/sandbox"
-    },
-    {
-      "path": "../../sandbox/sandbox-policy"
     }
   ]
 }

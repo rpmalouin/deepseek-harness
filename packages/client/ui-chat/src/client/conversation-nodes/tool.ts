@@ -1,12 +1,13 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {
-  ConversationMatch, ConversationNodeContext, ConversationNodeDefinition, RunningToolCall,
+  ConversationMatch, ConversationNodeContext, ConversationNodeDefinition, PreparingToolCall, StartedToolCall,
   ToolCallBlock, ToolResultNode,
 } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { isAppendSurfaceEvent } from '@deepseek-ai/dsh-session/surface'
-import type {} from '@deepseek-ai/dsh-tools/types'
-import type { ToolChatData } from '../contract/chat-nodes.ts'
-import { CHAT_SYNTHETIC_SEQ_OFFSETS, chatNode } from './common.ts'
+import type {} from '@deepseek-ai/dsh-tool-executor-ptc/client'
+import { PartialArguments } from '@deepseek-ai/dsh-util-values'
+import type { ChatNode, ToolChatData } from '../contract/chat-nodes.ts'
+import { CHAT_SYNTHETIC_SEQ_OFFSETS, chatNode, contextLocation } from './common.ts'
 
 declare module '../contract/chat-nodes.ts' {
   interface ChatNodeDataMap {
@@ -18,7 +19,8 @@ declare module '../contract/chat-nodes.ts' {
 const MAX_DEPTH = 256
 
 interface ToolState {
-  readonly root: ToolCallBlock
+  /** Absent until a named delta or `tool/call` identifies the call. */
+  readonly root: ToolCallBlock | undefined
   readonly children: ReadonlyMap<string, readonly ToolCallBlock[]>
   readonly parents: ReadonlyMap<string, string>
 }
@@ -36,12 +38,16 @@ function jsonArguments(value: unknown): string {
   return JSON.stringify(value)
 }
 
-function rootCall(match: ConversationMatch): RunningToolCall {
+function rootCall(match: ConversationMatch, previous?: ToolCallBlock): StartedToolCall {
   if (match.event.type !== 'tool/call') throw new Error('tool-call start requires tool/call')
   return {
+    phase: 'start',
     callId: String(match.event.data.callId),
     name: match.event.data.name,
     argsRaw: match.event.data.arguments,
+    args: previous === undefined
+      ? PartialArguments.fromText(match.event.data.arguments)
+      : previous.args.settle(match.event.data.arguments),
     turn: match.event.data.turn,
     step: match.event.data.step,
     time: match.event.time,
@@ -49,18 +55,62 @@ function rootCall(match: ConversationMatch): RunningToolCall {
   }
 }
 
-function rootResult(match: ConversationMatch, previous?: RunningToolCall): ToolResultNode | undefined {
+/**
+ * Retain argument fragments in the named call's lazy view. Root replacement
+ * belongs to publication, after all pending fragments can be observed together.
+ */
+function applyDelta(state: ToolState, match: ConversationMatch): ToolState {
+  const event = match.event
+  if (event.type !== 'assistant/live-chunk') return state
+  const chunk = event.data.chunk
+  const root = state.root
+  if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') {
+    if (root === undefined || 'kind' in root || root.phase !== 'preparing') return state
+    return { ...state, root: { ...root, name: chunk.block.name, args: root.args.settle(chunk.block.arguments) } }
+  }
+  if (chunk.type !== 'tool-call-delta') return state
+  if (root === undefined) {
+    // An unnamed delta before the name is skipped; a view opened late sees a non-object prefix and reports nothing.
+    if (!chunk.name) return state
+    const args = new PartialArguments()
+    args.append(chunk.argumentsDelta)
+    return {
+      ...state,
+      root: {
+        phase: 'preparing',
+        callId: String(chunk.id), name: chunk.name,
+        turn: event.data.turn, step: event.data.step, time: event.time,
+        subCalls: [],
+        args,
+      },
+    }
+  }
+  if ('kind' in root || root.phase !== 'preparing' || root.args.isSealed) return state
+  root.args.append(chunk.argumentsDelta)
+  return state
+}
+
+function preparingBlock(root: PreparingToolCall, current: ToolCallBlock | undefined): PreparingToolCall {
+  const changed = root.args.refresh()
+  if (!changed && current !== undefined && !('kind' in current)
+    && current.phase === 'preparing' && current.name === root.name && current.args === root.args) return current
+  return changed ? { ...root } : root
+}
+
+function rootResult(match: ConversationMatch, previous?: StartedToolCall): ToolResultNode | undefined {
   if (match.event.type !== 'tool/result') return undefined
-  const result = match.event.data.message.content[0]
+  const message = match.event.data.message
   return {
     kind: 'tool-result',
     seq: match.event.seq,
     time: match.event.time,
-    callId: String(match.event.data.message.source.callId),
+    callId: String(message.source.callId),
+    name: previous?.name ?? '',
+    args: previous?.args ?? PartialArguments.EMPTY,
     call: previous === undefined ? null : { name: previous.name, argsRaw: previous.argsRaw },
     callTime: previous?.time ?? null,
-    content: result.content,
-    isError: result.isError === true,
+    content: message.content,
+    isError: message.isError === true,
     ...match.event.data.error === undefined ? {} : { error: match.event.data.error },
     meta: match.event.data.meta,
     subCalls: [],
@@ -75,14 +125,17 @@ interface DispatchData {
   readonly isError?: boolean
   readonly error?: { name: string; code: string; reason?: string }
   readonly content?: ToolResultNode['content']
+  readonly meta?: ToolResultNode['meta']
 }
 
-function childCall(match: ConversationMatch, data: DispatchData): RunningToolCall {
+function childCall(match: ConversationMatch, data: DispatchData): StartedToolCall {
   return {
+    phase: 'start',
     callId: data.subCallId,
     parentCallId: data.parentCallId,
     name: data.name,
     argsRaw: jsonArguments(data.arguments),
+    args: PartialArguments.fromObject(data.arguments),
     turn: locationTurn(match),
     step: locationStep(match),
     time: match.event.time,
@@ -97,9 +150,12 @@ function childResult(match: ConversationMatch, data: DispatchData, previous?: To
     time: match.event.time,
     callId: data.subCallId,
     parentCallId: data.parentCallId,
+    name: data.name,
+    args: previous !== undefined && !('kind' in previous) ? previous.args : PartialArguments.fromObject(data.arguments),
     call: { name: data.name, argsRaw: jsonArguments(data.arguments) },
     callTime: previous?.time ?? null,
     content: data.content ?? [],
+    meta: data.meta,
     isError: data.isError === true,
     ...data.error === undefined ? {} : { error: data.error },
     subCalls: [],
@@ -174,6 +230,7 @@ function projectBlock(
   visited = new Set<string>(),
   depth = 1,
 ): ToolCallBlock {
+  if (!('kind' in block) && block.phase === 'preparing') return block
   if (visited.has(block.callId) || depth > MAX_DEPTH) return { ...block, subCalls: [] }
   const nextVisited = new Set(visited)
   nextVisited.add(block.callId)
@@ -196,6 +253,8 @@ function projectBlock(
       time: interruptedAt.time,
       callId: block.callId,
       ...block.parentCallId === undefined ? {} : { parentCallId: block.parentCallId },
+      name: block.name,
+      args: block.args,
       call: { name: block.name, argsRaw: block.argsRaw },
       callTime: block.time,
       content: [],
@@ -229,11 +288,19 @@ function fallbackState(context: ConversationNodeContext<ToolState>): ToolState |
   return state
 }
 
-/** Root Tool lifecycle and nested PTC dispatch Definition. */
+/** Root Tool preparation, dispatch, result, and nested PTC calls. */
 export const toolDefinition: ConversationNodeDefinition<ToolState> = {
   kind: 'tool-call',
   target: 'chat',
   match: (event) => {
+    if (event.type === 'assistant/live-chunk') {
+      // Every delta of a call is a start candidate: the earliest opens the Context, later ones fold as updates.
+      const chunk = event.data.chunk
+      if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') {
+        return { id: String(chunk.block.id), role: 'start' }
+      }
+      return chunk.type === 'tool-call-delta' ? { id: String(chunk.id), role: 'start' } : null
+    }
     if (event.type === 'tool/call') return { id: String(event.data.callId), role: 'start' }
     if (event.type === 'tool/result' && isAppendSurfaceEvent(event)) {
       return { id: String(event.data.message.source.callId), role: 'update' }
@@ -246,22 +313,42 @@ export const toolDefinition: ConversationNodeDefinition<ToolState> = {
     }
     return null
   },
-  start: (_context, match) => ({ root: rootCall(match), children: new Map(), parents: new Map() }),
+  start: (_context, match) => {
+    const state: ToolState = { root: undefined, children: new Map(), parents: new Map() }
+    return match.event.type === 'tool/call' ? { ...state, root: rootCall(match) } : applyDelta(state, match)
+  },
   update: (context, match) => {
+    if (match.event.type === 'assistant/live-chunk') return applyDelta(context.state, match)
+    if (match.event.type === 'tool/call') return { ...context.state, root: rootCall(match, context.state.root) }
     if (match.event.type === 'tool/result') {
-      const running = 'kind' in context.state.root ? undefined : context.state.root
+      const root = context.state.root
+      const running = root !== undefined && !('kind' in root) && root.phase === 'start' ? root : undefined
       const result = rootResult(match, running)
       return result === undefined ? context.state : { ...context.state, root: result }
     }
     return updateDispatch(context.state, match)
   },
+  publication: match => match.event.type === 'assistant/live-chunk' ? 'animation-frame' : 'immediate',
   buildViewNode: (context) => {
+    const current = context.current.get('chat') as ChatNode<'tool-call'> | null | undefined
     const state = context.state ?? fallbackState(context)
-    if (state === undefined) return null
-    const projected = projectBlock(state.root, state, interruption(context))
+    if (state?.root === undefined) {
+      return current == null ? null : current.visibility === 'hidden' ? current : { ...current, visibility: 'hidden' }
+    }
+    const interruptedAt = interruption(context)
+    const root = !('kind' in state.root) && state.root.phase === 'preparing'
+      ? preparingBlock(state.root, current?.data.root)
+      : state.root
+    const projected = projectBlock(root, state, interruptedAt)
     const anchor = context.start?.event.seq
       ?? ('kind' in state.root ? state.root.seq : context.matches[0]?.event.seq ?? 0)
-    return chatNode(context, 'tool-call', anchor, { root: projected } satisfies ToolChatData)
+    const preparing = !('kind' in projected) && projected.phase === 'preparing'
+    const visibility = preparing && interruptedAt !== undefined ? 'hidden' : 'visible'
+    const location = contextLocation(context)
+    const data = current?.data.root === projected ? current.data : { root: projected } satisfies ToolChatData
+    if (current?.data === data && current.anchorSeq === anchor
+      && current.visibility === visibility && current.location === location) return current
+    return chatNode(context, 'tool-call', anchor, data, { visibility, location })
   },
 }
 
@@ -270,5 +357,15 @@ export const toolDefinition: ConversationNodeDefinition<ToolState> = {
  * @param ctx - owning UI Conversation context.
  */
 export function registerToolConversationNode(ctx: Context): void {
-  ctx.uiConversation.events.register(toolDefinition)
+  const match = toolDefinition.match.bind(toolDefinition)
+  ctx.uiConversation.events.register({
+    ...toolDefinition,
+    match: {
+      'assistant/live-chunk': match,
+      'tool/call': match,
+      'tool/result': match,
+      'tool/ptc-dispatch-start': match,
+      'tool/ptc-dispatch': match,
+    },
+  })
 }

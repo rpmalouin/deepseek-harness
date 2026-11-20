@@ -1,25 +1,33 @@
+import { executeToolFixture } from '@deepseek-ai/dsh-tool-testkit'
+import { mountWorkingDirectoryFixture } from '../../subagent/tests/working-directory-fixture.ts'
+import { afterEach } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import LlmRuntime, { ToolCallId } from '@deepseek-ai/dsh-llm'
-import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
-import ToolRuntime from '@deepseek-ai/dsh-tools'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { ToolCallId } from '@deepseek-ai/dsh-llm/types'
 import type { Agent, AgentOptions } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
 import SubagentRuntime from '@deepseek-ai/dsh-subagent'
-import { Session, SessionId } from '@deepseek-ai/dsh-session'
-import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
+import type { SessionId } from '@deepseek-ai/dsh-session'
 import * as mock from './scripted-provider.ts'
+import type { Config as toolConfig } from '../src/index.ts'
 import * as tool from '../src/index.ts'
 import SubagentModelSelectionConfig from '../src/model-selection-settings.ts'
 
+const contexts = new Set<Context>()
+afterEach(async () => {
+  for (const ctx of contexts) await ctx.fiber.dispose()
+  contexts.clear()
+})
+
+/** Register a test context for awaited teardown. */
+export function ownContext(ctx: Context): Context {
+  contexts.add(ctx)
+  return ctx
+}
+
 /** Shared non-aborted tool signal for package-local integration tests. */
 export const testToolSignal = new AbortController().signal
-
-/** Build the minimal parent Agent owned by the package-local scripted provider. */
-export function fakeAgent(id = 'parent-1'): Agent {
-  const sessionId = SessionId(id)
-  return { id: sessionId, options: {}, session: Session.create(sessionId) } as unknown as Agent
-}
 
 /** Mount the real tool and service stack around one scripted subagent provider. */
 const setupAgents = new WeakMap<Context, Agent>()
@@ -27,8 +35,10 @@ const setupProviders = new WeakMap<Context, Awaited<ReturnType<typeof mock.mount
 let setupAgentCounter = 0
 
 /** Test-only opt-in translated to the real Host setting and Session path. */
-type SetupConfig = tool.Config & {
+type SetupConfig = toolConfig & {
   withModelSelection?: boolean
+  /** Host setting sampled by a `withModelSelection` setup; defaults to enabled. */
+  hostSelectionEnabled?: boolean
   parentAgentOptions?: AgentOptions
 }
 
@@ -42,24 +52,25 @@ const TEST_ALLOWED_MODELS = [
 ])
 
 export async function setup(toolConfig: SetupConfig, mockConfig: Partial<mock.Config> = {}): Promise<Context> {
-  const ctx = new Context()
-  const { withModelSelection, parentAgentOptions, ...config } = toolConfig
+  const ctx = ownContext(new Context())
+  const { withModelSelection, hostSelectionEnabled = true, parentAgentOptions, ...config } = toolConfig
+  await mountAgentLoopTestDependencies(ctx)
   if (withModelSelection === true) {
     await ctx.plugin(SubagentModelSelectionConfig, {
-      enabled: true,
+      enabled: hostSelectionEnabled,
       allowedModels: TEST_ALLOWED_MODELS,
     })
-    await mountAgentLoopTestDependencies(ctx)
     await ctx.plugin(AgentLoop, { agents: [] })
+    await mountWorkingDirectoryFixture(ctx)
     await ctx.plugin(SubagentRuntime)
     const provider = await mock.mountScriptedProvider(ctx, { name: 'mock', ...mockConfig })
     setupProviders.set(ctx, provider)
     const handle = await ctx.agents.create({
-      sessionId: SessionId(`model-selection-setup-${++setupAgentCounter}`),
+      sessionId: brandString<SessionId>(`model-selection-setup-${++setupAgentCounter}`),
       ...parentAgentOptions !== undefined ? { agentOptions: parentAgentOptions } : {},
-      setup: async (agentCtx, agent) => {
+      setup: async (agentCtx) => {
         const fiber = agentCtx.inject(tool.inject, (runtimeCtx) => {
-          tool.apply(runtimeCtx, { ...config, modelSelectionSettings: true }, agent.session)
+          tool.apply(runtimeCtx, { ...config, modelSelection: true, modelDiscovery: true })
         })
         await fiber.await()
       },
@@ -67,14 +78,14 @@ export async function setup(toolConfig: SetupConfig, mockConfig: Partial<mock.Co
     setupAgents.set(ctx, handle.agent)
     return ctx
   }
-  await ctx.plugin(LlmRuntime)
-  await ctx.plugin(SystemPrompt)
-  await ctx.plugin(ToolRuntime)
+  await ctx.plugin(AgentLoop, { agents: [] })
+  await mountWorkingDirectoryFixture(ctx)
   await ctx.plugin(SubagentRuntime)
-  await ctx.plugin(SessionProjectionRegistry)
   const provider = await mock.mountScriptedProvider(ctx, { name: 'mock', ...mockConfig })
   setupProviders.set(ctx, provider)
   await ctx.plugin(tool, config)
+  const handle = await ctx.agents.create({ sessionId: brandString<SessionId>(`tool-setup-${++setupAgentCounter}`), ...parentAgentOptions === undefined ? {} : { agentOptions: parentAgentOptions } })
+  setupAgents.set(ctx, handle.agent)
   return ctx
 }
 
@@ -96,7 +107,7 @@ export function modelSelectionSetupAgent(ctx: Context): Agent {
 let callCounter = 0
 
 /** Execute the registered subagent tool through the real ToolRuntime pipeline. */
-export function callSubagent(
+export async function callSubagent(
   ctx: Context,
   args: unknown,
   over: { agent?: Agent | undefined; signal?: AbortSignal } = {},
@@ -104,10 +115,11 @@ export function callSubagent(
   // Distinguish "no override" (use a default agent) from an explicit
   // `{ agent: undefined }` (test the no-agent path). Under
   // exactOptionalPropertyTypes the key is omitted rather than set to undefined.
-  const agent = 'agent' in over ? over.agent : setupAgents.get(ctx) ?? fakeAgent()
-  return ctx.tools.execute({
+  const agent = 'agent' in over ? over.agent : setupAgents.get(ctx)
+    ?? (await ctx.agents.create({ sessionId: brandString<SessionId>(`tool-call-parent-${++setupAgentCounter}`) })).agent
+  return executeToolFixture(ctx, {
     signal: testToolSignal,
-    callId: ToolCallId(`call-${++callCounter}`),
+    callId: brandString<ToolCallId>(`call-${++callCounter}`),
     name: 'subagent',
     arguments: args,
     ...agent ? { agent } : {},
@@ -116,6 +128,6 @@ export function callSubagent(
 }
 
 /** Join text blocks from one rendered tool result. */
-export function text(result: { content: { type: string; text?: string }[] }): string {
+export function text(result: { content: readonly { type: string; text?: string }[] }): string {
   return result.content.filter(block => block.type === 'text').map(block => block.text).join('')
 }

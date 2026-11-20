@@ -2,7 +2,7 @@
 import { useEffect, useLayoutEffect, useRef, type ReactNode } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
-import { Button, IconPlusOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, IconPlusOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { TerminalViewState, TerminalView } from '@deepseek-ai/dsh-api-terminal-controller/client'
 import type { InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ThemeSnapshot } from '@deepseek-ai/dsh-client-ui-theme/client'
@@ -29,7 +29,7 @@ export function TerminalBody({ useTabInfo, useTerminal, useTheme, view, t }: Ter
   useEffect(() => model.mount(), [model])
   if (state === undefined) return null
   const newTerminal = <Button variant="primary" size={state.issue === 'missingTerminal' ? 'md' : 'sm'}
-    icon={<span className={css.actionIcon} aria-hidden="true"><IconPlusOutline16 /></span>}
+    icon={<span className={css.actionIcon} aria-hidden="true"><IconPlusOutlineRegular /></span>}
     onClick={() => { tab.actions.openTab('terminal', { replaceTab: true }) }}>
     {t('new')}
   </Button>
@@ -69,6 +69,16 @@ export function TerminalBody({ useTabInfo, useTerminal, useTheme, view, t }: Ter
   )
 }
 
+/**
+ * xterm.js reports the person's input and terminal-protocol replies through the same data event, so input that
+ * follows a person's gesture within this window counts as typed; IME commits arrive in a later task. Scrolling is
+ * not a gesture: xterm turns the wheel into arrow keys on the alternate screen, and reading must not take over.
+ */
+const TYPED_INPUT_WINDOW_MS = 250
+const INPUT_GESTURES = ['keydown', 'beforeinput', 'paste', 'compositionend', 'drop', 'mousedown', 'touchstart'] as const
+/** Focus-in and focus-out reports (DECSET 1004) that xterm.js sends when a click focuses the screen. */
+const FOCUS_REPORTS = new Set(['\x1b[I', '\x1b[O'])
+
 /* oxlint-disable typescript/no-non-null-assertion -- React sets the DOM ref, then these effects initialize and use the emulator. */
 function TerminalScreen({ state, model, visible, label, theme }: {
   state: TerminalViewState
@@ -82,12 +92,17 @@ function TerminalScreen({ state, model, visible, label, theme }: {
   const fit = useRef<FitAddon>()
   const colors = useRef<TerminalTheme>()
   const lastRevision = useRef(0)
-  const current = useRef({ state, visible })
-  current.current = { state, visible }
+  const fontFamily = terminalFontFamily(theme.fontFamilies.terminal)
+  const fontSize = theme.fontSizes.terminal
+  const current = useRef({ state, visible, fontFamily, fontSize })
+  current.current = { state, visible, fontFamily, fontSize }
 
   useLayoutEffect(() => {
     const node = element.current!
-    const xterm = new Terminal({ minimumContrastRatio: 4.5, cursorBlink: true, fontSize: 13, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace', scrollback: current.current.state.environment?.scrollback ?? 0 })
+    const xterm = new Terminal({
+      minimumContrastRatio: 4.5, cursorBlink: true, fontSize: current.current.fontSize, fontFamily: current.current.fontFamily,
+      scrollback: current.current.state.environment?.scrollback ?? 0,
+    })
     const addon = new FitAddon()
     xterm.loadAddon(addon)
     xterm.open(node)
@@ -98,7 +113,12 @@ function TerminalScreen({ state, model, visible, label, theme }: {
     terminal.current = xterm
     fit.current = addon
     lastRevision.current = 0
-    const input = xterm.onData((data) => { model.write(data) })
+    let gestureAt = Number.NEGATIVE_INFINITY
+    const gesture = (): void => { gestureAt = performance.now() }
+    for (const type of INPUT_GESTURES) node.addEventListener(type, gesture, { capture: true, passive: true })
+    const input = xterm.onData((data) => {
+      model.write(data, performance.now() - gestureAt < TYPED_INPUT_WINDOW_MS && !FOCUS_REPORTS.has(data))
+    })
     const measure = (): void => {
       if (!current.current.visible || !current.current.state.writable || node.clientWidth === 0 || node.clientHeight === 0) return
       fitScreen(xterm, addon, current.current.state, model)
@@ -107,6 +127,7 @@ function TerminalScreen({ state, model, visible, label, theme }: {
     observer.observe(node)
     return () => {
       observer.disconnect()
+      for (const type of INPUT_GESTURES) node.removeEventListener(type, gesture, { capture: true })
       input.dispose()
       cursor.dispose()
       palette.dispose()
@@ -120,6 +141,18 @@ function TerminalScreen({ state, model, visible, label, theme }: {
     const style = getComputedStyle(element.current!)
     colors.current!.update(style.backgroundColor, style.color)
   }, [theme, model])
+
+  useLayoutEffect(() => {
+    const xterm = terminal.current!
+    if (xterm.options.fontFamily === fontFamily && xterm.options.fontSize === fontSize) return
+    // xterm remeasures cells on option change; refit so the Host grid follows the new cell size.
+    xterm.options.fontFamily = fontFamily
+    xterm.options.fontSize = fontSize
+    const { state: live, visible: shown } = current.current
+    if (shown && live.writable && element.current!.clientWidth && element.current!.clientHeight) {
+      fitScreen(xterm, fit.current!, live, model)
+    }
+  }, [fontFamily, fontSize, model])
 
   useLayoutEffect(() => {
     const xterm = terminal.current!
@@ -147,6 +180,13 @@ function TerminalScreen({ state, model, visible, label, theme }: {
   return <div className={css.screen} ref={element} />
 }
 /* oxlint-enable typescript/no-non-null-assertion */
+
+/** Built-in terminal stack placed after the user's normalized list. */
+const TERMINAL_FONT_STACK = 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'
+
+function terminalFontFamily(list: string): string {
+  return list === '' ? TERMINAL_FONT_STACK : `${list}, ${TERMINAL_FONT_STACK}`
+}
 
 function fitScreen(xterm: Terminal, fit: FitAddon, state: TerminalViewState, model: TerminalView): void {
   const dimensions = fit.proposeDimensions()

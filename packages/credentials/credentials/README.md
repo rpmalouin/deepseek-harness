@@ -53,12 +53,14 @@ declare const ctx: Context
 
 const ref = credentialRef('DEEPSEEK_API_KEY')          // POSIX shell identifier, branded
 const hit = await ctx.credentials.resolve(ref)         // { value, source } | undefined
-const info = await ctx.credentials.describe(ref)       // { configured, source?, writable } — never the value
-await ctx.credentials.set(ref, 'sk-…')                 // rejects while a read-only source shadows the ref
-await ctx.credentials.unset(ref)                       // no-op when absent; same shadowing rule
+const info = await ctx.credentials.describe(ref)       // { configured, source?, writable, masked? } — never the value
+await ctx.credentials.set(ref, 'sk-…')                 // the stored value outranks environment fallbacks
+await ctx.credentials.unset(ref)                       // no-op when absent; an environment fallback then applies again
 ```
 
-Store a key with `set`, remove it with `unset`, check its status with `describe`, and read the current value with `resolve` when an operation needs it. `describe` reports whether the key is set, where it comes from, and whether you can write to it — it never returns the value.
+Store a key with `set`, remove it with `unset`, check its status with `describe`, and read the current value with `resolve` when an operation needs it. `describe` reports whether the key is set, where it comes from, and whether you can write to it — it never returns the value. Providers may disclose a masked stored-value preview through the optional `masked` field; the full value stays on the Host.
+
+Consumers that must also work in compositions without a credentials service, such as DeepSeek request authentication, read references through `resolveCredentialRef(ctx, ref)` and `credentialRefConfigured(ctx, ref)`: a mounted service is authoritative, including when it holds no value, and only its absence makes them read the launch environment, where an empty value is absent. Store failures propagate. Callers validate the value's format with `normalizeApiKey(raw)`, which trims the value and rejects a blank one or one with characters no HTTP header can carry, and word their own error for the `reason` it returns; this package words no diagnostic.
 
 ### Storing, updating, and removing records
 
@@ -92,7 +94,7 @@ Requests that need the key use its current stored value, so rotating the key tak
 
 ### What can go wrong
 
-- **A key the launching environment supplies cannot be overwritten** — `DEEPSEEK_API_KEY=… dsh` (or a CI secret, a container `-e`) wins for this run and is reported read-only; clear the variable in the launching shell before storing a different value.
+- **A stored key outranks the launching environment** — while a value is stored, `DEEPSEEK_API_KEY=… dsh` (or a CI secret, a container `-e`) does not apply; `unset` the stored key to use the exported one.
 - **An empty value cannot be stored** — storing an empty string is refused; remove the key instead.
 - **Key values never appear in configuration UIs or diagnostics** — the UI shows whether a key is set, where it comes from, and whether you can change it; the value itself stays in the store.
 
@@ -114,7 +116,7 @@ One doctrine and four consequences:
 - **Consumers resolve per operation.** Resolution is a per-call read with no cross-operation cache; that read is the hot-update mechanism.
 - **An empty stored value is absent.** `resolve` skips it, `describe` reports it unconfigured — a blank can never masquerade as a configured secret.
 - **Records are durable, and presence is the fact.** A record is stored per `<scope>/<id>` and survives restarts; the empty-value rule does not apply, so an `api-key` record carrying neither a key nor environment values is a deliberate statement, not a blank.
-- **Listener failures are contained.** `notifyUpdated` fans `credentials/reference-updated` out so every listener runs; a sync throw or async rejection is logged without changing the committed operation's outcome, except `INVARIANT`-coded failures, which rethrow after every listener ran.
+- **Listener failures are contained.** `notifyUpdated` fans `credentials/reference-updated` out so every listener runs; a sync throw or async rejection is logged without changing the committed operation's outcome.
 
 ### The credentials/reference-updated event
 
@@ -131,8 +133,8 @@ One doctrine and four consequences:
 | File | Role |
 |---|---|
 | [`src/index.ts`](src/index.ts) | Service Definition: the `credentialRef`/`credentialKey` brands, `ResolvedCredential`/`CredentialRecordInfo`, the abstract provider over both key spaces, contained fan-out |
+| [`src/api-key.ts`](src/api-key.ts) | The well-formedness check of a resolved API key and the diagnostic that names where to fix it |
 | [`src/types.ts`](src/types.ts) | Client-safe type surface: the `CredentialRef` and `CredentialKey` brands, the stored-record union, the `CredentialInfo` reference view, the `credentials/reference-updated` and `credentials/record-updated` declarations |
-| [`src/invariant.ts`](src/invariant.ts) | Invariant companion: `credentials/reference-updated` only fires while a credentials service is live |
 
 ### Client-safe types
 
@@ -140,7 +142,7 @@ The `./types` subpath export holds the event declarations together with the `Cre
 
 ### Lifecycle
 
-The service is a Cordis `Service` registered by the provider: disposing the mounting fiber removes `ctx.credentials`. The invariant companion checks that `credentials/reference-updated` never fires without a live service — an emission after disposal means a provider leaked work past its teardown quiescence.
+The service is a Cordis `Service` registered by the provider: disposing the mounting fiber removes `ctx.credentials`.
 
 </details>
 

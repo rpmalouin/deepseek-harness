@@ -44,6 +44,20 @@ describe('desktop package target', () => {
       .toThrow(/at most one target/u)
   })
 
+  it('parses a build version, including the separator a pnpm run script forwards', () => {
+    expect(parseDesktopPackageInvocation(['mac-arm64'], 'darwin', 'arm64').requestedBuildVersion).toBeUndefined()
+    expect(parseDesktopPackageInvocation(['mac-arm64', '--build-version', '0.1.6-alpha.2.20260921.1'], 'darwin', 'arm64')
+      .requestedBuildVersion).toBe('0.1.6-alpha.2.20260921.1')
+    expect(parseDesktopPackageInvocation(['mac-arm64', '--build-version', 'auto'], 'darwin', 'arm64')
+      .requestedBuildVersion).toBe('auto')
+    // A run script's preset arguments come first, so pnpm forwards the separator after the target.
+    expect(parseDesktopPackageInvocation(['mac-arm64', '--', '--build-version', 'auto'], 'darwin', 'arm64'))
+      .toMatchObject({ requestedBuildVersion: 'auto', target: { name: 'mac-arm64' } })
+    expect(parseDesktopPackageInvocation(['--', '--check'], 'darwin', 'arm64').check).toBe(true)
+    expect(() => parseDesktopPackageInvocation(['mac-arm64', '--build-version', '  '], 'darwin', 'arm64'))
+      .toThrow(/--build-version requires a value/u)
+  })
+
   it('keeps electron-builder publishing disabled for the separate validated upload', () => {
     const target = resolveDesktopPackageTarget('mac-arm64', 'darwin', 'arm64')
     expect(desktopElectronBuilderArguments(target, false)).toEqual([
@@ -59,14 +73,16 @@ describe('desktop package target', () => {
     expect(desktopElectronBuilderArguments(target, true)).toContain('--dir')
   })
 
-  it('accepts unsigned Windows artifacts and rejects other targets or preparation-only use', () => {
+  it('accepts unsigned supported targets and rejects preparation-only use', () => {
     expect(parseDesktopPackageInvocation(['win-x64', '--unsigned'], 'win32', 'x64').unsigned).toBe(true)
     expect(parseDesktopPackageInvocation(['win-x64'], 'win32', 'x64').unsigned).toBe(false)
     expect(parseDesktopPackageInvocation(['--unsigned', '--dir'], 'win32', 'x64')).toMatchObject({
       unsigned: true, directory: true,
     })
-    expect(() => parseDesktopPackageInvocation(['mac-arm64', '--unsigned'], 'darwin', 'arm64'))
-      .toThrow(/requires win-x64/u)
+    for (const name of ['mac-arm64', 'mac-x64']) {
+      expect(parseDesktopPackageInvocation([name, '--unsigned'], 'darwin', 'arm64').unsigned).toBe(true)
+      expect(parseDesktopPackageInvocation([name, '--unsigned', '--dir'], 'darwin', 'arm64').directory).toBe(true)
+    }
     expect(() => parseDesktopPackageInvocation(['--unsigned', '--prepare-only'], 'win32', 'x64'))
       .toThrow(/cannot use --prepare-only/u)
   })
@@ -79,10 +95,16 @@ describe('desktop package target', () => {
       CSC_KEY_PASSWORD: 'secret',
       WIN_CSC_LINK: 'windows.pfx',
       CSC_IDENTITY_AUTO_DISCOVERY: 'true',
+      APPLE_API_KEY: 'private.p8',
+      APPLE_APP_SPECIFIC_PASSWORD: 'apple-secret',
+      DSH_DESKTOP_MACOS_SIGNING_IDENTITY: 'Example Company (TEAMID1234)',
+      DSH_DESKTOP_MACOS_TEAM_ID: 'TEAMID1234',
+      DSH_DESKTOP_MACOS_PACK_CONCURRENCY: '2',
       DSH_DESKTOP_UNSIGNED: '1',
     }
     expect(desktopElectronBuilderEnvironment(environment, true)).toEqual({
       DSH_DESKTOP_APP_ID: 'com.example.desktop',
+      DSH_DESKTOP_MACOS_PACK_CONCURRENCY: '2',
       CSC_IDENTITY_AUTO_DISCOVERY: 'false',
       DSH_DESKTOP_UNSIGNED: '1',
     })
@@ -125,4 +147,13 @@ describe('desktop package target', () => {
       DSH_DESKTOP_AUTO_UPDATE_ENV: 'production',
     })
   })
+})
+
+it('allows skipping notarization only for signed macOS packages', () => {
+  expect(parseDesktopPackageInvocation(['mac-arm64'], 'darwin', 'arm64').skipNotarization).toBe(false)
+  expect(parseDesktopPackageInvocation(['mac-arm64', '--skip-notarization'], 'darwin', 'arm64').skipNotarization).toBe(true)
+  for (const flag of ['--unsigned', '--prepare-only']) {
+    expect(() => parseDesktopPackageInvocation(['mac-arm64', '--skip-notarization', flag], 'darwin', 'arm64')).toThrow(/requires a signed macOS build/u)
+  }
+  expect(() => parseDesktopPackageInvocation(['win-x64', '--skip-notarization'], 'win32', 'x64')).toThrow(/requires a signed macOS build/u)
 })

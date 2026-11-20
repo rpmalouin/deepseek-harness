@@ -5,10 +5,10 @@
   min-width: 0;
   max-width: 220px;
   height: 28px;
-  padding: 0 4px 0 8px;
+  padding: 0 4px 0 12px;
   border: none;
   /* Rounded chip chrome, matching the sibling model trigger. */
-  border-radius: 24px;
+  border-radius: var(--dsw-radius-sm);
   outline: none;
   background: transparent;
   color: var(--dsw-alias-label-secondary);
@@ -18,12 +18,14 @@
   cursor: pointer;
 }
 
-.trigger:hover:not(:disabled) {
-  background: var(--dsw-alias-interactive-bg-hover);
+@media (hover: hover) {
+  .trigger:hover:not(:disabled) {
+    background: var(--dsw-alias-interactive-bg-hover);
+  }
 }
 
 .trigger:focus-visible {
-  box-shadow: 0 0 0 2px var(--dsw-alias-border-l3);
+  box-shadow: 0 0 0 2px var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
 }
 
 .trigger:disabled {
@@ -36,11 +38,10 @@
   flex: 0 0 auto;
 }
 
-/* The shared 16px glyphs render one step smaller on the exposed trigger;
-   the dropdown rows keep the full 16px. */
+/* Keep the composer mode visible beside its label. */
 .triggerIcon svg {
-  width: 14px;
-  height: 14px;
+  width: 16px;
+  height: 16px;
 }
 
 .triggerLabel {
@@ -52,7 +53,7 @@
 
 .optionLabel {
   display: inline-flex;
-  align-items: baseline;
+  align-items: center;
   gap: 4px;
   min-width: 0;
   max-width: 100%;
@@ -67,12 +68,10 @@
 
 .badge {
   flex: none;
-  align-self: flex-start;
-  margin-top: -1px;
   color: var(--dsw-alias-label-tertiary);
   font-size: 8px;
   line-height: 10px;
-  font-weight: 600;
+  font-weight: 500;
   letter-spacing: 0.2px;
 }
 
@@ -85,8 +84,8 @@
   transition: transform 120ms ease;
 }
 
-/* Narrow composer: the trigger collapses to icon + chevron so the row keeps
-   fitting. Only triggers that actually carry a mode glyph drop their label —
+/* Narrow composer: mode text collapses while icons stay visible.
+   Only triggers that actually carry a mode glyph drop their label —
    a host-configured mode without one keeps its text as the sole identifier.
    The 460px cut is the point where the row (attach + modes + model + send)
    starts squeezing labels; the container is the composer row (InputBar .row —

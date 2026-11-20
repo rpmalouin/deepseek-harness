@@ -2,15 +2,15 @@
 import type { ComponentType } from 'react'
 import type { InputTriggerCandidate } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
 import {
-  IconCompactOutline16, IconDownloadOutline16, IconGoalOutline16, IconPaperPlaneOutline14, IconPlanOutline14,
-  IconShieldOutline16,
+  IconCompactOutlineRegular, IconDownloadOutlineRegular,
+  IconGoalOutlineRegular, IconPaperPlaneOutlineRegular, IconPlanOutlineRegular,
+  PermissionIconFullAccessRegular,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { IconProps } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { TranslateNS } from '@deepseek-ai/dsh-client-locale/client'
 import type { CommandDescriptor } from '@deepseek-ai/dsh-commands/types'
 import type { CommandKey } from './locales.ts'
-import { builtinCommandName } from './resolution.ts'
-import type { BuiltinCommandName } from './resolution.ts'
+import { builtinCommandName, type BuiltinCommandName } from '@deepseek-ai/dsh-commands/builtin'
 
 /** The menu's two sections. */
 export type MenuSection = 'add' | 'commands'
@@ -39,12 +39,12 @@ function hostFace(name: BuiltinCommandName, icon: ComponentType<IconProps>): rea
 
 /** Built-in Host commands whose client face this package owns. */
 const HOST_FACES: ReadonlyMap<BuiltinCommandName, HostFace> = new Map([
-  hostFace('goal', IconGoalOutline16),
-  hostFace('plan', IconPlanOutline14),
-  hostFace('feedback', IconPaperPlaneOutline14),
-  hostFace('compact', IconCompactOutline16),
-  hostFace('permission', IconShieldOutline16),
-  hostFace('export', IconDownloadOutline16),
+  hostFace('goal', IconGoalOutlineRegular),
+  hostFace('plan', IconPlanOutlineRegular),
+  hostFace('feedback', IconPaperPlaneOutlineRegular),
+  hostFace('compact', IconCompactOutlineRegular),
+  hostFace('permission', PermissionIconFullAccessRegular),
+  hostFace('export', IconDownloadOutlineRegular),
 ])
 
 /**

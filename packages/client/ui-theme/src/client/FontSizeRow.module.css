@@ -19,6 +19,23 @@
   padding-right: 48px;
 }
 
+@media (max-width: 767px) {
+  /* The wide-row gutter squeezes labels beside steppers in narrow browser panels. */
+  :global(html:not([data-windows-titlebar]):not([data-platform='darwin'])) .row:not(.stacked) .rowText {
+    padding-right: 16px;
+  }
+
+  .stacked {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .stacked .rowText {
+    flex: none;
+    padding-right: 0;
+  }
+}
+
 .title {
   font-size: 14px;
   font-weight: 400;
@@ -33,9 +50,7 @@
   color: var(--dsw-alias-label-tertiary);
 }
 
-/* Stepper pill + unit label. The pill reuses the selector-pill geometry
-   (h36 r18, module fill) holding the px value and an always-visible arrow
-   column; the unit sits outside the pill. */
+/* Standard-size stepper with an always-visible arrow column and an external unit label. */
 .control {
   display: inline-flex;
   align-items: center;
@@ -49,7 +64,7 @@
   justify-content: center;
   min-width: 72px;
   height: 36px;
-  border-radius: 18px;
+  border-radius: var(--dsw-radius-md);
   background: var(--dsw-alias-bg-module-platform);
 }
 
@@ -81,9 +96,18 @@
   opacity: 0;
 }
 
-.stepper:hover .arrows,
+@media (hover: hover) {
+  .stepper:hover .arrows {
+    opacity: 1;
+  }
+}
+
 .stepper:focus-within .arrows {
   opacity: 1;
+}
+
+@media (hover: none) {
+  .arrows { opacity: 1; }
 }
 
 /* Arrow buttons: small chips carrying a translucent wash of the layer-1
@@ -97,17 +121,48 @@
   height: 12px;
   padding: 0;
   border: none;
-  border-radius: 3px;
+  border-radius: var(--dsw-radius-xs);
   background: color-mix(in srgb, var(--dsw-alias-bg-layer-1) 75%, transparent);
   color: var(--dsw-alias-label-primary);
   cursor: pointer;
 }
 
-.arrow:hover:not(:disabled) {
-  background: var(--dsw-alias-bg-layer-1);
+@media (hover: hover) {
+  .arrow:hover:not(:disabled) {
+    background: var(--dsw-alias-bg-layer-1);
+  }
 }
 
 .arrow:disabled {
   color: var(--dsw-alias-label-caption);
   cursor: default;
+}
+
+/* Disclosure for the per-role font settings; rotates while open. */
+.expander {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: var(--dsw-radius-xs);
+  background: transparent;
+  color: var(--dsw-alias-label-tertiary);
+  cursor: pointer;
+}
+
+@media (hover: hover) {
+  .expander:hover {
+    background: var(--dsw-alias-interactive-bg-hover);
+  }
+}
+
+.expander svg {
+  transition: transform var(--ds-transition-duration-fast) var(--ds-ease-in-out);
+}
+
+.expander[aria-expanded='true'] svg {
+  transform: rotate(180deg);
 }

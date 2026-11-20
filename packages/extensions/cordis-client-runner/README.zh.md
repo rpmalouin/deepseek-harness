@@ -55,6 +55,8 @@ kind: "package-reference"
 
 ### 源码地图
 
+入口在 runner 的上下文中安装与 Host 共用的 vendored Cordis `TimerService`。浏览器包内联 Timer，并使用模块表中的 Cordis 实例。定时任务归调用插件的 fiber 所有，释放该 fiber 会取消尚未执行的任务。
+
 | 文件 | 职责 |
 |---|---|
 | [`src/client/index.ts`](src/client/index.ts) | 插件入口：runner、编排器、inspect 注册表、转发事件订阅 |
@@ -64,7 +66,10 @@ kind: "package-reference"
 | [`src/client/guard.ts`](src/client/guard.ts) | 已装载浏览器半收到的白名单 `ctx` façade |
 | [`src/client/inspect-registry.ts`](src/client/inspect-registry.ts) | Client Inspect Provider 与待答查询路由器 |
 | [`src/client/providers.ts`](src/client/providers.ts) | 第一方 client Inspect Provider（slots、theme、events） |
-| [`src/client/timer.ts`](src/client/timer.ts) | 动态包注入的 client 定时器服务 |
+
+### 查询槽位输入
+
+Slots provider 的精确 `listSubTree` 查询包含带说明的 owner 字段及顶层别名、交叉类型和联合类型声明。嵌套字段的值类型只列出引用名称，因此查询 Tool 视图可以获得共享回调和阶段联合，而不会展开完整 Session 类型图。
 
 ### 一次 run 如何执行
 
@@ -139,5 +144,3 @@ React 可能在加载成功后失败。Client 报告其拥有的每个 entry 失
 无。
 
 </details>
-
-**运行时不变式：** 不发布伴生入口。所属关系（一个 live Plugin 的 loader entry 仅在一个 Plugin Run ID 存活期间存在）是只能通过 Client 半服务访问的浏览器侧状态，Node 平面的伴生入口无法观察。该关系改由本包自己的装载与拆除测试直接断言。

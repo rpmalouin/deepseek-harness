@@ -77,7 +77,6 @@ The package separates the script, run, result, and event contracts from executio
 | [`src/index.ts`](src/index.ts) | Service definition, `workflow/*` event declarations, `WorkflowError` and its fatal flag |
 | [`src/types.ts`](src/types.ts) | Browser-safe vocabulary: `WorkflowMeta`, `WorkflowResult`, run and agent event info |
 | [`src/runtime-types.ts`](src/runtime-types.ts) | Host-only `WorkflowStartRequest` and `WorkflowRun` handles |
-| [`src/invariant.ts`](src/invariant.ts) | Invariant companion: event pairing and identity checks |
 
 ### Lifecycle and ownership
 
@@ -87,7 +86,7 @@ A run is holder-owned: engine-plugin unload prevents new starts but does not rev
 
 ### Failure discipline
 
-`WorkflowError` carries a machine-routable code and a `fatal` flag; every code is fatal, and `parallel()` and `pipeline()` re-throw fatal errors instead of mapping the item to `null` — a typo'd option must kill the script loudly. Codes cover start failures, contract violations, exceeded caps, provider and result faults, unserializable values, and cancellation; the exact set and meanings live in [`src/index.ts`](src/index.ts).
+`WorkflowError` carries a machine-routable code and a `fatal` flag; every code is fatal, and `parallel()` and `pipeline()` re-throw fatal errors instead of mapping the item to `null` — a typo'd option must kill the script loudly. Codes cover start failures, contract violations, exceeded caps, provider and result faults, unserializable values, and cancellation; the code that ended a run is reported as `WorkflowResult.errorCode`, and `RUN_FAILED` classifies an `error` run without one; the exact set and meanings live in [`src/index.ts`](src/index.ts).
 
 The per-item `null` is reserved for child-run failures and ordinary in-stage script errors, so a child that resolves normally with a non-completed stop reason is not an infrastructure exception: `agent()` returns `null`, letting the script handle an ordinary child failure.
 
@@ -104,7 +103,7 @@ Read these pages when the package-level contract is not enough. They move from t
 - [Group map](../README.md) — the workflow capability family and its packages.
 - [workflow tool](../tool-workflow/README.md) — the model-facing consumer that owns the call schema and result envelope.
 - [PTC workflow engine](../workflow-ptc/README.md) — the current execution engine and its isolation boundary.
-- [Dynamic workflows Agent Note](../../../.agents/notes/implemented/feature/2026-07-05-dynamic-workflows.md) — the seam design and its decisions.
+- [historical Dynamic workflows Agent Note](../../../.agents/notes/archived/feature/2026-07-05-dynamic-workflows.md) — the seam design and its decisions.
 
 -----
 

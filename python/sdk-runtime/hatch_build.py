@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import runpy
 import stat
 from pathlib import Path
 
@@ -76,7 +77,7 @@ class RuntimeBuildHook(BuildHookInterface):
         target = next(name for name, value in _PLATFORMS.items() if value[0] == platform_tag)
         runtime_dir = Path(self.root) / "src" / "deepseek_harness_runtime" / "runtime"
         runtime_files = sorted(
-            runtime_dir.glob("deepseek-harness-sdk-runtime-*") if runtime_dir.is_dir() else []
+            (path for path in runtime_dir.iterdir() if path.name != "node") if runtime_dir.is_dir() else []
         )
         expected_files = (
             [expected_executable, f"{expected_executable.removesuffix('.exe')}-rg.exe"]
@@ -85,8 +86,8 @@ class RuntimeBuildHook(BuildHookInterface):
         )
         if "-macos-" in expected_executable:
             expected_files.append(f"{expected_executable}-spawn-helper")
-        office = runtime_dir / f"{expected_executable.removesuffix('.exe')}-office"
-        expected_files.append(office.name)
+        resources = runtime_dir / target
+        expected_files.append(resources.name)
         expected_files.sort()
         found_files = [path.name for path in runtime_files]
         if found_files != expected_files:
@@ -94,16 +95,9 @@ class RuntimeBuildHook(BuildHookInterface):
                 f"runtime wheel {platform_tag} payload must be {expected_files}; found {found_files}"
             )
         for executable in runtime_files:
-            if executable == office:
-                adapter = office / "node_modules/@deepseek-ai/libreoffice-kit/package.json"
-                if not adapter.is_file():
-                    raise RuntimeError(f"runtime Office dependency is missing: {adapter}")
-                native = target.replace("win-", "win32-").replace("macos-", "darwin-")
-                declared = json.loads(adapter.read_text(encoding="utf-8")).get("optionalDependencies", {})
-                engine = native if f"@deepseek-ai/libreoffice-kit-{native}" in declared else "wasm"
-                required = office / "node_modules" / f"@deepseek-ai/libreoffice-kit-{engine}/prebuilds.json"
-                if not required.is_file():
-                    raise RuntimeError(f"runtime Office dependency is missing: {required}")
+            if executable == resources:
+                validate = runpy.run_path(str(runtime_dir.parent / "_resources.py"))["validate_downloads"]
+                validate(resources, target)
                 continue
             if not executable.is_file():
                 raise RuntimeError(f"runtime executable is not a file: {executable}")

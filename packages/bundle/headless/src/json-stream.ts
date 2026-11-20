@@ -37,8 +37,8 @@ export interface JsonProjectionOptions {
 
 /** The live handle of one `--json` projection. */
 export interface JsonProjection {
-  /** Write the terminal `final` event carrying the run's answer text. */
-  finish(text: string): void
+  /** Write the answer and durable turn reason; omission reports no terminal turn. */
+  finish(text: string, reason?: SessionEvent<'turn/end'>['data']['reason']): void
   /** Stop observing the Session. */
   dispose(): void
 }
@@ -156,12 +156,12 @@ function parseArguments(raw: string): unknown {
   if (raw === '') return {}
   const seen = { nonFinite: false }
   try {
-    const parsed = JSON.parse(raw, (_key, value: unknown) => {
+    const parsed: unknown = JSON.parse(raw, (_key, value: unknown) => {
       // `1e400` is valid JSON but parses to Infinity, which JSON.stringify
       // reports as null; keep the raw text rather than misdescribe the call.
       if (typeof value === 'number' && !Number.isFinite(value)) seen.nonFinite = true
       return value
-    }) as unknown
+    })
     return seen.nonFinite ? raw : parsed
   } catch {
     return raw
@@ -232,8 +232,9 @@ function addUsage(state: StepUsageState, next: StepUsage | undefined): StepUsage
  * The opening `session` event is written before the subscription starts, so a
  * caller must invoke this before submitting the task. Text and reasoning are
  * emitted only when the step's `assistant/message` commits them, and the
- * terminal `final` event carries the same lossless answer the default mode
- * prints (it is deliberately not bounded).
+ * terminal `final` event carries the exact Session identity, the durable turn
+ * reason (null without a terminal turn), and the lossless answer. It is not bounded.
+ * Tool results include any durable structured error under the ordinary output bounds.
  * @param ctx - plugin context carrying the live Session feed.
  * @param agent - the exact Agent whose events belong to this invocation.
  * @param sink - stdout sink receiving one JSON object per line.
@@ -301,12 +302,13 @@ export function projectJsonRun(
         // Compaction replaces older results in the surface; those are history,
         // not this run's output, and would otherwise duplicate a callId.
         if (event.surfaceOp !== 'append') return
-        const block = event.data.message.content[0]
+        const message = event.data.message
         write({
           type: 'tool_result',
-          callId: block.toolCallId,
-          status: block.isError === true ? 'error' : 'completed',
-          result: resultText(block.content),
+          callId: message.toolCallId,
+          status: message.isError === true ? 'error' : 'completed',
+          result: resultText(message.content),
+          ...event.data.error === undefined ? {} : { error: event.data.error },
         })
         return
       }
@@ -319,10 +321,10 @@ export function projectJsonRun(
   const stopSession = ctx.on('session/event', onSessionEvent)
 
   return {
-    finish(text: string): void {
+    finish(text: string, reason?: SessionEvent<'turn/end'>['data']['reason']): void {
       // The answer is the lossless terminal contract, so it is not truncated.
       if (disposed) return
-      sink.write(`${JSON.stringify({ type: 'final', text })}\n`)
+      sink.write(`${JSON.stringify({ type: 'final', sessionId: agent.id, reason: reason ?? null, text })}\n`)
     },
     dispose(): void {
       disposed = true

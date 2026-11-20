@@ -54,7 +54,7 @@ kind: "package-reference"
 
 ### 添加提供方
 
-可选异步提供方可通过 `ctx.sessionTitle.register(provider)` 注册一个；第二次注册会立即抛出。随附的模型支持提供方是[首消息](../session-title-first-prompt-llm/README.zh.md)与[全消息](../session-title-all-prompts-llm/README.zh.md)，两者都使用共享的 [LLM（大语言模型）生成策略](../session-title-llm/README.zh.md)。提供方只有在带标记、由循环构建的请求的确切路由与已记录 `request/header` 匹配时才启动，较新的修订会取代并中止旧工作。
+可选异步提供方可通过 `ctx.sessionTitle.register(provider)` 注册一个；在前一个提供方开始释放之前，第二次注册会立即抛出。因此替代提供方可以在前一个提供方排空期间激活，前一个提供方迟到的结果不会提交。随附的模型支持提供方是[首消息](../session-title-first-prompt-llm/README.zh.md)与[全消息](../../experimental/session-title-all-prompts-llm/README.zh.md)，两者都使用共享的 [LLM（大语言模型）执行模块](../session-title-llm/README.zh.md)。每次调用前，服务会捕获最新已接纳标题快照（包括它刚刚确保的回退），并作为 `request.currentTitle` 传入；提供方自行决定是否以及如何使用。提供方只有在带标记、由循环构建的请求的确切路由与已记录 `request/header` 匹配时才启动，较新的修订会取代并中止旧工作。路由不变时，活跃步骤中带标记的请求会启动待处理的自动生成，无需新的 header 事件；已接受的人类消息可以位于当前 `step/start` 之后。 首提示词生成排除带继承前缀及 subagent 来源的 Session；独立 fork 不会因缺少来源关系而变为符合条件。
 
 ### 读取标题
 
@@ -88,6 +88,8 @@ kind: "package-reference"
 
 ### 生命周期与并发
 
+激活期间收到的消息会等待服务就绪，再请求内置回退标题。提供方在服务就绪后注册；此前的消息和请求不会追溯触发提供方。激活失败、服务卸载或 Session 移除都会阻止延后的回退标题写入。
+
 每个会话的工作状态维护一个修订计数器、一个进行中的回退，以及待处理与活跃的提供方工作。较新的用户消息、提供方 dispose（资源释放）、会话 dispose 或显式刷新都会通过 `AbortController` 中止旧工作；提供方、修订、会话或信号已陈旧的完成结果无法追加。显式刷新会在提供方工作之前预留修订号；重叠的自动／显式回退请求共享一个会话本地正在进行的追加操作。服务拆卸会取消排队工作，并在卸载完成前等待不响应取消的调用结算。
 
 ### 规范化
@@ -104,9 +106,9 @@ kind: "package-reference"
 当服务约定不够用时阅读以下页面。它们从子系统参考逐步进入在此插拔的模型支持提供方。
 
 - [会话标题子系统](../../../docs/subsystems/session-title.zh.md)——持久标题状态与提供方词汇类型。
-- [共享 LLM 标题策略](../session-title-llm/README.zh.md)——两个随附提供方共用的模型生成辅助模块。
+- [共享 LLM 执行模块](../session-title-llm/README.zh.md)——两个随附提供方共用的模型执行模块。
 - [首消息标题提供方](../session-title-first-prompt-llm/README.zh.md)——根据第一条符合条件的用户消息生成标题。
-- [全消息标题提供方](../session-title-all-prompts-llm/README.zh.md)——根据所有符合条件的用户消息生成标题。
+- [全消息标题提供方](../../experimental/session-title-all-prompts-llm/README.zh.md)——根据所有符合条件的用户消息生成标题。
 - [会话包映射](../README.zh.md)——相邻的持久化、投影、标题与遥测包。
 
 -----

@@ -67,19 +67,20 @@ export class ClientRealmSource {
 
 function sessionClientSourceId(): InspectorSourceDescriptor['sourceId'] {
   const generated = generatedClientSourceId()
+  let stored: string | null = null
   try {
-    const stored = sessionStorage.getItem(CLIENT_SOURCE_STORAGE_KEY)
-    if (stored !== null) {
-      try {
-        return inspectorId<'InspectorSourceId'>(stored, 'sourceId')
-      } catch {
-        // Invalid page-owned storage is replaced with a fresh protocol identity below.
-      }
-    }
-    sessionStorage.setItem(CLIENT_SOURCE_STORAGE_KEY, generated)
-  } catch {
+    stored = sessionStorage.getItem(CLIENT_SOURCE_STORAGE_KEY)
+  } catch (_storageUnavailable) {
     // Disabled or unavailable session storage limits identity to this page lifetime.
   }
+  if (stored !== null) {
+    try {
+      return inspectorId<'InspectorSourceId'>(stored, 'sourceId')
+    } catch (_invalidStoredId) {
+      // Invalid page-owned storage is replaced with a fresh protocol identity below.
+    }
+  }
+  persistClientSourceId(generated)
   return generated
 }
 
@@ -90,7 +91,7 @@ function generatedClientSourceId(): InspectorSourceDescriptor['sourceId'] {
 function persistClientSourceId(sourceId: InspectorSourceDescriptor['sourceId']): void {
   try {
     sessionStorage.setItem(CLIENT_SOURCE_STORAGE_KEY, sourceId)
-  } catch {
+  } catch (_storageUnavailable) {
     // Disabled or unavailable session storage limits identity to this page lifetime.
   }
 }
@@ -119,8 +120,8 @@ function tryClaimSourceId(
 }
 
 function clientOrigin(): string {
-  const location = Reflect.get(globalThis, 'location') as unknown
+  const location: unknown = Reflect.get(globalThis, 'location')
   if (typeof location !== 'object' || location === null) return ''
-  const origin = Reflect.get(location, 'origin') as unknown
+  const origin: unknown = Reflect.get(location, 'origin')
   return typeof origin === 'string' ? origin : ''
 }

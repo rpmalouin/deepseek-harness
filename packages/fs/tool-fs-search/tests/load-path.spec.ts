@@ -14,6 +14,8 @@
  * red, revert.
  */
 
+import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
+import { provideWorkingDirectoryFixture } from '@deepseek-ai/dsh-agent-loop-testkit'
 import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
@@ -30,15 +32,17 @@ describe('dsh-tool-fs-search real-load-path guard', () => {
     const unwrapped = loader.unwrapExports(toolFsSearch) as Record<string, unknown>
     expect(unwrapped).toBe(toolFsSearch)
     expect(unwrapped.name).toBe('tool-fs-search')
-    expect(unwrapped.inject).toEqual(['tools', 'systemPrompt', 'subprocess'])
+    expect(unwrapped.inject).toEqual(['tools', 'systemPrompt', 'subprocess', 'workingDirectory'])
     expect(typeof unwrapped.Config).toBe('function')
     expect(typeof unwrapped.apply).toBe('function')
   })
 
   it('boots over ctx.subprocess through the unwrapped module without an inject error', async () => {
     const ctx = new Context()
+    provideWorkingDirectoryFixture(ctx)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
+    await ctx.plugin(NativeToolExecutor)
     await ctx.plugin(LocalSubprocessRuntime)
 
     const loader = Object.create(Loader.prototype) as Loader

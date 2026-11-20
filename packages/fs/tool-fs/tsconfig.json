@@ -4,8 +4,16 @@
     "rootDir": "src",
     "outDir": "lib/types"
   },
-  "include": ["src"],
+  "include": [
+    "src"
+  ],
   "references": [
+    {
+      "path": "../../util/brand"
+    },
+    {
+      "path": "../../util/error"
+    },
     {
       "path": "../../../vendor/cosmokit"
     },
@@ -41,6 +49,18 @@
     },
     {
       "path": "../../attachment/attachment"
+    },
+    {
+      "path": "../../util/code-language"
+    },
+    {
+      "path": "../fs-patch"
+    },
+    {
+      "path": "../../util/values"
+    },
+    {
+      "path": "../../session/working-directory"
     }
   ]
 }

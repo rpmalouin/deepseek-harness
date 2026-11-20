@@ -1,16 +1,21 @@
 /** Test-owned Session Controller faces over declarative fixtures. */
 import type { Context } from '@deepseek-ai/cordis'
-import type { AttachmentIdType } from '@deepseek-ai/dsh-attachment'
+import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import {
   createScope, MutableSessionEventSource, scopeOf, SESSION_SEARCH_RESULT_LIMIT,
 } from '@deepseek-ai/dsh-api-session-controller/client'
 import type {
   AgentContext, ISessions, ProjectionsFace, SessionBinding, SessionFace, SessionListState,
   SessionEventLikeEntry, SessionLiveEventEntry, SessionSearchResultItem,
-  SessionReference, SessionReferenceSource, SessionRetainInfo, SessionRetainOptions,
+  SessionReference, SessionReferenceSource, SessionRetainFacet, SessionRetainInfo, SessionRetainOptions,
   SessionSnapshot, SessionSummary, SessionTarget, SubmissionHandle,
 } from '@deepseek-ai/dsh-api-session-controller/client'
 import { scopeIdentityOf } from '@deepseek-ai/dsh-api-session-controller/src/client/scope.ts'
+import {
+  EMPTY_RETAIN_INFO,
+  heldFacets,
+  shiftRetention,
+} from '@deepseek-ai/dsh-api-session-controller/src/client/sessions/facets.ts'
 import type { SessionRequestId } from '@deepseek-ai/dsh-api-session-controller/types'
 import type { SubagentAddress } from '@deepseek-ai/dsh-subagent/client'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
@@ -123,10 +128,10 @@ export class FixtureSession implements SessionFace {
 
   /**
    * Fail-loud stub; supply `readAttachment` on the fixture's session face to exercise it.
-   * @param _attachmentId - opaque durable attachment id.
+   * @param _attachment - complete durable image reference.
    * @returns never — always throws.
    */
-  readAttachment(_attachmentId: AttachmentIdType): never {
+  readAttachment(_attachment: ImageAttachmentRef): never {
     throw new Error(`test session "${this.sessionId}": readAttachment is not stubbed — supply it on the fixture's session face`)
   }
 
@@ -160,6 +165,14 @@ export class FixtureSession implements SessionFace {
    */
   loadOlder(): never {
     throw new Error(`test session "${this.sessionId}": loadOlder is not stubbed — supply it on the fixture's session face`)
+  }
+
+  /**
+   * Fail-loud stub; supply `consumeOlder` on the fixture's session face to exercise it.
+   * @returns never — always throws.
+   */
+  consumeOlder(): never {
+    throw new Error(`test session "${this.sessionId}": consumeOlder is not stubbed — supply it on the fixture's session face`)
   }
 
   /**
@@ -206,17 +219,8 @@ interface OpeningControl {
   readonly reject: (error: unknown) => void
 }
 
-function freezeRetainedBy(
-  counts: Partial<Record<SessionReferenceSource, number>>,
-): SessionRetainInfo['retainedBy'] {
-  Object.setPrototypeOf(counts, null)
-  return Object.freeze(counts)
-}
-
-const EMPTY_RETAIN_INFO: SessionRetainInfo = Object.freeze({
-  referenceCount: 0,
-  retainedBy: freezeRetainedBy({}),
-})
+/** Fixture references default to a rendering use, so Conversation assembly runs as it does under a main view. */
+const DEFAULT_TEST_RETAIN: SessionRetainOptions = { source: 'testFixture', facets: { conversation: true } }
 
 // TestSessions implements SessionReference against its fixture-owned
 // SessionGeneration without importing the production service's private record.
@@ -311,7 +315,7 @@ export class TestSessions implements ISessions {
 
   /** Calls observed on the service-level face, newest last. */
   readonly calls: {
-    method: 'create' | 'setSubagentCatalogOpen' | 'refreshSubagents' | 'refresh' | 'search' | 'fork'
+    method: 'create' | 'refreshProjections' | 'refresh' | 'search' | 'fork'
     args: unknown[]
   }[] = []
 
@@ -328,7 +332,7 @@ export class TestSessions implements ISessions {
    */
   constructor(private readonly stabilize: Stabilizer, private readonly rootCtx: Context) {
     this.list = createSnapshotStore<SessionListState>({
-      ids: [], byId: {}, phase: 'ready', subagentsByParent: {}, jobsBySession: {},
+      ids: [], byId: {}, phase: 'ready', projectionsBySession: {},
     })
     rootCtx.effect(() => async () => {
       this.closed = true
@@ -518,16 +522,17 @@ export class TestSessions implements ISessions {
   /* jscpd:ignore-start -- The fixture intentionally mirrors production SessionReference acquisition and release semantics. */
   retain(
     target: SessionTarget,
-    options: SessionRetainOptions = { source: 'testFixture' },
+    options: SessionRetainOptions = DEFAULT_TEST_RETAIN,
   ): SessionReference {
-    const { source, signal } = options
+    const { source, signal, facets } = options
     signal?.throwIfAborted()
     if (this.closed) throw new Error('test Session Controller is disposed')
     const id = this.resolveTarget(target)
     const generation = this.generations.get(id) ?? this.materialize(id, this.require(id))
-    const reference = this.retainGeneration(id, generation, source)
+    const connected = options.connection !== false
+    const reference = this.retainGeneration(id, generation, source, heldFacets(facets), connected)
     try {
-      reference.attachOpening(generation.opening, signal)
+      reference.attachOpening(connected ? generation.opening : Promise.resolve(), signal)
       return reference
     } catch (error: unknown) {
       reference.release()
@@ -569,7 +574,7 @@ export class TestSessions implements ISessions {
   retainFor(
     ownerCtx: Context,
     target: SessionTarget,
-    options: SessionRetainOptions = { source: 'testFixture' },
+    options: SessionRetainOptions = DEFAULT_TEST_RETAIN,
   ): SessionReference {
     const reference = this.retain(target, options)
     try {
@@ -629,23 +634,18 @@ export class TestSessions implements ISessions {
   subagentAddress(id: SessionId): SubagentAddress | undefined {
     const retained = this.addresses.get(id)
     if (retained !== undefined) return retained
-    for (const [parentSessionId, catalog] of Object.entries(this.list.getSnapshot().subagentsByParent)) {
-      const child = catalog.entries.find(entry => entry.kind === 'child' && entry.id === id)
-      if (child?.kind === 'child') {
+    for (const [parentSessionId, projections] of Object.entries(this.list.getSnapshot().projectionsBySession)) {
+      const child = projections.values.subagentCatalog?.find(entry => entry.id === id)
+      if (child !== undefined && child.mode !== 'external') {
         return { parentSessionId: parentSessionId as SessionId, childSessionId: id, mode: child.mode }
       }
     }
     return undefined
   }
 
-  /** Record catalog consumption; fixture callers drive snapshots explicitly. */
-  setSubagentCatalogOpen(parentSessionId: SessionId, open: boolean): void {
-    this.calls.push({ method: 'setSubagentCatalogOpen', args: [parentSessionId, open] })
-  }
-
-  /** Record a catalog refresh; fixture callers drive snapshots explicitly. */
-  refreshSubagents(parentSessionId: SessionId): Promise<void> {
-    this.calls.push({ method: 'refreshSubagents', args: [parentSessionId] })
+  /** Record a projection refresh; fixture callers drive snapshots explicitly. */
+  refreshProjections(sessionId: SessionId): Promise<void> {
+    this.calls.push({ method: 'refreshProjections', args: [sessionId] })
     return Promise.resolve()
   }
 
@@ -682,7 +682,7 @@ export class TestSessions implements ISessions {
    * @param opts - source session id, optional cut anchor, and client title policy.
    * @returns the source id (no child record is created).
    */
-  fork(opts: { sessionId: SessionId; atSeq?: number; increaseTitle?: boolean }): Promise<SessionId> {
+  fork(opts: Parameters<ISessions['fork']>[0]): Promise<SessionId> {
     this.calls.push({ method: 'fork', args: [opts] })
     return Promise.resolve(opts.sessionId)
   }
@@ -717,26 +717,15 @@ export class TestSessions implements ISessions {
     id: SessionId,
     generation: SessionGeneration,
     source: SessionReferenceSource,
+    facets: readonly SessionRetainFacet[],
+    connected: boolean,
   ): TestSessionReference {
-    const previous = generation.retention
-    generation.retention = Object.freeze({
-      referenceCount: previous.referenceCount + 1,
-      retainedBy: freezeRetainedBy({
-        ...previous.retainedBy,
-        [source]: (previous.retainedBy[source] ?? 0) + 1,
-      }),
-    })
+    const use = { source, facets, connected }
+    generation.retention = shiftRetention(generation.retention, use, 1)
     const reference = new TestSessionReference(id, generation, () => {
       if (!generation.live) return
-      const count = generation.retention.referenceCount - 1
-      const { [source]: sourceCount = 0, ...otherSources } = generation.retention.retainedBy
-      const retainedBy = sourceCount > 1
-        ? { ...otherSources, [source]: sourceCount - 1 }
-        : otherSources
-      generation.retention = count === 0
-        ? EMPTY_RETAIN_INFO
-        : Object.freeze({ referenceCount: count, retainedBy: freezeRetainedBy(retainedBy) })
-      if (count === 0) this.drop(id, generation)
+      generation.retention = shiftRetention(generation.retention, use, -1)
+      if (generation.retention.referenceCount === 0) this.drop(id, generation)
       else this.publishRetention(id)
     })
     this.publishRetention(id)

@@ -5,11 +5,11 @@ import { pathToFileURL } from 'node:url'
 import { inspect } from 'node:util'
 import { afterAll, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import SystemPrompt, { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
+import type {} from '@deepseek-ai/dsh-system-prompt'
 import {
-  addHarnessSourceSection, auditStartupEntries, boot, StartupError,
-  FAIL_LOUD_RELEASE_TIMEOUT_MS, HARNESS_SOURCE_SECTION,
-  installFailLoud, loadEnv, loadLayeredEnv, loadOverlayPatches, resolveConfigPath, type FailLoudProcess,
+  auditStartupEntries, boot, StartupError,
+  FAIL_LOUD_RELEASE_TIMEOUT_MS,
+  installFailLoud, loadEnv, loadLayeredEnv, loadOverlayPatches, resolveConfigPath, type FailLoudEvent, type FailLoudProcess,
 } from '../src/index.ts'
 
 const NAME = 'dsh-test-bin'
@@ -25,6 +25,13 @@ const tmp = (): string => {
   return dir
 }
 
+
+/** Give a fake Loader the root group that the startup audit reads for rejected options. */
+function withRoot(ctx: Context, rows: unknown[] = []): Context {
+  const root = { data: rows, getOuterStack: () => [] }
+  Object.assign(ctx.loader, { root })
+  return ctx
+}
 describe('resolveConfigPath', () => {
   it('resolves relative to the given cwd outside replay mode', () => {
     expect(resolveConfigPath('./cordis.yml', undefined, `${sep}base`)).toBe(resolve(`${sep}base`, 'cordis.yml'))
@@ -144,6 +151,9 @@ describe('loadLayeredEnv', () => {
     ['a network proxy', 'HTTPS_PROXY=http://attacker.example\n'],
     ['a lowercase network proxy', 'https_proxy=http://attacker.example\n'],
     ['a browser command', 'BROWSER=./script\n'],
+    ['a DeepSeek model endpoint', 'DEEPSEEK_BASE_URL=http://attacker.example\n'],
+    ['a DeepSeek search endpoint', 'DEEPSEEK_SEARCH_BASE_URL=http://attacker.example\n'],
+    ['a lowercase DeepSeek endpoint', 'deepseek_base_url=http://attacker.example\n'],
   ])('refuses to launch when a .env sets %s, before applying anything', (_case, content) => {
     const home = tmp()
     const project = tmp()
@@ -189,12 +199,59 @@ describe('loadLayeredEnv', () => {
     }
   })
 
-  it('still refuses every other bootstrap name in the Harness-home .env', () => {
+  it('accepts the DeepSeek endpoints from the Harness-home .env, below an exported one', () => {
     const home = tmp()
     const project = tmp()
-    // A CA path sits in the same network group as the proxy names and changes what is trusted,
-    // not where traffic goes; the exemption must not widen to it.
-    writeFileSync(join(home, '.env'), 'SSL_CERT_FILE=/tmp/ca.pem\n')
+    writeFileSync(join(home, '.env'), [
+      'DEEPSEEK_BASE_URL=https://from-home.example/anthropic',
+      'DEEPSEEK_SEARCH_BASE_URL=https://from-home.example/v1',
+      '',
+    ].join('\n'))
+    clear()
+    vi.stubEnv('DSH_HOME', home)
+    vi.stubEnv('DEEPSEEK_BASE_URL', 'https://exported.example/anthropic')
+    vi.stubEnv('DEEPSEEK_SEARCH_BASE_URL', undefined)
+    try {
+      const snapshot = loadLayeredEnv(NAME, project, vi.fn())
+      expect(snapshot.get('DEEPSEEK_SEARCH_BASE_URL'))
+        .toEqual({ value: 'https://from-home.example/v1', source: 'user-env', path: join(home, '.env') })
+      expect(snapshot.get('DEEPSEEK_BASE_URL')).toEqual({ value: 'https://exported.example/anthropic', source: 'process' })
+      expect(process.env.DEEPSEEK_SEARCH_BASE_URL).toBe('https://from-home.example/v1')
+      expect(process.env.DEEPSEEK_BASE_URL).toBe('https://exported.example/anthropic')
+    } finally {
+      clear()
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it.each(['deepseek_base_url', 'DeepSeek_Search_Base_URL'])('refuses %s from the Harness-home .env and names the exact spelling', (name) => {
+    const home = tmp()
+    const project = tmp()
+    // Consumers look the endpoint up by its exact name on POSIX, so another spelling would load without effect.
+    writeFileSync(join(home, '.env'), `${name}=https://from-home.example/v1\n`)
+    clear()
+    vi.stubEnv('DSH_HOME', home)
+    vi.stubEnv(name, undefined)
+    try {
+      expect(() => loadLayeredEnv(NAME, project, vi.fn()))
+        .toThrow(`spell it ${name.toUpperCase()}, then export it or put it in ${join(home, '.env')}`)
+      expect(process.env[name]).toBeUndefined()
+    } finally {
+      clear()
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it.each([
+    'SSL_CERT_FILE=/tmp/ca.pem\n',
+    'NODE_TLS_REJECT_UNAUTHORIZED=0\n',
+    'DSH_HOME=/tmp/elsewhere\n',
+  ])('still refuses every other bootstrap name in the Harness-home .env: %s', (content) => {
+    const home = tmp()
+    const project = tmp()
+    // The CA and TLS names sit in the same network group as the proxy and DeepSeek endpoint names but change what
+    // is trusted, not where traffic goes, and DSH_HOME would move the exemption itself; none may join it.
+    writeFileSync(join(home, '.env'), content)
     clear()
     vi.stubEnv('DSH_HOME', home)
     try {
@@ -205,16 +262,17 @@ describe('loadLayeredEnv', () => {
     }
   })
 
-  it('names the Harness-home file as the way out when a project .env sets a proxy', () => {
+  it.each(['HTTP_PROXY', 'DEEPSEEK_BASE_URL'])('names the Harness-home file as the way out when a project .env sets %s', (name) => {
     const home = tmp()
     const project = tmp()
-    writeFileSync(join(project, '.env'), 'HTTP_PROXY=http://attacker.example\n')
+    writeFileSync(join(project, '.env'), `${name}=http://attacker.example\n`)
     clear(); clearProxy()
     vi.stubEnv('DSH_HOME', home)
+    vi.stubEnv(name, undefined)
     try {
       expect(() => loadLayeredEnv(NAME, project, vi.fn()))
-        .toThrow(`export HTTP_PROXY, or put it in ${join(home, '.env')}, which does not travel with a repository`)
-      expect(process.env.HTTP_PROXY).toBeUndefined()
+        .toThrow(`export ${name}, or put it in ${join(home, '.env')}, which does not travel with a repository`)
+      expect(process.env[name]).toBeUndefined()
     } finally {
       clear(); clearProxy()
       vi.unstubAllEnvs()
@@ -360,14 +418,24 @@ describe('loadLayeredEnv', () => {
 })
 
 describe('installFailLoud', () => {
-  function fakeProc(): FailLoudProcess & { handlers: Array<(err: unknown) => void>; written: string[]; exits: number[] } {
-    const handlers: Array<(err: unknown) => void> = []
+  type Handler = (err: unknown) => void
+  function fakeProc(): FailLoudProcess & {
+    handlers: Handler[]
+    rejection: Handler
+    exception: Handler
+    written: string[]
+    exits: number[]
+  } {
+    const handlers: Handler[] = []
+    const registered = new Map<FailLoudEvent, Handler>()
     const written: string[] = []
     const exits: number[] = []
     return {
       handlers, written, exits,
-      on: (_event, handler) => { handlers.push(handler) },
-      off: (_event, handler) => { handlers.splice(handlers.indexOf(handler), 1) },
+      get rejection() { return registered.get('unhandledRejection')! },
+      get exception() { return registered.get('uncaughtException')! },
+      on: (event, handler) => { handlers.push(handler); registered.set(event, handler) },
+      off: (event, handler) => { handlers.splice(handlers.indexOf(handler), 1); registered.delete(event) },
       stderr: { write: (chunk: string) => { written.push(chunk) } },
       exit: (code: number) => { exits.push(code) },
     }
@@ -377,7 +445,7 @@ describe('installFailLoud', () => {
     const proc = fakeProc()
     installFailLoud(NAME, proc)
     const error = new Error('boom')
-    proc.handlers[0]!(error)
+    proc.rejection(error)
     expect(proc.written[0]).toContain(`${NAME}: fatal load failure: `)
     expect(proc.written[0]).toContain(error.stack)
     expect(proc.exits).toEqual([1])
@@ -388,7 +456,7 @@ describe('installFailLoud', () => {
   it('stringifies a non-Error rejection and an Error without a stack falls back to its message', () => {
     const plain = fakeProc()
     installFailLoud(NAME, plain)
-    plain.handlers[0]!('plain failure')
+    plain.rejection('plain failure')
     expect(plain.written[0]).toContain('plain failure')
     expect(plain.exits).toEqual([1])
 
@@ -396,7 +464,7 @@ describe('installFailLoud', () => {
     delete (stackless as { stack?: string }).stack
     const bare = fakeProc()
     installFailLoud(NAME, bare)
-    bare.handlers[0]!(stackless)
+    bare.rejection(stackless)
     expect(bare.written[0]).toContain('no stack')
     expect(bare.exits).toEqual([1])
   })
@@ -404,16 +472,18 @@ describe('installFailLoud', () => {
   it('returns an uninstaller that removes the handler (and defaults to the real process)', () => {
     const proc = fakeProc()
     const uninstall = installFailLoud(NAME, proc)
-    expect(proc.handlers).toHaveLength(1)
+    expect(proc.handlers).toHaveLength(2)
     uninstall()
     expect(proc.handlers).toHaveLength(0)
     // Default-proc arm: install on the real process, then immediately uninstall
     // so the suite leaks no handler and can never exit the runner.
-    const before = process.listenerCount('unhandledRejection')
+    const before = [process.listenerCount('unhandledRejection'), process.listenerCount('uncaughtException')]
     const uninstallReal = installFailLoud(NAME)
-    expect(process.listenerCount('unhandledRejection')).toBe(before + 1)
+    expect(process.listenerCount('unhandledRejection')).toBe(before[0]! + 1)
+    expect(process.listenerCount('uncaughtException')).toBe(before[1]! + 1)
     uninstallReal()
-    expect(process.listenerCount('unhandledRejection')).toBe(before)
+    expect(process.listenerCount('unhandledRejection')).toBe(before[0])
+    expect(process.listenerCount('uncaughtException')).toBe(before[1])
   })
 
   it('does not report an activation rejection shared by entries in the boot audit', async () => {
@@ -421,7 +491,7 @@ describe('installFailLoud', () => {
     installFailLoud(NAME, proc)
     const error = new Error('assembled activation failure')
     const warn = vi.fn()
-    const audit = auditStartupEntries({
+    const audit = auditStartupEntries(withRoot({
       loader: {
         entries: () => ['broken-a', 'broken-b'].map(name => ({
           options: { id: name, name },
@@ -433,15 +503,15 @@ describe('installFailLoud', () => {
           },
         })),
       },
-    } as unknown as Context, NAME, warn)
+    } as unknown as Context), NAME, warn)
     await Promise.resolve()
     await Promise.resolve()
-    proc.handlers[0]!(error)
+    proc.rejection(error)
     expect(proc.written).toEqual([])
     expect(proc.exits).toEqual([])
     await audit
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('assembled activation failure'))
-    proc.handlers[0]!(error)
+    proc.rejection(error)
     expect(proc.exits).toEqual([1])
   })
 
@@ -455,7 +525,7 @@ describe('installFailLoud', () => {
       await Promise.resolve()
       order.push('released')
     })
-    proc.handlers[0]!(new Error('sibling entry rejected'))
+    proc.rejection(new Error('sibling entry rejected'))
     expect(proc.written[0]).toContain(`${NAME}: fatal load failure: `)
     // The release is in flight, so the exit has not committed yet.
     expect(proc.exits).toEqual([])
@@ -466,7 +536,7 @@ describe('installFailLoud', () => {
   it('still exits when the release hook rejects', async () => {
     const proc = fakeProc()
     installFailLoud(NAME, proc, () => Promise.reject(new Error('terminal stop failed')))
-    proc.handlers[0]!(new Error('boom'))
+    proc.rejection(new Error('boom'))
     await vi.waitFor(() => { expect(proc.exits).toEqual([1]) })
   })
 
@@ -475,7 +545,7 @@ describe('installFailLoud', () => {
     try {
       const proc = fakeProc()
       installFailLoud(NAME, proc, () => new Promise<void>(() => {}))
-      proc.handlers[0]!(new Error('boom'))
+      proc.rejection(new Error('boom'))
       expect(proc.exits).toEqual([])
       await vi.advanceTimersByTimeAsync(FAIL_LOUD_RELEASE_TIMEOUT_MS)
       expect(proc.exits).toEqual([1])
@@ -494,11 +564,49 @@ describe('installFailLoud', () => {
       await Promise.resolve()
       released = true
     })
-    proc.handlers[0]!(new Error('first rejection'))
-    proc.handlers[0]!(new Error('second rejection'))
-    expect(proc.handlers).toHaveLength(1)
+    proc.rejection(new Error('first rejection'))
+    proc.rejection(new Error('second rejection'))
+    proc.exception(new Error('exception during teardown'))
+    expect(proc.handlers).toHaveLength(2)
     expect(proc.written).toHaveLength(1)
     expect(proc.written[0]).toContain('first rejection')
+    await vi.waitFor(() => { expect(proc.exits).toEqual([1]) })
+    expect(released).toBe(true)
+  })
+
+  it('turns an uncaught exception into a labelled diagnostic with its enumerable properties and exits 1', () => {
+    const proc = fakeProc()
+    installFailLoud(NAME, proc)
+    const error = Object.assign(new Error("ENOENT: no such file or directory, open '/tmp/dsh-subprocess-x/out.log'"), {
+      errno: -2, code: 'ENOENT', syscall: 'open', path: '/tmp/dsh-subprocess-x/out.log',
+    })
+    proc.exception(error)
+    expect(proc.written).toHaveLength(1)
+    expect(proc.written[0]).toContain(`${NAME}: fatal uncaught exception: `)
+    expect(proc.written[0]).toContain(error.stack)
+    expect(proc.written[0]).toContain("syscall: 'open'")
+    expect(proc.written[0]).toContain("path: '/tmp/dsh-subprocess-x/out.log'")
+    expect(proc.exits).toEqual([1])
+  })
+
+  it('includes the cause chain in the diagnostic', () => {
+    const proc = fakeProc()
+    installFailLoud(NAME, proc)
+    proc.exception(new Error('wrapper', { cause: new Error('root cause') }))
+    expect(proc.written[0]).toContain('[cause]: Error: root cause')
+    expect(proc.exits).toEqual([1])
+  })
+
+  it('awaits the release hook for an uncaught exception as it does for a rejection', async () => {
+    const proc = fakeProc()
+    let released = false
+    installFailLoud(NAME, proc, async () => {
+      await Promise.resolve()
+      released = true
+    })
+    proc.exception(new Error('listener threw'))
+    expect(proc.written[0]).toContain('fatal uncaught exception')
+    expect(proc.exits).toEqual([])
     await vi.waitFor(() => { expect(proc.exits).toEqual([1]) })
     expect(released).toBe(true)
   })
@@ -507,7 +615,10 @@ describe('installFailLoud', () => {
 describe('auditStartupEntries', () => {
   const requiredIds = [
     'agent-loop',
+    'tool-executor-native',
+    'tool-executor-ptc',
     'webserver',
+    'web-runtime',
     'modules',
     'connection',
     'headless-runner',
@@ -524,11 +635,12 @@ describe('auditStartupEntries', () => {
     }
     disabled?: boolean
     options: { id: string; name: string }
+    parent?: { tree: { import(name: string): Promise<unknown> } }
   }
 
-  const ctxWith = (entries: FakeEntry[]): Context => ({
+  const ctxWith = (entries: FakeEntry[], rows: unknown[] = []): Context => withRoot(({
     loader: { entries: () => entries.values() },
-  }) as unknown as Context
+  }) as unknown as Context, rows)
 
   const fiber = (
     state: number,
@@ -559,7 +671,7 @@ describe('auditStartupEntries', () => {
     const warn = vi.fn()
     const original = new Error('todo apply failure')
     await auditStartupEntries(ctxWith([
-      { options: { id: 'missing-tool', name: './missing.mjs' } },
+      { options: { id: 'missing-tool', name: './missing.mjs' }, parent: { tree: { import: () => Promise.resolve() } } },
       { fiber: fiber(3, original), options: { id: 'tool-todo', name: '@deepseek-ai/dsh-tool-todo' } },
       {
         fiber: fiber(0, undefined, { ready: {}, missing: {} }, ['ready']),
@@ -687,9 +799,32 @@ describe('auditStartupEntries', () => {
     expect(warn).not.toHaveBeenCalled()
   })
 
+  it('fails startup for required options their group rejected and lists optional ones', async () => {
+    const error = await auditStartupEntries(ctxWith([], [
+      { id: 'webserver', name: './webserver.mjs', disabled: 'yes' },
+      { id: 'tool-todo', name: 7 },
+      { id: 'valid', name: './valid.mjs' },
+    ]), NAME, vi.fn()).catch((error: unknown) => error)
+    expect(error).toBeInstanceOf(StartupError)
+    const message = (error as Error).message
+    expect(message).toContain(`${NAME}: startup failed: 1 required plugin did not activate`)
+    expect(message).toContain('  webserver (required)\n    Package: ./webserver.mjs\n    invalid entry options: EntryValidationError: invalid entry options:\n      - disabled must be a boolean (at disabled)')
+    expect(message).toContain('  tool-todo\n    Package: 7\n')
+    expect(message).not.toContain('valid.mjs')
+    expect((error as StartupError).entries.map(entry => [entry.id, entry.required, entry.fiberState])).toEqual([
+      ['webserver', true, undefined], ['tool-todo', false, undefined],
+    ])
+  })
+
+  it('warns about rejected options without an id', async () => {
+    const warn = vi.fn()
+    await auditStartupEntries(ctxWith([], [null]), NAME, warn)
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('(no id) (undefined): invalid entry options:'))
+  })
+
   it('omits an error cause when required plugins are only waiting for services', async () => {
     const error = await auditStartupEntries(ctxWith([
-      { fiber: fiber(0, undefined, { webRuntime: {} }), options: { id: 'connection', name: './connection.mjs' } },
+      { fiber: fiber(0, undefined, { webStartup: {} }), options: { id: 'connection', name: './connection.mjs' } },
     ]), NAME, vi.fn()).catch((error: unknown) => error)
     expect(error).toBeInstanceOf(StartupError)
     expect(Object.hasOwn(error as StartupError, 'cause')).toBe(false)
@@ -700,9 +835,9 @@ describe('auditStartupEntries', () => {
   it('keeps diagnostic metadata available without expanding it in ordinary error inspection', () => {
     const entries = [{
       id: 'connection', module: './connection.mjs', required: true, fiberState: 0,
-      outcome: { kind: 'pending' as const, missing: ['webRuntime'] },
+      outcome: { kind: 'pending' as const, missing: ['webStartup'] },
     }]
-    const error = new StartupError('waiting for webRuntime', entries)
+    const error = new StartupError('waiting for webStartup', entries)
     const startup = { configurationPath: '/private/cordis.yml', messages: [
       { ts: 1, name: 'loader', type: 'warn', args: ['raw diagnostic argument'] },
     ] }
@@ -710,7 +845,7 @@ describe('auditStartupEntries', () => {
     expect(error.entries).toBe(entries)
     expect(error.startup).toBe(startup)
     const output = inspect(error)
-    expect(output).toContain('waiting for webRuntime')
+    expect(output).toContain('waiting for webStartup')
     expect(output).not.toContain('connection.mjs')
     expect(output).not.toContain('/private/cordis.yml')
     expect(output).not.toContain('raw diagnostic argument')
@@ -742,12 +877,12 @@ describe('auditStartupEntries', () => {
     const error = await auditStartupEntries(ctxWith([
       { fiber: fiber(0, undefined, { webServer: {} }), options: { id: 'web-runtime', name: './web.mjs' } },
       { fiber: fiber(3, original), options: { id: 'webserver', name: '@deepseek-ai/dsh-host-webserver' } },
-      { fiber: fiber(0, undefined, { webRuntime: {} }), options: { id: 'connection', name: './connection.mjs' } },
+      { fiber: fiber(0, undefined, { webStartup: {} }), options: { id: 'connection', name: './connection.mjs' } },
       { fiber: fiber(0), options: { id: 'unknown', name: './unknown.mjs' } },
     ]), NAME, warn).catch((error: unknown) => error)
     expect(error).toBeInstanceOf(StartupError)
     expect((error as Error).message).toMatchInlineSnapshot(`
-      "dsh-test-bin: startup failed: 2 required plugins did not activate
+      "dsh-test-bin: startup failed: 3 required plugins did not activate
 
       Failed plugins (1):
         webserver (required)
@@ -756,10 +891,10 @@ describe('auditStartupEntries', () => {
               at Server.listen (node:net:1:2)
 
       Plugins waiting for services (3):
-        Plugin                 Missing services
-        connection (required)  webRuntime
-        web-runtime            webServer
-        unknown                unknown"
+        Plugin                  Missing services
+        web-runtime (required)  webServer
+        connection (required)   webStartup
+        unknown                 unknown"
     `)
     expect(warn).not.toHaveBeenCalled()
   })
@@ -782,7 +917,7 @@ describe('loadOverlayPatches', () => {
     expect(loadOverlayPatches(NAME, valid)).toEqual([{ id: 'target', config: { value: { __jsExpr: 'process.env.VALUE' } } }])
     expect(() => loadOverlayPatches(NAME, join(dir, 'missing.yml'))).toThrow(`${NAME}: failed to read overlay`)
     const malformed = join(dir, 'malformed.yml')
-    writeFileSync(malformed, ': bad')
+    writeFileSync(malformed, '- [bad\n')
     expect(() => loadOverlayPatches(NAME, malformed)).toThrow(`${NAME}: failed to parse overlay`)
     const mapping = join(dir, 'mapping.yml')
     writeFileSync(mapping, 'id: target\n')
@@ -803,7 +938,7 @@ describe('boot', () => {
     const error = failure as StartupError
     expect(error.entries).toEqual([{
       id: 'webserver', module: './missing.mjs', required: true, fiberState: undefined,
-      outcome: { kind: 'failed', error: 'failed to import' },
+      outcome: { kind: 'failed', error: expect.objectContaining({ message: expect.stringContaining('missing.mjs') as string }) as Error, phase: 'failed to import' },
     }])
     expect(error.startup?.configurationPath).toBe(config)
     expect(error.startup?.messages.some(message => message.args.some(arg => arg instanceof Error && arg.message.includes('missing.mjs')))).toBe(true)
@@ -963,7 +1098,7 @@ describe('boot', () => {
     }
   })
 
-  it('exposes dshHomePath to Loader config expressions', async () => {
+  it('exposes dshHomePath and dshPath to Loader config expressions', async () => {
     const dir = tmp()
     const dshHome = join(dir, 'home')
     vi.stubEnv('DSH_HOME', dshHome)
@@ -971,6 +1106,7 @@ describe('boot', () => {
       'export const name = "capture"',
       'export function apply(ctx, config) {',
       '  ctx.provide("capturedPath", config.path)',
+      '  ctx.provide("capturedStatePath", config.state)',
       '}',
       '',
     ].join('\n'))
@@ -979,12 +1115,14 @@ describe('boot', () => {
       '  name: ./capture.mjs',
       '  config:',
       "    path: !!js dshHomePath('sessions')",
+      "    state: !!js dshPath('state', 'capture')",
       '',
     ].join('\n'))
     let ctx: Context | undefined
     try {
       ctx = await boot(NAME, join(dir, 'cordis.yml'))
       expect(ctx.get('capturedPath')).toBe(join(dshHome, 'sessions'))
+      expect(ctx.get('capturedStatePath')).toBe(join(dshHome, 'state', 'capture'))
     } finally {
       await ctx?.fiber.dispose()
       vi.unstubAllEnvs()
@@ -1000,7 +1138,7 @@ describe('boot', () => {
     writeFileSync(join(dir, 'exiting.mjs'), [
       'export const name = "exiting"',
       'export function apply(ctx) {',
-      '  void ctx.root.fiber.dispose()',
+      '  void ctx[Symbol.for("cordis.root")].fiber.dispose()',
       '}',
       '',
     ].join('\n'))
@@ -1094,7 +1232,7 @@ describe('boot', () => {
 
   it.each([
     ['missing', undefined, 'config file not found'],
-    ['malformed', 'invalid: [unclosed\n', 'unexpected end'],
+    ['malformed', 'invalid: [unclosed\n', 'must be sufficiently indented and end with a ] (at '],
     ['non-array', 'entries: []\n', 'top-level array'],
   ])('rejects a %s root configuration', async (_kind, content, message) => {
     const dir = tmp()
@@ -1214,62 +1352,4 @@ describe('boot', () => {
     }
   })
 
-})
-
-describe('addHarnessSourceSection', () => {
-  const SOURCE_ROOT = `${sep}opt${sep}harness-src`
-  const EXPECTED = `The DeepSeek Harness implementation checkout is at ${SOURCE_ROOT}. The checkout location and current working directory are separate values and may differ; never infer the working directory from this path. Use pwd to determine the current working directory. Use this checkout only to inspect or extend DSH itself.`
-
-  it('distinguishes the source path from the current workdir after reusable instructions', async () => {
-    const ctx = new Context()
-    try {
-      await ctx.plugin(SystemPrompt, { personaPrefix: 'You are a coding agent.' })
-      ctx.systemPrompt.section({
-        name: 'tools:sdk', order: ctx.systemPrompt.getSectionOrder('TOOLS_SDK'), text: 'Reusable tool SDK.',
-      })
-      const dispose = addHarnessSourceSection(ctx, SOURCE_ROOT)
-      expect(dispose).toBeTypeOf('function')
-      const systemPrompt = ctx.get('systemPrompt')!
-      const rendered = renderPrompt(await systemPrompt.assemble())
-      expect(rendered).toContain(EXPECTED)
-      // The >= 0 guards keep a drifted opener/persona string from a false pass
-      // through `-1 < n`.
-      const identityAt = rendered.indexOf('You are an AI agent powered by DeepSeek Harness.')
-      const sourceAt = rendered.indexOf(EXPECTED)
-      const personaAt = rendered.indexOf('You are a coding agent.')
-      expect(identityAt).toBeGreaterThanOrEqual(0)
-      expect(personaAt).toBeGreaterThanOrEqual(0)
-      const sdkAt = rendered.indexOf('Reusable tool SDK.')
-      expect(personaAt).toBeGreaterThan(identityAt)
-      expect(sdkAt).toBeGreaterThan(personaAt)
-      expect(sdkAt).toBeLessThan(sourceAt)
-    } finally {
-      await ctx.fiber.dispose()
-    }
-  })
-
-  it('is a no-op returning undefined when no systemPrompt service is mounted', async () => {
-    const ctx = new Context()
-    try {
-      expect(addHarnessSourceSection(ctx, SOURCE_ROOT)).toBeUndefined()
-    } finally {
-      await ctx.fiber.dispose()
-    }
-  })
-
-  it('disposes the section it added, so a systemPrompt reload leaves no residue', async () => {
-    const ctx = new Context()
-    try {
-      await ctx.plugin(SystemPrompt, {})
-      const systemPrompt = ctx.get('systemPrompt')!
-      const dispose = addHarnessSourceSection(ctx, SOURCE_ROOT)!
-      const present = await systemPrompt.assemble()
-      expect(present.sections.some(section => section.name === HARNESS_SOURCE_SECTION)).toBe(true)
-      dispose()
-      const gone = await systemPrompt.assemble()
-      expect(gone.sections.some(section => section.name === HARNESS_SOURCE_SECTION)).toBe(false)
-    } finally {
-      await ctx.fiber.dispose()
-    }
-  })
 })

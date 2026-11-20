@@ -11,6 +11,7 @@ import {
 } from '@deepseek-ai/dsh-session'
 import { prepareSessionSnapshotFixtureForComparison } from '@deepseek-ai/dsh-llm-replay'
 import { redactSessionSnapshotIds } from './identity.ts'
+import { sessionHeaderVersion } from './session-files.ts'
 
 const SESSION_ID = '{{sessionId}}'
 const MESSAGE_ID = '{{messageId}}'
@@ -20,6 +21,7 @@ const SYSTEM = '{{system}}'
 const TOOLS = '{{tools}}'
 const EVENT_TIME = '{{eventTime}}'
 const EVENT_OMITTED_BYTES = '{{eventOmittedBytes}}'
+const SOURCE_SESSION_FORMAT = '{{sourceSessionFormatVersion}}'
 const PACKED_CHUNK_ROW_TYPES = new Set(['text-chunks', 'reasoning-chunks', 'tool-call-chunks'])
 
 function isPackedFixtureRow(record: Record<string, unknown>): boolean {
@@ -46,6 +48,7 @@ const FILE_URI_PATH_PREFIX_RE = /(?:^|[^a-z0-9+.-])file:\/\/\/?$/i
 
 /** A UUID v4 string, the shape `randomUUID()` produces for session ids. */
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi
+const SHORT_JOB_ID_RE = /-[0-9a-f]{16}$/i
 // Separator runs also match JSON-escaped Windows paths; extraction preserves their exact serialized spelling.
 const LOCAL_SPILL_PATH_RE = new RegExp(
   String.raw`\{\{cwd\}\}[\\/]+\.spill[\\/]+session-[0-9a-f]{12}[\\/]+[0-9a-f]{12}-([A-Za-z0-9._~-]+?)`
@@ -103,6 +106,12 @@ export interface NormalizeOptions {
   cwdPathMode?: CwdPathMode
   /** Keep already-redacted typed ids and arbitrary UUID-like prose unchanged. */
   identityMode?: 'legacy' | 'preserve'
+}
+
+/** Comparison controls for complete primary and child Session logs. */
+export interface SessionSnapshotComparisonOptions extends Omit<NormalizeOptions, 'identityMode'> {
+  /** Inputs are captured native writer output, rather than source-versus-migrated-artifact comparisons. */
+  nativeWriterOutput?: true
 }
 
 /** Return every known spelling of the generated cwd, most specific first. */
@@ -346,8 +355,35 @@ export function normalizeSessionLog(
   const cwdPathMode = options.cwdPathMode ?? 'canonical'
   const identityMode = options.identityMode ?? 'legacy'
   const lines = rawLog.split('\n').filter(line => line.trim().length > 0)
-  const records = lines.map((line) => {
-    const record = JSON.parse(line) as Record<string, unknown>
+  const parsed = lines.map(line => JSON.parse(line) as Record<string, unknown>)
+  const jobTokens = new Map<string, string>()
+  const reservedTokens = new Set(rawLog.match(/\{\{id:[1-9]\d*\}\}/g) ?? [])
+  let nextJobToken = 1
+  if (identityMode === 'legacy') {
+    for (const record of parsed) {
+      if ((record.type !== 'job/registered' && record.type !== 'job/settled')
+        || record.data === null || typeof record.data !== 'object') continue
+      const id = (record.data as Record<string, unknown>).jobId
+      if (typeof id !== 'string' || (id.search(UUID_RE) < 0 && !SHORT_JOB_ID_RE.test(id)) || jobTokens.has(id)) continue
+      let token: string
+      do { token = `{{id:${nextJobToken++}}}` } while (reservedTokens.has(token))
+      jobTokens.set(id, token)
+    }
+  }
+  const replaceJobs = (value: unknown): unknown => {
+    if (typeof value === 'string') {
+      let output = value
+      for (const [id, token] of jobTokens) output = output.split(id).join(token)
+      return output
+    }
+    if (Array.isArray(value)) return value.map(replaceJobs)
+    if (value !== null && typeof value === 'object') {
+      return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, replaceJobs(item)]))
+    }
+    return value
+  }
+  const records = parsed.map((raw) => {
+    const record = jobTokens.size === 0 ? raw : replaceJobs(raw) as Record<string, unknown>
     if (record.type === 'session') {
       if ('createdAt' in record) record.createdAt = 0
     } else if (isPackedFixtureRow(record)) {
@@ -377,6 +413,13 @@ export function normalizeSessionLog(
       if ('durationMs' in data) data.durationMs = 0
     }
     normalizeFeedbackClocks(record)
+    normalizeTimelineClocks(record)
+    if ((record.type === 'job/registered' || record.type === 'job/settled')
+      && record.data !== null && typeof record.data === 'object') {
+      const data = record.data as Record<string, unknown>
+      if ('startedAt' in data) data.startedAt = 0
+      if ('finishedAt' in data) data.finishedAt = 0
+    }
     if (record.type === 'goal/change' && record.data !== null && typeof record.data === 'object') {
       const data = record.data as Record<string, unknown>
       if ('createdAt' in data) data.createdAt = 0
@@ -432,41 +475,52 @@ export function normalizeSessionSnapshot(
 
 /**
  * Normalize one scenario's primary and child logs with shared typed identity redaction.
+ * Native-writer comparison strictly restores each input before tokenizing its own delivery generation.
  * @param rawLogs - primary-first persisted or projected session JSONL.
  * @param ctx - generated cwd spellings and other volatile run facts.
- * @param options - separator controls; relationship-preserving identity mode is mandatory.
- * @returns normalized session fixtures in input order.
+ * @param options - separator and native-writer comparison controls; identity relationships are preserved.
+ * @returns comparison-only Session records in input order; not persistence or fixture write-back input.
  */
 export function normalizeSessionSnapshots(
   rawLogs: readonly string[],
   ctx: NormalizeContext,
-  options: Omit<NormalizeOptions, 'identityMode'> = {},
+  options: SessionSnapshotComparisonOptions = {},
 ): string[] {
-  const currentLogs = rawLogs.map(log => hasSessionFormatVersion(log)
-    ? prepareSessionSnapshotFixtureForComparison(log)
-    : log)
-  const comparableLogs = currentLogs.map(normalizeSessionFormatMetadata)
+  const { nativeWriterOutput, ...normalizeOptions } = options
+  const comparableLogs = rawLogs.map((log) => {
+    if (!hasSessionFormatVersion(log)) return normalizeSessionFormatMetadata(log)
+    const currentLog = prepareSessionSnapshotFixtureForComparison(log)
+    return normalizeSessionFormatMetadata(currentLog, nativeWriterOutput
+      ? sessionHeaderVersion(log, 'source Session snapshot') : undefined)
+  })
   return redactSessionSnapshotIds(comparableLogs).map(log => projectSessionSnapshot(
     scrubSessionSnapshot(normalizeSessionLog(
       log,
       { ...ctx, sessionIds: [] },
-      { ...options, identityMode: 'preserve' },
+      { ...normalizeOptions, identityMode: 'preserve' },
     )),
   ))
 }
 
 /**
  * Omit the artifact header generation after official migration for comparison.
- * Delivery and captured-source generations retain their opaque recorded values.
+ * An explicit source version tokenizes only delivery markers for that original input generation.
+ * Other delivery generations and every captured-source generation retain their recorded values.
  * @param rawLog - Session records or events as compact JSON lines.
- * @returns the same records with only the Session header version omitted.
+ * @param sourceVersion - original generation of strictly validated native writer output; otherwise omit.
+ * @returns comparison-only records with the Session header version omitted and native delivery qualifiers tokenized.
  */
-export function normalizeSessionFormatMetadata(rawLog: string): string {
+export function normalizeSessionFormatMetadata(rawLog: string, sourceVersion?: number): string {
   return rawLog.split('\n').map((line) => {
     if (line.trim().length === 0) return line
     const record = JSON.parse(line) as Record<string, unknown>
-    if (record.type !== 'session' || !Object.hasOwn(record, 'version')) return line
-    delete record.version
+    if (record.type === 'session' && Object.hasOwn(record, 'version')) {
+      delete record.version
+    } else if (sourceVersion !== undefined && record.type === 'session-log-deepseek/delivery-accepted') {
+      const data = record.data as Record<string, unknown> | undefined
+      if (data?.sessionFormatVersion !== sourceVersion) return line
+      data.sessionFormatVersion = SOURCE_SESSION_FORMAT
+    } else return line
     return JSON.stringify(record)
   }).join('\n')
 }
@@ -499,7 +553,9 @@ export function scrubSystemPrompts(rawLog: string): string {
 
 /**
  * Replace tool schemas in full request-header snapshots with `{{tools}}`
- * tokens while retaining field presence. System-prompt text stays verbatim so
+ * tokens while retaining field presence. Logs containing developer messages
+ * retain tool names so historical addition references remain verifiable.
+ * System-prompt text stays verbatim so
  * pinning fixtures can move only schema bulk into their dedicated JSON
  * sidecar. Lines without a tool payload pass through byte-for-byte; the
  * transform is idempotent.
@@ -529,7 +585,8 @@ export function scrubModelRequestBulk(rawLog: string): string {
 /**
  * Project a persisted session log while tokenizing prompt text and schema
  * bulk. Each non-empty line is parsed at most once; the session header stays
- * byte-identical. Body records omit their persistence-only envelopes.
+ * byte-identical. Body records omit their persistence-only envelopes and expand
+ * source-event ranges without changing reference order.
  *
  * @param rawLog - persisted or already-projected session JSONL.
  * @returns committed snapshot JSONL with prompt text and tool schemas tokenized.
@@ -545,7 +602,11 @@ export function scrubSessionSnapshot(rawLog: string): string {
       return line
     }
     omitFixtureEnvelope(record)
+    if (Object.hasOwn(record, 'sourceEventSeqs')) {
+      record.sourceEventSeqs = decodeSeqRanges(record.sourceEventSeqs)
+    }
     normalizeFeedbackClocks(record)
+    normalizeTimelineClocks(record)
     return JSON.stringify(record)
   }).join('\n')
 }
@@ -558,6 +619,28 @@ function normalizeFeedbackClocks(record: Record<string, unknown>): void {
   const clocks = item as Record<string, unknown>
   if ('createdAt' in clocks) clocks.createdAt = 0
   if ('updatedAt' in clocks) clocks.updatedAt = 0
+}
+
+/** Normalize only Timeline-owned task clocks and their card receipts. */
+function normalizeTimelineClocks(record: Record<string, unknown>): void {
+  const data = record.data as Record<string, unknown> | undefined
+  if (data === undefined) return
+  const zero = (value: unknown, keys: readonly string[]): void => {
+    if (value === null || typeof value !== 'object') return
+    const fields = value as Record<string, unknown>
+    for (const key of keys) {
+      if (typeof fields[key] === 'number') fields[key] = 0
+    }
+  }
+  if (record.type === 'plugin:timeline/tree') {
+    const tree = data.tree as { tasks?: unknown[] } | undefined
+    zero(tree, ['createdAt', 'lastTaskUpdate'])
+    for (const task of tree?.tasks ?? []) zero(task, ['createdAt', 'updatedAt'])
+    zero(data.receipt, ['at', 'previousAt'])
+  } else if (record.type === 'tool/result') {
+    const meta = data.meta as { timeline?: unknown } | undefined
+    zero(meta?.timeline, ['at', 'previousAt'])
+  }
 }
 
 /** Which independent model-request payloads a scrubber replaces. */
@@ -579,9 +662,11 @@ function systemPromptBlock(data: Record<string, unknown>): Record<string, unknow
 /** Transform the selected model-request payloads. */
 function scrubModelRequestContent(rawLog: string, options: ModelRequestScrubOptions): string {
   const lines = rawLog.split('\n')
-  const out = lines.map((line) => {
-    if (line.trim().length === 0) return line
-    const record = JSON.parse(line) as Record<string, unknown>
+  const records = lines.map(line => line.trim().length === 0 ? undefined : JSON.parse(line) as Record<string, unknown>)
+  const retainToolNames = records.some(record => record?.type === 'developer/message')
+  const out = lines.map((line, index) => {
+    const record = records[index]
+    if (record === undefined) return line
     const data = record.data as Record<string, unknown> | null | undefined
     if (data === null || typeof data !== 'object') return line
     if (options.system === true && record.type === 'system/message') {
@@ -593,7 +678,9 @@ function scrubModelRequestContent(rawLog: string, options: ModelRequestScrubOpti
     if (options.tools === true && record.type === 'request/header') {
       const header = data.header as Record<string, unknown> | null | undefined
       if (header === null || typeof header !== 'object' || !('tools' in header)) return line
-      header.tools = TOOLS
+      header.tools = retainToolNames && Array.isArray(header.tools)
+        ? header.tools.map((tool: string | { name: string }) => typeof tool === 'string' ? tool : tool.name)
+        : TOOLS
       return JSON.stringify(record)
     }
     return line

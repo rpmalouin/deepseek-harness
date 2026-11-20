@@ -37,7 +37,7 @@ export function directoryInstallSection(source) {
 !macroend`)
   result = replaceOnce(result, '!insertmacro setLinkVars', `!insertmacro setLinkVars
 !insertmacro dshStageApplication`)
-  result = replaceOnce(result, '!insertmacro installApplicationFiles', 'Call dshPromoteDirectories\nIfErrors 0 +4\n  SetErrorLevel 2\n  MessageBox MB_OK|MB_ICONEXCLAMATION "$(appCannotBeClosed)" /SD IDOK\n  Quit')
+  result = replaceOnce(result, '!insertmacro installApplicationFiles', 'Call dshPromoteDirectories\nIfErrors 0 +3\n  SetErrorLevel 2\n  Quit')
   result = replaceOnce(result, '!ifdef UNINSTALLER_ICON\n  File /oname=uninstallerIcon.ico "${UNINSTALLER_ICON}"\n!endif\n', '')
   // The staging macro uses the upstream installer macro, including its signed uninstaller.
   return result
@@ -78,9 +78,21 @@ export function installWindowsDirectoryInstaller() {
       adapted = replaceOnce(adapted, `!include "${helper}"`, `!include "${path}"`)
     }
     const uninstaller = join(directory, 'uninstaller.nsh')
-    await writeFile(uninstaller, replaceOnce(await readFile(join(templates, 'uninstaller.nsh'), 'utf8'),
-      'RMDir /r $INSTDIR', 'RMDir /r "\\\\?\\$INSTDIR"'))
+    await writeFile(uninstaller, directoryUninstaller(await readFile(join(templates, 'uninstaller.nsh'), 'utf8')))
     adapted = replaceOnce(adapted, '!include "uninstaller.nsh"', `!include "${uninstaller}"`)
-    return `!define DSH_SEVENZIP_PATH "${tool}"\n!define DSH_SEVENZIP_LICENSE_DIR "${dirname(dirname(sourceTool))}"\n${await compute.call(this, adapted, ...args)}`
+    return `!define DSH_UPDATER_CACHE_NAME "${this.packager.appInfo.updaterCacheDirName}"\n!define DSH_SEVENZIP_PATH "${tool}"\n!define DSH_SEVENZIP_LICENSE_DIR "${dirname(dirname(sourceTool))}"\n${await compute.call(this, adapted, ...args)}`
   }
+}
+
+/**
+ * Keep user-data removal in the native helper, which refuses unsafe roots and never follows links.
+ * @param {string} source - Pinned upstream uninstaller source.
+ * @returns {string} Uninstaller with long-path application removal and no upstream RMDir data removal.
+ */
+export function directoryUninstaller(source) {
+  const normalized = source.replaceAll('\r\n', '\n')
+  const start = normalized.indexOf('  Var /GLOBAL isDeleteAppData\n')
+  const end = normalized.indexOf('  DeleteRegKey SHELL_CONTEXT "${UNINSTALL_REGISTRY_KEY}"', start)
+  if (start < 0 || end < 0) throw new Error('NSIS uninstaller data removal template changed')
+  return replaceOnce(normalized.slice(0, start) + normalized.slice(end), 'RMDir /r $INSTDIR', 'RMDir /r "\\\\?\\$INSTDIR"')
 }

@@ -34,8 +34,7 @@ export interface AcpRunSpec {
   args: string[]
   /**
    * Absolute working directory for the child process AND its ACP session
-   * `cwd`. The provider resolves it before this spec exists: config override,
-   * else the delegating parent session's workspace.
+   * `cwd`, selected before provider startup.
    */
   cwd: string
   /** How to auto-answer the child's permission prompts. */
@@ -277,7 +276,7 @@ function toError(value: unknown): Error {
 function reportFailure(spec: AcpRunSpec, error: unknown): void {
   try {
     spec.onError?.(toError(error), 'error')
-  } catch {
+  } catch (_diagnosticSinkFailed) {
     // Host diagnostic logging cannot replace the child failure.
   }
 }
@@ -476,7 +475,7 @@ export async function startAcpRun(request: SubagentStartRequest, spec: AcpRunSpe
   request.signal.addEventListener('abort', onAbort, { once: true })
 
   // Read at every return so a partial answer survives a later cancel/error.
-  const collectOutput = (): ContentBlock[] => fold.collect() ?? []
+  const collectOutput = (): readonly ContentBlock[] => fold.collect() ?? []
 
   // Establish the remote session before publishing a handle. Any failure owns
   // the still-private process and therefore reaps it before rejecting.

@@ -28,7 +28,8 @@ export interface ClientSourceAsset {
   readonly scriptKey: RuntimeScriptKey
   readonly url: string
   readonly hash: string
-  readonly sourceMapUrl?: string
+  /** Map URL, available after loadSource when derived from the script's emitted trailer. */
+  readonly sourceMapUrl?: string | undefined
   readonly isModule?: boolean
   loadSource(): Promise<string>
   loadSourceMap?(): Promise<string | undefined>
@@ -151,8 +152,9 @@ export class ClientSourceCatalog {
     return entry.sourceBytes
   }
 
-  private sourceMapBytes(entry: LoadedAsset, maxContentBytes: number): Promise<Uint8Array | undefined> {
-    if (entry.asset.loadSourceMap === undefined) return Promise.resolve(undefined)
+  private async sourceMapBytes(entry: LoadedAsset, maxContentBytes: number): Promise<Uint8Array | undefined> {
+    if (entry.asset.loadSourceMap === undefined) return undefined
+    await this.source(entry, maxContentBytes)
     entry.sourceMapBytes ??= entry.asset.loadSourceMap().then(value =>
       value === undefined ? undefined : new TextEncoder().encode(value),
     ).catch((error: unknown) => {
@@ -168,32 +170,36 @@ export class ClientSourceCatalog {
 }
 
 /**
- * Discover this package's bundle URL from the Host-injected web boot graph.
+ * Discover this package's bundle URL from the Host-injected web boot graph and its map from the loaded script trailer.
  * @returns A lazy catalog, or `undefined` outside the assembled web application.
  */
 export function discoverInspectorClientSourceCatalog(): ClientSourceCatalog | undefined {
-  const graph = Reflect.get(globalThis, '__DSH_BOOT__') as unknown
+  const graph: unknown = Reflect.get(globalThis, '__DSH_BOOT__')
   if (typeof graph !== 'object' || graph === null) return undefined
-  const entries = Reflect.get(graph, 'entries') as unknown
+  const entries: unknown = Reflect.get(graph, 'entries')
   if (!Array.isArray(entries)) return undefined
   const row = entries.find((value) => {
     if (typeof value !== 'object' || value === null) return false
     return Reflect.get(value, 'id') === PACKAGE_ID
   }) as Record<string, unknown> | undefined
   if (row === undefined || typeof row.url !== 'string' || typeof row.rev !== 'string') return undefined
-  const base = browserLocation()
+  const base = documentBase()
   if (base === undefined) return undefined
   const sourceUrl = new URL(row.url, base)
-  const sourceMapUrl = new URL(sourceUrl.href)
-  sourceMapUrl.pathname = `${sourceMapUrl.pathname}.map`
+  let sourceMapUrl: string | undefined
   return new ClientSourceCatalog([{
     scriptKey: CLIENT_SCRIPT_KEY,
     url: sourceUrl.href,
     hash: row.rev,
-    sourceMapUrl: sourceMapUrl.href,
+    get sourceMapUrl() { return sourceMapUrl },
     isModule: false,
-    loadSource: async () => fetchText(sourceUrl.href),
-    loadSourceMap: async () => fetchText(sourceMapUrl.href),
+    loadSource: async () => {
+      const source = await fetchText(sourceUrl.href)
+      const reference = /\/\/#\s*sourceMappingURL=(\S+)\s*$/u.exec(source)?.[1]
+      if (reference !== undefined) sourceMapUrl = new URL(reference, sourceUrl).href
+      return source
+    },
+    loadSourceMap: async () => sourceMapUrl === undefined ? undefined : fetchText(sourceMapUrl),
   }])
 }
 
@@ -203,10 +209,19 @@ async function fetchText(url: string): Promise<string> {
   return response.text()
 }
 
-function browserLocation(): string | undefined {
-  const location = Reflect.get(globalThis, 'location') as unknown
+/**
+ * Base every app-owned route reference resolves against: the document's
+ * `baseURI`, else the location URL, else undefined outside a browser.
+ */
+function documentBase(): string | undefined {
+  const document: unknown = Reflect.get(globalThis, 'document')
+  if (typeof document === 'object' && document !== null) {
+    const baseURI: unknown = Reflect.get(document, 'baseURI')
+    if (typeof baseURI === 'string' && baseURI !== '') return baseURI
+  }
+  const location: unknown = Reflect.get(globalThis, 'location')
   if (typeof location !== 'object' || location === null) return undefined
-  const href = Reflect.get(location, 'href') as unknown
+  const href: unknown = Reflect.get(location, 'href')
   return typeof href === 'string' ? href : undefined
 }
 
@@ -224,7 +239,7 @@ function renderError(error: unknown): string {
 
 function normalizedUrl(value: string): string {
   try {
-    const url = new URL(value, browserLocation())
+    const url = new URL(value, documentBase())
     url.hash = ''
     return url.href
   } catch {

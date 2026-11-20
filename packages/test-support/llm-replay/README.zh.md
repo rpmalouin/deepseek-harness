@@ -9,7 +9,7 @@ kind: "package-reference"
 
 ## 概述
 
-`dsh-llm-replay` 从已记录的 Session JSONL fixture（测试前置数据）回放模型流，让快照测试无需 API 密钥即可运行真实 agent。每个 parent 与 subagent 会话按首次调用顺序取得各自的已记录脚本，而同一会话内的调用会独立推进。`replay.override.json` 伴随文件表示持久 settlement 无法重建的分片前失败、取消、挂起与注入重试。需要以固定模型输出确定性测试真实 loop 行为时，可在 ACP（Agent Client Protocol）、headless 与 Web 浏览器场景中使用本包。
+`dsh-llm-replay` 从已记录的 Session JSONL fixture（测试前置数据）回放模型流，让快照测试无需 API 密钥即可运行真实 agent。每个 parent 与 subagent 会话按首次调用顺序取得各自的已记录脚本，而同一会话内的调用会独立推进。`replay.override.json` 伴随文件提供所选 fixture 中缺失的场景行为，包括失败、取消、挂起、重试和对保留程序的人工改写。需要以固定模型输出确定性测试真实 loop 行为时，可在 ACP（Agent Client Protocol）、headless 与 Web 浏览器场景中使用本包。
 
 ## 目录
 
@@ -28,6 +28,8 @@ kind: "package-reference"
 本包让无密钥测试拥有带固定模型 transcript 的真实 agent：把它挂载到真实 LLM 适配器的位置，指向已记录的 fixture，然后就像模型真的产生了已记录输出那样运行场景。
 
 ### 挂载它
+
+已准备调用要求使用路由适配器模式。将 `models[].reasoningEfforts` 按可选强度从低到高排列。配置函数在准备期间接收该顺序；`defaultReasoningEffort` 仍独立于首个条目。
 
 配置 `providers` 后，插件会注册仅用于回放的适配器，其模型目录可供测试模型发现功能的场景使用；未配置 `providers` 时，它安装无需模型发现功能的测试所用的 catch-all `llm/stream` waterfall（瀑布式事件）：
 
@@ -77,11 +79,15 @@ parent agent 委托给进程内 subagent 的场景会为每个 Session 记录一
 
 有两种失败模式无法仅根据持久 Assistant settlement 重建：任何 chunk 之前的纯 throw 没有携带异常的 stream member，而 cancel/hang 需要的是不终止语义，不能用有限前缀回放。需要这些行为的场景可提供可选伴随文件（`<scenario>/replay.override.json`）：它用裸 `ReplayEntry[]` 替换派生脚本，或用 `{ patches: [{ at, entry }] }` 增补——保留所有派生调用，只替换指定的从 0 开始计数的调用索引；当 `at` 等于派生长度时，则在注入瞬态异常后的重试位置追加。有前缀分片的 `throw` 条目会接受 DeepSeek 请求扩展；零分片 throw 默认表示 2xx 前未接受，也可设 `accepted: true` 表示 2xx 后无分片失败。`hang` 条目可以指定 `readyFile`，回放在等待取消前写入它，使外部 driver 可以确定性取消。
 
+固定在历史录制或已停用工具录制上的场景，可以用 authored override 调整程序以遵循当前执行说明，同时保留原 Session。将调整后的场景标为 `recording: authored`。普通成功脚本直接从所选 Session 派生。
+
 ### 可能出什么问题
 
 - **fixture 未被完全消费**——在测试中直接安装回放时调用 `assertConsumed()`，它会把场景静默驱动的模型调用少于记录数转换为明确诊断。
 - **未记录的会话发起调用**——回放会明确报错，并提示你重新录制场景。
 - **脚本占位符匹配不到内容**——`{{fromRequest:<regex>}}` 解析会校验模式与请求语料，匹配不到、模式非法或占位符未闭合都会明确报错。
+
+独立转录提取向 V3→V4 显式提供空的子 Session 事实集合；保留已有目录记录，但不发现关联文件。完整的历史父目录迁移由 JSONL 持久化负责。
 
 -----
 
@@ -105,7 +111,6 @@ parent agent 委托给进程内 subagent 的场景会为每个 Session 记录一
 |---|---|
 | [`src/index.ts`](src/index.ts) | 类型、fixture 派生、override 校验、占位符解析、会话绑定、`installLlmReplay` 与插件导出 |
 | [`tests/session-format-corpus.spec.ts`](tests/session-format-corpus.spec.ts) | 已提交代际还原与精确历史拒绝检查 |
-| — | 不发布运行时不变式伴生入口；该仅测试适配器消费固定的回放脚本；其流语法由 LLM 伴生插件与 fixture 派生测试检验。 |
 
 ### 绑定与流式流程
 

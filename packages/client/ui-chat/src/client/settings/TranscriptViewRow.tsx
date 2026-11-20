@@ -1,21 +1,28 @@
-/** General Settings row for completed-Turn transcript presentation. */
+/** General Settings row for work-details presentation. */
 
-import { useState } from 'react'
 import type { SnapshotStore } from '@deepseek-ai/dsh-client-store'
-import { IconChevronDownOutline14, Menu } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import type { TranscriptViewMode } from '../../chat-settings.ts'
+import { TRANSCRIPT_VIEW_MODES, type TranscriptViewMode } from '../../chat-settings.ts'
 import type { ChatKey } from '../locale.ts'
-import css from './TranscriptViewRow.module.css'
+import { COLLAPSE_TIMINGS, FOLDED_REPLIES, type CollapseTiming, type FoldedReplies } from '../presentation-policy.ts'
+import { PreferenceRow } from './PreferenceRow.tsx'
 
-/** Registration-side transcript preference face. */
+/** Registration-side work-details preference face. */
 export interface TranscriptViewRowInjected {
   hooks: {
-    /** Persisted transcript preference bound as useTranscriptView. */
+    /** Persisted work-details preference bound as useTranscriptView. */
     transcriptView: SnapshotStore<TranscriptViewMode>
+    /** Persisted collapse timing bound as useCollapseTiming. */
+    collapseTiming: SnapshotStore<CollapseTiming>
+    /** Persisted folded-reply choice bound as useFoldedReplies. */
+    foldedReplies: SnapshotStore<FoldedReplies>
   }
-  /** Change the completed-Turn transcript presentation. */
+  /** Change the work-details presentation. */
   setTranscriptView: (mode: TranscriptViewMode) => void
+  /** Persist collapse timing independently of the work-details mode. */
+  setCollapseTiming: (timing: CollapseTiming) => void
+  /** Persist which Assistant replies stay visible in a folded Turn. */
+  setFoldedReplies: (replies: FoldedReplies) => void
 }
 
 /** Full Settings-row props. */
@@ -24,56 +31,63 @@ export type TranscriptViewRowProps =
   & PropsLocale<'chat'>
   & InjectFace<TranscriptViewRowInjected>
 
-const OPTIONS: readonly { id: TranscriptViewMode; label: ChatKey }[] = [
-  { id: 'normal', label: 'settings.transcript.normal' },
-  { id: 'compact', label: 'settings.transcript.compact' },
-]
+const LABELS = {
+  compact: 'settings.transcript.compact',
+  standard: 'settings.transcript.standard',
+  detailed: 'settings.transcript.detailed',
+  verbose: 'settings.transcript.verbose',
+} as const satisfies Record<TranscriptViewMode, ChatKey>
+
+const COLLAPSE_LABELS = {
+  completion: 'settings.collapse.completion',
+  'next-input': 'settings.collapse.nextInput',
+} as const satisfies Record<CollapseTiming, ChatKey>
+
+const FOLDED_REPLY_LABELS = {
+  all: 'settings.foldedReplies.all',
+  final: 'settings.foldedReplies.final',
+} as const satisfies Record<FoldedReplies, ChatKey>
 
 /**
- * Render the completed-Turn transcript mode selector.
+ * Render the independent, Host-backed work-details, collapse-timing, and folded-reply selectors.
+ * Verbose never folds a Turn, so it omits the folded-reply selector.
  * @param props - composed Settings slot props.
  * @returns the preference row.
  */
-export function TranscriptViewRow({ useTranscriptView, setTranscriptView, t }: TranscriptViewRowProps) {
+export function TranscriptViewRow({
+  useTranscriptView, setTranscriptView, useCollapseTiming, setCollapseTiming, useFoldedReplies, setFoldedReplies, t,
+}: TranscriptViewRowProps) {
   const mode = useTranscriptView(value => value)
-  const [open, setOpen] = useState(false)
-  const selectedLabel = mode === 'normal'
-    ? 'settings.transcript.normal'
-    : 'settings.transcript.compact'
-  const closeMenu = () => { setOpen(false) }
-  const selectMode = (id: string) => {
-    closeMenu()
-    setTranscriptView(id as TranscriptViewMode)
-  }
-  const selector = (
-    <button
-      type="button"
-      className={css.selector}
-      aria-haspopup="menu"
-      aria-expanded={open}
-      onClick={() => { setOpen(value => !value) }}
-    >
-      {t(selectedLabel)}
-      <IconChevronDownOutline14 className={css.chevron} />
-    </button>
-  )
-
+  const timing = useCollapseTiming(value => value)
+  const replies = useFoldedReplies(value => value)
   return (
-    <div className={css.row}>
-      <div className={css.rowText}>
-        <div className={css.title}>{t('settings.transcript.title')}</div>
-        <div className={css.desc}>{t('settings.transcript.description')}</div>
-      </div>
-      <Menu
-        open={open}
-        onClose={closeMenu}
-        items={OPTIONS.map(option => ({ id: option.id, label: t(option.label) }))}
-        selectedId={mode}
-        onSelect={selectMode}
-        align="end"
-        portal
-        anchor={selector}
+    <>
+      <PreferenceRow
+        title={t('settings.transcript.title')}
+        description={t('settings.transcript.description')}
+        value={mode}
+        selectedLabel={t(LABELS[mode])}
+        options={TRANSCRIPT_VIEW_MODES.map(id => ({ id, label: t(LABELS[id]) }))}
+        onSelect={(value) => { setTranscriptView(value as TranscriptViewMode) }}
       />
-    </div>
+      <PreferenceRow
+        title={t('settings.collapse.title')}
+        description={t('settings.collapse.description')}
+        value={timing}
+        selectedLabel={t(COLLAPSE_LABELS[timing])}
+        options={COLLAPSE_TIMINGS.map(id => ({ id, label: t(COLLAPSE_LABELS[id]) }))}
+        onSelect={(value) => { setCollapseTiming(value as CollapseTiming) }}
+      />
+      {mode !== 'verbose' && (
+        <PreferenceRow
+          title={t('settings.foldedReplies.title')}
+          description={t('settings.foldedReplies.description')}
+          value={replies}
+          selectedLabel={t(FOLDED_REPLY_LABELS[replies])}
+          options={FOLDED_REPLIES.map(id => ({ id, label: t(FOLDED_REPLY_LABELS[id]) }))}
+          onSelect={(value) => { setFoldedReplies(value as FoldedReplies) }}
+        />
+      )}
+    </>
   )
 }

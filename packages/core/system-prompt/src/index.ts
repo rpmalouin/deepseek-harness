@@ -17,9 +17,9 @@ declare module '@deepseek-ai/cordis' {
 
   interface Events {
     /**
-     * Expert waterfall over the assembled sections, contexts, tools, and variables.
+     * Presentation waterfall over assembled sections, contexts, and variables.
      * Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): scoped listeners
-     * receive only that scope's assemblies. The returned value is authoritative.
+     * receive only that scope's assemblies. The returned text is authoritative; tool declarations remain provider-owned.
      * A supplied signal controls only this explicit assembly request and must not
      * be retained to control later turns. A registered complete section is
      * restored after this waterfall, so listeners cannot add to or replace
@@ -28,7 +28,7 @@ declare module '@deepseek-ai/cordis' {
      * @param context - the caller's per-assembly context.
      * @mode waterfall
      */
-    'system-prompt/assemble'(this: Scoped<SystemPrompt>, assembly: PromptAssembly, context: AssembleContext, next: () => Promise<PromptAssembly>): Promise<PromptAssembly>
+    'system-prompt/assemble'(this: Scoped<SystemPrompt>, assembly: PromptPresentation, context: AssembleContext, next: () => Promise<PromptPresentation>): Promise<PromptPresentation>
     /**
      * Emitted when any prompt provider changes. This registry notification is
      * unfiltered because a global change affects every scope.
@@ -81,8 +81,12 @@ export interface PromptContext {
   readonly name: string
   /** Contexts are joined in ascending order. */
   readonly order: number
-  /** Static text or a provider evaluated for each assembly. Empty text contributes nothing. */
+  /** Static text or a provider evaluated at assembly and admission refresh. Empty text contributes nothing. */
   readonly text: string | ((context: AssembleContext) => string)
+  /** Whether to interpolate prompt variables. Defaults to true; false preserves literal text. */
+  readonly interpolate?: boolean
+  /** Keep this operational context when optional runtime context is disabled. */
+  readonly required?: boolean
 }
 
 /** One section of an assembly: {@link PromptSection} with its text resolved. */
@@ -101,6 +105,8 @@ export interface AssembledContext {
   name: string
   /** The resolved text before variable interpolation. */
   text: string
+  /** Whether to interpolate prompt variables. Defaults to true; false preserves literal text. */
+  interpolate?: boolean
 }
 
 /** Tool schemas visible in one assembly and their pre-restriction name set. */
@@ -112,14 +118,19 @@ export interface ToolProviderResult {
 }
 
 /**
- * Merge-extensible assembled model input. Sections and contexts remain
- * uninterpolated until rendered; tools are already in canonical order.
+ * Prompt text contributions that the assembly waterfall may transform.
+ * Sections and contexts remain uninterpolated until rendered; tool
+ * declarations are owned by their providers.
  */
-export interface PromptAssembly {
+export interface PromptPresentation {
   sections: AssembledSection[]
   contexts: AssembledContext[]
-  tools: ToolSchema[]
   variables: Record<string, string | undefined>
+}
+
+/** Completed model inputs: the presentation plus tool declarations in canonical order. */
+export interface PromptAssembly extends PromptPresentation {
+  tools: ToolSchema[]
 }
 
 const SECTION_ORDERS = {
@@ -134,16 +145,18 @@ const SECTION_ORDERS = {
   TOOL_READ: 1100,
   TOOL_WRITE: 1200,
   TOOL_EDIT: 1300,
+  TOOL_APPLY_PATCH: 1350,
   TOOL_GLOB: 1400,
   TOOL_GREP: 1500,
   TOOL_JOBS: 1600,
   TOOL_PTY: 1700,
+  TOOL_PTY_PANEL: 1710,
   TOOL_WEB_SEARCH: 2000,
   TOOL_WEB_FETCH: 2100,
   TOOL_LSP: 2200,
   TOOL_SESSION_QUERY: 2300,
   TOOL_GOAL: 2400,
-  TOOL_CORDIS: 2500,
+  TOOL_SCHEDULE: 2500,
   TOOL_WORKFLOW: 2600,
   TOOL_RALPH: 2700,
   TOOL_SUBAGENT: 2800,
@@ -163,9 +176,14 @@ const SECTION_ORDERS = {
 export type PromptSectionOrderName = keyof typeof SECTION_ORDERS
 
 const CONTEXT_ORDERS = {
+  WORKING_DIRECTORY: 100,
   SANDBOX_POLICY: 110,
   APPROVAL_POLICY: 115,
   SUBAGENT_DELEGATION: 120,
+  // Process-specific paths and endpoints stay out of the cached system prompt.
+  HARNESS_SOURCE: 200,
+  WEB_SURFACE: 210,
+  PLUGIN_CLIS: 220,
 } as const
 
 /** Name of a centrally allocated runtime-context position. */
@@ -248,7 +266,7 @@ function compareToolNames(a: ToolSchema, b: ToolSchema): number {
 export interface Config {
   /** Include the fixed DeepSeek Harness identity before the deployment persona (default true). */
   includeHarnessIdentity?: boolean
-  /** Include dynamic runtime-context snapshots in model history (default true). */
+  /** Include optional runtime-context snapshots in model history (default true); required context remains. */
   includeRuntimeContext?: boolean
   /**
    * Deployment-wide persona prefix template before first-party guidance. A scoped section named
@@ -285,7 +303,7 @@ export function renderPrompt(assembly: PromptAssembly): string {
 }
 
 /**
- * Render the complete dynamic context snapshot.
+ * Render the complete dynamic context snapshot, preserving literal contributions.
  * @param assembly - the assembly whose contexts and variables to render.
  * @returns the current full snapshot, or `''` when no context is active.
  */
@@ -312,13 +330,17 @@ export function joinContextSections(sections: readonly ContextSnapshotSection[])
  *
  * {@link renderContextSnapshot} joins these for the model; a consumer that
  * presents the snapshot uses them to attribute each part to the subsystem that
- * contributed it, without re-splitting the joined prose.
+ * contributed it, without re-splitting the joined prose. Contributions with
+ * `interpolate: false` preserve literal text instead of resolving prompt variables.
  * @param assembly - the assembly whose contexts and variables to render.
  * @returns one entry per contributing context that rendered to non-empty text.
  */
 export function renderContextSections(assembly: PromptAssembly): ContextSnapshotSection[] {
   return assembly.contexts
-    .map(context => ({ name: context.name, text: interpolate(context, assembly.variables, 'context') }))
+    .map(context => ({
+      name: context.name,
+      text: context.interpolate === false ? context.text : interpolate(context, assembly.variables, 'context'),
+    }))
     .filter(section => section.text.length > 0)
 }
 
@@ -360,6 +382,15 @@ function interpolate(
     last = open + group[0].length
   }
   return result + text.slice(last)
+}
+
+/** Resolve one registered runtime fact without assembling sections or tools. */
+function resolveContext(entry: PromptContext, context: AssembleContext): AssembledContext {
+  return {
+    name: entry.name,
+    text: typeof entry.text === 'function' ? entry.text(context) : entry.text,
+    ...entry.interpolate !== undefined ? { interpolate: entry.interpolate } : {},
+  }
 }
 
 /** One tool-schema provider stored in a prompt layer. */
@@ -499,7 +530,7 @@ export class SystemPrompt extends Service {
   }
 
   /**
-   * Suppress every dynamic runtime-context contribution in the calling
+   * Suppress optional dynamic runtime-context contributions in the calling
    * context's scope without changing the services that own or enforce those
    * facts. Multiple suppressors remain independently disposable.
    * @returns the exact Cordis effect disposer.
@@ -547,13 +578,45 @@ export class SystemPrompt extends Service {
   }
 
   /**
+   * Refresh accepted registered runtime facts for request admission. Contexts
+   * added only by the assembly waterfall retain their accepted values. Current
+   * suppression removes optional contexts, and missing required registrations
+   * are restored in registry order. Sections, tools, and interpolation variables
+   * retain the accepted assembly; their providers and waterfall do not rerun.
+   * @param assembly - accepted assembly for this scope and step.
+   * @param context - the same scope and current plugin-defined assembly fields.
+   * @returns the accepted assembly with current runtime-context provider text.
+   */
+  refreshContext(assembly: PromptAssembly, context: AssembleContext = {}): PromptAssembly {
+    const providers = this.layers.merge(context.scope, layer => layer.contexts)
+    const suppressed = !this.layers.global.runtimeContextSuppressors.isEmpty()
+      || this.layers.chainLayers(context.scope).some(layer => !layer.runtimeContextSuppressors.isEmpty())
+    const required = new Map([...providers].filter(([, entry]) => entry.required === true))
+    const contexts: AssembledContext[] = []
+    for (const accepted of assembly.contexts) {
+      const provider = providers.get(accepted.name)
+      required.delete(accepted.name)
+      if (suppressed && provider?.required !== true) continue
+      contexts.push(provider === undefined ? accepted : resolveContext(provider, context))
+    }
+    for (const provider of required.values()) {
+      const index = contexts.findIndex((entry) => {
+        const next = providers.get(entry.name)
+        return next !== undefined && next.order > provider.order
+      })
+      contexts.splice(index < 0 ? contexts.length : index, 0, resolveContext(provider, context))
+    }
+    return { ...assembly, contexts }
+  }
+
+  /**
    * Assemble global and scoped providers, detach tool parameters, apply
-   * canonical ordering, then run the assembly waterfall. Scoped sections and
-   * variables shadow globals. The returned waterfall value is authoritative
-   * except that an effective complete section is restored afterwards as the
-   * sole prompt section.
-   * @param context - the optional scope and plugin-defined assembly fields.
-   * @returns the post-waterfall assembly with any complete prompt enforced.
+   * canonical ordering, then run the presentation waterfall. Scoped sections
+   * and variables shadow globals. The waterfall's text is authoritative except
+   * that an effective complete section is restored afterwards as the sole
+   * prompt section; tool declarations stay provider-owned.
+   * @param context - the optional scope, step tool set, and plugin-defined assembly fields.
+   * @returns the post-waterfall assembly with ordered tool declarations and any complete prompt enforced.
    */
   // Keep configuration failures on the declared asynchronous error path.
   async assemble(context: AssembleContext = {}): Promise<PromptAssembly> {
@@ -584,10 +647,11 @@ export class SystemPrompt extends Service {
     const knownNames = new Set<string>()
     for (const provider of providers) {
       const result = provider(context)
-      const schemas = result.schemas.map(({ name, description, parameters }): ToolSchema => ({
+      const schemas = result.schemas.map(({ name, description, parameters, deferLoading }): ToolSchema => ({
         name,
         description,
         parameters: structuredClone(parameters),
+        ...deferLoading === true ? { deferLoading } : {},
       }))
       const acceptedKnownNames = result.knownNames ?? schemas.map(tool => tool.name)
       collected.push(...schemas)
@@ -609,28 +673,26 @@ export class SystemPrompt extends Service {
         if (section.complete === true) completeSection = { ...assembled }
         return assembled
       })
-    const assembly: PromptAssembly = {
+    const tools = orderTools(collected, this.toolOrder, knownNames)
+    const assembly: PromptPresentation = {
       sections,
-      contexts: runtimeContextSuppressed
-        ? []
-        : [...contextByName.values()]
-          .sort((a, b) => a.order - b.order)
-          .map(entry => ({
-            name: entry.name,
-            text: typeof entry.text === 'function' ? entry.text(context) : entry.text,
-          })),
-      tools: orderTools(collected, this.toolOrder, knownNames),
+      contexts: [...contextByName.values()]
+        .filter(entry => !runtimeContextSuppressed || entry.required === true)
+        .sort((a, b) => a.order - b.order)
+        .map(entry => resolveContext(entry, context)),
       variables,
     }
     const transformed = await this.ctx.waterfall(
       scopeTarget(this, scope), 'system-prompt/assemble', assembly, context,
       () => Promise.resolve(assembly),
     )
-    if (completeSection === undefined && !runtimeContextSuppressed) return transformed
+    if (completeSection === undefined && !runtimeContextSuppressed) return { ...transformed, tools }
+    const requiredContexts = new Set([...contextByName.values()].filter(entry => entry.required === true).map(entry => entry.name))
     return {
       ...transformed,
+      tools,
       sections: completeSection === undefined ? transformed.sections : [completeSection],
-      contexts: runtimeContextSuppressed ? [] : transformed.contexts,
+      contexts: runtimeContextSuppressed ? transformed.contexts.filter(entry => requiredContexts.has(entry.name)) : transformed.contexts,
     }
   }
 }

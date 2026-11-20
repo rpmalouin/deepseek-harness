@@ -61,7 +61,9 @@ export function apply() {
       name: dsh-hello-plugin
 ```
 
-没有 `dsh.bundle` 声明的包仍然可以安装，但只作为普通依赖：`dsh plugin` 会打印警告，且不激活任何层。如果一个库供插件包 import，而不是供用户启用，就使用这种包格式。
+`patch` 也接受一个有序的文件列表，例如 `["./base.patch.yml", "./web.patch.yml"]`；launcher 按该顺序把它们作为同一层应用，每个文件中的相对插件路径相对于该文件解析。没有 `dsh.bundle` 声明的包仍然可以安装，但只作为普通依赖：`dsh plugin` 会打印警告，且不激活任何层。如果一个库供插件包 import，而不是供用户启用，就使用这种包格式。
+
+使用 `engines.dsh` SemVer 范围声明组合包支持的 DSH 版本，例如 `"engines": { "dsh": ">=0.2.0 <0.3.0" }`。安装和 profile 启动会拒绝当前运行的 DSH 不满足该范围的组合包；没有 `engines.dsh` 时，改为检查其 `@deepseek-ai/dsh*` peer 依赖范围（[规则](../../../../packages/boot/app-boot/README.zh.md#profiles)）。
 
 ### profile manifest
 
@@ -70,7 +72,7 @@ profile 目录包含两个文件：
 - `package.json` — profile 的树外插件依赖（由 pnpm 管理），加上 `dsh.profile` manifest 及其有序的 `bundles` 列表。
 - `cordis.patch.yml` — 用户自己的 patch 层，在每个组合包层之后应用。
 
-profile manifest 从不需要手写：`dsh --profile <name> --from-default-profile <template>` 可以从随附应用模板创建 profile，`dsh plugin` 则创建一个以 base 为基础的 profile，并维护其中已安装的 bundle 列表。创建规则以 [CLI（命令行界面）行为参考](../../../../apps/cli/reference/README.zh.md#profile-boot)为准；下一节展示插件路径。
+profile manifest 从不需要手写：`dsh --profile <name> --from-default-profile <template>` 可以从随附应用模板创建或重置 profile，`dsh plugin` 则创建一个以 base 为基础的 profile，并维护其中已安装的 bundle 列表。创建规则以 [CLI（命令行界面）行为参考](../../../../apps/cli/reference/README.zh.md#profile-boot)为准；下一节展示插件路径。
 
 ## 安装进 profile
 
@@ -99,6 +101,12 @@ dsh plugin --profile demo add ./hello-plugin
   }
 }
 ```
+
+通过链接安装的 checkout 保留自己的 `node_modules`。与 harness 自身的包一样，需要与宿主共享实例的 dsh 包同时声明在 `peerDependencies` 与 `devDependencies` 中。在该 manifest 的查询位置，运行中 dsh 的 runtime resolution 已包含的 peer 使用安装中的副本；devDependency 副本供类型检查和独立测试使用。需要独立版本的第三方依赖和无状态 dsh 工具包放在 `dependencies` 中。
+
+普通 linked import 遵循 Node 的祖先顺序，检查每个目录当前的 peer 声明。更近的物理包先于更高的 peer 声明。link 目标可以没有 `package.json`，祖先 peer 仍可生效，即使该 manifest 旁没有物理 `node_modules`。显式 `require.resolve(..., { paths })` 始终是原生查询，包括指向 profile 内的路径。npm、Desktop 与源码启动共用这些规则；规则不会使已加载模块失效，也不校验 peer 版本范围。作用域和文件查询行为见[解析规则](../../../../.agents/notes/implemented/architecture/2026-09-19-profile-resolution-lookup-order.zh.md)。
+
+链接整个 checkout 不会对运行中安装自身的包目录应用 peer 拦截。目标仍位于 profile 内的链接（包括它的 pnpm store）属于 profile 自己安装的内容，不算外部 linked root。外部链接互相重叠也不改变查找顺序，每个请求仍从其 importer 所在目录开始。
 
 先不启动、只验证该层，再启动：
 

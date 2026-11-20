@@ -1,4 +1,5 @@
 /** Builds an isolated native payload through the production NSIS configuration and exercises its UI. */
+import { readInstallerLocales, renderInstallerStrings } from './installer-locales.mjs'
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
@@ -21,6 +22,9 @@ const { getMakeNsisPath } = require('app-builder-lib/out/toolsets/windows.js')
 const guid = randomUUID()
 const id = guid.replaceAll('-', '')
 const productName = `Harness Installer Test ${id.slice(0, 8)}`
+// Scoped like the shipped package so Electron user data nests under a scope directory; the scope is unique per run.
+const packageName = `@harness-installer-test-${id.slice(0, 8)}/app-${id}`
+const uninstallOnly = process.argv.includes('--uninstall-only')
 const outputRoot = join(appRoot, '.desktop-build', 'installer-tests')
 await mkdir(outputRoot, { recursive: true })
 const output = await mkdtemp(join(outputRoot, 'run-'))
@@ -44,7 +48,9 @@ try {
     DSH_DESKTOP_TARGET_PLATFORM: 'win32', DSH_DESKTOP_TARGET_ARCH: 'x64',
     DSH_DESKTOP_UNSIGNED: '1', CSC_IDENTITY_AUTO_DISCOVERY: 'false', ELECTRON_BUILDER_7Z_FILTER: 'BCJ',
     DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN: signingEnvironment.DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN
-      ?? 'https://harness-test.deepseek.com',
+      ?? 'https://test.example.com',
+    DSH_DESKTOP_MANDATORY_UPDATE_CONFIG: signingEnvironment.DSH_DESKTOP_MANDATORY_UPDATE_CONFIG
+      ?? JSON.stringify({ allowedAuthOrigins: ['https://login.example.com'] }),
     ...signingRun ? { DSH_DESKTOP_PACKAGING_RUN_DIR: signingRun.directory } : {},
   })
   const { createElectronBuilderConfig } = await import('../electron-builder.config.mjs')
@@ -53,14 +59,38 @@ try {
     join(appRoot, 'scripts', 'prepare-windows-installer.ps1'), '-OutputDirectory', join(output, 'ui'), '-CompileProgressOnly'], childOptions)
   const progressTest = join(output, 'ui', 'progress-test.exe')
   const presentationTest = join(output, 'ui', 'presentation-test.exe')
+  const renderTest = join(output, 'ui', 'render-test.exe')
+  const cleanupTest = join(output, 'ui', 'data-cleanup-test.exe')
   if (sign) {
     await sign({ path: progressTest, hash: 'sha256', isNest: false })
     await sign({ path: presentationTest, hash: 'sha256', isNest: false })
+    await sign({ path: renderTest, hash: 'sha256', isNest: false })
+    await sign({ path: cleanupTest, hash: 'sha256', isNest: false })
     await sign({ path: join(output, 'ui', 'window-frame.dll'), hash: 'sha256', isNest: false })
     installWindowsNsisBootstrapSigner({ sign })
   }
-  await execute(progressTest, [], childOptions)
-  await execute(presentationTest, [], childOptions)
+  if (!uninstallOnly) {
+    await execute(progressTest, [], childOptions)
+    await execute(presentationTest, [], childOptions)
+    const renderResults = []
+    const themeSource = await readFile(join(appRoot, 'installer', 'theme.nsh'), 'utf8')
+    const captionColor = (name) => {
+      const match = themeSource.match(new RegExp(`^!define ${name} (0x[0-9A-Fa-f]{8})\\r?$`, 'm'))
+      if (!match) throw new Error(`Missing installer caption color: ${name}`)
+      return match[1]
+    }
+    for (const dpi of [96, 192]) {
+      for (const theme of ['light', 'dark']) {
+        const brand = theme === 'dark' ? 'brand-dark-2x.bmp' : 'brand-2x.bmp'
+        const prefix = theme === 'dark' ? 'INSTALLER_DARK_CONTROL' : 'INSTALLER_CONTROL'
+        const result = await execute(renderTest, [join(output, 'ui', brand), String(dpi), theme,
+          captionColor(`${prefix}_HOVER`), captionColor(`${prefix}_PRESSED`)], childOptions)
+        renderResults.push(result.stdout)
+      }
+    }
+    await writeFile(join(output, 'render-results.log'), renderResults.join(''))
+  }
+  await execute(cleanupTest, [join(output, 'ui', `cleanup-${id}`)], childOptions)
   const payloadSource = join(output, 'payload.nsi')
   await writeFile(payloadSource, `Unicode true
 RequestExecutionLevel user
@@ -78,28 +108,41 @@ SectionEnd
   const compiler = await getMakeNsisPath()
   await execute(compiler.path, ['/V2', payloadSource], { ...childOptions, env: { ...childOptions.env, ...compiler.env } })
   if (sign) await sign({ path: join(payload, `${productName}.exe`), hash: 'sha256', isNest: false })
-  const sourceStrings = await readFile(join(appRoot, 'installer', 'strings.nsh'), 'utf8')
-  const config = createElectronBuilderConfig()
-  if (sign) {
-    config.win.forceCodeSigning = true
-    config.win.signtoolOptions.sign = sign
+  if (!uninstallOnly && !process.argv.includes('--compile-only')) {
+    const owner = join(output, 'restart-status-owner.exe')
+    await execute(compiler.path, ['/V2', `/DOWNER_EXE=${owner}`,
+      `/DBANNER_INCLUDE=${join(appRoot, 'scripts', 'restart-banner.nsh')}`,
+      `/DSTATUS_DLL=${join(output, 'ui', 'window-frame.dll')}`,
+      join(appRoot, 'tests', 'fixtures', 'restart-status-owner.nsi')],
+    { ...childOptions, env: { ...childOptions.env, ...compiler.env } })
+    if (sign) await sign({ path: owner, hash: 'sha256', isNest: false })
+    await execute('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+      join(appRoot, 'tests', 'windows-restart-status.ps1'), '-OwnerExe', owner], childOptions)
   }
-  for (const language of ['en_US', 'zh_CN']) {
+  for (const locale of readInstallerLocales()) {
+    const language = locale.id
+    const config = createElectronBuilderConfig()
+    if (sign) {
+      config.win.forceCodeSigning = true
+      config.win.signtoolOptions.sign = sign
+    }
     const languageOutput = join(output, language)
     await mkdir(languageOutput)
     const strings = join(languageOutput, 'strings.nsh')
-    const languageId = language === 'en_US' ? 'ENGLISH' : 'SIMPCHINESE'
-    await writeFile(strings, sourceStrings.split('\n').filter((line) =>
-      !line.startsWith('LangString ') || line.includes(`\${LANG_${languageId}}`)).join('\n'))
+    await writeFile(strings, renderInstallerStrings([locale]), 'utf8')
     const include = join(languageOutput, 'include.nsh')
     await writeFile(include, `!define INSTALLER_BUILD_DIR "${join(output, 'ui')}"\n!define INSTALLER_STRINGS_FILE "${strings}"\n!include "${join(appRoot, 'scripts', 'installer.nsh')}"\n`)
     await build({ projectDir: appRoot, prepackaged: payload, targets: Platform.WINDOWS.createTarget(['nsis'], Arch.x64), publish: 'never',
-      config: { ...config, productName, artifactName: 'installer-test.exe', directories: { output: languageOutput },
+      config: { ...config, productName, extraMetadata: { ...config.extraMetadata, name: packageName },
+        artifactName: 'installer-test.exe', directories: { output: languageOutput },
         nsis: { ...config.nsis, guid, include, installerLanguages: [language] }, beforeBuild: undefined, afterPack: undefined, afterSign: undefined, artifactBuildCompleted: undefined },
     })
+    if (process.argv.includes('--compile-only')) continue
     const result = await execute('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
-      join(appRoot, 'tests', 'windows-installer-smoke.ps1'), '-Installer', join(languageOutput, 'installer-test.exe'),
-      '-ProductName', productName, '-RegistryKey', guid, '-OutputDirectory', languageOutput], childOptions)
+      join(appRoot, 'tests', uninstallOnly ? 'windows-uninstall-smoke.ps1' : 'windows-installer-smoke.ps1'),
+      '-Installer', join(languageOutput, 'installer-test.exe'),
+      '-ProductName', productName, '-RegistryKey', guid, '-OutputDirectory', languageOutput,
+      '-Language', language, ...uninstallOnly ? ['-PackageName', packageName] : []], childOptions)
     process.stdout.write(`${language}\n${result.stdout}`)
   }
   succeeded = true

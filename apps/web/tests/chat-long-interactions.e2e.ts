@@ -10,7 +10,7 @@ import { chromium } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { ReplayEntry, ReplayOverrideDoc } from '@deepseek-ai/dsh-llm-replay'
-import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
+import type { SessionId, SessionEvent } from '@deepseek-ai/dsh-session'
 import { createChatScrollFixture } from './chat-scroll-fixture.ts'
 import {
   launchWebScaffold,
@@ -19,7 +19,8 @@ import {
   webSnapshotMode,
   type WebScaffold,
 } from './scaffold.ts'
-import { conversationContextKey, expandOwningTurnProcess, newEnglishPage, saveFailureShot } from './support.ts'
+import { conversationContextKey, expandOwningTurnProcess, loadEarlierChatPage, newEnglishPage, saveFailureShot } from './support.ts'
+import { brandString } from '@deepseek-ai/dsh-brand'
 
 const MODE = webSnapshotMode()
 const SESSION_ID = 'chat-long-interactions-e2e'
@@ -83,7 +84,7 @@ async function openSeed(page: Page): Promise<void> {
   // Search collapsed into a header action; expand it before filling.
   const searchButton = page.getByRole('button', { name: 'Search sessions' })
   if (await searchButton.getAttribute('aria-expanded') !== 'true') await searchButton.click()
-  const search = page.getByRole('textbox', { name: 'Search sessions...', exact: true })
+  const search = page.getByRole('textbox', { name: 'Search session names', exact: true })
   await search.fill(FIXTURE.markers.user(1))
   const results = page.getByRole('tree', { name: 'Search results' }).getByRole('treeitem')
   await results.first().waitFor({ timeout: 60_000 })
@@ -174,10 +175,10 @@ describe('web e2e: long Chat interaction contract', () => {
   it.skipIf(MODE === 'record')('keeps heterogeneous rows and their actions bound to exact semantic identities', async () => {
     onTestFailed(() => saveFailureShot(page, 'web-e2e-chat-long-interactions'))
     await expect.poll(
-      () => scaffold.ctx.agents.get(SessionId(SESSION_ID)) !== undefined,
+      () => scaffold.ctx.agents.get(brandString<SessionId>(SESSION_ID)) !== undefined,
       { timeout: 10_000 },
     ).toBe(true)
-    const source = scaffold.ctx.agents.get(SessionId(SESSION_ID))
+    const source = scaffold.ctx.agents.get(brandString<SessionId>(SESSION_ID))
     if (source === undefined) throw new Error('seeded long-history agent is not attached')
 
     const toolUserMarker = FIXTURE.markers.user(TOOL_TURN)
@@ -198,35 +199,36 @@ describe('web e2e: long Chat interaction contract', () => {
 
     const turnNavigation = page.getByRole('navigation', { name: 'Turn navigation' })
     await turnNavigation.waitFor({ state: 'visible', timeout: 15_000 })
-    // The whole-log outline offers every fixture turn before any paging, with
-    // the live tail mark current.
     const marks = turnNavigation.getByRole('button')
-    await expect.poll(() => marks.count(), { timeout: 15_000 }).toBe(FIXTURE_TURNS)
-    expect(await marks.last().getAttribute('aria-current')).toBe('true')
+    await expect.poll(() => marks.last().getAttribute('aria-current'), { timeout: 15_000 }).toBe('true')
+    expect(await marks.count()).toBeLessThan(FIXTURE_TURNS)
     // The oldest turn is an unloaded mark whose outline preview already
     // carries both the prompt and the settled response.
     const firstTurnButton = turnNavigation
       .getByRole('button', { name: 'Load and jump to turn 1', exact: true })
+    const railScroller = turnNavigation.locator('[class*="scroller"]')
+    await railScroller.hover()
+    await page.mouse.wheel(0, -FIXTURE_TURNS * 10)
+    await expect.poll(() => railScroller.evaluate(element => element.scrollTop)).toBe(0)
     await firstTurnButton.focus()
     const preview = page.getByRole('tooltip')
     await preview.waitFor({ state: 'visible', timeout: 5_000 })
-    expect(await preview.textContent()).toContain(FIXTURE.markers.user(1))
+    await expect.poll(() => preview.textContent(), { timeout: 5_000 }).toContain(FIXTURE.markers.user(1))
     expect(await preview.textContent()).toContain(FIXTURE.markers.assistant(1))
-    const firstTurnPosition = await firstTurnButton.evaluate(button => (
-      button.parentElement?.style.getPropertyValue('--turn-natural-position') ?? ''
+    const markPitch = () => turnNavigation.getByRole('button').evaluateAll(buttons => (
+      buttons[1]!.getBoundingClientRect().top - buttons[0]!.getBoundingClientRect().top
     ))
-    expect(firstTurnPosition).toBe('0px')
+    expect(await markPitch()).toBe(10)
 
-    const loadEarlier = page.getByRole('button', { name: 'Load earlier', exact: true })
-    const loadedMarks = turnNavigation.getByRole('button', { name: /^Jump to turn / })
-    const loadedBefore = await loadedMarks.count()
-    await loadEarlier.click()
-    // Paging converts marks to their loaded form without moving the
-    // fixed-pitch ladder.
-    await expect.poll(() => loadedMarks.count(), { timeout: 15_000 }).toBeGreaterThan(loadedBefore)
-    expect(await firstTurnButton.evaluate(button => (
-      button.parentElement?.style.getPropertyValue('--turn-natural-position') ?? ''
-    ))).toBe(firstTurnPosition)
+    const loadedRows = page.locator('[data-chat-flow-key]')
+    const loadedBefore = await loadedRows.count()
+    await loadEarlierChatPage(page)
+    await expect.poll(() => loadedRows.count(), { timeout: 15_000 }).toBeGreaterThan(loadedBefore)
+    await railScroller.hover()
+    await page.mouse.wheel(0, -FIXTURE_TURNS * 10)
+    await expect.poll(() => railScroller.evaluate(element => element.scrollTop)).toBe(0)
+    await firstTurnButton.waitFor({ state: 'visible' })
+    expect(await markPitch()).toBe(10)
     // Activating the still-unloaded oldest mark pages the rest in and lands
     // on the turn's own row.
     await firstTurnButton.focus()
@@ -305,24 +307,26 @@ describe('web e2e: long Chat interaction contract', () => {
     await expect.poll(() => page.evaluate(() => navigator.clipboard.readText()), { timeout: 5_000 })
       .toBe(expectedUserText)
 
+    const existing = new Set(scaffold.ctx.agents.list().map(agent => agent.id))
     await turnTailRow.hover()
     await turnTailRow.getByRole('button', { name: 'Branch into a new conversation', exact: true }).click()
     await expect.poll(
-      () => scaffold.ctx.agents.list().find(agent => agent.session.header.parentSession === SessionId(SESSION_ID)),
+      () => scaffold.ctx.agents.list().find(agent => !existing.has(agent.id)),
       { timeout: 15_000 },
     ).toBeDefined()
     const child = scaffold.ctx.agents.list()
-      .find(agent => agent.session.header.parentSession === SessionId(SESSION_ID))
+      .find(agent => !existing.has(agent.id))
     if (child === undefined) throw new Error('message branch did not create a child session')
+    expect(child.session.header.parentSession).toBeUndefined()
     expect(child.session.inheritedEventCount).toBe(boundary.seq + 1)
     expect(child.session.snapshotEvents().some(event => carries(event, branchAssistantMarker))).toBe(true)
     expect(child.session.snapshotEvents().some(event => carries(event, FIXTURE.markers.user(BRANCH_TURN + 1)))).toBe(false)
     expect(child.session.snapshotEvents().some(event => carries(event, FIXTURE.markers.user(FIXTURE.turns)))).toBe(false)
 
+    // The current crumb renders as plain text, not a button.
     const currentCrumb = page.getByRole('navigation', { name: 'Session hierarchy' })
-      .getByRole('button').last()
-    await expect.poll(() => currentCrumb.textContent(), { timeout: 15_000 })
-      .toBe(`${FIXTURE.title} (1)`)
+      .getByText(`${FIXTURE.title} (1)`, { exact: true })
+    await expect.poll(() => currentCrumb.count(), { timeout: 15_000 }).toBe(1)
     await page.getByText(branchAssistantMarker, { exact: false }).last().waitFor({ timeout: 15_000 })
     const settled = scaffold.whenTurnSettled(60_000)
     const composer = page.locator('[data-composer-input][contenteditable="true"]').last()

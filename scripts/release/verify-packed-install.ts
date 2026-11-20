@@ -1,6 +1,7 @@
 /**
  * Install packed tarballs into a throwaway consumer outside the repository and
- * drive the installed executable with plain Node.
+ * drive the installed executable with plain Node. Its npm cache belongs to that
+ * consumer and is removed with it on normal completion or failure.
  *
  * Every tarball the installed tree needs comes from `--from`, so the only
  * registry traffic is for external dependencies. That matters beyond hermetic
@@ -21,9 +22,10 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
+import { acceptsNpmPlatform } from '../npm-platform.ts'
 import { releaseFamily } from './families.ts'
 import { capture, isEntry } from './process.ts'
-import { packedIdentity } from './tarball.ts'
+import { packedManifest } from './tarball.ts'
 import { verifyInstalledProductIsolation } from './installed-product-isolation.ts'
 
 /**
@@ -45,29 +47,32 @@ function consumerEnvironment(consumerRoot: string): NodeJS.ProcessEnv {
 }
 
 /**
- * Every packed tarball in the given directories, as `file:` dependency entries.
+ * Packed tarballs and their compatibility with the verification host, as `file:` dependency entries.
  *
  * The directories are read by their contents rather than a pack order file: a
  * directory here can hold tarballs packed only to satisfy a cross-sequence
  * dependency, which no release order describes.
  * @param directories - absolute directories holding packed tarballs.
- * @returns Package name to tarball file URL, and the version each carries.
+ * @returns Package name to tarball URL, version, and host compatibility.
  */
-function packedDependencies(directories: readonly string[]): Map<string, { url: string; version: string }> {
-  const dependencies = new Map<string, { url: string; version: string }>()
+function packedDependencies(directories: readonly string[]): Map<string, { url: string; version: string; compatible: boolean }> {
+  const dependencies = new Map<string, { url: string; version: string; compatible: boolean }>()
   for (const directory of directories) {
     const tarballs = readdirSync(directory).filter(name => name.endsWith('.tgz')).sort()
     if (tarballs.length === 0) throw new Error(`${directory} holds no packed tarball`)
     for (const filename of tarballs) {
       const tarball = join(directory, filename)
-      const { name, version } = packedIdentity(tarball)
-      dependencies.set(name, { url: pathToFileURL(tarball).href, version })
+      const manifest = packedManifest(tarball)
+      const { name, version } = manifest
+      if (typeof name !== 'string' || typeof version !== 'string') throw new Error(`${tarball} manifest lacks name/version`)
+      const compatible = acceptsNpmPlatform(manifest.os, process.platform) && acceptsNpmPlatform(manifest.cpu, process.arch)
+      dependencies.set(name, { url: pathToFileURL(tarball).href, version, compatible })
     }
   }
   return dependencies
 }
 
-/** Install every tarball under `--from` and drive the `--family` entry. */
+/** Install platform-compatible tarballs under `--from` and drive the `--family` entry. */
 function main(): void {
   const { values } = parseArgs({
     options: { family: { type: 'string' }, from: { type: 'string', multiple: true } },
@@ -95,7 +100,11 @@ function main(): void {
       name: `dsh-packed-install-${family.id}`,
       version: '0.0.0',
       private: true,
-      dependencies: Object.fromEntries([...packed].map(([name, entryPacked]) => [name, entryPacked.url])),
+      dependencies: Object.fromEntries([...packed].filter(([, entryPacked]) => entryPacked.compatible)
+        .map(([name, entryPacked]) => [name, entryPacked.url])),
+      // Keep foreign-platform metadata local without turning those tarballs into required installations.
+      optionalDependencies: Object.fromEntries([...packed].filter(([, entryPacked]) => !entryPacked.compatible)
+        .map(([name, entryPacked]) => [name, entryPacked.url])),
     }, null, 2)}\n`)
 
     const environment = consumerEnvironment(consumerRoot)
@@ -105,7 +114,7 @@ function main(): void {
     // that cannot install them must still start — which is what optional means
     // here. Their entry package is a plain dependency of dsh-sandbox-local, so
     // its tarball is supplied through --from.
-    capture('npm', ['install', '--no-audit', '--no-fund', '--package-lock=false', '--omit=optional', '--loglevel=http'],
+    capture('npm', ['install', '--cache', join(consumerRoot, '.npm-cache'), '--no-audit', '--no-fund', '--package-lock=false', '--omit=optional', '--loglevel=http'],
       { cwd: consumerRoot, env: environment })
 
     const installedEntry = join(consumerRoot, 'node_modules', entry.packageName)

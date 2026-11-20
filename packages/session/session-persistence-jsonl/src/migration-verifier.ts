@@ -1,5 +1,6 @@
 /** Isolated verification for a staged or competing current JSONL generation. */
 
+import { fileURLToPath } from 'node:url'
 import { Worker } from 'node:worker_threads'
 import type { WorkerOptions } from 'node:worker_threads'
 import type { JsonlCompression } from './format.ts'
@@ -71,10 +72,11 @@ class VerificationScheduler {
 const verificationScheduler = new VerificationScheduler()
 
 function workerSpawn(request: VerificationRequest): { readonly entry: string | URL; readonly options: WorkerOptions } {
+  // The single-file runtime resolves string Worker entries through its embedded filesystem.
   /* v8 ignore next 3 -- built-worker coverage owns the bundled path. */
   if (!import.meta.url.endsWith('.ts')) {
     return {
-      entry: new URL('./worker.cjs', import.meta.url),
+      entry: fileURLToPath(new URL('./worker.cjs', import.meta.url)),
       options: { workerData: request, execArgv: [] },
     }
   }
@@ -103,7 +105,7 @@ function workerSpawn(request: VerificationRequest): { readonly entry: string | U
  * @param expectedEventCount - exact logical event count expected after decoding.
  * @param expectedPrefix - verified physical prefix; an append tail may be present and is not validated.
  * @param signal - optional cancellation for scheduler wait and Worker execution.
- * @returns stable physical identity and digest observed by the worker.
+ * @returns the worker's physical identity and digest after its natural zero exit.
  */
 export function verifyCurrentGenerationInWorker(
   path: string,
@@ -140,6 +142,7 @@ function runVerificationWorker(
   const worker = new Worker(entry, options)
   return new Promise((resolve, reject) => {
     let settled = false
+    let success: Extract<VerificationResponse, { ok: true }> | undefined
     const cleanup = (): void => {
       signal?.removeEventListener('abort', abort)
     }
@@ -169,16 +172,20 @@ function runVerificationWorker(
         fail(error)
         return
       }
-      settled = true
-      cleanup()
-      void worker.terminate().then(
-        () => { resolve(response.result) },
-        (error: unknown) => { reject(error instanceof Error ? error : new Error(String(error))) },
-      )
+      success = response
     })
     worker.once('error', fail)
     worker.once('exit', (code) => {
-      if (!settled) fail(new Error(`migration verifier exited before reporting a result (code ${code})`))
+      if (settled) return
+      settled = true
+      cleanup()
+      if (success === undefined) {
+        reject(new Error(`migration verifier exited before reporting a result (code ${code})`))
+      } else if (code !== 0) {
+        reject(new Error(`migration verifier exited after reporting a result (code ${code})`))
+      } else {
+        resolve(success.result)
+      }
     })
     const abort = (): void => { fail(verifierAbortError(signal)) }
     signal?.addEventListener('abort', abort, { once: true })

@@ -49,7 +49,7 @@ Load the package with a composition entry; the only deployment choice is the def
 
 ### Session projection
 
-`GoalService` requires `ctx.sessionProjections` ([`@deepseek-ai/dsh-session-projection`](../../session/session-projection/README.md)) and registers the `goal` projection unit at startup; a composition that omits the projection registry cannot activate `ctx.goals`. The unit's version 6 host state retains the latest valid current goal, every previously used goal id, and the first strict replay failure. Its client view exposes the current goal or `null` before the first create and after a clear tombstone. The key merges into both `SessionProjectionStateMap` and `SessionProjectionMap`; carriers serve the client value on the history tail page and the `session/projection` push frame.
+`GoalService` requires `ctx.sessionProjections` ([`@deepseek-ai/dsh-session-projection`](../../session/session-projection/README.md)) and registers the `goal` projection unit at startup; a composition that omits the projection registry cannot activate `ctx.goals`. The unit's version 6 host state retains the latest valid current goal, every previously used goal id, and the first strict replay failure. Its client view exposes the current goal or `null` before the first create and after a clear tombstone. The client key merges into `SessionProjectionMap`; carriers serve the client value on the history tail page and the `session/projection` push frame.
 
 ### Drive the lifecycle
 
@@ -98,7 +98,7 @@ This section explains how the service realizes the behavior above; the observabl
 - **Compare-and-set mutations.** `ctx.goals` accepts only the exact live `Agent` registered under its id. `get()` returns a detached `GoalView`; mutations take a `GoalRef { id, revision }` and reject stale refs. Creation resolves the deployment default internally before committing.
 - **Activation is process-local.** `armed` and `disarmed` live in a per-session cache and are never persisted. A fresh cache and every `agent/created` edge disarm continuation even when replay finds an active durable phase; `disarm()` removes authority without writing a revision or emitting a mutation.
 - **Strict replay.** The fold derives lifecycle mutations only from `goal/change` and rejects malformed shapes, discontinuous revisions, illegal phase transitions, non-monotonic per-goal timestamps, and non-sequential admitted rounds. Positive rounds advance only on admitted goal-sourced `user/message` events, and mutation timestamps clamp against the preceding update when wall time moves backward.
-- **Projection unit.** The package requires the projection registry and registers a strict `goal` unit. Its host state retains replay validation data and the first failure, while its client view exposes the latest valid whole goal or `null`; `GoalService` rejects access after a retained replay failure.
+- **Projection unit.** The package requires the projection registry and registers a strict `goal` unit. Its host state retains replay validation data and the first failure, while its client view exposes the latest valid whole goal or `null`; `GoalService` rejects access after a retained replay failure with `GoalError` `GOAL_STATE_CORRUPT`.
 
 ### Source map
 
@@ -109,7 +109,6 @@ This section explains how the service realizes the behavior above; the observabl
 | [`src/types.ts`](src/types.ts) | Pure client-safe types: `GoalView`, `GoalSnapshot`, `GoalActivationChanged`, projection-key declaration |
 | [`src/fold.ts`](src/fold.ts) | Strict replay fold and decoder for durable goal changes |
 | [`src/runtime.ts`](src/runtime.ts) | `GoalId` brand, `GoalError` codes, change-version constant |
-| [`src/invariant.ts`](src/invariant.ts) | Invariant companion: independent incremental fold over every attached session |
 
 ### Events and attribution
 
@@ -127,7 +126,7 @@ The package-level contract is enough for most consumers; read these when you nee
 - [Goal subsystem](../../../docs/subsystems/goal.md) — the goal types, durable change payloads, and generated service API.
 - [Goal group map](../README.md) — the goal packages and how they compose.
 - [Generated configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-goal) — every accepted config field and its source declaration.
-- [Goal domain Agent Note](../../../.agents/notes/implemented/feature/2026-07-19-persisted-same-session-goal-domain.md) — the domain design, alternatives, and decisions.
+- [historical Goal domain Agent Note](../../../.agents/notes/archived/feature/2026-07-19-persisted-same-session-goal-domain.md) — the domain design, alternatives, and decisions.
 
 -----
 

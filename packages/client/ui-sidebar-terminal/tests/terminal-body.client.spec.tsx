@@ -17,7 +17,7 @@ const fake = vi.hoisted(() => ({
   dimensions: { cols: 120, rows: 40 } as { cols: number; rows: number } | undefined,
 }))
 class FakeTerminal {
-  options: { disableStdin?: boolean; theme?: ITheme }
+  options: { disableStdin?: boolean; theme?: ITheme; fontFamily?: string; fontSize?: number }
   textarea: HTMLTextAreaElement | undefined = document.createElement('textarea')
   input: ((data: string) => void) | undefined
   readonly disposeInput = vi.fn()
@@ -56,8 +56,8 @@ beforeEach(() => {
 })
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); disconnect.mockClear(); measure = undefined })
 
-const info = { id: 'terminal' as WebTerminalId, title: 'bash', shell: { path: '/bin/bash', name: 'bash', args: ['-i'] }, cwd: '/workspace', cols: 80, rows: 24, state: 'running' as const, exitCode: null }
-const environment = { cwd: '/workspace', maxCols: 200, maxRows: 100, scrollback: 1000, maxInputBytes: 1000 }
+const info = { id: 'terminal' as WebTerminalId, title: 'bash', shell: { path: '/bin/bash', name: 'bash', args: ['-i'] }, cwd: '/workspace', cols: 80, rows: 24, state: 'running' as const, exitCode: null, origin: 'user' as const, control: 'user' as const }
+const environment = { cwd: '/workspace', maxCols: 200, maxRows: 100, scrollback: 1000, maxInputBytes: 1000, maxBufferedBytes: 100_000 }
 const idle: TerminalViewState = { phase: 'idle', writable: false, environment }
 const titleSurfaces = [
   {
@@ -72,7 +72,10 @@ const titleSurfaces = [
 function mount(initial: TerminalViewState | undefined = idle, dictionary = en) {
   let state: TerminalViewState | undefined = initial
   let visible = true
-  let theme: ThemeSnapshot = { preference: 'light', fontSize: 14, active: { id: 'light', colorScheme: 'light', tokens: {} }, themes: [], revision: 0 }
+  let theme: ThemeSnapshot = {
+    preference: 'light', fontSizes: { text: 14, code: 11, terminal: 13 }, fontFamilies: { text: '', code: '', terminal: '' },
+    active: { id: 'light', colorScheme: 'light', tokens: {} }, themes: [], revision: 0,
+  }
   const detach = vi.fn()
   const model = {
     mount: vi.fn(() => detach), refresh: vi.fn(async () => {}),
@@ -90,7 +93,10 @@ function mount(initial: TerminalViewState | undefined = idle, dictionary = en) {
   const view = render(<TerminalBody {...props} />)
   return {
     view, props, model, detach, openTab,
-    changeTheme() { theme = { ...theme, revision: theme.revision + 1 }; view.rerender(<TerminalBody {...props} />) },
+    changeTheme(next: Partial<ThemeSnapshot> = {}) {
+      theme = { ...theme, ...next, revision: theme.revision + 1 }
+      view.rerender(<TerminalBody {...props} />)
+    },
     update(next: TerminalViewState | undefined, shown = visible) {
       state = next; visible = shown; view.rerender(<TerminalBody {...props} />)
     },
@@ -134,7 +140,7 @@ it('shows only the terminal screen while connected and detaches on unmount', () 
 })
 
 it('keeps one emulator across rename and locale updates, applies snapshots and output once, and releases listeners', () => {
-  const snapshot: TerminalViewState = { ...idle, info, phase: 'connected', writable: true, render: { revision: 1, frame: { type: 'snapshot', sequence: 0, info, screen: 'restored' } } }
+  const snapshot: TerminalViewState = { ...idle, info, phase: 'connected', writable: true, render: { revision: 1, frame: { type: 'snapshot', writable: true, sequence: 0, info, screen: 'restored' } } }
   const h = mount(snapshot)
   const terminal = fake.terminals[0]!
   expect(terminal.reset).toHaveBeenCalledOnce()
@@ -142,7 +148,7 @@ it('keeps one emulator across rename and locale updates, applies snapshots and o
   expect(h.model.acknowledge).toHaveBeenCalledWith(1)
   expect(terminal.focus).toHaveBeenCalledOnce()
   terminal.input?.('help\t')
-  expect(h.model.write).toHaveBeenCalledWith('help\t')
+  expect(h.model.write).toHaveBeenCalledWith('help\t', false)
   h.update({ ...snapshot, render: { revision: 2, frame: { type: 'output', sequence: 1, data: 'live' } } })
   expect(terminal.write).toHaveBeenCalledWith('live', expect.any(Function))
   h.update({ ...snapshot, render: { revision: 2, frame: { type: 'output', sequence: 1, data: 'duplicate' } } })
@@ -155,6 +161,40 @@ it('keeps one emulator across rename and locale updates, applies snapshots and o
   expect(terminal.dispose).toHaveBeenCalledOnce()
   expect(terminal.disposeInput).toHaveBeenCalledOnce()
   expect(disconnect).toHaveBeenCalledOnce()
+})
+
+it('marks emulator input as typed only shortly after a person gesture, never for focus reports or scrolling', () => {
+  const now = vi.spyOn(performance, 'now').mockReturnValue(1000)
+  const snapshot: TerminalViewState = { ...idle, info, phase: 'connected', writable: true }
+  const h = mount(snapshot)
+  const terminal = fake.terminals[0]!
+  terminal.input?.('\x1b[?1;2c')
+  expect(h.model.write).toHaveBeenLastCalledWith('\x1b[?1;2c', false)
+  fireEvent.keyDown(terminal.textarea!, { key: 'l' })
+  now.mockReturnValue(1100)
+  terminal.input?.('l')
+  expect(h.model.write).toHaveBeenLastCalledWith('l', true)
+  now.mockReturnValue(1400)
+  terminal.input?.('\x1b[I')
+  expect(h.model.write).toHaveBeenLastCalledWith('\x1b[I', false)
+  fireEvent.paste(terminal.textarea!)
+  terminal.input?.('pasted')
+  expect(h.model.write).toHaveBeenLastCalledWith('pasted', true)
+  now.mockReturnValue(2000)
+  fireEvent.mouseDown(terminal.textarea!)
+  terminal.input?.('\x1b[I')
+  expect(h.model.write).toHaveBeenLastCalledWith('\x1b[I', false)
+  terminal.input?.('\x1b[O')
+  expect(h.model.write).toHaveBeenLastCalledWith('\x1b[O', false)
+  terminal.input?.('\x1b[<0;3;4M')
+  expect(h.model.write).toHaveBeenLastCalledWith('\x1b[<0;3;4M', true)
+  now.mockReturnValue(3000)
+  fireEvent.wheel(terminal.textarea!)
+  terminal.input?.('\x1b[B')
+  expect(h.model.write).toHaveBeenLastCalledWith('\x1b[B', false)
+  h.view.unmount()
+  now.mockReturnValue(1450)
+  fireEvent.keyDown(terminal.textarea!, { key: 'x' })
 })
 
 it('displays disconnect, close and exit states and offers explicit reconnection and takeover', () => {
@@ -206,6 +246,34 @@ it('updates screen, cursor and selection colors without replacing the terminal o
   expect(terminal.dispose).not.toHaveBeenCalled()
   expect(h.model.mount).toHaveBeenCalledOnce()
   expect(h.detach).not.toHaveBeenCalled()
+})
+
+it('applies the terminal font list and size and refits without replacing the terminal', () => {
+  const state: TerminalViewState = { ...idle, info, phase: 'connected', writable: true }
+  const h = mount(state)
+  const terminal = fake.terminals[0]!
+  const stack = 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'
+  expect(terminal.options.fontFamily).toBe(stack)
+  h.model.resize.mockClear()
+  h.changeTheme({ fontFamilies: { text: '"Inter"', code: '', terminal: '' } })
+  expect(h.model.resize).not.toHaveBeenCalled()
+  fake.dimensions = { cols: 100, rows: 30 }
+  h.changeTheme({ fontFamilies: { text: '', code: '', terminal: '"MesloLGS NF"' } })
+  expect(terminal.options.fontFamily).toBe(`"MesloLGS NF", ${stack}`)
+  expect(h.model.resize).toHaveBeenCalledWith(100, 30)
+  h.model.resize.mockClear()
+  h.update(state, false)
+  h.changeTheme({ fontFamilies: { text: '', code: '', terminal: '' } })
+  expect(terminal.options.fontFamily).toBe(stack)
+  expect(h.model.resize).not.toHaveBeenCalled()
+  h.update(state, true)
+  expect(terminal.options.fontSize).toBe(13)
+  fake.dimensions = { cols: 90, rows: 25 }
+  h.changeTheme({ fontSizes: { text: 14, code: 11, terminal: 16 } })
+  expect(terminal.options.fontSize).toBe(16)
+  expect(h.model.resize).toHaveBeenCalledWith(90, 25)
+  expect(fake.terminals).toEqual([terminal])
+  expect(terminal.dispose).not.toHaveBeenCalled()
 })
 
 it('reads the current theme on xterm render and releases the cursor listener on unmount', () => {
@@ -284,6 +352,29 @@ it.each(titleSurfaces)('shows saved and attached terminal names in the $name', (
   expect(title.container.textContent).toBe('bash')
   expect(title.container.querySelector('svg')?.getAttribute('aria-hidden')).toBe('true')
   expect(title.container.querySelector('svg rect')).toBeNull()
+})
+
+it.each(titleSurfaces)('badges agent control in the $name and, after takeover, a confined sandbox', (surface) => {
+  const agentInfo = { ...info, origin: 'agent' as const, control: 'agent' as const, sandboxMode: 'workspace-write' as const }
+  const h = mount({ ...idle, info: agentInfo })
+  const chip = () => surface.wrap(<TerminalTitle {...h.props} />)
+  const title = render(chip())
+  const hint = (text: string) => title.getByText(text).closest('[title]')?.getAttribute('title')
+  expect(title.container.textContent).toBe(`${en['badge.agent']}bash`)
+  expect(hint(en['badge.agent'])).toBe(`${en['badge.agentHint']} ${en['badge.workspaceWriteHint']}`)
+  h.update({ ...idle, info: { ...agentInfo, control: 'user' } })
+  title.rerender(chip())
+  expect(title.container.textContent).toBe(`${en['badge.sandbox']}bash`)
+  expect(hint(en['badge.sandbox'])).toBe(en['badge.workspaceWriteHint'])
+  h.update({ ...idle, info: { ...agentInfo, control: 'user', sandboxMode: 'read-only' } })
+  title.rerender(chip())
+  expect(hint(en['badge.sandbox'])).toBe(en['badge.readOnlyHint'])
+  h.update({ ...idle, info: { ...agentInfo, sandboxMode: 'danger-full-access' } })
+  title.rerender(chip())
+  expect(hint(en['badge.agent'])).toBe(en['badge.agentHint'])
+  h.update({ ...idle, info: { ...agentInfo, control: 'user', sandboxMode: 'danger-full-access' } })
+  title.rerender(chip())
+  expect(title.container.textContent).toBe('bash')
 })
 
 it.each(titleSurfaces)('renames from the $name pointer target, preserving dragging and isolating editor shortcuts', (surface) => {

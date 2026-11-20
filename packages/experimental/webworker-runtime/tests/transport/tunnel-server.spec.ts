@@ -21,6 +21,7 @@ function seams(openStream: TunnelSeams['openStream']): TunnelSeams {
   return {
     directFetch: () => Promise.reject(new Error('fixture has no direct fetch')),
     bootPayload: () => ({}),
+    packageAssets: () => bytes(1, 2, 3),
     openStream,
     streamFailure: error => ({
       code: 'fixture-stream-failed',
@@ -63,6 +64,22 @@ describe('worker tunnel unary authentication', () => {
     if (frame?.t !== 'res' || frame.body === undefined) throw new Error('direct retry did not return one body')
     expect(new TextDecoder().decode(frame.body)).toBe('direct answer')
     expect(directFetch).toHaveBeenCalledOnce()
+  })
+})
+
+describe('worker tunnel package assets', () => {
+  it('answers GET /__assets__ with the package-asset archive and refuses other methods', async () => {
+    const { server, frames } = harness()
+    server.serve(seams(async () => (async function *(): AsyncGenerator { yield undefined })()))
+
+    server.handleMessage({ t: 'req', id: 1, method: 'GET', url: 'http://localhost/__assets__', headers: {} })
+    server.handleMessage({ t: 'req', id: 2, method: 'POST', url: 'http://localhost/__assets__', headers: {} })
+
+    await vi.waitFor(() => { expect(frames).toHaveLength(2) })
+    expect(frames[0]).toMatchObject({ t: 'res', id: 1, status: 200, headers: { 'content-type': 'application/x-tar', 'cache-control': 'no-store' } })
+    if (frames[0]?.t !== 'res' || frames[0].body === undefined) throw new Error('archive response carried no body')
+    expect([...new Uint8Array(frames[0].body)]).toEqual([1, 2, 3])
+    expect(frames[1]).toMatchObject({ t: 'res', id: 2, status: 405, headers: { allow: 'GET' } })
   })
 })
 
@@ -137,8 +154,8 @@ describe('worker tunnel logical streams', () => {
     })
     expect(frames).toEqual([])
 
-    server.serve(seams(async (endpoint, payload, signal) => {
-      seen.push(endpoint, payload, signal)
+    server.serve(seams(async (endpoint, payload, uplink, signal) => {
+      seen.push(endpoint, payload, uplink, signal)
       return (async function *(): AsyncGenerator {
         yield { type: 'baseline' }
         yield { type: 'event', seq: 1 }
@@ -155,15 +172,103 @@ describe('worker tunnel logical streams', () => {
     expect(seen).toEqual([
       'session/follow',
       { args: { sessionId: 'session-1' } },
+      expect.any(Object),
       expect.any(AbortSignal),
     ])
+  })
+
+  it('buffers uplink items until the Host reads them and ends the uplink on half-close', async () => {
+    const { server, frames } = harness()
+    server.handleMessage({ t: 'stream-open', id: 6, endpoint: 'job/attach', payload: { args: {} } })
+    server.handleMessage({ t: 'stream-uplink-item', id: 6, value: 'a' })
+    server.serve(seams(async (_endpoint, _payload, uplink) => (async function *(): AsyncGenerator {
+      for await (const item of uplink) yield `echo:${String(item)}`
+    })()))
+    await vi.waitFor(() => { expect(frames).toEqual([{ t: 'stream-item', id: 6, value: 'echo:a' }]) })
+
+    server.handleMessage({ t: 'stream-uplink-item', id: 6, value: 'b' })
+    server.handleMessage({ t: 'stream-uplink-item', id: 99, value: 'no such stream' })
+    server.handleMessage({ t: 'stream-uplink-end', id: 99 })
+    server.handleMessage({ t: 'stream-uplink-end', id: 6 })
+    await vi.waitFor(() => {
+      expect(frames).toEqual([
+        { t: 'stream-item', id: 6, value: 'echo:a' },
+        { t: 'stream-item', id: 6, value: 'echo:b' },
+        { t: 'stream-end', id: 6 },
+      ])
+    })
+  })
+
+  it('drops uplink items once the Host stops reading them', async () => {
+    const { server, frames } = harness()
+    const outcome = Promise.withResolvers<unknown>()
+    server.serve(seams(async (_endpoint, _payload, uplink) => {
+      const iterator = uplink[Symbol.asyncIterator]()
+      return (async function *(): AsyncGenerator {
+        yield 'ready'
+        const first = await iterator.next()
+        await iterator.return?.()
+        outcome.resolve({ first, afterReturn: await iterator.next() })
+      })()
+    }))
+    server.handleMessage({ t: 'stream-open', id: 7, endpoint: 'job/attach', payload: {} })
+    await vi.waitFor(() => { expect(frames).toContainEqual({ t: 'stream-item', id: 7, value: 'ready' }) })
+    server.handleMessage({ t: 'stream-uplink-item', id: 7, value: 'one' })
+    server.handleMessage({ t: 'stream-uplink-item', id: 7, value: 'dropped' })
+    await expect(outcome.promise).resolves.toEqual({
+      first: { value: 'one', done: false },
+      afterReturn: { value: undefined, done: true },
+    })
+    await vi.waitFor(() => { expect(frames).toContainEqual({ t: 'stream-end', id: 7 }) })
+  })
+
+  it('ends a pending uplink read when the page aborts the stream', async () => {
+    const { server } = harness()
+    const read = Promise.withResolvers<unknown>()
+    const opened = Promise.withResolvers<undefined>()
+    server.serve(seams(async (_endpoint, _payload, uplink, signal) => {
+      uplink[Symbol.asyncIterator]().next().then(read.resolve, read.resolve)
+      opened.resolve(undefined)
+      return (async function *(): AsyncGenerator {
+        await new Promise<void>((resolve) => {
+          signal.addEventListener('abort', () => { resolve() }, { once: true })
+        })
+      })()
+    }))
+    server.handleMessage({ t: 'stream-open', id: 8, endpoint: 'job/attach', payload: {} })
+    await opened.promise
+    server.handleMessage({ t: 'abort', id: 8 })
+    await expect(read.promise).resolves.toEqual({ value: undefined, done: true })
+  })
+
+  it('fails a stream whose Host reads the uplink twice concurrently', async () => {
+    const { server, frames } = harness()
+    server.serve(seams(async (_endpoint, _payload, uplink) => {
+      const iterator = uplink[Symbol.asyncIterator]()
+      void iterator.next()
+      await iterator.next()
+      return (async function *(): AsyncGenerator {})()
+    }))
+    server.handleMessage({ t: 'stream-open', id: 9, endpoint: 'job/attach', payload: {} })
+    await vi.waitFor(() => {
+      expect(frames).toEqual([{
+        t: 'stream-error',
+        id: 9,
+        failure: {
+          kind: 'remote',
+          code: 'fixture-stream-failed',
+          message: 'webworker tunnel: stream uplink has one pending read',
+          details: { fixture: true },
+        },
+      }])
+    })
   })
 
   it('cancels one logical stream without emitting a terminal frame', async () => {
     const { server, frames } = harness()
     const opened = Promise.withResolvers<AbortSignal>()
     const stopped = Promise.withResolvers<undefined>()
-    server.serve(seams(async (_endpoint, _payload, signal) => {
+    server.serve(seams(async (_endpoint, _payload, _uplink, signal) => {
       opened.resolve(signal)
       return (async function *(): AsyncGenerator {
         yield 'ready'

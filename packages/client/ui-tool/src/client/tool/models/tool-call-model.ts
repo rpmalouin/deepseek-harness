@@ -1,24 +1,23 @@
 /**
  * Pure row-model derivation for tool summary rows: variant classification,
  * one-line summary, expansion-time body input, and flattened result output
- * from the frozen call slice. Input material comes from the call ARGUMENTS;
- * output and error material from the settled result node. A supported terminal
+ * from the frozen call slice. Labels keep the call arguments; navigation,
+ * output, and errors use the settled result. A supported terminal
  * call gets its expanded body from `terminalCardModel` instead.
  */
-// The block union's defining home is runtime (fold-product types); this
-// contract only forwards it (type-definition authority stays with the layer
-// that produces the values).
-import type { ToolCallBlock, ToolResultNode } from '@deepseek-ai/dsh-client-ui-chat/client'
+import type { ToolArgs, ToolCallBlock, ToolResultNode } from '@deepseek-ai/dsh-client-ui-chat/client'
 import type { LocaleKeysOf } from '@deepseek-ai/dsh-client-ui-slots'
-import { abbreviateHomePath, relativizeToCwd } from '@deepseek-ai/dsh-util-workspace-path'
+import { parsePatch, PatchParseError, type PatchOperation } from '@deepseek-ai/dsh-fs-patch'
+import { abbreviateHomePath, isAbsoluteWorkspacePath, relativizeToCwd } from '@deepseek-ai/dsh-util-workspace-path'
+import { recordedAbsolutePath } from './recorded-path.ts'
 
 export type { ToolCallBlock } from '@deepseek-ai/dsh-client-ui-chat/client'
 
 /** Tool-call row variants selected by the generic atomic renderer. */
 export type ToolRowVariant = 'search' | 'read' | 'bash' | 'write' | 'edit' | 'code' | 'others'
 
-/** Row state semantic; colors self-supplied via StateDot (design gives none). */
-export type ToolRowState = 'running' | 'ok' | 'error' | 'stopped'
+/** Row lifecycle state used by summary styling and accessible status text. */
+export type ToolRowState = 'preparing' | 'running' | 'ok' | 'error' | 'stopped'
 
 /** Locale-neutral structured fact consumed only by the user-facing Tool row. */
 export interface AutoReviewDenial {
@@ -26,7 +25,7 @@ export interface AutoReviewDenial {
   reason: string | null
 }
 
-type ToolTitleKey = Extract<LocaleKeysOf<'conversation'>, `tool.title.${string}`>
+type ToolTitleKey = Extract<LocaleKeysOf<'conversation'>, `tool.title.${string}` | 'ask.rowTitle' | 'todo.rowTitle'>
 
 /** Locale key per generic row variant. */
 export const VARIANT_TITLE_KEYS = {
@@ -61,7 +60,9 @@ const TOOL_VARIANTS: Record<string, ToolRowVariant> = {
   glob: 'search',
   write: 'write',
   edit: 'edit',
+  apply_patch: 'edit',
   run_code: 'code',
+  cua_run_code: 'code',
   cordis_package_inspect: 'read',
   cordis_runtime_inspect: 'read',
   // The three run-control verbs take one package id and produce a receipt, so
@@ -75,6 +76,7 @@ const TOOL_VARIANTS: Record<string, ToolRowVariant> = {
 
 /** Tool-owned titles that refine a generic row variant without replacing it. */
 const TOOL_TITLE_KEYS: Record<string, ToolTitleKey> = {
+  apply_patch: 'tool.title.applyPatch',
   cordis_package_inspect: 'tool.title.inspect',
   cordis_runtime_inspect: 'tool.title.inspect',
   cordis_run: 'tool.title.runCordis',
@@ -82,6 +84,49 @@ const TOOL_TITLE_KEYS: Record<string, ToolTitleKey> = {
   cordis_undefine: 'tool.title.removeCordis',
   pwsh: 'tool.title.pwsh',
   read_image: 'tool.title.readImage',
+  todo_write: 'todo.rowTitle',
+  ask_user_question: 'ask.rowTitle',
+  create_goal: 'tool.title.createGoal',
+  get_goal: 'tool.title.getGoal',
+  update_goal: 'tool.title.updateGoal',
+  schedule_create: 'tool.title.createSchedule',
+  schedule_list: 'tool.title.listSchedules',
+  schedule_view: 'tool.title.viewSchedule',
+  schedule_edit: 'tool.title.editSchedule',
+  schedule_delete: 'tool.title.deleteSchedule',
+  schedule_update: 'tool.title.updateSchedule',
+  cordis_inspect: 'tool.title.inspect',
+  cordis_inspect_list: 'tool.title.inspectProviders',
+  cordis_inspect_query: 'tool.title.queryRuntime',
+  cordis_inspect_self: 'tool.title.inspectPlugins',
+  workflow: 'tool.title.workflow',
+  ralph: 'tool.title.ralph',
+  session_event_read: 'tool.title.readEvent',
+  session_event_search: 'tool.title.searchEvents',
+  session_event_trace: 'tool.title.traceEvent',
+  session_search: 'tool.title.searchSessions',
+  session_trace: 'tool.title.traceSession',
+  list_subagent_models: 'tool.title.listModels',
+  subagent: 'tool.title.subagent',
+  subagent_fork: 'tool.title.subagentFork',
+  list_agents: 'tool.title.listAgents',
+  send_message: 'tool.title.sendMessage',
+  interrupt_agent: 'tool.title.interruptAgent',
+  job_list: 'tool.title.listJobs',
+  job_output: 'tool.title.readJob',
+  job_kill: 'tool.title.killJob',
+  terminal_open: 'tool.title.openTerminal',
+  terminal_read: 'tool.title.readTerminal',
+  terminal_list: 'tool.title.listTerminals',
+  terminal_signal: 'tool.title.signalTerminal',
+  terminal_close: 'tool.title.closeTerminal',
+  lsp: 'tool.title.lsp',
+  spawn_teammate: 'tool.title.spawnTeammate',
+  team_task_create: 'tool.title.createTeamTask',
+  team_task_get: 'tool.title.getTeamTask',
+  team_task_update: 'tool.title.updateTeamTask',
+  team_task_list: 'tool.title.listTeamTasks',
+  wait_agent: 'tool.title.waitAgent',
 }
 
 /**
@@ -93,17 +138,50 @@ export function classifyTool(toolName: string): ToolRowVariant {
   return TOOL_VARIANTS[toolName] ?? 'others'
 }
 
+/**
+ * Select a tool-owned or generic title without reading arguments.
+ * @param toolName - wire tool name.
+ * @returns the localized title key.
+ */
+export function toolTitleKey(toolName: string): ToolTitleKey {
+  return TOOL_TITLE_KEYS[toolName] ?? VARIANT_TITLE_KEYS[classifyTool(toolName)]
+}
+
+/** Text between two files a patch row names. */
+export const FILE_TARGET_SEPARATOR = ', '
+
+/** Text between a moved file's source and destination. */
+export const FILE_TARGET_MOVE = ' → '
+
+/** One file a patch row names, rendered as its own link when `filePath` is set. */
+export interface ToolRowFileTarget {
+  /** One-based patch line of the file header; identifies the file operation within its call. */
+  readonly id: number
+  /** Display path of a moved file's source; the source no longer exists once the move completes. */
+  readonly from?: string | undefined
+  /** Display path of the file, or of a move's destination. */
+  readonly label: string
+  /** Path to open; absent for a deletion or while the row cannot open argument paths. */
+  readonly filePath: string | undefined
+}
+
 /** Everything ToolRow needs, derived once from the frozen slice. */
 export interface ToolRowModel {
   variant: ToolRowVariant
   titleKey: ToolTitleKey
+  /** Generic rows retain the wire tool name; available arguments append their summary. */
   summary: string
   /**
-   * Filesystem path from args (`path` / `file_path`) when the row is a file
-   * tool; absent for URL reads and non-file tools. The chat view resolves
-   * relative values against the session cwd before opening.
+   * Operation-time absolute result path for file rows. Old results without
+   * location metadata retain their argument fallback; running relative paths
+   * stay unavailable until their result identifies the target.
    */
   filePath: string | undefined
+  /**
+   * Per-file links for a patch naming several files or a move; undefined for
+   * every other row, which uses `filePath` for the whole summary.
+   */
+  fileTargets: readonly ToolRowFileTarget[] | undefined
   /** Original argument JSON retained for expansion-time body formatting. */
   bodyRaw: string | null
   /** Flattened result text ({@link resultText}); null while running or when the result carries no text. */
@@ -126,28 +204,33 @@ function deriveAutoReviewDenial(block: ToolCallBlock): AutoReviewDenial | null {
 
 /**
  * Flatten a settled result's content blocks to display text: text blocks
- * verbatim, other block shapes as pretty JSON. Empty content on a failed call
- * falls back to the structured error's `name: code` line.
+ * verbatim, images through the supplied formatter, and other blocks
+ * as pretty JSON. Empty failure content falls back to the structured error's
+ * `name: code` line.
  * @param node - the settled result node.
+ * @param formatImage - Optional formatter for unvalidated image attachments; omission or undefined preserves image JSON.
  * @returns the flattened result text (may be empty).
  */
-export function resultText(node: ToolResultNode): string {
+export function resultText(node: ToolResultNode, formatImage?: (image: unknown) => string | undefined): string {
   const parts: string[] = []
   for (const block of node.content) {
     if (block.type === 'text') parts.push(block.text)
-    else parts.push(JSON.stringify(block, null, 2))
+    else {
+      const image = block.type === 'image' ? formatImage?.(block.attachment) : undefined
+      parts.push(image ?? JSON.stringify(block, null, 2))
+    }
   }
   if (parts.length === 0 && node.error !== undefined) {
     parts.push(`${node.error.name}: ${node.error.code}`)
   }
-  return parts.join('\n')
+  return parts.reduce((text, part, index) => text + (index === 0 || text.endsWith('\n') ? '' : '\n') + part, '')
 }
 
 function parseArgs(argsRaw: string): unknown {
   try {
     return JSON.parse(argsRaw)
   } catch {
-    // Non-JSON args (mid-stream truncation): summary/body fall back to the raw string.
+    // Non-JSON args (mid-stream truncation or a rejected call kept verbatim): summary/body fall back to the raw string.
     return undefined
   }
 }
@@ -182,7 +265,7 @@ function deriveSummary(variant: ToolRowVariant, argsRaw: string): string {
   if (typeof parsed !== 'object' || parsed === null) return firstLine(argsRaw)
   const args = parsed as Record<string, unknown>
   if (variant === 'search' && Array.isArray(args.queries)) {
-    const queries = args.queries.filter((query): query is string => typeof query === 'string' && query !== '')
+    const queries = args.queries.filter((query: unknown): query is string => typeof query === 'string' && query !== '')
     if (queries.length > 0) return queries.map(firstLine).join(', ')
   }
   const picked = pickString(args, SUMMARY_KEYS[variant])
@@ -198,6 +281,65 @@ const FILE_PATH_KEYS = ['path', 'file_path'] as const
 
 /** File-tool variants whose summary may be an openable workspace path. */
 const FILE_PATH_VARIANTS: ReadonlySet<ToolRowVariant> = new Set(['read', 'write', 'edit'])
+
+/**
+ * Summary material read the same way at every stage from the argument view: a
+ * complete `file_path` for file tools, otherwise the `description` text so far.
+ * Empty when the view carries neither, so the caller falls back to the raw text.
+ */
+function argumentSummary(
+  variant: ToolRowVariant, args: ToolArgs, cwd?: string, home?: string,
+): { summary: string; filePath: string | undefined } {
+  if (FILE_PATH_VARIANTS.has(variant)) {
+    const path = args.complete('file_path') ? args.text('file_path') : undefined
+    // Decoding text can discover an invalid escape and make complete() false.
+    const filePath = path !== undefined && path !== '' && args.complete('file_path') ? firstLine(path) : undefined
+    return { summary: filePath === undefined ? '' : abbreviateHomePath(relativizeToCwd(filePath, cwd), home), filePath }
+  }
+  const description = args.text('description')
+  return { summary: description === undefined ? '' : firstLine(description), filePath: undefined }
+}
+
+/** Summary material read from patch file headers; `targets` keep each file's raw openable path. */
+interface PatchSummary {
+  summary: string
+  filePath: string | undefined
+  targets: readonly ToolRowFileTarget[]
+}
+
+/**
+ * Summary material for `apply_patch`: the files a complete `input` names, parsed
+ * by the same `parsePatch` the executor uses. A move reads `source → destination`,
+ * and only its destination is openable; a deletion is not. Only a lone added or
+ * updated file without a move sets `filePath`. Incomplete or malformed patch text
+ * yields an empty summary.
+ */
+function patchSummary(args: ToolArgs, cwd?: string, home?: string): PatchSummary {
+  const patch = args.complete('input') ? args.text('input') : undefined
+  let operations: PatchOperation[] = []
+  if (patch !== undefined) {
+    try {
+      operations = parsePatch(patch)
+    } catch (error) {
+      // PatchParseError: the executor rejects this patch before changing any file, so no file is named.
+      if (!(error instanceof PatchParseError)) throw error
+    }
+  }
+  const display = (path: string) => abbreviateHomePath(relativizeToCwd(path, cwd), home)
+  const targets = operations.map((operation): ToolRowFileTarget => {
+    const moveTo = operation.kind === 'update' ? operation.moveTo : undefined
+    return moveTo === undefined
+      ? { id: operation.lineNumber, label: display(operation.path), filePath: operation.kind === 'delete' ? undefined : operation.path }
+      : { id: operation.lineNumber, from: display(operation.path), label: display(moveTo), filePath: moveTo }
+  })
+  const summary = targets.map(target => target.from === undefined ? target.label
+    : `${target.from}${FILE_TARGET_MOVE}${target.label}`).join(FILE_TARGET_SEPARATOR)
+  const only = operations.length === 1 ? operations[0] : undefined
+  return {
+    summary, targets,
+    filePath: only?.kind === 'add' || only?.kind === 'update' && only.moveTo === undefined ? only.path : undefined,
+  }
+}
 
 function deriveFilePath(variant: ToolRowVariant, argsRaw: string): string | undefined {
   if (!FILE_PATH_VARIANTS.has(variant)) return undefined
@@ -229,38 +371,58 @@ export function formatToolBody(variant: ToolRowVariant, argsRaw: string): string
 /**
  * Derive the full row model from a frozen call slice.
  * @param toolName - wire tool name (dispatch-supplied; survives windowless results).
- * @param block - RunningToolCall or ToolResultNode off the snapshot caches.
+ * @param block - preparing call, dispatched call, or result from the snapshot.
  * @param cwd - session workspace root; workspace-rooted path summaries display relative to it.
  * @param home - host account home; a leftover POSIX home path displays as `~`.
+ * @param formatImage - Optional image formatter; omission preserves image JSON.
  * @returns the row model.
  */
-export function toolRowModel(toolName: string, block: ToolCallBlock, cwd?: string, home?: string): ToolRowModel {
+export function toolRowModel(
+  toolName: string, block: ToolCallBlock, cwd?: string, home?: string,
+  formatImage?: (image: unknown) => string | undefined,
+): ToolRowModel {
   const variant = classifyTool(toolName)
+  const titleKey = toolTitleKey(toolName)
   const done = 'kind' in block
-  const argsRaw = (done ? block.call?.argsRaw : block.argsRaw) ?? ''
-  const state: ToolRowState = !done ? 'running'
+  const argsRaw = done ? block.call?.argsRaw ?? '' : block.phase === 'start' ? block.argsRaw : null
+  // Result metadata marks a settled call that did not finish every requested effect.
+  const stopped = done && typeof block.meta === 'object' && block.meta !== null
+    && !Array.isArray(block.meta) && (block.meta as Record<string, unknown>).stopped === true
+  const patch = toolName === 'apply_patch' ? patchSummary(block.args, cwd, home) : undefined
+  const primary = patch ?? argumentSummary(variant, block.args, cwd, home)
+  const argumentPath = primary.filePath ?? (argsRaw === null ? undefined : deriveFilePath(variant, argsRaw))
+  const recordedPath = done ? recordedAbsolutePath(block.meta, 'path') : undefined
+  const usableArgumentPath = (path: string) => isAbsoluteWorkspacePath(path)
+    || done && !block.isError && block.parentCallId === undefined
+  const canUseArgumentPath = argumentPath !== undefined && usableArgumentPath(argumentPath)
+  // A lone added or updated file keeps the whole-summary link; several files or a move link each file.
+  const fileTargets = patch !== undefined && (patch.targets.length > 1 || patch.targets.some(target => target.from !== undefined))
+    ? patch.targets.map(target => target.filePath === undefined || usableArgumentPath(target.filePath) ? target
+      : { ...target, filePath: undefined })
+    : undefined
+  const filePath = argumentPath === undefined ? undefined
+    : recordedPath ?? (canUseArgumentPath ? argumentPath : undefined)
+  const state: ToolRowState = !done ? block.phase === 'preparing' ? 'preparing' : 'running'
     : block.error?.code === 'interrupted' ? 'stopped'
-      : block.isError ? 'error' : 'ok'
-  const base = argsRaw === ''
-    ? block.callId
-    : abbreviateHomePath(relativizeToCwd(deriveSummary(variant, argsRaw), cwd), home)
-  const toolTitleKey = TOOL_TITLE_KEYS[toolName]
-  // Others keeps the static "Tool call" title (figma literal); the real tool
-  // name rides the mutable summary slot unless the tool owns a specific title.
-  const summary = variant === 'others' && toolName !== '' && toolTitleKey === undefined
-    ? `${toolName} · ${base}`
-    : base
+      : block.isError || stopped ? 'error' : 'ok'
+  // The argument view serves every stage; the raw text is the fallback when it carries nothing useful.
+  // An incomplete patch keeps an empty summary instead of falling back to the raw patch text.
+  const base = toolName === 'apply_patch' || primary.summary !== '' || argsRaw === null ? primary.summary
+    : argsRaw === '' ? block.callId
+      : abbreviateHomePath(relativizeToCwd(deriveSummary(variant, argsRaw), cwd), home)
+  const summary = [titleKey === 'tool.title.generic' ? toolName : '', base].filter(Boolean).join(' · ')
   // The empty string is "no text" for both derived result fields: a settled
   // call with blank content has nothing to expand, and a blank first line
   // would erase the collapsed error row's summary slot.
-  const output = done ? (resultText(block) || null) : null
+  const output = done ? (resultText(block, formatImage) || null) : null
   const errorSummary = state === 'error' && output !== null ? firstLine(output) : null
   const bodyRaw = argsRaw === '' ? null : argsRaw
   return {
     variant,
-    titleKey: toolTitleKey ?? VARIANT_TITLE_KEYS[variant],
+    titleKey,
     summary,
-    filePath: deriveFilePath(variant, argsRaw),
+    filePath,
+    fileTargets,
     bodyRaw,
     output,
     errorSummary,

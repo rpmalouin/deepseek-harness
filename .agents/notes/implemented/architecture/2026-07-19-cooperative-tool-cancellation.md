@@ -32,7 +32,7 @@ An around-dispatch wrapper may replace `exec.signal` for its delegated lifetime 
 
 `ABORTED_BEFORE_DISPATCH` carries `{ name: 'AbortError' }` and model text `Error: tool call aborted before dispatch`. It applies whenever cancellation prevents body invocation, including pre-aborted entry, cancellation during pre-policy or approval, an aborted wrapper signal, a wrapper success overtaken by caller cancellation before delegation, and agent-loop siblings skipped after turn cancellation.
 
-`ABORTED` carries model text `Error: tool call aborted` and applies only after the body was invoked, including cancellation while an around wrapper or post-policy listener waits after body completion. A denial, wrapper failure, tool failure, or post-policy failure remains more specific than generic cancellation. A timeout owned by timeout-policy remains `TOOL_TIMEOUT`, and contexts deferred before a successful outcome is replaced remain attached.
+`ABORTED` carries model text `Error: tool call aborted` and applies only after the body was invoked, including cancellation while an around wrapper or post-policy listener waits after body completion. A started body that throws the signal's reason or an `Error` named `AbortError` without `HarnessError` identity keeps that message and carries `{ name: 'AbortError', code: 'ABORTED' }`. A `tools/execute` wrapper that throws such a value after caller cancellation is classified the same way, with `ABORTED_BEFORE_DISPATCH` when the body never started. A denial, other wrapper failure, other tool failure, or post-policy failure remains more specific than generic cancellation. A timeout owned by timeout-policy remains `TOOL_TIMEOUT`, and contexts deferred before a successful outcome is replaced remain attached.
 
 ### Pre-aborted entry short-circuits after materialization
 
@@ -46,7 +46,7 @@ This decision requires cancellation at the tool invocation boundary only. Making
 
 ## Verification
 
-[`execution-signal-types.spec.ts`](../../../../packages/core/tools/tests/execution-signal-types.spec.ts) proves the required exact signal types, readonly observer and tool views, mutable-but-required around-dispatch view, and `defineTool()` inference. [`tools.spec.ts`](../../../../packages/core/tools/tests/tools.spec.ts) covers pre-aborted materialization, phase skipping, policy and wrapper races, body invocation classification, caller-signal fusion, error precedence, context retention, and quiescent drainage. [`tool-calls.spec.ts`](../../../../packages/core/agent-loop/tests/tool-calls.spec.ts) and [`contract-regressions.spec.ts`](../../../../packages/core/agent-loop/tests/contract-regressions.spec.ts) cover balanced durable results for undispatched siblings. [`ptc.spec.ts`](../../../../packages/core/tools/tests/ptc.spec.ts) and first-party integration suites cover explicit forwarding, while [`timeout-policy.spec.ts`](../../../../packages/guard/timeout-policy/tests/timeout-policy.spec.ts) preserves timeout ownership.
+[`execution-signal-types.spec.ts`](../../../../packages/core/tools/tests/execution-signal-types.spec.ts) proves the required exact signal types, readonly observer and tool views, mutable-but-required around-dispatch view, and `defineTool()` inference. [`tools.spec.ts`](../../../../packages/core/tools/tests/tools.spec.ts) covers pre-aborted materialization, phase skipping, policy and wrapper races, body invocation classification, caller-signal fusion, error precedence, context retention, and quiescent drainage. [`tool-calls.spec.ts`](../../../../packages/core/agent-loop/tests/tool-calls.spec.ts) and [`contract-regressions.spec.ts`](../../../../packages/core/agent-loop/tests/contract-regressions.spec.ts) cover balanced durable results for undispatched siblings. [`ptc.spec.ts`](../../../../packages/core/tool-executor-ptc/tests/ptc.spec.ts) and first-party integration suites cover explicit forwarding, while [`timeout-policy.spec.ts`](../../../../packages/guard/timeout-policy/tests/timeout-policy.spec.ts) preserves timeout ownership.
 
 No registry test can prove that arbitrary third-party same-process code observes the signal or stops in bounded time. Capability tests continue to prove cancellation and quiescence at the boundary that owns each side effect.
 
@@ -62,7 +62,7 @@ No registry test can prove that arbitrary third-party same-process code observes
 
 **Forbid around wrappers from replacing the signal.** Rejected because deadlines and nested operational scopes need lexical derivation. Capturing and fusing the caller signal preserves composition without allowing detachment.
 
-**Race the tool promise against cancellation.** Rejected because it reports completion while side effects may remain live, violating the [quiescent-disposal rule](../../../../docs/defensive-patterns.md#dispose-must-reach-quiescence-not-just-request-it).
+**Race the tool promise against cancellation.** Rejected because it reports completion while side effects may remain live, violating the [quiescent-disposal rule](../../../../docs/defensive-patterns/general.md#dispose-must-reach-quiescence-not-just-request-it).
 
 ## Consequences
 

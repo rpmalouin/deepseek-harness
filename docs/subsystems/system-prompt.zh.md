@@ -8,7 +8,7 @@
 
 ## 组装上下文
 
-`AssembleContext` 标识一次组装所解析的作用域层，并可携带该请求的显式控制信号。它可合并扩展：`dsh-agent` 添加可选字段 `agent`，用于携带当前的 agent（智能体）实例；`assembleContextFor(agent, signal)` 则一起设置这些显式字段。裸组装既没有作用域，也没有信号。
+`AssembleContext` 标识一次组装所解析的作用域层，并可携带该请求的显式控制信号。它可合并扩展：`dsh-agent` 添加可选字段 `agent` 和 `modelSelection`。`assembleContextFor(agent, signal)` 设置 agent（智能体）、作用域和信号；循环提供为该步骤捕获并在重试期间保留的模型选择，省略推理强度时使用适配器默认值。裸组装既没有作用域，也没有信号。
 
 ```ts type-equiv
 /** Merge-extensible context for one prompt assembly. */
@@ -22,6 +22,8 @@ interface AssembleContext {
   signal?: AbortSignal
 }
 ```
+
+`TOOL_APPLY_PATCH` 的顺序为 1350，位于 `TOOL_EDIT`（1300）与 `TOOL_GLOB`（1400）之间。
 
 ## 工具提供方结果
 
@@ -82,8 +84,26 @@ interface PromptContext {
   readonly name: string
   /** Contexts are joined in ascending order. */
   readonly order: number
-  /** Static text or a provider evaluated for each assembly. Empty text contributes nothing. */
+  /** Static text or a provider evaluated at assembly and admission refresh. Empty text contributes nothing. */
   readonly text: string | ((context: AssembleContext) => string)
+  /** Whether to interpolate prompt variables. Defaults to true; false preserves literal text. */
+  readonly interpolate?: boolean
+  /** Keep this operational context when optional runtime context is disabled. */
+  readonly required?: boolean
+}
+```
+
+`required: true` 在可选运行时上下文被抑制时保留操作所需的贡献。`interpolate: false` 原样保留文本，包括看起来像变量的目录名。`AssembledContext` 将已求值文本及其插值选择传给渲染过程。
+
+```ts type-equiv
+/** One resolved dynamic context contribution. */
+interface AssembledContext {
+  /** The contributing context's unique name. */
+  name: string
+  /** The resolved text before variable interpolation. */
+  text: string
+  /** Whether to interpolate prompt variables. Defaults to true; false preserves literal text. */
+  interpolate?: boolean
 }
 ```
 
@@ -135,7 +155,7 @@ getContextOrder(name: PromptContextOrderName): number
 context(context: PromptContext): () => void
 
 /**
- * Suppress every dynamic runtime-context contribution in the calling
+ * Suppress optional dynamic runtime-context contributions in the calling
  * context's scope without changing the services that own or enforce those
  * facts. Multiple suppressors remain independently disposable.
  * @returns the exact Cordis effect disposer.
@@ -162,13 +182,25 @@ tools(provider: (context: AssembleContext) => ToolProviderResult): () => void
 variable(name: string, provider: (context: AssembleContext) => string | undefined): () => void
 
 /**
+ * Refresh accepted registered runtime facts for request admission. Contexts
+ * added only by the assembly waterfall retain their accepted values. Current
+ * suppression removes optional contexts, and missing required registrations
+ * are restored in registry order. Sections, tools, and interpolation variables
+ * retain the accepted assembly; their providers and waterfall do not rerun.
+ * @param assembly - accepted assembly for this scope and step.
+ * @param context - the same scope and current plugin-defined assembly fields.
+ * @returns the accepted assembly with current runtime-context provider text.
+ */
+refreshContext(assembly: PromptAssembly, context: AssembleContext = {}): PromptAssembly
+
+/**
  * Assemble global and scoped providers, detach tool parameters, apply
- * canonical ordering, then run the assembly waterfall. Scoped sections and
- * variables shadow globals. The returned waterfall value is authoritative
- * except that an effective complete section is restored afterwards as the
- * sole prompt section.
- * @param context - the optional scope and plugin-defined assembly fields.
- * @returns the post-waterfall assembly with any complete prompt enforced.
+ * canonical ordering, then run the presentation waterfall. Scoped sections
+ * and variables shadow globals. The waterfall's text is authoritative except
+ * that an effective complete section is restored afterwards as the sole
+ * prompt section; tool declarations stay provider-owned.
+ * @param context - the optional scope, step tool set, and plugin-defined assembly fields.
+ * @returns the post-waterfall assembly with ordered tool declarations and any complete prompt enforced.
  */
 async assemble(context: AssembleContext = {}): Promise<PromptAssembly>
 ```
@@ -183,13 +215,13 @@ Source: [`packages/core/system-prompt/src/index.ts`](../../packages/core/system-
 
 #### `system-prompt/assemble` — waterfall
 
-Expert waterfall over the assembled sections, contexts, tools, and variables. Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): scoped listeners receive only that scope's assemblies. The returned value is authoritative. A supplied signal controls only this explicit assembly request and must not be retained to control later turns. A registered complete section is restored after this waterfall, so listeners cannot add to or replace that scope's system prompt.
+Presentation waterfall over assembled sections, contexts, and variables. Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): scoped listeners receive only that scope's assemblies. The returned text is authoritative; tool declarations remain provider-owned. A supplied signal controls only this explicit assembly request and must not be retained to control later turns. A registered complete section is restored after this waterfall, so listeners cannot add to or replace that scope's system prompt.
 
 ```ts cordis-catalog
 /**
- * Expert waterfall over the assembled sections, contexts, tools, and variables.
+ * Presentation waterfall over assembled sections, contexts, and variables.
  * Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): scoped listeners
- * receive only that scope's assemblies. The returned value is authoritative.
+ * receive only that scope's assemblies. The returned text is authoritative; tool declarations remain provider-owned.
  * A supplied signal controls only this explicit assembly request and must not
  * be retained to control later turns. A registered complete section is
  * restored after this waterfall, so listeners cannot add to or replace
@@ -198,7 +230,7 @@ Expert waterfall over the assembled sections, contexts, tools, and variables. Sc
  * @param context - the caller's per-assembly context.
  * @mode waterfall
  */
-'system-prompt/assemble'(this: Scoped<SystemPrompt>, assembly: PromptAssembly, context: AssembleContext, next: () => Promise<PromptAssembly>): Promise<PromptAssembly>
+'system-prompt/assemble'(this: Scoped<SystemPrompt>, assembly: PromptPresentation, context: AssembleContext, next: () => Promise<PromptPresentation>): Promise<PromptPresentation>
 ```
 
 Types: [Scoped](scope.zh.md)

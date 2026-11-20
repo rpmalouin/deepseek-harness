@@ -1,5 +1,5 @@
 .block {
-  --dsl-terminal-radius: 12px;
+  --dsl-terminal-radius: var(--dsw-radius-lg);
   --dsl-terminal-line-height: 22px;
   /* Rebindable by consumers (CodeBlock's --dsl-code-block-content-font
      pattern): a surface wanting the smaller code size rebinds this together
@@ -51,7 +51,7 @@
 .header::-webkit-scrollbar-thumb {
   border: 2px solid transparent;
   background-clip: padding-box;
-  border-radius: 6px;
+  border-radius: var(--dsw-radius-sm);
 }
 
 .header::-webkit-scrollbar-track {
@@ -87,11 +87,11 @@
 /* Out of flow inside the card's own gutter padding, so the reservation and the
    dot move together and no consumer margin can pull them apart; the dot neither
    indents its command nor depends on the command's text metrics to line up.
-   Centered against the row's line box, not the code font's baseline. */
+   Centered against the first visual line box, not the code font's baseline. */
 .runState {
   position: absolute;
   left: calc(-1 * var(--dsl-terminal-gutter) + 8px);
-  top: 50%;
+  top: calc(var(--dsl-terminal-line-height) / 2);
   transform: translateY(-50%);
 }
 
@@ -110,15 +110,11 @@
   color: var(--dsw-alias-label-tertiary);
 }
 
-/* `pre`, not `nowrap`: the prompt row renders the command verbatim, and
-   `nowrap` collapses the repeated spaces, tabs, and alignment of an indented
-   continuation. Both hold the single row and the ellipsis. */
+/* Each authored command line scrolls independently of its prompt and status.
+   `pre` preserves whitespace; hosts can opt into wrapping with `pre-wrap`. */
 .command {
-  min-width: 0;
+  --dsl-command-whitespace: var(--dsl-terminal-command-whitespace, pre);
   color: var(--dsw-alias-label-primary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: pre;
 }
 
 /* Capped to the prompt's line height (Pill's own 24px height would exceed a
@@ -167,7 +163,7 @@
 .output::-webkit-scrollbar-thumb {
   border: 2px solid transparent;
   background-clip: padding-box;
-  border-radius: 6px;
+  border-radius: var(--dsw-radius-sm);
 }
 
 /* Track end-margins keep the thumb's travel out of the card's rounded
@@ -176,10 +172,14 @@
   margin: 6px;
 }
 
-/* No wrapping, no word-break: alignment is the payload of terminal output. */
+/* Default `pre`: alignment is the payload of terminal output. Hosts opt
+   into wrapping long lines by rebinding the variable to `pre-wrap`, which
+   also keeps the output region from ever scrolling sideways; overflow-wrap
+   is inert while white-space stays `pre`. */
 .line {
   min-height: var(--dsl-terminal-line-height);
-  white-space: pre;
+  white-space: var(--dsl-terminal-line-whitespace, pre);
+  overflow-wrap: anywhere;
 }
 
 .expand {
@@ -194,8 +194,10 @@
   text-align: left;
 }
 
-.expand:hover {
-  color: var(--dsw-alias-label-secondary);
+@media (hover: hover) {
+  .expand:hover {
+    color: var(--dsw-alias-label-secondary);
+  }
 }
 
 .empty {

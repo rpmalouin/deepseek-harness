@@ -2,8 +2,8 @@
 // The built-bundle boot smoke: the assembled-jsdom test that owns the boot
 // graph itself. Other files share the same scaffolding (assembled-boot.ts) to
 // reach a surface only the built bundles expose; this one asserts that the
-// graph assembles at all — staged activation across the immediately tier and
-// the inject layers, per-plugin CSS injection, and a rendered journey reaching
+// graph assembles at all — activation across the immediately tier and
+// the inject layers, renderer-owned module styles, and a rendered journey reaching
 // chat content from the keyless RemoteMock scenario.
 //
 // Component behavior remains owned by per-package suites (SlotTestRuntime
@@ -91,11 +91,14 @@ it('boots the built plugin graph and renders a fixture session end to end', asyn
   expect(waitingRow.querySelector('[data-state="warning"]')).not.toBeNull()
   expect(waitingRow.querySelector('[data-state="ongoing"]')).toBeNull()
   within(waitingRow).getByText('Waiting for answer')
+  within(waitingRow).getByText('Answer')
 
   // Opening a session reaches chat content through the RemoteMock transport.
   fireEvent.click(waitingTitle)
   await waitFor(() => {
     expect(document.querySelector('[data-sample="bash"]')).not.toBeNull()
+    expect(document.querySelector('[data-chat-running]')?.parentElement?.getAttribute('data-slot'))
+      .toBe('conversation.chat.flow')
   }, { timeout: 10_000 })
   // The generated bundle roster mounts the question UI before the approval UI.
   // Skip the resident fixture's three questions, then resolve its approval so
@@ -103,7 +106,12 @@ it('boots the built plugin graph and renders a fixture session end to end', asyn
   for (let index = 0; index < 3; index += 1) {
     fireEvent.click(await screen.findByRole('button', { name: 'Skip' }))
   }
-  fireEvent.click(await screen.findByRole('button', { name: 'Allow once' }))
+  const allowOnce = await screen.findByRole('button', { name: 'Allow once' })
+  await waitFor(() => {
+    within(waitingRow).getByText('Waiting for approval')
+    within(waitingRow).getByText('Approval')
+  })
+  fireEvent.click(allowOnce)
 
   // The fixture mirrors all three token-meter projections, so the assembled
   // ContextMeter reaches its composition panel instead of only the occupancy
@@ -115,24 +123,29 @@ it('boots the built plugin graph and renders a fixture session end to end', asyn
   within(contextPanel).getByText('Tool definitions')
   within(contextPanel).getByText('Messages')
 
-  // The write/edit turns render a real diff card through the assembled graph
-  // (the keyed FileMutationRow composing ToolRow + DiffBlock), not just the
-  // fixture's raw text. The card is collapsed by default, so expand each edit/
-  // write row first. The write turn's `hello fixture\n` proves the terminator
-  // rule end to end: a trailing newline terminates its line, so the footer reads
-  // `+1` (not a phantom `+2`) and one distinct file. The `+ ` prefix is a CSS
-  // ::before, so it is absent from textContent — assert on the line body and the
-  // footer.
-  const mutationRows = [...document.querySelectorAll('[data-variant="write"],[data-variant="edit"]')]
+  // The built ToolRow and DiffBlock share the write fixture's trailing-newline
+  // semantics: `hello fixture\n` contributes one addition. Counts belong to the
+  // tool row; the diff's line markers are CSS pseudo-elements, absent from textContent.
+  const mutationRows = [...document.querySelectorAll<HTMLElement>('[data-variant="write"],[data-variant="edit"]')]
   expect(mutationRows.length).toBeGreaterThan(0)
+  const writeRow = mutationRows.find(row => row.getAttribute('data-variant') === 'write'
+    && row.textContent?.includes('new-demo.txt'))
+  if (writeRow === undefined) throw new Error('fixture write row missing')
+  expect(within(writeRow).getAllByText('+1', { exact: true })).toHaveLength(1)
+  expect(within(writeRow).getAllByText('-0', { exact: true })).toHaveLength(1)
+  expect(writeRow.querySelector('[data-diff]')).toBeNull()
   for (const row of mutationRows) {
     const toggle = row.querySelector('[data-expandable]')
     if (toggle !== null) act(() => { fireEvent.click(toggle) })
   }
   const diffCards = [...document.querySelectorAll('[data-diff]')]
   expect(diffCards.length).toBeGreaterThan(0)
-  const footers = diffCards.map(card => card.textContent ?? '')
-  expect(footers.some(text => text.includes('hello fixture') && text.includes('+1 -0 · 1 file'))).toBe(true)
+  const writeDiff = writeRow.querySelector<HTMLElement>('[data-diff]')
+  if (writeDiff === null) throw new Error('expanded fixture write diff missing')
+  within(writeDiff).getByText('hello fixture', { exact: true })
+  expect(within(writeRow).getAllByText('+1', { exact: true })).toHaveLength(1)
+  expect(within(writeRow).getAllByText('-0', { exact: true })).toHaveLength(1)
+  expect(writeDiff.textContent).not.toContain('+1 -0')
 
   // The web render intent reaches the assembled boot graph: the fixture's
   // web_search / web_fetch turns render their keyed WebRow cards, proving the

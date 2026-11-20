@@ -3,38 +3,42 @@
   min-width: 0;
 }
 
-/* Figma 313:14108 ToggleButton: 13/20 medium secondary label, 4px gap,
+/* Figma 313:14108 ToggleButton: 13/20 regular secondary label, 4px gap,
    12px caption chevron; 28px chip height matches the sibling Plan /
    Read-only selects in the same tool row. */
 .trigger {
+  anchor-name: var(--dsh-model-anchor);
   display: flex;
   align-items: center;
   gap: 4px;
   min-width: 0;
-  /* Legacy fallback, then a row-relative cap that grants long names more
-     room without letting this trailing control consume the composer. */
-  max-width: 220px;
-  max-width: min(360px, 45cqw);
+  /* Preferred width: the composer measures this expanded seat against the
+     space the other controls leave, so the cap must not shrink with the row.
+     A row-relative cap would let the measured demand fall with the available
+     width, and the expanded text would then always fit. */
+  max-width: 360px;
   height: 28px;
   padding: 0 4px 0 8px;
   border: none;
   /* Rounded chip chrome, matching the sibling permission trigger. */
-  border-radius: 24px;
+  border-radius: var(--dsw-radius-sm);
   outline: none;
   background: transparent;
   color: var(--dsw-alias-label-secondary);
   font-size: 13px;
   line-height: 20px;
-  font-weight: 500;
+  font-weight: 400;
   cursor: pointer;
 }
 
-.trigger:hover:not(:disabled) {
-  background: var(--dsw-alias-interactive-bg-hover);
+@media (hover: hover) {
+  .trigger:hover:not(:disabled) {
+    background: var(--dsw-alias-interactive-bg-hover);
+  }
 }
 
-.trigger:focus-visible {
-  box-shadow: 0 0 0 2px var(--dsw-alias-border-l3);
+.trigger:focus-visible:not([data-selection-focus]) {
+  box-shadow: 0 0 0 2px var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
 }
 
 .trigger:disabled {
@@ -49,7 +53,7 @@
   white-space: nowrap;
 }
 
-/* Effort value beside the model name (mock's 'High': same 13/20/500, caption
+/* Effort value beside the model name (mock's 'High': same 13/20/400, caption
    tone). Adaptive priority: the huge shrink factor makes the effort absorb
    all deficit first — it ellipsizes away to nothing before the model name
    loses a single pixel, and the chevron stays snug throughout. */
@@ -62,27 +66,17 @@
   color: var(--dsw-alias-label-caption);
 }
 
-/* Stand-in for the whole text below the icon-only cut: the settings page's
-   Models glyph (IconDataOutline16), hidden while any text fits. */
+/* The Models glyph replaces the text when the composer row cannot fit it. */
 .triggerIcon {
-  display: none;
+  display: var(--dsh-composer-model-icon-display, none);
   flex: 0 0 auto;
 }
 
-/* Icon-only floor: past continuous shrink (effort ellipsizes away first, then
-   the name), a 360px composer row leaves the 45cqw cap too little for a
-   legible name, so the text yields to the Models glyph. Same anonymous
-   container as PermissionSelect's 460px cut (InputBar .row); the full name
-   stays reachable through the trigger's title and aria-label. */
-@container (max-width: 360px) {
-  .triggerIcon {
-    display: block;
-  }
-
-  .triggerLabel,
-  .triggerEffort {
-    display: none;
-  }
+/* The composer measures expanded row demand and owns these display variables.
+   Outside a composer, the trigger retains its text. */
+.triggerLabel,
+.triggerEffort {
+  display: var(--dsh-composer-model-text-display, block);
 }
 
 .chevron {
@@ -95,27 +89,34 @@
   transform: rotate(180deg);
 }
 
-/* Portaled to body and placed from the trigger rect by the component (the
-   Menu primitive's portal rules), so the sidebar and the columns' overflow
-   clips cannot crop it; z matches the primitive's .portal layer. */
+/* The body portal escapes overflow ancestors. CSS anchors keep the card above
+   its trigger; layout viewport bounds do not shrink during pinch zoom. */
 .menu {
+  box-sizing: border-box;
   position: fixed;
+  position-anchor: var(--dsh-model-anchor);
+  top: max(12px, var(--dsh-frame-overlay-top, 12px));
+  left: 12px;
+  /* Anchor insets stay linear because scroll compensation runs after layout. */
+  right: anchor(right);
+  bottom: calc(anchor(top) + 8px);
+  align-self: safe end;
+  justify-self: safe end;
+  margin: 0;
   z-index: 1100;
   display: flex;
   flex-direction: column;
-  /* Let the visible pane's rows set the card width, but keep pathological ids
-     and narrow screens inside a bounded card where ellipsis remains. */
-  width: max-content;
-  min-width: min(240px, calc(100vw - 32px));
-  max-width: min(420px, calc(100vw - 32px));
-  max-height: min(360px, calc(100vh - 96px));
+  /* Rows size the card up to its visible bounds; longer names ellipsize. */
+  width: fit-content;
+  height: fit-content;
+  min-width: min(240px, calc(100vw - 24px));
+  max-width: min(420px, calc(100vw - 24px));
+  max-height: min(360px, calc(100dvh - 96px));
   overflow: hidden;
   padding: 4px;
   /* Surface tokens match the Menu primitive card (ui-primitives
    * Menu.module.css) so every dropdown reads as the same material. */
   border: 0;
-  border-radius: 20px;
-  background: var(--dsw-specific-menu);
   --dsw-elevation-stroke-color: var(--dsw-alias-border-l1);
   box-shadow: var(--dsw-elevation-prominent);
   color: var(--dsw-alias-label-primary);
@@ -128,12 +129,16 @@
   --dsh-scrollbar-thumb-hover: var(--dsw-alias-scrollbar-hover-l2);
 }
 
+.settingsMenu {
+  width: min(240px, calc(100vw - 24px));
+}
+
 .status,
 .empty {
-  padding: 10px;
+  padding: 8px;
   color: var(--dsw-alias-label-tertiary);
-  font-size: 13px;
-  line-height: 20px;
+  font-size: 12px;
+  line-height: 18px;
 }
 
 .error,
@@ -141,14 +146,14 @@
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 4px;
-  padding: 7px 8px;
-  border-radius: 8px;
+  gap: 6px;
+  margin-bottom: 3px;
+  padding: 6px 7px;
+  border-radius: var(--dsw-radius-md);
   background: var(--dsw-alias-interactive-bg-hover-danger);
   color: var(--dsw-alias-state-error-primary);
-  font-size: 12px;
-  line-height: 18px;
+  font-size: 11px;
+  line-height: 16px;
 }
 
 .warning {
@@ -167,38 +172,93 @@
   cursor: pointer;
 }
 
-.groups {
-  min-height: 0;
-  overflow-y: auto;
+.searchRow {
+  position: relative;
+  flex-shrink: 0;
+  margin: 2px 0 3px;
 }
 
-.group + .group {
-  margin-top: 4px;
+.searchRow .search {
+  display: flex;
+  height: auto;
+  padding: 5px 7px;
+  border: 0 solid transparent;
+  border-radius: var(--dsw-radius-md);
+  background: transparent;
 }
 
-.groupTitle {
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  padding: 5px 8px 3px;
-  background: var(--dsw-specific-menu);
-  color: var(--dsw-alias-label-tertiary);
+.searchRow .searchWithQuery {
+  padding-right: 34px;
+}
+
+.searchClear {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  corner-shape: round;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+}
+
+.searchClear:focus-visible {
+  outline: none;
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+@media (hover: hover) {
+  .searchClear:hover {
+    outline: none;
+    background: var(--dsw-alias-interactive-bg-hover);
+  }
+}
+
+.searchRow .search:focus-within {
+  border-color: transparent;
+}
+
+.searchRow .search input {
+  padding: 0;
   font-size: 12px;
-  line-height: 18px;
-  font-weight: 500;
+  line-height: normal;
+}
+
+@media (pointer: coarse) {
+  .searchRow .search input {
+    font-size: 16px;
+  }
+}
+
+.searchRow .search input::placeholder {
+  color: var(--dsw-alias-label-caption);
+}
+
+.groups:not([hidden]) {
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .option {
   box-sizing: border-box;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   width: auto;
   min-width: 100%;
-  min-height: 38px;
-  padding: 6px 8px;
+  min-height: 34px;
+  padding: 5px 7px;
   border: none;
-  border-radius: 10px;
+  border-radius: var(--dsw-radius-md);
   outline: none;
   background: transparent;
   color: inherit;
@@ -206,9 +266,19 @@
   cursor: pointer;
 }
 
-.option:hover:not(:disabled),
-.option:focus-visible {
+.option:focus-visible,
+.optionActive:not(:disabled) {
   background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.modelOption {
+  max-width: 100%;
+}
+
+@media (hover: hover) {
+  .option:not(.modelOption):hover:not(:disabled) {
+    background: var(--dsw-alias-interactive-bg-hover);
+  }
 }
 
 /* Selection marker is the trailing check, not a fill — matches the Menu
@@ -232,44 +302,73 @@
 .modelName {
   overflow: hidden;
   color: inherit;
-  font-size: 14px;
-  line-height: 20px;
-  font-weight: 500;
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 400;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.badgedName {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  gap: 4px;
+  vertical-align: baseline;
+  white-space: nowrap;
+}
+
+.badgedNameText {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.badge {
+  flex: none;
 }
 
 .check {
   display: grid;
   place-items: center;
-  flex: 0 0 18px;
+  flex: 0 0 14px;
   color: var(--dsw-alias-label-primary);
 }
 
-/* Two-level root cells (figma 496:26454 .Menu_cell): 40px row, 10px side
-   padding, 8px gap, 10px radius; 14/22 label in primary, value in the
-   #81858C tertiary tone, right chevron drilling into the sub-list. */
+.check svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* Two-level root cells use the same compact rhythm as the model rows. */
 .cell {
   box-sizing: border-box;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   width: auto;
   min-width: 100%;
-  height: 40px;
-  padding: 0 10px;
+  height: 34px;
+  padding: 0 8px;
   border: none;
-  border-radius: 10px;
+  border-radius: var(--dsw-radius-md);
   background: transparent;
   color: var(--dsw-alias-label-primary);
-  font-size: 14px;
-  line-height: 22px;
+  font-size: 13px;
+  line-height: 20px;
   cursor: pointer;
   text-align: left;
+  outline: none;
 }
 
-.cell:hover {
+.cell:focus-visible {
   background: var(--dsw-alias-interactive-bg-hover);
+}
+
+@media (hover: hover) {
+  .cell:hover {
+    background: var(--dsw-alias-interactive-bg-hover);
+  }
 }
 
 .cellLabel {
@@ -289,5 +388,7 @@
 
 .cellChevron {
   flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
   color: var(--dsw-alias-label-tertiary);
 }

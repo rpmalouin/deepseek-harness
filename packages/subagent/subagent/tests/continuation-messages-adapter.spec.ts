@@ -1,3 +1,4 @@
+import { mountWorkingDirectoryFixture } from './working-directory-fixture.ts'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -8,12 +9,13 @@ import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { DeepSeekAdapter, resolveAdapterOptions } from '@deepseek-ai/dsh-llm-deepseek'
-import { SessionId } from '@deepseek-ai/dsh-session'
-import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import type { SessionId } from '@deepseek-ai/dsh-session'
+import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import * as SubagentSpawn from '@deepseek-ai/dsh-subagent-spawn-in-process'
-import { end, MODEL, server, sse, start } from '../../../llm/llm-deepseek/tests/messages/helpers.ts'
+import { end, MODEL, server, sse, start } from '../../../llm/llm-deepseek/tests/helpers.ts'
 import SubagentRuntime, { type SubagentRunEndInfo } from '../src/index.ts'
 import { loadStoredSession } from './persistence-helpers.ts'
+import { brandString } from '@deepseek-ai/dsh-brand'
 
 it('continues the parent through default Messages after a reasoning-bearing continuable child settles', async () => {
   const root = mkdtempSync(join(tmpdir(), 'dsh-settlement-messages-'))
@@ -37,17 +39,18 @@ it('continues the parent through default Messages after a reasoning-bearing cont
     const connection = resolveAdapterOptions({ baseURL: http.url })
     const adapter = new DeepSeekAdapter({
       options: () => connection,
-      resolveApiKey: () => Promise.resolve('test-key'),
+      resolveAuth: () => Promise.resolve({ headers: { 'x-api-key': 'test-key' } }),
       resolveUserId: () => '00000000-0000-4000-8000-000000000001' as AnonymousUserId,
       prepareExtensions: () => Promise.resolve({ fields: {}, accept: () => Promise.resolve() }),
     })
-    await mountAgentLoopTestDependencies(ctx)
+    await mountAgentLoopTestDependencies(ctx, { workingDirectory: true })
     await ctx.plugin(JsonlSessionPersistence, { root })
     await ctx.plugin(AgentLoop, { agents: [] })
+    await mountWorkingDirectoryFixture(ctx)
     await ctx.plugin(SubagentRuntime)
     await ctx.plugin(SubagentSpawn, { providerName: 'spawn' })
     ctx.llm.registerAdapter(['deepseek-official'], adapter)
-    const parent = await ctx.agentLoop.create(SessionId('parent'), { provider: 'deepseek-official', model: MODEL })
+    const parent = await ctx.agentLoop.create(brandString<SessionId>('parent'), { provider: 'deepseek-official', model: MODEL })
     const ends: SubagentRunEndInfo[] = []
     const settled = Promise.withResolvers<undefined>()
     ctx.on('subagent/end', (info) => {
@@ -55,10 +58,11 @@ it('continues the parent through default Messages after a reasoning-bearing cont
       settled.resolve(undefined)
     })
 
-    const started = await ctx.subagents.startContinuable({
+    const started = await ctx.subagents.startActivation({
+      delivery: 'parent',
       provider: 'spawn',
       label: 'child task',
-      request: { parent, prompt: [{ type: 'text', text: 'child task' }] },
+      parent, prompt: [{ type: 'text', text: 'child task' }],
       signal: new AbortController().signal,
     })
     await settled.promise
@@ -75,12 +79,24 @@ it('continues the parent through default Messages after a reasoning-bearing cont
     expect(requests).toHaveLength(2)
     expect(requests.map(request => request.path)).toEqual(['/anthropic/v1/messages', '/anthropic/v1/messages'])
     const notice = parent.session.deriveMessages().find(message => message.source.kind === 'subagent-settled')
-    expect(notice?.content).toEqual([
-      { type: 'text', text: `Background subagent ${started.childId} finished and will do no further work unless you send it more.` },
+    const closingContent = [
+      { type: 'text', text: 'Background subagent agent-1 finished and will do no further work unless you send it more.' },
       { type: 'text', text: 'Its closing message:' },
       { type: 'text', text: 'child answer' },
-    ])
-    expect(requests[1]?.body).toMatchObject({ messages: [{ role: 'user', content: notice?.content }] })
+    ]
+    expect(notice?.content).toEqual(closingContent)
+    expect(notice?.source).toMatchObject({
+      stopReason: 'completed', senderSessionId: started.childId,
+    })
+    const noticeWithContext = [
+      ...closingContent,
+      {
+        type: 'text',
+        text: '<system-reminder>\nThe following information describes your current session:\n\n'
+          + `Current working directory: ${JSON.stringify(process.cwd())}.\n</system-reminder>`,
+      },
+    ]
+    expect(requests[1]?.body).toMatchObject({ messages: [{ role: 'user', content: noticeWithContext }] })
 
     parent.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'continue' }] }))
     await parent.whenIdle()
@@ -88,7 +104,7 @@ it('continues the parent through default Messages after a reasoning-bearing cont
       .toMatchObject([{ data: { reason: { kind: 'completed' } } }, { data: { reason: { kind: 'completed' } } }])
     expect(requests).toHaveLength(3)
     expect(requests[2]?.body).toMatchObject({ messages: [
-      { role: 'user', content: notice?.content },
+      { role: 'user', content: noticeWithContext },
       { role: 'assistant', content: [{ type: 'text', text: 'parent answer' }] },
       { role: 'user', content: [{ type: 'text', text: 'continue' }] },
     ] })

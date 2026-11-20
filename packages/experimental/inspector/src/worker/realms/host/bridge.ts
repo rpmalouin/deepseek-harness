@@ -19,7 +19,7 @@ interface DynamicInspectorSession {
 
 /** Connection-local carrier for requests and notifications from the Host V8 inspector. */
 export class HostInspectorSession {
-  private readonly session = new Session() as unknown as DynamicInspectorSession
+  private readonly session = new Session() as DynamicInspectorSession
   private readonly listeners = new Set<(message: HostInspectorNotification) => void>()
   private connected = false
   private failure: string | undefined
@@ -30,7 +30,7 @@ export class HostInspectorSession {
       for (const listener of [...this.listeners]) {
         try {
           listener(rewritten)
-        } catch {
+        } catch (_listenerFailed) {
           // One domain subscriber cannot starve notifications for sibling domains.
         }
       }
@@ -75,7 +75,7 @@ export class HostInspectorSession {
     this.connected = false
     try {
       this.session.disconnect()
-    } catch {
+    } catch (_alreadyDisconnected) {
       // The underlying inspector session is already disconnected.
     }
   }
@@ -149,7 +149,7 @@ export class HostNotificationChannel<Event> {
       for (const listener of [...this.listeners]) {
         try {
           listener(event)
-        } catch {
+        } catch (_listenerFailed) {
           // One notification consumer cannot prevent delivery to its siblings.
         }
       }

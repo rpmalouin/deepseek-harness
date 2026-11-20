@@ -37,7 +37,7 @@ A caller with no configured MCP server sees no MCP prompt text or resource tools
 
 When system-prompt assembly is mounted, the prompt lists server names visible to the calling agent. Call `list_mcp_resources` or `list_mcp_resource_templates` with one of those names as `server`. Without a cursor, the MCP SDK collects the server’s pages. An explicit `cursor` requests that page; pass a returned `nextCursor` unchanged. Read a listed URI or an expanded template with `read_mcp_resource`, using the same `server` name and an explicit `uri`.
 
-Every operation resolves the server in the calling agent's scope. A missing server argument or unavailable server fails before dispatch. The connection owner handles request cancellation, timeouts, and recovery; a failed request remains a failed tool call.
+Every operation resolves the server in the calling agent's scope. A missing server argument or unavailable server fails before dispatch; an unavailable server fails as `ToolArgsError` with `INVALID_ARGS`. The connection owner handles request cancellation, timeouts, and recovery; a failed request remains a failed tool call.
 
 -----
 
@@ -64,8 +64,6 @@ Canonical results retain the complete JSON for programmatic callers. The pure te
 | [`src/tools.ts`](src/tools.ts) | Shared resource operations and argument schemas |
 | [`src/render.ts`](src/render.ts) | Attributed text projection without inline binary payloads |
 
-No runtime invariant companion is published: tools, prompt names, and dispatch derive from the same effect-owned provider registrations. They supply no independent observation to reconcile; registry-effect checks are not runtime invariants.
-
 </details>
 
 -----
@@ -77,8 +75,8 @@ These pages cover server configuration, execution, and the decisions behind reso
 
 - [MCP client](../mcp-client/README.md) — server transports, instructions, and connection lifecycle.
 - [Tools subsystem](../../../docs/subsystems/tools.md) — canonical values and model-visible results.
-- [Resource visibility decision](../../../.agents/notes/implemented/feature/2026-09-13-mcp-resources-in-profiles.md) — shared profile mounting and visibility from configured servers.
-- [Resources and instructions decision](../../../.agents/notes/implemented/feature/2026-09-12-mcp-resources-and-instructions.md) — scope, on-demand access, and excluded mechanisms.
+- [Resource visibility reference](README.md) — shared profile mounting and visibility from configured servers.
+- [Resources and instructions reference](README.md) — scope, on-demand access, and excluded mechanisms.
 
 -----
 
@@ -119,7 +117,7 @@ Each result appends to history without rewriting earlier results. Later reads ca
 
 Resource access is explicit and on demand.
 
-- A configured server without the MCP `resources` capability still appears in the server-name prompt and keeps shared resource tools available. The SDK returns empty resource and template lists; unsupported reads fail.
+- A configured server without the MCP `resources` capability still appears in the server-name prompt and keeps shared resource tools available. The MCP client returns empty resource and template lists without contacting the server; unsupported reads fail.
 - `tools.restrict()` checks names supplied by global or ancestor scopes when the filter is registered. Naming a resource tool absent from those scopes fails as an unknown tool. Resource tools registered in the caller's own scope are outside allow/deny masks.
 - Resource subscriptions and update notifications are unsupported; call the list or read tools again to obtain current content.
 - Binary resources are not projected as native images or audio. Programmatic callers retain their canonical base64 values.

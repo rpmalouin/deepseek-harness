@@ -10,30 +10,26 @@
  * @module @deepseek-ai/dsh/profile-boot
  */
 
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { FiberState, type Context } from '@deepseek-ai/cordis'
-import type { PatchOptions } from '@deepseek-ai/cordis-plugin-include'
 import {
   boot,
   readProfilePatches,
-  createProfileResolutionGeneration,
-  healProfilesModuleFallback,
-  healIsolatedProfileModuleFallback,
+  createRuntimeResolution,
   initProfile,
   installFailLoud,
-  loadOverlayPatches,
   loadProfile,
+  reportSkippedBundles,
   PluginPackages,
   PROFILE_PATCH_FILENAME,
-  PROFILE_TEMPLATES,
   resolveProfileDir,
   type ProfileContext,
   type Profile,
-  type ProfileResolutionGeneration,
-  type ProfileResolutionMode,
+  type RuntimeResolution,
 } from '@deepseek-ai/dsh-app-boot'
+import { PROFILE_TEMPLATES } from '@deepseek-ai/dsh-official-bundles'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { installProxyFromEnvironment } from '@deepseek-ai/dsh-http-proxy'
 import { DSH_LAUNCH_ENVIRONMENT_KEY, type LaunchEnvironmentSnapshot } from '@deepseek-ai/dsh-launch-environment'
@@ -90,15 +86,22 @@ const PROFILE_ROOT_CONFIG = `# dsh profile root — an empty entry list. The tre
 export const PROFILE_ROOT_FILENAME = 'cordis.yml'
 
 /**
- * Initialize a missing profile from one shipped template. This copies only
- * the template's bundle list; local state from the
+ * Replace the named custom profile with a fresh copy of one shipped template.
+ * This copies only the template's bundle list; local state from the
  * same-named shipped profile is not read, and no inheritance metadata is
- * persisted. Shipped profile names are reserved, and the target directory is
- * claimed exclusively so existing or concurrent state is never reused.
- * @param name - the new profile name.
+ * persisted. The new profile is assembled in a `.<name>.staging-*` directory
+ * under the profiles directory and moved into place; only then is any previous
+ * target directory, including its dependencies and user patch, deleted. A
+ * failed move restores the previous directory; when restoring also fails, it
+ * stays in the staging directory. Shipped profile names, compared without
+ * case, are reserved. Concurrent replacements leave one complete copy; each
+ * one either succeeds or reports the concurrent recreation.
+ * @param name - the profile name to create or replace.
  * @param fromDefaultProfile - shipped profile template to copy.
  * @param home - Harness home containing the profile directory.
- * @throws when the template is unknown, the target name is shipped, or the target directory exists.
+ * @throws when the template is unknown, the target name is shipped, another process recreates the target
+ *   between the two renames, or a file-system operation fails; a restore failure is an `AggregateError`
+ *   that names the staging path holding the previous profile.
  */
 export function initializeProfileFromDefault(
   name: string,
@@ -115,42 +118,62 @@ export function initializeProfileFromDefault(
       `${NAME}: unknown default profile ${JSON.stringify(fromDefaultProfile)}; expected one of ${expected}`,
     )
   }
-  if (Object.hasOwn(PROFILE_TEMPLATES, name)) {
+  // Case-insensitive file systems resolve a case variant such as `Web` to the shipped directory.
+  const shipped = Object.keys(PROFILE_TEMPLATES).find(shippedName => shippedName.toLowerCase() === name.toLowerCase())
+  if (shipped !== undefined) {
     throw new Error(
-      `${NAME}: profile ${JSON.stringify(name)} is shipped and cannot be a custom profile target; `
+      `${NAME}: profile ${JSON.stringify(name)} names shipped profile ${JSON.stringify(shipped)} and cannot be a custom profile target; `
       + 'omit --from-default-profile to use it',
     )
   }
   mkdirSync(dirname(dir), { recursive: true })
+  // The staging directory sits beside the target so both renames stay on one filesystem.
+  const staging = mkdtempSync(join(dirname(dir), `.${name}.staging-`))
+  const previous = join(staging, 'previous')
   try {
-    mkdirSync(dir)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
-    const manifestPath = join(dir, 'package.json')
-    if (existsSync(manifestPath)) {
-      throw new Error(
-        `${NAME}: profile ${JSON.stringify(name)} already exists at ${manifestPath}; `
-        + 'omit --from-default-profile to use it',
-      )
-    }
-    throw new Error(
-      `${NAME}: profile directory ${dir} already exists; choose an unused profile name`,
-    )
-  }
-  try {
-    initProfile(dir, template.bundles)
-  } catch (error) {
+    const fresh = join(staging, 'new', name)
+    initProfile(fresh, template.bundles)
+    let moved = false
     try {
-      rmSync(dir, { recursive: true, force: true })
-    } catch (cleanupError) {
-      throw new AggregateError(
-        [error, cleanupError],
-        `${NAME}: profile initialization failed and ${dir} could not be removed`,
-      )
+      renameSync(dir, previous)
+      moved = true
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     }
+    try {
+      renameSync(fresh, dir)
+    } catch (error) {
+      // Windows reports EPERM instead of EEXIST or ENOTEMPTY, so the target's state identifies a concurrent winner.
+      if (existsSync(dir)) {
+        // The concurrent replacement supersedes the previous profile.
+        rmSync(previous, { recursive: true, force: true })
+        throw new Error(`${NAME}: profile ${JSON.stringify(name)} was recreated concurrently at ${dir}`, { cause: error })
+      }
+      if (moved) {
+        try {
+          renameSync(previous, dir)
+        } catch (restoreError) {
+          throw new AggregateError(
+            [error, restoreError],
+            `${NAME}: profile replacement failed and ${dir} could not be restored from ${previous}`,
+          )
+        }
+      }
+      throw error
+    }
+  } catch (error) {
+    // A previous profile that could not be restored stays in staging at the reported path.
+    if (!existsSync(previous)) rmSync(staging, { recursive: true, force: true })
     throw error
   }
+  try {
+    rmSync(staging, { recursive: true, force: true })
+  } catch (error) {
+    // The replacement is complete; leftover files only occupy space.
+    process.stderr.write(`${NAME}: replaced profile ${JSON.stringify(name)} but could not remove ${staging}: ${String(error)}\n`)
+  }
 }
+
 /**
  * Load a resolved profile for `name` and (re)write the empty root config. The
  * root is always rewritten: the whole composition is patch layers, and the
@@ -162,13 +185,14 @@ export function initializeProfileFromDefault(
  * the identical base).
  * @param name - the profile name.
  * @param userLayer - `false` skips parsing `cordis.patch.yml` (the default dump).
- * @param fromDefaultProfile - shipped template used once to initialize a missing profile.
+ * @param fromDefaultProfile - shipped template that replaces the profile before loading it.
  * @returns the loaded profile.
- * @throws when explicit initialization names an unknown template or an existing profile.
+ * @throws when explicit initialization names an unknown template or a shipped target.
  */
 export function prepareProfile(name: string, userLayer = true, fromDefaultProfile?: string): Profile {
   if (fromDefaultProfile !== undefined) initializeProfileFromDefault(name, fromDefaultProfile)
   const profile = loadProfile(NAME, name, INSTALL_ANCHOR, undefined, { userLayer })
+  reportSkippedBundles(NAME, profile)
   writeFileSync(join(profile.dir, PROFILE_ROOT_FILENAME), PROFILE_ROOT_CONFIG)
   return profile
 }
@@ -176,10 +200,10 @@ export function prepareProfile(name: string, userLayer = true, fromDefaultProfil
 /** One profile's patch layers, in application order. */
 interface ComposedProfile {
   profile: Profile
-  /** Immutable package fallback selected before any plugin imports. */
-  resolution: ProfileResolutionGeneration
-  /** Command-line overlay contents, frozen for this invocation. */
-  overlays: PatchOptions[]
+  /** Immutable runtime resolution computed before any plugin imports. */
+  resolution: RuntimeResolution
+  /** Absolute command-line overlay files, in argv order. */
+  overlayPaths: string[]
 }
 
 /**
@@ -191,27 +215,21 @@ interface ComposedProfile {
  * then the telemetry switch.
  * @param name - the profile name.
  * @param patchFiles - `--patch` overlay paths, in argv order.
- * @param resolutionMode - runtime lookup, disk links, or dual verification of both.
- * @param fromDefaultProfile - shipped template for a missing named profile.
+ * @param fromDefaultProfile - shipped template that replaces the named profile.
  * @param resolvedProfile - application-owned profile and installation.
  * @returns the profile and its patch layers.
  */
 async function composeProfile(
   name: string,
   patchFiles: readonly string[],
-  resolutionMode: ProfileResolutionMode,
   fromDefaultProfile?: string,
   resolvedProfile?: ResolvedProfileRuntime,
 ): Promise<ComposedProfile> {
   const profile = resolvedProfile?.profile ?? prepareProfile(name, true, fromDefaultProfile)
   if (resolvedProfile !== undefined) writeFileSync(join(profile.dir, PROFILE_ROOT_FILENAME), PROFILE_ROOT_CONFIG)
   const resolutionOptions = { installAnchor: resolvedProfile?.installAnchor ?? INSTALL_ANCHOR, profile }
-  if (resolvedProfile !== undefined && resolutionMode !== 'runtime') healIsolatedProfileModuleFallback(resolvedProfile)
-  const resolution = resolutionMode === 'runtime' || resolvedProfile !== undefined
-    ? await createProfileResolutionGeneration(resolutionOptions)
-    : await healProfilesModuleFallback(resolutionOptions)
-  const overlays = patchFiles.flatMap(file => loadOverlayPatches(NAME, resolve(file)))
-  return { profile, resolution, overlays }
+  const resolution = await createRuntimeResolution(resolutionOptions)
+  return { profile, resolution, overlayPaths: patchFiles.map(file => resolve(file)) }
 }
 
 /** An application-owned profile and its independent installation fallback. */
@@ -230,7 +248,7 @@ export interface RunProfileOptions {
   profile: string
   /** Loaded application profile; bypasses named profile initialization when supplied. */
   resolvedProfile?: ResolvedProfileRuntime | undefined
-  /** Shipped template used once to initialize a missing profile. */
+  /** Shipped template that replaces the named profile before boot. */
   fromDefaultProfile?: string | undefined
   /** `--patch` overlay paths, in argv order. */
   patchFiles: readonly string[]
@@ -238,8 +256,17 @@ export interface RunProfileOptions {
   args: readonly string[]
   /** Application-owned package runtime, scoped to plugin package operations. */
   packageManager?: ProfileContext['packageManager']
-  /** Module fallback backend; defaults to runtime. Plain Node callers may override it; pkg executables always use runtime. */
-  resolutionMode?: ProfileResolutionMode
+}
+
+/**
+ * Render a profile name as an RFC 9110 `User-Agent` product version: bytes outside `tchar`, and `%`, are percent-encoded,
+ * so spaces, `/`, and non-ASCII names stay readable and reversible.
+ * @param name - the booted profile name.
+ * @returns the encoded name.
+ */
+export function userAgentProfile(name: string): string {
+  // encodeURIComponent leaves only `(` and `)` outside tchar.
+  return encodeURIComponent(name).replace(/[()]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)
 }
 
 /**
@@ -250,6 +277,8 @@ export interface RunProfileOptions {
  * @throws after disposing startup resources; cleanup failures retain the original error.
  */
 export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Context; shutdown: ProcessShutdown }> {
+  // Model providers see which profile sent a request.
+  process.env.DSH_USER_AGENT_SUFFIX = `dsh-profile/${userAgentProfile(options.profile)}`
   // Before the first plugin mounts and before anything can issue a request: Node's fetch ignores the
   // proxy environment on its own, so every profile would otherwise connect directly. Resolving from
   // the launcher's snapshot — not `process.env` — is what lets a proxy declared in a `.env` layer
@@ -259,8 +288,6 @@ export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Con
     (message) => { process.stderr.write(`${NAME}: ${message}\n`) },
   )
 
-  const packaged = (process as NodeJS.Process & { pkg?: unknown }).pkg !== undefined
-  const resolutionMode = packaged ? 'runtime' : options.resolutionMode ?? 'runtime'
   const app: { current?: Context } = {}
   let disposal: Promise<void> | undefined
   const dispose = (): Promise<void> => disposal ??= (async () => {
@@ -273,7 +300,7 @@ export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Con
   })()
   try {
     const composed = await composeProfile(
-      options.profile, options.patchFiles, resolutionMode, options.fromDefaultProfile, options.resolvedProfile,
+      options.profile, options.patchFiles, options.fromDefaultProfile, options.resolvedProfile,
     )
     const appReady = createAppReady()
     const shutdown = createProcessShutdown(dispose)
@@ -301,7 +328,7 @@ export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Con
       installAnchor: options.resolvedProfile?.installAnchor ?? INSTALL_ANCHOR,
       startedBundles: composed.profile.layers.map(layer => layer.packageName),
       cwd: process.cwd(), home: resolveDshHome(),
-      overlays: composed.overlays, telemetryDisabledEnv: process.env.DSH_TELEMETRY_DISABLED,
+      overlayPaths: composed.overlayPaths, telemetryDisabledEnv: process.env.DSH_TELEMETRY_DISABLED,
     }
     const ctx = await boot(NAME, rootConfig, readProfilePatches(NAME, profileContext, composed.profile), async (hostCtx) => {
       app.current = hostCtx
@@ -309,9 +336,8 @@ export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Con
       // Before any config-tree entry mounts, so plugins resolve all launch-time
       // environment values from the same immutable launch snapshot.
       hostCtx.provide(DSH_LAUNCH_ENVIRONMENT_KEY, options.environment)
-      await hostCtx.plugin(PluginPackages, resolutionMode === 'link' ? {} : {
-        generation: composed.resolution,
-        behavior: resolutionMode === 'dual' ? 'verify' : 'enforce',
+      await hostCtx.plugin(PluginPackages, {
+        resolution: composed.resolution,
       })
       // The command line and bounded exit request are launcher facts available
       // to every app plugin that injects the argument snapshot.

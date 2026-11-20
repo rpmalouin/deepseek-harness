@@ -28,6 +28,12 @@
     },
     {
       "path": "../../util/home-paths"
+    },
+    {
+      "path": "../../fs/fs"
+    },
+    {
+      "path": "../../session/working-directory"
     }
   ]
 }

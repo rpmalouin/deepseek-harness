@@ -1,7 +1,7 @@
 /** Recorded-session replay through the shipped headless `dsh` profile. */
 
 import { startHttpMcpFixture } from '../../packages/mcp/mcp-client/tests/http-fixture.ts'
-import { cp, copyFile, mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises'
+import { chmod, cp, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
@@ -9,7 +9,7 @@ import { basename, delimiter, dirname, isAbsolute, join, relative, sep } from 'n
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import ts from 'typescript'
-import { SESSION_FORMAT_VERSION } from '@deepseek-ai/dsh-session'
+import { deriveEventMessage, foldSurface, SESSION_FORMAT_VERSION } from '@deepseek-ai/dsh-session'
 import { releasedV0SessionFormatCodec } from '@deepseek-ai/dsh-session-format-v0-to-v1'
 import type { SessionFormatEvent, SessionFormatMigrationContext } from '@deepseek-ai/dsh-session-format'
 import { assertWorkspaceOutsideTemp, outsideTempWorkspaceParent } from '../../scripts/snapshot-workspace-parent.ts'
@@ -28,9 +28,11 @@ import {
   normalizedSystemPrompts,
   normalizedToolSchemas,
   parseSnapshotManifest,
+  parseSessionFixtureName,
   parseToolSchemasSnapshot,
   redactSessionSnapshotIds,
   refreshFixtureReplacements,
+  REPLAY_CREDENTIAL_ENV,
   restorePinnedToolSchemas,
   scrubSessionSnapshot,
   scrubSystemPrompts,
@@ -50,7 +52,7 @@ import {
   type SnapshotManifest,
   type WorkspaceSnapshotEntry,
 } from '@deepseek-ai/dsh-session-snapshot'
-import { LOADER_SMOKE_TEST_TIMEOUT_MS, runLoaderSmoke } from '@deepseek-ai/dsh-loader-smoke'
+import { LOADER_SMOKE_TEST_TIMEOUT_MS, resolveExampleMode, runLoaderSmoke } from '@deepseek-ai/dsh-loader-smoke'
 import { resolvePwshPath } from '@deepseek-ai/dsh-pwsh-local'
 import { parseSessionLog, prepareSessionSnapshotFixtureForComparison } from '@deepseek-ai/dsh-llm-replay'
 
@@ -58,10 +60,6 @@ const repoRoot = fileURLToPath(new URL('../../', import.meta.url))
 const snapshotsRoot = fileURLToPath(new URL('./', import.meta.url))
 const dshBin = join(repoRoot, 'apps/cli/src/bin.ts')
 const tsconfigPath = join(repoRoot, 'tsconfig.json')
-const editingCordisSkill = join(
-  repoRoot,
-  'packages/preset/agent-presets/presets/cordis/skills/editing-cordis-compositions/SKILL.md',
-)
 
 type SnapshotMode = 'replay' | 'record' | 'refresh'
 
@@ -98,6 +96,17 @@ interface SessionLog {
   readonly header: JsonObject
 }
 
+/** Keep the cwd text priced by compaction independent of the platform's temporary-root length. */
+async function compactionWorkspaceOptions(): Promise<{ tempDirParent: string; tempDirPrefix: string }> {
+  const tempDirParent = await realpath(tmpdir())
+  const prefix = 'dsh-log-snap-'
+  // mkdtemp appends six characters; JSON quoting is part of the runtime-context text.
+  const unpaddedLength = JSON.stringify(join(tempDirParent, `${prefix}XXXXXX`)).length
+  const paddingLength = 192 - unpaddedLength
+  if (paddingLength < 0) throw new Error('compaction snapshot temporary root exceeds its fixed cwd text length')
+  return { tempDirParent, tempDirPrefix: prefix + '-'.repeat(paddingLength) }
+}
+
 function propertyName(node: ts.PropertyName): string | undefined {
   if (ts.isIdentifier(node) || ts.isStringLiteral(node) || ts.isNumericLiteral(node)) return node.text
   return undefined
@@ -107,6 +116,8 @@ function bindsOsAssignedPort(argument: ts.Expression | undefined): boolean {
   if (argument === undefined) return false
   if (ts.isNumericLiteral(argument)) return Number(argument.text) === 0
   if (!ts.isObjectLiteralExpression(argument)) return false
+  if (argument.properties.some(property => !ts.isSpreadAssignment(property) && propertyName(property.name) === 'path')
+    && argument.properties.every(property => !ts.isSpreadAssignment(property) && propertyName(property.name) !== 'port')) return true
   let portIsZero: boolean | undefined
   for (const property of argument.properties) {
     if (ts.isSpreadAssignment(property)) {
@@ -156,15 +167,32 @@ function records(log: string): JsonObject[] {
     .map(line => JSON.parse(line) as JsonObject)
 }
 
+/** Compare deterministic recorded tool output with raw writer fields; only message ids are volatile. */
+function verifyToolResultWriterParity(fixture: string, actual: string): void {
+  expect(sessionHeaderVersion(fixture, 'retained tool-result input')).toBe(3)
+  expect(sessionHeaderVersion(actual, 'raw tool-result writer')).toBe(SESSION_FORMAT_VERSION)
+  const withoutMessageId = (message: object): JsonObject => Object.fromEntries(
+    Object.entries(message).filter(([key]) => key !== 'id'),
+  )
+  const expected = parseSessionLog(fixture).flatMap(event => event.type === 'tool/result'
+    ? [withoutMessageId(event.data.message)] : [])
+  const written = records(actual).flatMap(event => event.type === 'tool/result'
+    ? [withoutMessageId((event.data as JsonObject).message as JsonObject)] : [])
+  expect(expected.length, 'recorded stock tool results').toBeGreaterThan(0)
+  expect(written, 'native tool-result messages match migration output').toEqual(expected)
+}
+
 function headerOf(log: string): JsonObject {
   return records(log)[0] ?? {}
 }
 
 function contextOf(logs: readonly string[]): NormalizeContext {
   const headers = logs.map(headerOf)
+  const cwd = typeof headers[0]?.cwd === 'string' ? headers[0].cwd : '\0missing-cwd\0'
   return {
     sessionIds: headers.flatMap(header => typeof header.id === 'string' ? [header.id] : []),
-    cwd: typeof headers[0]?.cwd === 'string' ? headers[0].cwd : '\0missing-cwd\0',
+    cwd,
+    cwdAliases: [cwd.split(sep).join('/')],
   }
 }
 
@@ -196,13 +224,19 @@ async function persistedSessions(cwd: string): Promise<SessionLog[]> {
   })
 }
 
-async function fixtureSessions(scenario: HeadlessScenario): Promise<string[]> {
-  const files = sessionFixtureNames(await readdir(scenario.dir))
+async function fixtureSessions(scenario: HeadlessScenario, selectedFiles?: readonly string[]): Promise<string[]> {
+  const files = selectedFiles ?? sessionFixtureNames(await readdir(scenario.dir))
   return Promise.all(files.map(async (file) => {
     const content = await readFile(join(scenario.dir, file), 'utf8')
     assertSessionFixtureVersion(file, content)
     return content
   }))
+}
+
+/** First live recordings use manifest input and the composition's model until a Session exists. */
+function recordingFixtureNames(names: readonly string[], recordingMode: SnapshotMode): string[] {
+  const hasFixtures = names.some(name => parseSessionFixtureName(name) !== undefined)
+  return recordingMode === 'record' && !hasFixtures ? [] : sessionFixtureNames(names)
 }
 
 async function primaryFixtureFile(dir: string): Promise<string> {
@@ -226,6 +260,9 @@ async function writeSessionFixtures(
   const replacements = mode === 'refresh'
     ? refreshFixtureReplacements(actualLogs.map(harvested), prior)
     : []
+  for (const replacement of [...replacements]) {
+    if (replacement.from === ctx.cwd) replacements.push({ from: ctx.cwd.split(sep).join('/'), to: replacement.to })
+  }
   const fresh = actualLogs.map((log, index) => {
     const stable = tokenizeSessionFixtureCwd(mode === 'refresh'
       ? stabilizeRefreshLog(log.content, prior[index] as string, replacements, ctx)
@@ -459,14 +496,64 @@ async function seedWorkspace(scenario: HeadlessScenario, cwd: string): Promise<v
   await prepare(cwd)
 }
 
+const WORKTREE_CHECKOUT_FILTER = "printf 'FILTERED CHECKOUT CONTENT\\n'"
+const WORKTREE_CHECKOUT_ATTRIBUTES = 'tracked.txt filter=dsh-snapshot-checkout\n'
+
 const workspaceSetups: Record<string, (cwd: string) => Promise<void>> = {
+  async 'readonly-patch-directory'(cwd) {
+    const directory = join(cwd, 'locked')
+    await mkdir(directory)
+    await chmod(directory, 0o555)
+  },
+  async 'cua-script-guidance'(cwd) {
+    // Keep the real prompt's bridge URL under the fixture workspace on every host.
+    const source = join(repoRoot, 'packages/experimental/cua')
+    const target = join(cwd, 'cua-runtime')
+    const face = resolveExampleMode() === 'lib' ? 'lib' : 'src'
+    const extension = face === 'lib' ? 'js' : 'ts'
+    const guidanceDirectory = face === 'lib' ? 'lib/types' : 'src'
+    await cp(join(source, face), join(target, face), { recursive: true })
+    await copyFile(join(source, 'package.json'), join(target, 'package.json'))
+    await symlink(join(source, 'node_modules'), join(target, 'node_modules'), 'dir')
+    await copyFile(join(repoRoot, `packages/experimental/cua-macos/${guidanceDirectory}/guidance.${extension}`), join(target, `guidance.${extension}`))
+  },
+  async 'dsh-doc-resources'(cwd) {
+    await cp(join(repoRoot, 'packages/preset/agent-preset/skills/dsh-doc'), join(cwd, '.dsh/skills/dsh-doc'), { recursive: true })
+  },
+  async 'windows-acl-skill'(cwd) {
+    const target = join(cwd, '.dsh', 'skills', 'diagnose-windows-sandbox-acl', 'SKILL.md')
+    await mkdir(dirname(target), { recursive: true })
+    await copyFile(join(repoRoot, 'packages/sandbox/sandbox-windows-acl/assets/diagnose-windows-sandbox-acl/SKILL.md'), target)
+  },
   async 'office-skills'(cwd) {
     await cp(join(repoRoot, 'packages/skill/skill-office/assets'), join(cwd, 'office-skills'), { recursive: true })
   },
-  async 'editing-cordis-skill'(cwd) {
+  async 'office-retired-ptc'(cwd) {
+    await workspaceSetups['office-skills']!(cwd)
+    // A copied macOS Node binary cannot find its adjacent libnode.dylib.
+    const nodePath = process.execPath.replaceAll("'", "'\\''")
+    await writeFile(join(cwd, 'office-node'), `#!/bin/sh\nexec '${nodePath}' "$@"\n`, { mode: 0o755 })
+    // Keep the removed-tool error without process-specific stack locations.
+    await writeFile(join(cwd, 'office-ptc-node'), '#!/bin/sh\nexec "$(dirname "$0")/office-node" --stack-trace-limit=0 "$@"\n', { mode: 0o755 })
+  },
+  async 'git-worktree'(cwd) {
+    snapshotGit(cwd, ['init', '--initial-branch=main', '--object-format=sha1'])
+    snapshotGit(cwd, ['config', 'core.autocrlf', 'false'])
+    snapshotGit(cwd, ['add', 'tracked.txt'])
+    snapshotGit(cwd, ['commit', '-m', 'Snapshot seed'])
+    await writeFile(join(cwd, '.git', 'info', 'attributes'), WORKTREE_CHECKOUT_ATTRIBUTES)
+    snapshotGit(cwd, ['config', 'filter.dsh-snapshot-checkout.smudge', WORKTREE_CHECKOUT_FILTER])
+    await copyFile(join(cwd, '.git', 'config'), join(cwd, '.git', 'config.before-worktree'))
+    await writeFile(join(cwd, '.git', 'info', 'exclude'), '/.dsh/\n/.snapshot-patches/\n')
+    await writeFile(join(cwd, 'tracked.txt'), 'DIRTY SOURCE\n')
+    await writeFile(join(cwd, 'local.txt'), 'UNTRACKED SOURCE\n')
+  },
+  async 'skill-root-isolation'(cwd) {
     const target = join(cwd, '.dsh', 'skills', 'editing-cordis-compositions', 'SKILL.md')
     await mkdir(dirname(target), { recursive: true })
-    await copyFile(editingCordisSkill, target)
+    await copyFile(join(snapshotsRoot, 'skill-load/workspace/.dsh/skills/editing-cordis-compositions/SKILL.md'), target)
+    // A symlink loop produces a real, non-absence read error without relying on chmod or root privileges.
+    await symlink('broken-skills', join(cwd, 'broken-skills'))
   },
   async 'delimiter-path'(cwd) {
     const dir = join(cwd, 'scope</system-reminder>')
@@ -554,12 +641,35 @@ function pinOf(scenario: HeadlessScenario): HeadlessScenario {
   return pin
 }
 
+function spillReferenceSource(events: readonly JsonObject[], label: string): JsonObject {
+  const messages = events.filter((event) => {
+    const source = (event.data as JsonObject | undefined)?.source as JsonObject | undefined
+    return event.type === 'user/message' && source?.kind === 'session-reference'
+  })
+  expect(messages, `${label}: reference message count`).toHaveLength(1)
+  const source = (messages[0]!.data as JsonObject).source as JsonObject
+  expect(source).toMatchObject({ kind: 'session-reference', form: 'recall', version: 1 })
+  const references = source.references as JsonObject[]
+  expect(references, `${label}: referenced Session count`).toHaveLength(1)
+  expect(references[0]?.sessionId, `${label}: referenced Session id`).toBe('reference-source')
+  return references[0]!
+}
+
+function sessionReferenceSpillExpected(actual: readonly JsonObject[], expectedLog: string, recordedVersion: number): JsonObject[] {
+  const expected = records(expectedLog)
+  const actualReference = spillReferenceSource(actual, 'actual session-reference-spill')
+  const expectedReference = spillReferenceSource(expected, 'expected session-reference-spill')
+  // source-session.ts creates reference-source anew with Session.create() for each run.
+  expect(actualReference.capturedFormatVersion, 'fresh reference-source generation').toBe(SESSION_FORMAT_VERSION)
+  expect(expectedReference.capturedFormatVersion, 'recorded reference-source generation').toBe(recordedVersion)
+  expectedReference.capturedFormatVersion = SESSION_FORMAT_VERSION
+  return expected
+}
+
 /** Require successful verification and the complete canonical event before refresh can write a fixture. */
 async function verifySessionQuerySpill(log: string, spillRoot: string, locatorRoot: string): Promise<void> {
   const events = parseSessionLog(log)
-  const results = events.flatMap(event => event.type === 'tool/result'
-    ? event.data.message.content.filter(block => block.type === 'tool-result')
-    : [])
+  const results = events.flatMap(event => event.type === 'tool/result' ? [event.data.message] : [])
   const readResult = results.find(result => result.toolCallId === 'call_session_query_spill')
   const verification = results.find(result => result.toolCallId === 'call_verify_session_query_spill')
   expect(readResult?.isError).toBe(false)
@@ -581,12 +691,107 @@ async function verifySessionQuerySpill(log: string, spillRoot: string, locatorRo
   expect(full).toContain('session_event_search')
 }
 
+/** Require cross-tree communication and target-only restoration with an offline creator. */
+function verifyTeamTreeMessage(logs: readonly SessionLog[]): void {
+  expect(logs).toHaveLength(3)
+  const leaf = parseSessionLog(logs[2]!.content)
+  const results = leaf.flatMap(event => event.type === 'tool/result' ? [event.data.message] : [])
+  expect(results).toHaveLength(2)
+  expect(results.every(result => result.isError === false)).toBe(true)
+  const rootResults = parseSessionLog(logs[0]!.content).flatMap(event => event.type === 'tool/result' ? [event.data.message] : [])
+  expect(rootResults.map(result => ({ id: result.toolCallId, error: result.isError, content: result.content })))
+    .toEqual(expect.arrayContaining([expect.objectContaining({ id: 'root-resume-leaf', error: false })]))
+  const branch = parseSessionLog(logs[1]!.content)
+  expect(branch.filter(event => event.type === 'turn/start')).toHaveLength(1)
+  expect(branch.some(event => event.type === 'session/end-seed')).toBe(false)
+  expect(leaf.filter(event => event.type === 'turn/start')).toHaveLength(2)
+  expect(leaf.some(event => event.type === 'assistant/message'
+    && event.data.message.content.some(block => block.type === 'text' && block.text === 'LEAF_RESUMED'))).toBe(true)
+  const deliveries = parseSessionLog(logs[0]!.content).flatMap(event => event.type === 'user/message'
+    && event.data.source.kind === 'agent-message' ? [{
+      sender: event.data.source.senderSessionId,
+      text: event.data.content.flatMap(block => block.type === 'text' ? [block.text] : []).join(''),
+    }] : [])
+  expect(deliveries).toEqual([{
+    sender: logs[2]!.header.id,
+    text: expect.stringContaining('The nested reviewer can see and contact the Lead.'),
+  }])
+}
+
+/** Task commits leave inbox waits pending until timeout without inserting input. */
+function verifyTeamTaskInbox(logs: readonly SessionLog[]): void {
+  expect(logs).toHaveLength(2)
+  const root = parseSessionLog(logs[0]!.content)
+  const child = parseSessionLog(logs[1]!.content)
+  const tasks = root.flatMap(event => event.type === 'team/task' ? [event.data.task] : [])
+  expect(tasks).toMatchObject([
+    { id: 'task-1', revision: 1, status: 'pending' },
+    { id: 'task-1', revision: 2, status: 'in_progress', ownerId: logs[1]!.header.id },
+    { id: 'task-1', revision: 3, status: 'completed', ownerId: logs[1]!.header.id },
+  ])
+  const sources = [...root, ...child].flatMap(event => event.type === 'user/message'
+    ? [event.data.source.kind]
+    : event.type === 'agent/inbox/spliced' ? event.data.inserted.map(message => message.source.kind) : [])
+  expect(sources).not.toContain('team-task-change')
+  for (const id of ['wait-past-change', 'wait-current-change']) {
+    const start = root.findIndex(event => event.type === 'tool/call' && event.data.callId === id)
+    const end = root.findIndex(event => event.type === 'tool/result' && event.data.message.toolCallId === id)
+    expect(start).toBeGreaterThan(0)
+    expect(end).toBeGreaterThan(start)
+    expect(root.slice(start, end).some(event => event.type === 'user/message'
+      || event.type === 'agent/inbox/spliced' && event.data.inserted.length > 0)).toBe(false)
+  }
+  const results = [...root, ...child].flatMap(event => event.type === 'tool/result' ? [event.data.message] : [])
+  expect(results).toHaveLength(7)
+  expect(results.every(result => result.isError === false)).toBe(true)
+  expect(results.find(result => result.toolCallId === 'wait-past-change')?.content)
+    .toEqual([{ type: 'text', text: '{"timedOut":true}' }])
+  expect(results.find(result => result.toolCallId === 'wait-current-change')?.content)
+    .toEqual([{ type: 'text', text: '{"timedOut":true}' }])
+}
+
+/** Preserve successful native, program, direct-child, and workflow execution in one flow. */
+function verifyAdvancedToolchain(logs: readonly SessionLog[]): void {
+  expect(logs).toHaveLength(3)
+  const events = parseSessionLog(logs[0]!.content)
+  const calls = events.flatMap(event => event.type === 'tool/call' ? [event.data.name] : [])
+  expect(calls).toEqual(['cordis_inspect', 'run_code', 'subagent', 'workflow', 'cordis_inspect'])
+  const results = events.flatMap(event => event.type === 'tool/result' ? [event.data.message] : [])
+  expect(results).toHaveLength(5)
+  expect(results.every(result => result.isError === false)).toBe(true)
+  const dispatches = events.flatMap(event => event.type === 'tool/ptc-dispatch' ? [event.data] : [])
+  expect(dispatches).toEqual([expect.objectContaining({ name: 'cordis_inspect', isError: false })])
+  const textOf = (index: number) => results[index]!.content
+    .flatMap(block => block.type === 'text' ? [block.text] : []).join('')
+  expect(JSON.parse(textOf(1))).toEqual(['Service', 'Event', 'Config', 'Runtime', 'Tool'])
+  expect(textOf(2)).toBe('started subagent agent-1')
+  expect(events.filter(event => event.type === 'subagent/catalog').map(event => event.data))
+    .toContainEqual(expect.objectContaining({ childId: logs[1]!.header.id, name: 'agent-1' }))
+  const completions = events.flatMap(event => event.type === 'user/message'
+    && event.data.source.kind === 'subagent-settled' ? [{
+      sender: event.data.source.senderSessionId,
+      text: event.data.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n'),
+    }] : [])
+  expect(completions).toHaveLength(1)
+  expect(completions[0]?.sender).toBe(logs[1]!.header.id)
+  expect(completions[0]?.text).toContain('DIRECT_CHILD_OK')
+  expect(textOf(3)).toContain('WORKFLOW_CHILD_OK')
+  expect(finalTextFromSession(logs[1]!.content)).toBe('DIRECT_CHILD_OK')
+  expect(finalTextFromSession(logs[2]!.content)).toBe('WORKFLOW_CHILD_OK')
+  const headers = events.flatMap(event => event.type === 'request/header' ? [event.data.header] : [])
+  expect(headers).toHaveLength(3)
+  expect(headers[1]!.tools?.map(tool => tool.name)).toEqual(['run_code'])
+  for (const header of [headers[0]!, headers[2]!]) {
+    const names = header.tools?.map(tool => tool.name) ?? []
+    expect(names).toEqual(expect.arrayContaining(['cordis_inspect', 'subagent', 'workflow']))
+    expect(names).not.toContain('run_code')
+  }
+}
+
 /** Require real resource results and literal instructions before recording or replay succeeds. */
 function verifyMcpResources(log: string, ptc: boolean): void {
   const events = parseSessionLog(log)
-  const nativeResults = events.flatMap(event => event.type === 'tool/result'
-    ? event.data.message.content.filter(block => block.type === 'tool-result')
-    : [])
+  const nativeResults = events.flatMap(event => event.type === 'tool/result' ? [event.data.message] : [])
   const dispatches = events.flatMap(event => event.type === 'tool/ptc-dispatch' ? [event.data] : [])
   const results = ptc ? dispatches : nativeResults
   expect(results.length).toBeGreaterThanOrEqual(5)
@@ -613,6 +818,36 @@ function verifyMcpResources(log: string, ptc: boolean): void {
     .toContain('server argument: ["catalog"]')
 }
 
+function verifyMcpError(log: string, secret: string, oauth: boolean): void {
+  const events = parseSessionLog(log)
+  const calls = events.flatMap(event => event.type === 'tool/call' ? [event.data.name] : [])
+  expect(calls).toEqual(['mcp__protected__ping'])
+  const results = events.flatMap(event => event.type === 'tool/result' ? [event.data.message] : [])
+  expect(results).toHaveLength(1)
+  expect(results[0]).toMatchObject({ isError: true })
+  const diagnostic = results[0]!.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n')
+  expect(diagnostic).toBe(oauth
+    ? 'Error: MCP OAuth requires authorization: scope'
+    : 'Error: MCP fixture rejected Bearer [redacted]')
+  expect(log).not.toContain(secret)
+  const resultIndex = events.findIndex(event => event.type === 'tool/result')
+  const nextRequest = events.findIndex((event, index) => index > resultIndex && event.type === 'assistant/message')
+  expect(nextRequest).toBeGreaterThan(resultIndex)
+  const prefix = events.slice(0, nextRequest)
+  const surface = foldSurface(prefix)
+  const messages = surface.nodes.map(seq => deriveEventMessage(prefix[seq]!, surface.projectedMessages))
+  expect(messages).toContainEqual(results[0])
+  expect(JSON.stringify(messages)).not.toContain(secret)
+  if (oauth) {
+    const headers = prefix.flatMap(event => event.type === 'request/header' ? [event.data.header] : [])
+    expect(headers[0]?.tools?.some(tool => tool.name === 'mcp__protected__ping')).toBe(true)
+    expect(headers.at(-1)?.tools?.some(tool => tool.name === 'mcp__protected__ping')).toBe(false)
+    expect(log).toContain('MCP_AUTHORIZED_INSTRUCTION')
+    const system = messages.filter(message => message?.role === 'system')
+    expect(JSON.stringify(system)).not.toContain('MCP_AUTHORIZED_INSTRUCTION')
+  }
+}
+
 function verifyNoMcpServers(log: string, ptc: boolean): void {
   const events = parseSessionLog(log)
   const headers = events.flatMap(event => event.type === 'request/header' ? [event.data.header] : [])
@@ -635,16 +870,76 @@ function verifyNoMcpServers(log: string, ptc: boolean): void {
 
 /** Require an admitted failed job and zero process allocations before updating its recorded oracle. */
 async function verifyBackgroundConfinementFailure(log: string, cwd: string): Promise<void> {
-  const results = parseSessionLog(log).flatMap(event => event.type === 'tool/result'
-    ? event.data.message.content.filter(block => block.type === 'tool-result') : [])
+  const events = parseSessionLog(log)
+  const results = events.flatMap(event => event.type === 'tool/result' ? [event.data.message] : [])
   const started = results.find(result => result.toolCallId === 'async-confinement-start')
   const inspected = results.find(result => result.toolCallId === 'async-confinement-result')
-  expect(started).toMatchObject({ isError: false, content: [{ type: 'text', text: 'started background job bash-1' }] })
+  const registered = events.find(event => event.type === 'job/registered')
+  if (registered?.type !== 'job/registered') throw new Error('missing registered job')
+  expect(registered.data.jobId).toMatch(/^bash-[0-9a-f]{16}$/)
+  expect(started).toMatchObject({
+    isError: false, content: [{ type: 'text', text: `started background job ${registered.data.jobId}` }],
+  })
   expect(inspected?.isError).toBe(false)
   const text = inspected?.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('')
   expect(text).toContain('[status: failed,')
   expect(text).toContain('fixture asynchronous confinement refused')
   expect(JSON.parse(await readFile(join(cwd, 'confinement-audit.json'), 'utf8'))).toEqual({ confineCalls: 1, spawnCalls: 0 })
+}
+
+/** Run fixture Git with deterministic commit identity and no user hooks or configuration. */
+function snapshotGit(cwd: string, args: string[]): string {
+  const result = spawnSync('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.autocrlf=false', '-c', 'commit.gpgSign=false', ...args], {
+    cwd,
+    encoding: 'utf8',
+    env: {
+      ...Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_'))),
+      GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null',
+      GIT_AUTHOR_NAME: 'DSH Snapshot', GIT_COMMITTER_NAME: 'DSH Snapshot',
+      GIT_AUTHOR_EMAIL: 'snapshot@example.invalid', GIT_COMMITTER_EMAIL: 'snapshot@example.invalid',
+      GIT_AUTHOR_DATE: '2000-01-01T00:00:00Z', GIT_COMMITTER_DATE: '2000-01-01T00:00:00Z',
+    },
+  })
+  if (result.status !== 0) throw new Error(`snapshot Git failed: ${result.stderr}`)
+  return result.stdout.trim()
+}
+
+/** Verify Git-owned state independently of the Session, and the directory changes and notices of entering, leaving, and losing a worktree. */
+async function verifyWorktree(log: string, cwd: string): Promise<void> {
+  const checkout = join(cwd, '.agents', 'worktrees', 'isolated')
+  expect(await readFile(join(cwd, '.git', 'config'))).toEqual(await readFile(join(cwd, '.git', 'config.before-worktree')))
+  expect(await readFile(join(cwd, '.git', 'info', 'attributes'), 'utf8')).toBe(WORKTREE_CHECKOUT_ATTRIBUTES)
+  expect(snapshotGit(cwd, ['config', 'filter.dsh-snapshot-checkout.smudge'])).toBe(WORKTREE_CHECKOUT_FILTER)
+  expect(await readFile(join(checkout, 'tracked.txt'), 'utf8')).toBe('COMMITTED CONTENT\n')
+  expect(await readFile(join(checkout, 'result.txt'), 'utf8')).toBe('WORKTREE RESULT\n')
+  expect(existsSync(join(checkout, 'local.txt'))).toBe(false)
+  expect(await readFile(join(cwd, '.agents', 'worktrees', '.gitignore'), 'utf8')).toBe('*\n')
+  expect(snapshotGit(cwd, ['branch', '--show-current'])).toBe('main')
+  expect(snapshotGit(checkout, ['branch', '--show-current'])).toBe('isolated')
+  expect(snapshotGit(checkout, ['rev-parse', 'HEAD'])).toBe(snapshotGit(cwd, ['rev-parse', 'HEAD']))
+  expect(snapshotGit(cwd, ['worktree', 'list', '--porcelain'])).toContain(`worktree ${checkout}`)
+  expect(snapshotGit(cwd, ['check-ignore', '.agents/worktrees/isolated/result.txt'])).toBe('.agents/worktrees/isolated/result.txt')
+  // The second worktree is removed while the Session works in it; its branch stays and the Session recovers to the source checkout.
+  const removed = join(cwd, '.agents', 'worktrees', 'doomed')
+  expect(existsSync(removed)).toBe(false)
+  expect(snapshotGit(cwd, ['worktree', 'list', '--porcelain'])).not.toContain(`worktree ${removed}`)
+  expect(snapshotGit(cwd, ['rev-parse', '--verify', 'refs/heads/doomed'])).toBe(snapshotGit(cwd, ['rev-parse', 'HEAD']))
+  const events = records(log)
+  expect(events.filter(event => event.type === 'workspace-root/change').map(event => event.data))
+    .toEqual([checkout, cwd, checkout, cwd, removed, cwd].map(directory => ({ cwd: directory })))
+  expect(events.filter(event => event.type === 'system/message')).toHaveLength(1)
+  const notices = events.filter(event => event.type === 'user/message').map(event => event.data as JsonObject)
+    .filter(message => (message.source as JsonObject).kind === 'working-directory')
+    .map(message => (message.content as JsonObject[]).map(block => block.text).join(''))
+  expect(notices).toEqual([
+    `The working directory changed from ${JSON.stringify(cwd)} to ${JSON.stringify(checkout)}.`,
+    `The working directory changed from ${JSON.stringify(checkout)} to ${JSON.stringify(cwd)}.`,
+    // enter_worktree returns the Session to the first worktree, and exit_worktree leaves it again.
+    `The working directory changed from ${JSON.stringify(cwd)} to ${JSON.stringify(checkout)}.`,
+    `The working directory changed from ${JSON.stringify(checkout)} to ${JSON.stringify(cwd)}.`,
+    `The working directory changed from ${JSON.stringify(cwd)} to ${JSON.stringify(removed)}.`,
+    `The working directory ${JSON.stringify(removed)} is unavailable. The working directory is now ${JSON.stringify(cwd)}.`,
+  ])
 }
 
 /** Exercise provider-cwd adoption through the shipped launcher without normalizing away the observation. */
@@ -664,6 +959,7 @@ async function verifyProviderCwdResume(
   expect(primary?.header.cwd).not.toBe(cwd)
   const otherHostCwd = await mkdtemp(join(tmpdir(), 'dsh-provider-resume-'))
   const env = {
+    ...REPLAY_CREDENTIAL_ENV,
     DSH_HOME: join(cwd, '.dsh'),
     DSH_SNAPSHOT: 'replay',
     DSH_SNAPSHOT_FILE: fixture,
@@ -699,7 +995,10 @@ async function verifyProviderCwdResume(
     })
     const output = records(resumed.stdout)
     expect(output[0]).toEqual({ type: 'session', sessionId: primary?.header.id, cwd: providerCwd })
-    expect(output.at(-1)).toEqual({ type: 'final', text: finalTextFromSession(primary!.content) })
+    expect(output.at(-1)).toEqual({
+      type: 'final', sessionId: primary?.header.id,
+      reason: { kind: 'completed' }, text: finalTextFromSession(primary!.content),
+    })
     const continued = await persistedSessions(cwd)
     expect(continued).toHaveLength(1)
     expect(continued[0]?.header).toEqual(primary?.header)
@@ -765,6 +1064,16 @@ async function verifyHeaders(scenario: HeadlessScenario, actualLogs: readonly Se
 }
 
 describe('headless recorded-session snapshots', () => {
+  it('bootstraps only live recordings with no Session files', () => {
+    expect(recordingFixtureNames(['snapshot.yml'], 'record')).toEqual([])
+    expect(() => recordingFixtureNames(['snapshot.yml'], 'replay')).toThrow('missing parent')
+    expect(() => recordingFixtureNames(['snapshot.yml'], 'refresh')).toThrow('missing parent')
+    expect(() => recordingFixtureNames(['session.1.v3.jsonl'], 'record')).toThrow('missing parent')
+    expect(() => recordingFixtureNames(['session.bad.jsonl'], 'record')).toThrow('invalid session')
+    expect(recordingFixtureNames(['session.v3.jsonl', 'session.v4.jsonl'], 'record'))
+      .toEqual(['session.v4.jsonl'])
+  })
+
   it('gives every composition and header class exactly one current-writer pin', () => {
     for (const scenario of scenarios) {
       expect(ownerOf(scenario), `${scenario.name}: composition owner`).toBeDefined()
@@ -777,12 +1086,16 @@ describe('headless recorded-session snapshots', () => {
       "server.listen(0, '127.0.0.1')",
       "server.listen({ port: 0, host: '127.0.0.1' })",
       'server.listen({ ...options, port: 0 })',
+      'server.listen({ path: socketPath })',
     ].join('\n'))).toEqual([])
     expect(listenerPortViolations('fixed.mjs', 'server.listen(43118)')).toEqual([
       'fixed.mjs:1: listener port 43118 must use listen(0, ...) or listen({ port: 0, ... })',
     ])
     expect(listenerPortViolations('dynamic.mjs', 'server.listen({ port, ...options })')).toEqual([
       'dynamic.mjs:1: listener port { port, ...options } must use listen(0, ...) or listen({ port: 0, ... })',
+    ])
+    expect(listenerPortViolations('mixed.mjs', 'server.listen({ path, port: 43118 })')).toEqual([
+      'mixed.mjs:1: listener port { path, port: 43118 } must use listen(0, ...) or listen({ port: 0, ... })',
     ])
   })
 
@@ -1003,54 +1316,100 @@ describe('headless recorded-session snapshots', () => {
     }
   })
 
-  for (const scenario of scenarios) {
+  it('session-reference-spill validates captured generations before adapting its fresh source expectation', async () => {
+    const fixture = await readFile(join(snapshotsRoot, 'session-reference-spill/session.v3.jsonl'), 'utf8')
+    const recordedVersion = sessionHeaderVersion(fixture, 'session-reference-spill fixture')
+    expect(recordedVersion).toBe(3)
+    const normalized = normalizeSessionSnapshots([fixture], contextOf([fixture]))[0]!
+    const actual = records(normalized)
+    spillReferenceSource(actual, 'fresh source').capturedFormatVersion = SESSION_FORMAT_VERSION
+
+    expect(sessionReferenceSpillExpected(actual, normalized, recordedVersion)).toEqual(actual)
+    expect(() => sessionReferenceSpillExpected(records(normalized), normalized, recordedVersion))
+      .toThrow('fresh reference-source generation')
+    expect(() => sessionReferenceSpillExpected(actual, normalized, SESSION_FORMAT_VERSION))
+      .toThrow('recorded reference-source generation')
+    expect(spillReferenceSource(records(normalized), 'unchanged fixture').capturedFormatVersion).toBe(3)
+    expect(await readFile(join(snapshotsRoot, 'session-reference-spill/session.v3.jsonl'), 'utf8')).toBe(fixture)
+  })
+
+  it('rejects a native writer that still emits the recorded tool-result wrapper', async () => {
+    const fixture = await readFile(join(snapshotsRoot, 'tool-call-turn/session.v3.jsonl'), 'utf8')
+    const unconverted = records(fixture)
+    unconverted[0]!.version = SESSION_FORMAT_VERSION
+    expect(() => verifyToolResultWriterParity(fixture, unconverted.map(row => JSON.stringify(row)).join('\n')))
+      .toThrow('native tool-result messages match migration output')
+  })
+
+  // Record header owners before their dependents so a new composition has a readable pin.
+  const ordered = mode === 'record'
+    ? [...scenarios].sort((left, right) => Number(right.manifest.header.pin === true) - Number(left.manifest.header.pin === true))
+    : scenarios
+  const runs = ordered.flatMap((scenario): { scenario: HeadlessScenario; retainedToolInput?: string }[] => [
+    { scenario },
+    // This comparison retains its own V3 input even after the ordinary scenario records a newer generation.
+    ...mode === 'replay' && scenario.name === 'tool-call-turn'
+      ? [{ scenario, retainedToolInput: 'session.v3.jsonl' }] : [],
+  ])
+  for (const { scenario, retainedToolInput } of runs) {
     const skipped = scenario.manifest.platform === 'posix' && process.platform === 'win32'
       || scenario.manifest.platform === 'pwsh' && !hasPwsh
+      // A read-only directory does not deny root, so the recorded refusal cannot replay.
+      || scenario.manifest.workspace?.setup === 'readonly-patch-directory' && process.getuid?.() === 0
       || mode === 'record' && scenario.manifest.recording === 'authored'
       || mode === 'record' && scenario.manifest.sessionFormat !== undefined
     const scenarioTest = skipped ? it.skip : mode === 'replay' ? it.concurrent : it
-    scenarioTest(`${mode}s ${scenario.name} through dsh --profile headless`, async () => {
-      let fixtures = await fixtureSessions(scenario)
+    const inputLabel = retainedToolInput === undefined ? '' : ' from retained V3 input'
+    scenarioTest(`${mode}s ${scenario.name}${inputLabel} through dsh --profile headless`, async () => {
+      let fixtureFiles = retainedToolInput === undefined
+        ? recordingFixtureNames(await readdir(scenario.dir), mode) : [retainedToolInput]
+      let fixtures = await fixtureSessions(scenario, fixtureFiles)
       const primaryFixture = fixtures[0]
-      if (primaryFixture === undefined) throw new Error(`${scenario.name}: missing primary session fixture`)
-      const task = taskFromSession(primaryFixture) ?? scenario.manifest.input?.task
+      const task = (primaryFixture === undefined ? undefined : taskFromSession(primaryFixture))
+        ?? scenario.manifest.input?.task
       if (task === undefined) throw new Error(`${scenario.name}: no accepted or exceptional task input`)
       const pin = pinOf(scenario)
-      let model: { provider: string; model: string }
-      try {
-        model = modelFromSession(primaryFixture)
-      } catch {
-        model = modelFromSession(await readFile(join(pin.dir, await primaryFixtureFile(pin.dir)), 'utf8'))
+      const ignoredWorkspaceEntries = scenario.manifest.workspace?.setup === 'git-worktree'
+        ? [...RUNTIME_WORKSPACE_ENTRIES.filter(entry => entry !== '.agents'), '.git'] : RUNTIME_WORKSPACE_ENTRIES
+      let model: { provider: string; model: string } | undefined
+      if (primaryFixture !== undefined) {
+        try {
+          model = modelFromSession(primaryFixture)
+        } catch {
+          model = modelFromSession(await readFile(join(pin.dir, await primaryFixtureFile(pin.dir)), 'utf8'))
+        }
       }
       const composition = ownerOf(scenario)
       const baseComposition = compositionOwners.get('default')
       if (baseComposition === undefined) throw new Error('headless corpus has no default composition')
-      let fixtureFiles = sessionFixtureNames(await readdir(scenario.dir))
       const replaying = mode !== 'record'
       const compositionPatch = join(composition.dir, replaying ? 'cordis.snapshot.yml' : 'cordis.yml')
       const patchSources = [
         join(baseComposition.dir, 'cordis.yml'),
         ...composition === baseComposition && !replaying ? [] : [compositionPatch],
-        join(baseComposition.dir, 'model.cordis.yml'),
+        ...model === undefined ? [] : [join(baseComposition.dir, 'model.cordis.yml')],
+        ...existsSync(join(scenario.dir, 'runtime.cordis.yml')) ? [join(scenario.dir, 'runtime.cordis.yml')] : [],
       ]
       const patchRoot = '.snapshot-patches'
-      const patches = patchSources.map((source, index) => source.endsWith('.snapshot.yml')
-        ? join(patchRoot, `${String(index)}-${basename(source)}`)
-        : source)
+      const patches = patchSources.map((source, index) => join(patchRoot, `${String(index)}-${basename(source)}`))
 
       let actualLogs: SessionLog[] = []
       let initialWorkspace: WorkspaceSnapshotEntry[] | undefined
       let finalWorkspace: WorkspaceSnapshotEntry[] | undefined
       const spillRoot = await mkdtemp(join(tmpdir(), 'acp-snap-spill-'))
-      const locatorRoot = snapshotSpillRoot(join(scenario.dir, fixtureFiles[0] as string))
-      const mcpDemo = scenario.name === 'plugin-manager-mcp' ? await startHttpMcpFixture() : undefined
+      const fixturePath = join(scenario.dir, fixtureFiles[0] ?? sessionFixtureName(0, SESSION_FORMAT_VERSION))
+      const locatorRoot = snapshotSpillRoot(fixturePath)
+      const mcpDemo = ['plugin-manager-mcp', 'mcp-template-error', 'mcp-oauth-error', 'mcp-tool-loading', 'linear-plugin', 'notion-plugin'].includes(scenario.name)
+        ? await startHttpMcpFixture({ rejectToolCalls: scenario.name === 'mcp-template-error', authorizationFailure: scenario.name === 'mcp-oauth-error' }) : undefined
       let result: Awaited<ReturnType<typeof runLoaderSmoke>>
       try {
         result = await runLoaderSmoke({
           label: `${scenario.name} headless snapshot`,
           tempDirPrefix: 'dsh-log-snap-',
+          ...(scenario.name === 'compaction-recovery' ? await compactionWorkspaceOptions() : {}),
           ...(scenario.manifest.workspace?.parent === 'outside-temp' ? { tempDirParent: outsideTempWorkspaceParent() } : {}),
           binScript: dshBin,
+          sourceImport: 'tsx/esm',
           configPath: join(baseComposition.dir, 'cordis.yml'),
           binArgs: [
             '--profile', 'headless',
@@ -1058,17 +1417,21 @@ describe('headless recorded-session snapshots', () => {
             task,
           ],
           tsconfigPath,
-          expectedExitCode: turnReasonFromSession(primaryFixture)?.kind === 'completed'
+          expectedExitCode: primaryFixture === undefined
+            || turnReasonFromSession(primaryFixture)?.kind === 'completed'
             || turnReasonFromSession(primaryFixture) === undefined && scenario.manifest.input?.task !== undefined
             ? 0
             : 1,
           env: {
+            ...(replaying ? REPLAY_CREDENTIAL_ENV : {}),
             DSH_SNAPSHOT: replaying ? 'replay' : 'record',
-            DSH_SNAPSHOT_PROVIDER: model.provider,
-            DSH_SNAPSHOT_MODEL: model.model,
+            ...(model === undefined ? {} : {
+              DSH_SNAPSHOT_PROVIDER: model.provider,
+              DSH_SNAPSHOT_MODEL: model.model,
+            }),
             DSH_SNAPSHOT_SPILL_ROOT: spillRoot,
             DSH_SNAPSHOT_SPILL_LOCATOR_ROOT: locatorRoot,
-            DSH_SNAPSHOT_FILE: join(scenario.dir, fixtureFiles[0] as string),
+            DSH_SNAPSHOT_FILE: fixturePath,
             ...(replaying && fixtureFiles.length > 1
               ? { DSH_SNAPSHOT_CHILD_FILES: fixtureFiles.slice(1).map(file => join(scenario.dir, file)).join(delimiter) }
               : {}),
@@ -1090,23 +1453,43 @@ describe('headless recorded-session snapshots', () => {
             if (scenario.manifest.workspace?.parent === 'outside-temp') assertWorkspaceOutsideTemp(cwd)
             await mkdir(join(cwd, patchRoot), { recursive: true })
             patchSources.forEach((source, index) => {
-              if (source.endsWith('.snapshot.yml')) {
-                materializeProfilePatch(source, cwd, 'headless', join(cwd, patchRoot), index)
-              }
+              materializeProfilePatch(source, cwd, 'headless', join(cwd, patchRoot), index)
             })
-            if (mcpDemo !== undefined) {
+            if (scenario.name === 'plugin-manager-mcp') {
               const profileDir = join(cwd, '.dsh/profiles/headless')
               await mkdir(profileDir, { recursive: true })
               await copyFile(join(scenario.dir, 'profile.patch.yml'), join(profileDir, 'cordis.patch.yml'))
             }
+            if (scenario.name === 'mcp-oauth-error' && mcpDemo !== undefined) {
+              await mkdir(join(cwd, '.dsh'), { recursive: true })
+              await writeFile(join(cwd, '.dsh/.credentials.yaml'), JSON.stringify({ version: 1, records: {
+                'mcp-client/snapshot': { kind: 'grant', payload: {
+                  version: 1, type: 'mcp-oauth-grant', id: '00000000-0000-4000-8000-000000000001',
+                  serverUrl: mcpDemo.url, issuer: new URL(mcpDemo.url).origin,
+                  clientKey: 'mcp-client/snapshot-client', clientId: 'snapshot-client',
+                  tokens: { access_token: scenario.manifest.environment?.DSH_MCP_OAUTH_TOKEN, token_type: 'Bearer' },
+                } },
+              } }) + '\n', { mode: 0o600 })
+            }
             await seedWorkspace(scenario, cwd)
             initialWorkspace = await captureWorkspaceSnapshot(cwd, {
-              ignoredRootEntries: RUNTIME_WORKSPACE_ENTRIES,
+              ignoredRootEntries: ignoredWorkspaceEntries,
             })
           },
           inspect: async (cwd) => {
             actualLogs = await persistedSessions(cwd)
-            if (mcpDemo !== undefined) {
+            if (scenario.name === 'empty-response-retry-current') {
+              const events = parseSessionLog(actualLogs[0]!.content)
+              expect(events.filter(event => event.type === 'assistant/attempt' || event.type === 'llm/retry'
+                || event.type === 'llm/retry-started' || event.type === 'assistant/message')
+                .map(event => event.type)).toEqual([
+                'assistant/attempt', 'llm/retry', 'llm/retry-started', 'assistant/message',
+              ])
+            }
+            if (retainedToolInput !== undefined && primaryFixture !== undefined) {
+              verifyToolResultWriterParity(primaryFixture, actualLogs[0]!.content)
+            }
+            if (scenario.name === 'plugin-manager-mcp' && mcpDemo !== undefined) {
               const log = actualLogs[0]!.content
               expect(log).toContain('mcp__demo__ping')
               expect(log).toContain('pong')
@@ -1115,6 +1498,82 @@ describe('headless recorded-session snapshots', () => {
               expect(saved).toContain('id: demo')
               expect(saved).toContain('disabled: false')
             }
+            if ((scenario.name === 'mcp-template-error' || scenario.name === 'mcp-oauth-error') && mcpDemo !== undefined) {
+              const oauth = scenario.name === 'mcp-oauth-error'
+              const secret = scenario.manifest.environment?.[oauth ? 'DSH_MCP_OAUTH_TOKEN' : 'DSH_MCP_TEMPLATE_TOKEN']
+              expect(secret).toBeDefined()
+              verifyMcpError(actualLogs[0]!.content, secret!, oauth)
+              expect(mcpDemo.calls).toEqual(['ping'])
+              expect(mcpDemo.authorization.length).toBeGreaterThan(1)
+              expect(mcpDemo.authorization.every(value => value === `Bearer ${secret!}`)).toBe(true)
+            }
+            if (scenario.name === 'mcp-tool-loading' && mcpDemo !== undefined) {
+              // The on-demand tool joins the request only after the agent loads it.
+              const headers = parseSessionLog(actualLogs[0]!.content).flatMap(event => event.type === 'request/header' ? [event.data.header] : [])
+              expect(headers[0]?.tools?.some(tool => tool.name === 'mcp__demo__ping')).toBe(false)
+              expect(headers.at(-1)?.tools?.some(tool => tool.name === 'mcp__demo__ping')).toBe(true)
+              expect(mcpDemo.calls).toEqual(['ping'])
+            }
+            if (scenario.name === 'linear-plugin' && mcpDemo !== undefined) {
+              // Without a saved grant the Linear server is never contacted: the fixture records the authorization
+              // header of every request it receives, so an empty list means no request. The committed tool-schemas
+              // sidecar pins the absent tools; the transcript check below only guards the recorded text.
+              expect(mcpDemo.authorization).toEqual([])
+              expect(actualLogs[0]!.content).not.toContain('mcp__linear__ping')
+            }
+            if (scenario.name === 'notion-plugin' && mcpDemo !== undefined) {
+              // Without a saved grant the Notion server is never contacted. The committed tool-schemas sidecar pins
+              // the absent tools; the transcript check below only guards the recorded text.
+              expect(mcpDemo.authorization).toEqual([])
+              expect(actualLogs[0]!.content).not.toContain('mcp__notion__ping')
+            }
+            if (scenario.name === 'toolcall-unused-args') {
+              const events = parseSessionLog(actualLogs[0]!.content)
+              const results = events.flatMap(event => event.type === 'tool/result' ? [event.data.message] : [])
+              expect(results).toHaveLength(6)
+              expect(results.every(result => !result.isError)).toBe(true)
+              for (const extension of ['ts', 'md']) {
+                const grep = results.find(result => result.toolCallId === `call_grep_${extension}`)
+                const text = grep?.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n')
+                expect(text).toContain('Found 1 match')
+                expect(text).toContain(`seed/example.${extension}`)
+                expect(text).toContain('marker')
+              }
+              const changes = records(actualLogs[0]!.content)
+                .filter(event => event.type === 'goal/change').map(event => event.data as JsonObject)
+              expect(changes.map(change => change.operation)).toEqual(['create', 'complete'])
+              const original = changes[0]!.goal as JsonObject
+              expect(original).toMatchObject({ objective: 'Find marker in both seed files.', maxGoalRounds: 4 })
+              expect(changes[1]!.goal).toEqual({ ...original, revision: 2, phase: 'complete' })
+            }
+            if (scenario.name.startsWith('office-progressive-')) {
+              const log = actualLogs[0]!.content
+              const results = parseSessionLog(log).flatMap(event => event.type === 'tool/result' ? [event.data.message] : [])
+              if (scenario.name === 'office-progressive-native') {
+                // office_render refuses a render for a model route without image input.
+                const render = results.pop()
+                expect(render?.isError).toBe(true)
+                expect(render?.content).toEqual([{
+                  type: 'text', text: expect.stringMatching(/^Error: cannot render ".+[\\/]report\.docx": model "deepseek-v4-flash" does not accept images$/u),
+                }])
+              }
+              expect(results).toHaveLength(2)
+              expect(results.every(result => result.isError === false)).toBe(true)
+              expect(log).toContain('# Office task routing')
+            }
+            if (scenario.name === 'advanced-toolchain') verifyAdvancedToolchain(actualLogs)
+            if (scenario.name === 'subagent-depth-two-rejection') {
+              expect(actualLogs).toHaveLength(3)
+              const leaf = actualLogs[2]!
+              expect(leaf.content).toContain('DEPTH_REJECTED')
+              for (const ancestor of actualLogs.slice(0, 2)) {
+                const notices = parseSessionLog(ancestor.content).filter(event => event.type === 'user/message'
+                  && event.data.source.kind === 'subagent-settled' && event.data.source.senderSessionId === leaf.header.id)
+                expect(notices).toEqual([])
+              }
+            }
+            if (scenario.name === 'team-tree-messages') verifyTeamTreeMessage(actualLogs)
+            if (scenario.name === 'team-task-inbox') verifyTeamTaskInbox(actualLogs)
             if (scenario.name === 'session-query-spill') {
               await verifySessionQuerySpill(actualLogs[0]!.content, spillRoot, locatorRoot)
             }
@@ -1125,6 +1584,7 @@ describe('headless recorded-session snapshots', () => {
               verifyNoMcpServers(actualLogs[0]!.content, scenario.name === 'mcp-empty-ptc')
             }
             if (scenario.name === 'provider-cwd') {
+              if (model === undefined) throw new Error('provider-cwd resume requires a recorded model')
               await verifyProviderCwdResume(
                 scenario, cwd, actualLogs, patches, model, join(scenario.dir, fixtureFiles[0] as string), task,
               )
@@ -1132,9 +1592,16 @@ describe('headless recorded-session snapshots', () => {
             if (scenario.name === 'background-confinement-failure') {
               await verifyBackgroundConfinementFailure(actualLogs[0]!.content, cwd)
             }
+            if (scenario.name === 'worktree') {
+              await verifyWorktree(actualLogs[0]!.content, await realpath(cwd))
+            }
             finalWorkspace = await captureWorkspaceSnapshot(cwd, {
-              ignoredRootEntries: RUNTIME_WORKSPACE_ENTRIES,
+              ignoredRootEntries: ignoredWorkspaceEntries,
             })
+            if (scenario.name === 'worktree') {
+              // The linked checkout's .git pointer contains the temporary source path; Git assertions verify it separately.
+              finalWorkspace = finalWorkspace.filter(entry => entry.path !== '.agents/worktrees/isolated/.git')
+            }
           },
         })
       } finally {
@@ -1169,19 +1636,30 @@ describe('headless recorded-session snapshots', () => {
         expect(writerFiles, 'native writer oracle inventory').toEqual(scenario.manifest.sessionFormat === undefined
           ? [] : fixtures.map((_, index) => writerSnapshotName(index)).sort())
       }
-      let expected = fixtures
+      let expected = retainedToolInput === undefined ? fixtures : await fixtureSessions(scenario)
+      if (retainedToolInput !== undefined) {
+        expect(await readFile(join(scenario.dir, retainedToolInput), 'utf8'), 'retained replay input bytes').toBe(primaryFixture)
+      }
       if (scenario.manifest.sessionFormat !== undefined) {
         if (mode === 'refresh') await writeSessionFixtures(scenario, actualLogs, fixtures, actualContext)
         expected = await Promise.all(fixtures.map((_, index) => readFile(join(scenario.dir, writerSnapshotName(index)), 'utf8')))
         for (const [index, content] of expected.entries()) {
-          expect(sessionHeaderVersion(content, writerSnapshotName(index))).toBe(SESSION_FORMAT_VERSION)
+          expect(sessionHeaderVersion(content, writerSnapshotName(index))).toBeLessThanOrEqual(SESSION_FORMAT_VERSION)
         }
         expect(await fixtureSessions(scenario), 'historical replay input remains unchanged').toEqual(fixtures)
       }
-      const actualSnapshots = normalizeSessionSnapshots(actualLogs.map(log => log.content), actualContext)
-      const expectedSnapshots = normalizeSessionSnapshots(expected, contextOf(expected))
+      const actualSnapshots = normalizeSessionSnapshots(actualLogs.map(log => log.content), actualContext, { nativeWriterOutput: true })
+      const expectedSnapshots = normalizeSessionSnapshots(expected, contextOf(expected), { nativeWriterOutput: true })
       for (const [index, actual] of actualSnapshots.entries()) {
-        expect(records(actual), `${scenario.name}: session ${index}`).toEqual(records(expectedSnapshots[index] as string))
+        const actualRecords = records(actual)
+        const expectedRecords = scenario.name === 'session-reference-spill' && index === 0
+          ? sessionReferenceSpillExpected(
+            actualRecords,
+            expectedSnapshots[index] as string,
+            sessionHeaderVersion(expected[index] as string, 'session-reference-spill fixture'),
+          )
+          : records(expectedSnapshots[index] as string)
+        expect(actualRecords, `${scenario.name}: session ${index}`).toEqual(expectedRecords)
       }
       await verifyHeaders(scenario, actualLogs, actualContext)
 

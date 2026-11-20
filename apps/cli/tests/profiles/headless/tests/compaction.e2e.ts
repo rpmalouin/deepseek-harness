@@ -5,7 +5,8 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import { codingHarness, finalText, SYSTEM_PROMPT, waitForIdle } from './harness.ts'
-import { SessionId } from '@deepseek-ai/dsh-session'
+import type { SessionId } from '@deepseek-ai/dsh-session'
+import { brandString } from '@deepseek-ai/dsh-brand'
 
 /**
  * Key-gated smoke for mid-session compaction. It verifies the compact event
@@ -35,9 +36,12 @@ describe.skipIf(!process.env.DEEPSEEK_API_KEY)('compaction: a long session compa
     // Reasoning tokens require a larger generation cap than the retained checkpoint.
     ctx = await codingHarness(workdir, {
       personaPrefix: SYSTEM_PROMPT,
-      modelContextWindow: 8000,
+      // The explicit output cap leaves an 8,000-token message budget.
+      modelContextWindow: 15_000,
+      modelMaxTokens: 7_000,
       compact: {
         thresholdRatio: 0.5,
+        headroomTokens: 4_000,
         retainTokens: 400,
         summarizationProvider: '',
         summarizationModel: '',
@@ -46,7 +50,7 @@ describe.skipIf(!process.env.DEEPSEEK_API_KEY)('compaction: a long session compa
       },
       persistenceRoot: join(workdir, '.sessions'),
     })
-    const agent = await ctx.agentLoop.create(SessionId('e2e-compaction'), { provider: 'deepseek-official', model: 'deepseek-v4-flash' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('e2e-compaction'), { provider: 'deepseek-official', model: 'deepseek-v4-flash' }, { cwd: workdir })
 
     // Completed read turns cannot collapse into one retained parallel tool group.
     for (let i = 1; i <= 4; i++) {
@@ -78,7 +82,7 @@ describe.skipIf(!process.env.DEEPSEEK_API_KEY)('compaction: a long session compa
     const summaries = events.filter(e => e.type === 'compaction/summary')
     expect(summaries.length, JSON.stringify(ends.map(event => event.data.error))).toBeGreaterThan(0)
     const replaceNode = events.find((e) => {
-      const se = e as unknown as { type: string; surfaceOp?: unknown }
+      const se = e as { type: string; surfaceOp?: unknown }
       return se.type === 'user/message' && typeof se.surfaceOp === 'object' && se.surfaceOp !== null
     })
     expect(replaceNode).toBeDefined()
@@ -89,7 +93,7 @@ describe.skipIf(!process.env.DEEPSEEK_API_KEY)('compaction: a long session compa
     expect(summaryData.shadowedSeqs.length).toBeGreaterThan(0)
     expect(events.some(event => event.type === 'tool/result'
       && summaryData.shadowedSeqs.includes(event.seq)
-      && event.data.message.content[0].content.some(block => block.type === 'text'
+      && event.data.message.content.some(block => block.type === 'text'
         && block.text.includes('This is file number')))).toBe(true)
 
     // The conversation survived compaction: the agent produced a final answer

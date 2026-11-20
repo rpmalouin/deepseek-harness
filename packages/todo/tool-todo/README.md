@@ -71,7 +71,7 @@ The tool is built on four commitments:
 
 - **Whole-list replace, log-backed state.** The model resends the entire list; the `todo/write` snapshot lives on the event-sourced session log, so durability, replay, and resume reconstruction come from the log rather than a service.
 - **Single owner.** The list belongs to the calling agent session; there is no shared or swarm scope, and non-agent callers are rejected.
-- **Deployment policy, not a coded rule.** `allowParallelInProgress` is a required composition choice because the tool cannot observe runtime concurrency; the durable-log invariant deliberately stays silent on the active count so a log written under one policy still replays under another.
+- **Deployment policy, not a coded rule.** `allowParallelInProgress` is a required composition choice because the tool cannot observe runtime concurrency.
 - **Validation keeps the logged snapshot honest.** Schema-level rejection of unknown keys and `execute`-level rejection of empty or duplicate content keep the durable snapshot equal to what the model believes it wrote.
 
 The [todo_write tool Agent Note](../../../.agents/notes/archived/feature/2026-06-29-todo-write-tool.md) records the original design and alternatives; the [parallel in-progress Agent Note](../../../.agents/notes/archived/feature/2026-07-26-todo-parallel-in-progress.md) records the policy decision.
@@ -83,7 +83,6 @@ The [todo_write tool Agent Note](../../../.agents/notes/archived/feature/2026-06
 | [`src/index.ts`](src/index.ts) | Plugin entry: `Config` schema, tool registration, `todos` projection unit |
 | [`src/types.ts`](src/types.ts) | The one home of the `todos` projection-key declaration and its payload types |
 | [`src/client.ts`](src/client.ts) | Client-namespace re-export of the types outlet |
-| [`src/invariant.ts`](src/invariant.ts) | Invariant companion: validates durable whole-list snapshots and open-turn ownership |
 
 ### Export shape
 
@@ -92,10 +91,6 @@ The plugin is a function/namespace plugin: it exports `name` / `inject` / `apply
 ### Session projection
 
 When the composition mounts `ctx.sessionProjections` ([`@deepseek-ai/dsh-session-projection`](../../session/session-projection/README.md)), this package registers the `todos` unit on an injected child: the projection is the standing plan — the latest whole `todo/write` list, `null` before the first write, cleared when the next turn starts while `turn/end` keeps the finished checklist visible. The key merges into `SessionProjectionMap` here; carriers serve the value on the history tail page and the `session/projection` push frame. Compositions without the registry are unaffected; see [src/index.ts](src/index.ts) for the unit registration.
-
-### Durable-log invariant
-
-The invariant companion registers on `ctx.invariants`, validates existing and newly announced sessions once, and then advances a committed per-session turn trace for live appends. It rejects malformed entries, empty or duplicated content, unknown statuses, and any durable `todo/write` outside an open turn; core session treats declaration-merged events generically, while this producing package owns todo-specific rules. It deliberately says nothing about how many items are `in_progress`, because that is the tool's per-deployment policy, not a durable-data rule.
 
 ### Call mechanics
 
@@ -126,7 +121,7 @@ Read these pages when the package-level contract is not enough. They move from t
 
 #### What the model sees
 
-The model sees the generated [`todo_write` schema](../../../docs/tool-catalog.md#deepseek-aidsh-tool-todo): an object with one required `todos` array of `{ content, status }` items, where `status` is `pending`, `in_progress`, or `completed`. The description is the composed whole-list instruction whose active-status clause follows `allowParallelInProgress`.
+The model sees the generated [`todo_write` schema](../../../docs/tool-catalog.md#deepseek-aidsh-tool-todo): an object with one required `todos` array of `{ content, status }` items, where `status` is `pending`, `in_progress`, or `completed`. The `todos` description states that each call replaces the whole list; the tool description's active-status clause follows `allowParallelInProgress`.
 
 #### Token effect
 
@@ -140,7 +135,7 @@ Prefix-stable while the definition and visibility are unchanged. Plugin lifecycl
 
 #### What the model sees
 
-Each assistant tool call retains the entire replacement list in its arguments. Success returns exactly `Updated todo list: <pending> pending, <inProgress> in progress, <completed> completed.` Stable failures are ``Error: invalid todo: `content` must be a non-empty string``, `Error: invalid todos: duplicate content "<content>"`, `Error: todo_write requires an owning agent session`, and — only where the deployment set `allowParallelInProgress: false` — `Error: invalid todos: at most one task may be in_progress (got <n>)`. The full `todo/write` session event is UI and replay state, not a second model message.
+Each assistant tool call retains the entire replacement list in its arguments. Success returns exactly `Updated todo list: <pending> pending, <inProgress> in progress, <completed> completed.` Stable failures are `Error: invalid arguments: todos[<i>].content must be a non-empty string`, `Error: invalid arguments: todos[<i>].content duplicates "<content>"`, and — only where the deployment set `allowParallelInProgress: false` — `Error: invalid arguments: at most one task may be in_progress (got <n>)`, all `ToolArgsError` `INVALID_ARGS`, plus `Error: todo_write requires an owning agent session` as `ToolContextUnavailableError` `TOOL_CONTEXT_UNAVAILABLE`. The full `todo/write` session event is UI and replay state, not a second model message.
 
 #### Token effect
 

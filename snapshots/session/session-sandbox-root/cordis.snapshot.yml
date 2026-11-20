@@ -1,7 +1,7 @@
 # Keyless replay counterpart of session-sandbox-root.cordis.yml: the replay
 # swap, recorded model pin, and distinct sandbox fallback form one profile patch.
 - id: llm-deepseek
-  name: '@deepseek-ai/dsh-llm-deepseek'
+  name: '@deepseek-ai/dsh-llm-deepseek-api-key'
   disabled: true
 
 - id: agent-default-model
@@ -25,7 +25,7 @@
   name: '@deepseek-ai/dsh-system-prompt'
   config:
     personaPrefix: |
-      You are a coding assistant powered by the {{model}} model. Your working directory is {{cwd}}. Your bash tool runs under a file sandbox — a `[sandbox: file access denied …]` result is policy, not a command bug.
+      You are a coding assistant powered by the {{model}} model. Your bash tool runs under a file sandbox — a `[sandbox: file access denied …]` result is policy, not a command bug.
 
       Verify your work by running the code or tests. Keep answers brief and factual.
 
@@ -43,10 +43,20 @@
 - id: sandbox-policy
   name: '@deepseek-ai/dsh-sandbox-policy'
   config:
-    mode: workspace-write
+    mode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'
     workspaceRoot: /tmp
 
+- id: headless-runner
+  inject: [headlessStartup]
+  config:
+    task: !!js ctx.headlessStartup.task
+    sessionId: !!js ctx.headlessStartup.sessionId
+    json: !!js ctx.headlessStartup.json
+    permissionMode: workspace-write
+
 - insert:
+    - id: session-write-grant
+      name: '../../../packages/test-support/session-snapshot/tests/fixtures/session-write-grant.ts'
     - id: llm-replay
       name: '@deepseek-ai/dsh-llm-replay'
       config:

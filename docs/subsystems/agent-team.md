@@ -2,14 +2,14 @@
 
 English | [中文](agent-team.zh.md)
 
-Types shared by the experimental implicit-root Team domain, model tools, and host adapters. The [Agent Teams Agent Note](../../.agents/notes/implemented/feature/2026-08-05-agent-teams.md) owns identity, mailbox, task, and shared-checkout decisions; this page records the literal durable forms from [`packages/experimental/agent-team/src/types.ts`](../../packages/experimental/agent-team/src/types.ts).
+Types shared by the shared task board, model tools, and host adapters. The [task-board wait decision](../../.agents/notes/implemented/architecture/2026-10-19-team-task-board-inbox.md) owns coordination semantics; this page records durable and client-visible forms from [`packages/team/agent-team/src/types.ts`](../../packages/team/agent-team/src/types.ts).
 
-## Identity and roster
+## Identity and historical roster
 
-`TeamId` is the root `SessionId` under a distinct [brand](core.md#branded-ids). `TeamTaskId` is Team-local and monotonically allocated as `task-<n>`; `TeamMessageId` is globally random. A teammate's Session id remains its persistent identity, while `name` is an immutable model/UI label.
+`TeamId` brands the root `SessionId`; `TeamTaskId` uses `task-<n>`. `TeamMessageId` and roster records remain for historical decoding. The subagent runtime resolves the tree and discovers eligible task owners at arbitrary depth; historical roster entries grant no authority.
 
 ```ts type-equiv
-/** Whole durable value written on every teammate lifecycle change. */
+/** Historical roster value written by earlier Team builds on every teammate lifecycle change. */
 interface TeamMemberSnapshot {
   readonly id: SessionId
   readonly name: string
@@ -21,14 +21,14 @@ interface TeamMemberSnapshot {
 }
 ```
 
-Every member starts in `provisioning` and reaches exactly one terminal roster phase, `active` or `failed`. Runtime `running`/`idle`/`inactive` status is derived separately and never rewrites this record.
+Historical records retain their recorded `provisioning`, `active`, or `failed` phase. Current turn activity belongs to ordinary subagent discovery and Session status, independently of task completion.
 
-## Durable mailbox
+## Messages and historical mailbox
 
-The Lead Session first stores the complete queued message. A target receipt is acknowledged only after its pending inbox item or recorded user message is durable, leaving queued-minus-delivered as the recovery mailbox.
+Members exchange ordinary [subagent messages](subagent.md), retaining the real sender Session id. Task changes do not end inbox waits, add inbox messages, or start idle agents. Send an explicit message when an agent needs to act on a task update. The following historical mailbox types remain readable; Team never delivers their pending records.
 
 ```ts type-equiv
-/** One peer message retained until its target Session records it. */
+/** One peer message recorded by the historical Team mailbox. */
 interface TeamMessageSnapshot {
   readonly id: TeamMessageId
   readonly senderId: SessionId
@@ -38,12 +38,10 @@ interface TeamMessageSnapshot {
 }
 ```
 
-Every message attempts Steer delivery. A running target receives it at the nearest step boundary, an idle target starts a turn, and an inactive teammate cold-resumes. Scheduling is not stored in the durable record because callers cannot select another mode.
-
-The target Session keeps message identity and sender attribution on both the pending inbox item and the eventual user message. Folding that source across inbox and history is the target-side de-duplication key; the model-visible framing repeats the id and sender.
+Historical `team-message` sources retain the old message id and sender attribution; the client uses them for the message title and icon.
 
 ```ts type-equiv
-/** Source retained by the target Session for durable mailbox de-duplication. */
+/** Source recorded by a target Session for one historical Team mailbox delivery. */
 interface TeamMessageSource {
   readonly kind: 'team-message'
   readonly teamId: TeamId
@@ -66,16 +64,57 @@ interface TeamTaskSnapshot {
   readonly description: string
   readonly status: TeamTaskStatus
   readonly ownerId?: SessionId
+  /** Immutable agent path captured at assignment; absent on unnamed historical owners. */
+  readonly ownerName?: string
   readonly blockedBy: TeamTaskId[]
   readonly writeScopes: string[]
 }
 ```
 
-`pending` is unstarted or released, `in_progress` carries an owner, `completed` satisfies blockers, and `deleted` is a retained tombstone. Views add owner name, readiness, and write-scope overlap warnings without changing the durable snapshot.
+`pending` is unstarted or released, `in_progress` carries an owner, `completed` satisfies blockers, and `deleted` is a retained tombstone. Views expose `ownerId`, readiness, and advisory write-scope overlap without changing the durable snapshot.
+
+<a id="web-projection"></a>
+
+## Web projection
+
+`agentTeam.enabled` exposes the root Session’s saved selection. New Sessions default to false; `team/mode` records explicit selections. Historical tasks imply enabled until an explicit selection. Only the root can call `setEnabled`; descendants share that mode. The Web menu calls the same method through `remote.agentTeams.setEnabled`, with the root Session id resolved to its live Agent by the Gateway. Mode writes take effect before awaiting persistence. Tools resolve availability at step preparation; prompt providers read the selection when evaluated. Task mutations check the current mode when their queued operation starts; admitted mutations may finish. Mode changes do not end inbox waits. A failed flush leaves the appended selection active; retrying the same selection flushes it without a duplicate event.
+
+The root Session publishes non-deleted task views through `SessionProjectionMap.agentTeam`. `failure` reports a rejected persisted task or mode record beside the last valid state. Historical roster and mailbox records are not projected. Views identify every owner by its Session id; the task panel and task tools display the owner's agent name, or the Session id when the owner has no name.
+
+```ts type-equiv
+/** Runtime-enriched task view returned to tools and hosts. */
+interface TeamTaskView {
+  readonly id: TeamTaskId
+  readonly revision: number
+  readonly subject: string
+  readonly description: string
+  readonly status: TeamTaskStatus
+  readonly blockedBy: TeamTaskId[]
+  readonly writeScopes: string[]
+  readonly ownerId?: SessionId
+  /** Immutable agent path captured at assignment; absent on unnamed historical owners. */
+  readonly ownerName?: string
+  readonly ready: boolean
+  readonly writeScopeWarnings: string[]
+}
+```
+
+```ts type-equiv
+/**
+ * Durable Team state published to browser clients through the Lead Session's
+ * `agentTeam` projection. `failure` names the first rejected persisted Team
+ * record; tasks then stay at the last valid state.
+ */
+interface TeamProjection {
+  readonly enabled: boolean
+  readonly tasks: TeamTaskView[]
+  readonly failure?: string
+}
+```
 
 ## Replay
 
-`foldTeam()` replays one root Session into the roster, task board, and queued-minus-delivered mailbox that every Team operation reads. It selects records by `TeamId`, so events inherited by an ordinary fork retain the ancestor id and never enter the new root's state. Session event `seq` and `time` remain the ordering and timing record; Team snapshots do not duplicate them. Roster and task reads reach callers as views; pending mail stays internal to delivery and recovery. The package [README](../../packages/experimental/agent-team/README.md) owns operation, authorization, recovery, and limit behavior.
+The `agentTeam` projection replays task records selected by `TeamId` and the Session’s own mode selections. Subagent discovery owns current tree membership and ignores inherited catalog authority. Session event `seq` and `time` own ordering and timing. Committed durable generations are preserved. The [package README](../../packages/team/agent-team/README.md) defines task operations and limits.
 
 <!-- BEGIN GENERATED cordis-surface (gen-cordis-catalog.ts) — do not edit between markers -->
 
@@ -93,42 +132,35 @@ Agent Teams service backed by the exact live Lead Session log.
 
 ```ts cordis-catalog
 /**
- * Resolve one exact live Agent's Team role.
- * @param agent - exact live Agent used as the authority credential.
- * @returns its root, Team identity, role, and model-facing name.
+ * Read the Team selection shared by the caller's subagent tree.
+ * @param caller - exact live root or descendant.
+ * @returns whether Team tools and guidance are enabled.
  */
-membership(agent: Agent): TeamMembership
+isEnabled(caller: Agent): boolean
 
 /**
- * List the runtime-enriched roster visible to one Team member.
- * @param agent - exact live Team member.
- * @returns Lead and teammate rows in creation order.
+ * Save a root Session's Team selection without stopping children or deleting tasks.
+ * The selection takes effect before awaiting persistence. Tools resolve availability at
+ * step preparation; prompt providers read the selection when evaluated. Task mutations
+ * check the current mode when their queued operation starts; admitted operations finish.
+ * @param agent - exact live root whose tree receives the selection.
+ * @param enabled - selected Team mode.
+ * @param signal - cancellation checked before changing the selection.
+ * @returns fulfillment after the selection flushes.
+ * @throws when called by a descendant or persistence fails. An appended selection remains active;
+ * retrying the same selection flushes without a duplicate event.
  */
-listMembers(agent: Agent): TeamMemberView[]
-
-/**
- * Create one named, continuable direct child of the Team Lead.
- * @param caller - exact live Lead Agent.
- * @param request - immutable name, description, prompt, context mode, provider, and cancellation.
- * @returns the active roster row.
- */
-async spawnTeammate(caller: Agent, request: SpawnTeammateRequest): Promise<SpawnTeammateResult>
-
-/**
- * Queue one durable peer message, then attempt immediate delivery.
- * @param caller - exact live sending Team member.
- * @param request - target name, content, and pre-queue cancellation.
- * @returns durable message identity and immediate-delivery observation.
- */
-async sendMessage(caller: Agent, request: SendTeamMessageRequest): Promise<SendTeamMessageResult>
+@Remote async setEnabled(agent: Agent, enabled: boolean, signal?: AbortSignal): Promise<void>
 
 /**
  * Create one unowned pending task in the Team Lead log.
  * @param caller - exact live Team member creating the task.
  * @param request - task text, blockers, and advisory write scopes.
+ * @param signal - cancellation before the task event is appended; omitted means no cancellation.
  * @returns the revision-one task view.
+ * @throws TEAM_TASK_PERSISTENCE_UNCONFIRMED when the task is visible but durability is unknown; read it before retrying.
  */
-async createTask(caller: Agent, request: CreateTeamTaskRequest): Promise<TeamTaskView>
+async createTask(caller: Agent, request: CreateTeamTaskRequest, signal?: AbortSignal): Promise<TeamTaskView>
 
 /**
  * Return one task, including a deleted tombstone.
@@ -149,59 +181,14 @@ listTasks(caller: Agent): TeamTaskView[]
  * Compare-and-set one authorized task transition.
  * @param caller - exact live Team member authorizing the mutation.
  * @param request - task identity, expected revision, action, and action fields.
+ * @param signal - cancellation before the task event is appended; omitted means no cancellation.
  * @returns the committed next task revision.
+ * @throws TEAM_TASK_PERSISTENCE_UNCONFIRMED when the task is visible but durability is unknown; read it before retrying.
  */
-async updateTask(caller: Agent, request: UpdateTeamTaskRequest): Promise<TeamTaskView>
-
-/**
- * Wait for the next Team-domain or member-status change.
- * @param caller - exact live Team member waiting for activity.
- * @param timeoutMs - bounded wait duration from ten seconds through one hour.
- * @param signal - caller cancellation for the wait only.
- * @returns one observed change or a timeout result.
- */
-async waitForChange(caller: Agent, timeoutMs: number, signal: AbortSignal): Promise<TeamWaitResult>
-
-/**
- * Interrupt one live teammate turn without clearing its pending inbox.
- * @param caller - exact live Lead Agent.
- * @param targetName - durable teammate name.
- * @returns the target status sampled before cancellation.
- */
-interrupt(caller: Agent, targetName: string): { previousStatus: 'running' | 'idle' | 'inactive' }
-
-/**
- * Resolve a caller without throwing, used by scoped-tool installation and observers.
- * @param agent - candidate exact live Agent.
- * @returns Team membership, or undefined for non-Team subagents and stale identities.
- */
-tryMembership(agent: Agent): TeamMembership | undefined
-
-/**
- * Read the current roster and non-deleted task board through the generated Remote API.
- * @param agent - exact live Team member used as the authority credential.
- * @returns detached current roster and task views.
- */
-@Remote('view') remoteView(agent: Agent): TeamView
-
-/**
- * Create one shared task through the generated Remote API.
- * @param agent - exact live Team member creating the task.
- * @param request - task text, blockers, and advisory write scopes.
- * @returns the revision-one task or a typed Team rejection.
- */
-@Remote('createTask') remoteCreateTask(agent: Agent, request: CreateTeamTaskRequest): Promise<TeamTaskMutationResult>
-
-/**
- * Apply one task mutation and preserve Team rejections as business results.
- * @param agent - exact live Team member authorizing the mutation.
- * @param request - task identity, expected revision, action, and action fields.
- * @returns the committed task or a typed Team rejection.
- */
-@Remote('updateTask') remoteUpdateTask(agent: Agent, request: UpdateTeamTaskRequest): Promise<TeamTaskMutationResult>
+async updateTask(caller: Agent, request: UpdateTeamTaskRequest, signal?: AbortSignal): Promise<TeamTaskView>
 ```
 
 Types: [Agent](core.md)
 
-Source: [`packages/experimental/agent-team/src/index.ts`](../../packages/experimental/agent-team/src/index.ts)
+Source: [`packages/team/agent-team/src/index.ts`](../../packages/team/agent-team/src/index.ts)
 <!-- END GENERATED cordis-surface -->

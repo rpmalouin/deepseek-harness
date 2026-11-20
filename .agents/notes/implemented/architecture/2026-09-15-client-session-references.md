@@ -21,7 +21,8 @@ Client Session objects, Agent-scoped Client Contexts, references, consumer-sourc
 | Owner | Responsibility |
 | --- | --- |
 | Client Session Controller | Catalog, live generations, references, source counts, bindings, history windows, and existing Session control state |
-| `ui-session` | Explicit Session Provider integration and the unified UI status source |
+| `ui-session` | Explicit Session Provider integration and the effective pending-interaction source |
+| `ui-session-status` | The unified UI status source |
 | View or operation | Its own reference, target, source identifier, and release point |
 | Workspace UI | Main-area target and reference, navigation, persisted target, and creation flow |
 | UI composition boundary | Supplies an owner-provided reference to one explicit `SessionProvider` |
@@ -30,7 +31,7 @@ Client Session objects, Agent-scoped Client Contexts, references, consumer-sourc
 
 The [Client layering design](../../implemented/architecture/2026-08-20-client-session-conversation-ownership.md) defines one-way data, adapter, renderer, and presentation dependencies. Reference-source bookkeeping does not give the Controller a dependency on UI packages.
 
-This decision partially supersedes the list-selected scope lifecycle in the [Web Client Session scope and provide-channel decision](2026-07-25-web-client-session-scope-and-provide-channel.md); that note retains the blank-Session and adoption rationale under explicit Provider ownership.
+The [blank Session decision](2026-09-17-process-local-blank-sessions.md) owns creation and reuse; this decision owns explicit Provider references and adoption.
 
 ### Addresses, bindings, and references
 
@@ -51,7 +52,9 @@ This decision partially supersedes the list-selected scope lifecycle in the [Web
 | `sessions.sessionOf(ctx)` | Returns the matching live Session face or `undefined`; an ended Context cannot resolve to a same-id replacement |
 | `sessions.create(...)` / `sessions.fork(...)` | Existing Host operations returning a Session identity; retaining and displaying it remain explicit |
 
-`SessionRetainOptions` contains required `source: SessionReferenceSource` and optional `signal: AbortSignal`. Both acquisition methods accept `target: SessionTarget` and these options. Source keys are consumer-defined and declaration-merge extensible; there is no runtime source-registration protocol or default main-view source. A source is a usage label, not another Session address or a permission to act on it.
+`SessionRetainOptions` contains required `source: SessionReferenceSource`, optional `facets`, and optional `signal: AbortSignal`. Both acquisition methods accept `target: SessionTarget` and these options. Source keys are consumer-defined and declaration-merge extensible; there is no runtime source-registration protocol or default main-view source. A source is a usage label, not another Session address or a permission to act on it.
+
+[Session retain facets and recent views](2026-11-15-session-retain-facets-and-recent-views.md) owns `facets`, the independently counted parts a reference keeps beyond its history stream, and the `recentViews` source.
 
 ### Acquisition, failure, and release
 
@@ -73,7 +76,7 @@ The Controller owns source counts alongside each live generation's references. F
 
 Each available Session list row exposes a read-only `retainedBy` record from source key to positive reference count. An unretained row has an empty record; zero-count keys are absent. Acquisition failure and release update that projection, including removal of the final key. The source counts remain local facts when Host metadata is refreshed; Host responses cannot overwrite them.
 
-The generation owns the counts even if its Session has not reached the Host catalog or its catalog metadata has been removed. `byId` synthesizes a local fallback row for every live generation so Provider and ownership consumers can resolve it; `ids` remains the Host-list membership and ordering. A fallback row is not Host metadata. Every row's `retainedBy` projection uses the live generation's counts. Neither the reference objects nor the counts are persisted or sent to the Host.
+The generation owns the counts even if its Session has not reached the Host catalog or its catalog metadata has been removed. `byId` contains Host summaries, projected child-catalog rows, and fallback rows for retained subagents with a known direct-parent address. Acquisition publishes a missing subagent row synchronously so Provider discovery does not depend on parent-catalog arrival; title projections and reference-source counts continue to update that row. Ordinary retained Sessions do not synthesize fallback rows. `ids` remains the Host-list membership and ordering. Consumers of an unlisted generation use its binding and `retainInfo` directly. Every row's `retainedBy` projection uses the live generation's counts. Neither the reference objects nor the counts are persisted or sent to the Host.
 
 For example, `retainedBy = { mainView: 1, gateway: 2 }` means that the main view and two Host invocations own three references. Releasing the main-view reference removes only `mainView`; the Gateway invocations continue to own the generation. Source names in this example are consumer keys, not a closed Controller enum.
 
@@ -89,28 +92,22 @@ Window-level consumers may inspect source markers. Session business operations s
 
 ### Unified UI Session status
 
-`ui-session` owns a React-free `sessionStatus` source and exposes it through the standard `useSessionStatus` hook. The snapshot is indexed by Session identity and supplies one UI status record per known Session. It combines these independent facts rather than reducing them to one mutually exclusive phase:
+`ui-session-status` owns the React-free `uiSession.sessionStatus` service, read as `ctx.uiSession.sessionStatus`, and exposes it through the standard `useSessionStatus` hook. The snapshot is indexed by Session identity and supplies one UI status record per known Session. It combines these independent facts rather than reducing them to one mutually exclusive phase:
 
 | Field | Value | Meaning and owner |
 | --- | --- | --- |
 | `running` | `boolean` or `undefined` | Latest known Session running fact; absence of a baseline is not confirmed idle |
 | `pendingInteraction` | `SessionPendingInteraction` or `undefined` | Effective domain-owned request, or absence when no request is pending |
-| `completionUnread` | `boolean` | UI reminder for an observed stop that has not been acknowledged |
+| `completionUnread` | `boolean` | Host reading record carries a manual unread mark or an unacknowledged completed turn |
+| `completionFailed` | `boolean` | The Session is unread and its latest completed turn ended with an execution error |
 
 Source counts remain authoritative in `SessionListState.byId[id].retainedBy`; UI status reads them for acknowledgement policy without owning another reference registry. Titles, Workspace associations, history, queues, and projection data remain with their existing owners.
 
-Pending domains retain `SessionPendingInteractionMap`, request identities, precedence, publication disposers, and teardown delegation. The unified status includes the same effective request object; it does not copy requests or create a second pending registry. Workspace status indicators and Conversation composer selection read `useSessionStatus` instead of separate `useSessionPendingInteraction` and `useCompletedSessionIds` hooks.
+Pending domains retain `SessionPendingInteractionMap`, request identities, precedence, publication disposers, and teardown delegation in `ui-session`, which publishes each Session's effective request read-only as `ctx.uiSession.pendingInteractions`. The unified status includes the same effective request object; it does not copy requests or create a second pending registry. Workspace status indicators and Conversation composer selection read `useSessionStatus` instead of separate `useSessionPendingInteraction` and `useCompletedSessionIds` hooks.
 
-Completion tracking subscribes to the existing `api-session/status` events so a running-to-idle transition is not lost in batched catalog snapshots. Catalog snapshots establish initial and reconnect baselines. A pending empty catalog is not evidence that Sessions disappeared. The update rules are:
+Running tracking subscribes to the existing `api-session/status` events so a running-to-idle transition is not lost in batched catalog snapshots. Host-list rows (`ids`) establish initial and reconnect running baselines; synthetic catalog and retained rows preserve independently observed status. A pending empty catalog is not evidence that Sessions disappeared, and removing a Session clears its running baseline; pending-request teardown stays with the request's domain.
 
-- An initial idle baseline does not create a completion reminder.
-- Observing running clears an earlier reminder and records the running baseline.
-- A known running-to-idle transition sets `completionUnread` only when the Session lacks main-view ownership.
-- Acquiring main-view ownership clears the reminder; retaining from an unrelated source does not.
-- Releasing main-view ownership does not manufacture a reminder for an earlier stop.
-- Removing a Session clears its completion reminder and running baseline; pending-request teardown stays with the request's domain.
-
-The reminder denotes an observed stop, not successful task completion or completion of a particular queued message. Main-view ownership preserves selection-based acknowledgement even while a global panel temporarily hides the Conversation. The design has no `ui-session/view-presence` event, mounted-Provider index, or implicit acknowledgement from Provider mount.
+Completion reminders follow the Host reading records described in [Host-memory Session reading state](../feature/2026-10-23-session-reading-memory.md), which supersedes this note's earlier Client-local reminder rules: running changes and main-view ownership neither set nor clear a reminder, and the visible main view acknowledges a completed turn only after its body arrives. The reminder denotes a completed turn, not successful task completion or completion of a particular queued message. Main-view ownership preserves selection-based acknowledgement even while a global panel temporarily hides the Conversation. The design has no `ui-session/view-presence` event, mounted-Provider index, or implicit acknowledgement from Provider mount.
 
 The Session Controller publishes running and reference-source facts but owns no completion-reminder set, `consumeCompletion` method, or pending-interaction presentation. Reference acquisition does not execute completion-reminder business logic.
 
@@ -141,7 +138,7 @@ Scoped business objects capture their binding before awaiting work. They do not 
 
 ### Main-area navigation and presentation
 
-`uiWorkspace.openSession`, `openWorkspace`, `forkSession`, and `startSession` remain the navigation entry points. They accept or resolve explicit targets, change the main view, and return the main area to Conversation according to existing navigation policy. `retain` itself never navigates. There is no `registerNavigation` receiver protocol or second navigation service introduced by reference ownership.
+`uiWorkspace.openSession`, `openWorkspace`, and `startSession` are the navigation entry points. They accept or resolve explicit targets, change the main view, and return the main area to Conversation according to existing navigation policy. Sidebar `forkSession` creates and renames the child without retaining it or changing selection. `retain` itself never navigates. There is no `registerNavigation` receiver protocol or second navigation service introduced by reference ownership.
 
 The existing `uiWorkspace` implementation directly owns the main-area reference and target. Its navigation methods update that owner rather than calling a receiver registered by Conversation. `ui-session` derives the root Provider binding from the source marker; the main Conversation and associated right Sidebar only inherit the Provider and neither depend on `uiWorkspace` nor see the main reference. An independent Sidebar Conversation establishes a nested Provider from its own reference and overrides only that subtree's binding. The main reference is not a global standard prop, subtree Hook, or default value for ID-based lookup.
 
@@ -156,17 +153,17 @@ The main view privately persists its target identity and subagent address under 
 | Chat/Trajectory restoration | Restore the view for the explicitly selected main target; independently bound views keep their own state |
 | Cordis inventory panel | One list without current/other grouping; no public runner getter for main-area selection |
 
-Source metadata does not change when DOM focus moves or when a global panel hides a retained view. The [global main-panel design](../../implemented/architecture/2026-09-08-global-main-panels.md) owns panel selection and layout; Session reference ownership does not replace it.
+Source metadata does not change when DOM focus moves or when a global panel hides a retained view. The [global main-panel design](../../../../packages/client/ui-layout/README.md) owns panel selection and layout; Session reference ownership does not replace it.
 
 Conversation retains its `hero`, `settling`, and `active` composition and existing history-loading and `openError` handling. Acquisition adds no outer loading/error phase presentation, extra composer-hiding condition, Retry button, or replacement Sidebar recovery panel. Existing error handlers continue to handle their errors; call sites without error presentation gain none. Promise rejection and correct reference release do not imply an additional UI handler.
 
-Workspace connection and fork preserve their existing navigation guards and panel-switch invalidation. Direct Session opening gains no additional global-navigation cancellation policy. Agent Team refresh preserves its originating-selection validity condition instead of starting a global navigation token before refresh. Reference acquisition does not broaden cancellation to unrelated navigation or running operations, and local cancellation does not roll back Host effects.
+Workspace connection preserves its navigation guards and panel-switch invalidation. Sidebar fork does not supersede an in-flight navigation. Direct Session opening gains no additional global-navigation cancellation policy. Agent Team refresh preserves its originating-selection validity condition instead of starting a global navigation token before refresh. Reference acquisition does not broaden cancellation to unrelated navigation or running operations, and local cancellation does not roll back Host effects.
 
 ### Presets and creation flows
 
 Preset directories and deployment defaults may be shared. A bound Session's preset is read or changed through its Provider binding; preset controllers are cached by `SessionBinding` rather than managed by one root current-Session follower. The hero preset seat uses the `session-maybe` Provider: it shows the creation-flow choice without a Session and operates on the exact bound blank Session after one arrives. Header labels read the same Provider-bound Session projection.
 
-A preset chosen before Session creation remains in the main Conversation's `session-maybe` preset surface. After Workspace creation or reuse establishes the main Provider over a blank Session, that surface applies the choice to its Provider-bound Session. When Settings changes the default preset or picker setting, the preset service selects the blank Session whose established Provider binding carries `mainView` ownership and updates that Session. Non-blank main Sessions, independent Sidebar Providers, and other background references remain unchanged; preset subtrees do not read the main reference or use a global current follower to find their target.
+A preset chosen before Session creation remains in the main Conversation's `session-maybe` preset surface. After Workspace creation or reuse establishes the main Provider over a blank Session, that surface applies the choice to its Provider-bound Session. When Settings changes the default preset, the preset service selects the blank Session whose established Provider binding carries `mainView` ownership and updates that Session. Non-blank main Sessions, independent Sidebar Providers, and other background references remain unchanged; preset subtrees do not read the main reference or use a global current follower to find their target.
 
 ### Host-event Context ownership and Typert
 
@@ -221,6 +218,6 @@ Consumers must keep references until their real completion point; an unreleased 
 
 Final release discards non-persisted binding-owned state, including loaded history pages, Chat scroll anchors, preview wrapping, Files expansion, composer attachments, and undo history. Only persisted Session-keyed Store values or a generation kept alive by another reference survive a view switch; the runtime does not clear those persisted values.
 
-Every public `retain`, including the temporary references used by Session rename and fork-title assignment, starts the generation's shared initial history opening. These metadata operations await `reference.ready` before using the Session and therefore pay that history I/O for a cold generation.
+Every public `retain`, including the temporary reference used by ordinary Session rename, starts the generation's shared initial history opening. Fork-title assignment instead sends rename directly and applies its returned projection without a Client reference or history I/O. A metadata-only fork operation therefore cannot create a temporary list row or switch the main view.
 
 The catalog, UI status, and view target have separate owners and can publish independently. Their consumers must not infer a lifecycle transition solely from notification order. The main view remains an ordinary reference owner, while its navigation and presentation rules stay in UI rather than the reference allocator.

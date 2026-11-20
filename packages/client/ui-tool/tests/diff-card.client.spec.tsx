@@ -1,18 +1,21 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { useDisclosure } from '@deepseek-ai/dsh-client-ui-chat/src/client/chat/use-disclosure.ts'
 import { cleanup, fireEvent, render } from '@testing-library/react'
-import { bindSnapshotSelector } from '@deepseek-ai/dsh-client-test-runtime'
+import { contextMenuHook, bindSnapshotSelector } from '@deepseek-ai/dsh-client-test-runtime'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
-import type { RunningToolCall, ToolResultNode } from '@deepseek-ai/dsh-client-ui-chat/client'
+import type { StartedToolCall, ToolResultNode } from '@deepseek-ai/dsh-client-ui-chat/client'
 import type { SessionListState } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { makeTranslate } from '@deepseek-ai/dsh-client-test-runtime'
 import { zh as commonZh } from '@deepseek-ai/dsh-client-locale/src/locales/zh.ts'
+import { toolRowModel } from '../src/client/tool/models/tool-call-model.ts'
 import { CHAT_DIFF_MAX_LINES, diffCardModel } from '../src/client/tool/models/diff-card-model.ts'
 import { GenericToolCard, type GenericToolCardProps } from '../src/client/tool/toolviews/GenericToolCard.tsx'
 import { FileMutationRow, fileMutationToolview } from '../src/client/tool/toolviews/file-mutation-row.tsx'
 import { zh } from '@deepseek-ai/dsh-client-ui-conversation/src/client/locales.ts'
+import { PartialArguments } from '@deepseek-ai/dsh-util-values'
 
 afterEach(cleanup)
 
@@ -26,20 +29,42 @@ const ARGS = '{"file_path":"notes/demo.txt","old_string":"hello","new_string":"h
 
 const DIFFS = [{ path: 'notes/demo.txt', oldText: 'hello', newText: 'hello fixture' }]
 
-const running = (over?: Partial<RunningToolCall>): RunningToolCall => ({
-  callId: 'c1', name: 'edit', argsRaw: ARGS,
-  turn: 1, step: 1, time: 1_000, subCalls: [], ...over,
-})
+const running = (over?: Partial<StartedToolCall>): StartedToolCall => {
+  const argsRaw = over?.argsRaw ?? ARGS
+  return {
+    phase: 'start' as const, args: PartialArguments.fromText(argsRaw), callId: 'c1', name: 'edit', argsRaw,
+    turn: 1, step: 1, time: 1_000, subCalls: [], ...over,
+  }
+}
 
-const settled = (over?: Partial<ToolResultNode>): ToolResultNode => ({
-  kind: 'tool-result', seq: 10, time: 2_000, callId: 'c1',
-  call: { name: 'edit', argsRaw: ARGS },
-  callTime: 1_000,
-  content: [{ type: 'text', text: 'The file notes/demo.txt has been updated successfully.' }], isError: false,
-  meta: { diffs: DIFFS }, subCalls: [], ...over,
-})
+const settled = (over?: Partial<ToolResultNode>): ToolResultNode => {
+  const call = over?.call === undefined ? { name: 'edit', argsRaw: ARGS } : over.call
+  return {
+    kind: 'tool-result', seq: 10, time: 2_000, callId: 'c1',
+    name: call?.name ?? '', args: call === null ? PartialArguments.EMPTY : PartialArguments.fromText(call.argsRaw),
+    call,
+    callTime: 1_000,
+    content: [{ type: 'text', text: 'The file notes/demo.txt has been updated successfully.' }], isError: false,
+    meta: { diffs: DIFFS }, subCalls: [], ...over,
+  }
+}
 
 describe('diffCardModel', () => {
+  it('derives applied diffs from settled metadata when the arguments carry no single intended diff', () => {
+    const call = { name: 'apply_patch', argsRaw: '{"input":"invalid"}' }
+    expect(diffCardModel(running(call))).toBeNull()
+    expect(diffCardModel(settled({ call }))).toEqual({ card: { diffs: DIFFS } })
+    expect(diffCardModel(settled({ call: null }))).toEqual({ card: { diffs: DIFFS } })
+    expect(diffCardModel(settled({ call, isError: true }))).toBeNull()
+    expect(diffCardModel(settled({ call, meta: {} }))).toBeNull()
+    expect(diffCardModel(settled({ call, meta: { diffs: [] } }))).toBeNull()
+  })
+
+  it('retains the authored file label when navigation metadata identifies an absolute target', () => {
+    expect(diffCardModel(settled({
+      meta: { path: '/b/notes/demo.txt', diffs: [{ ...DIFFS[0]!, path: '/b/notes/demo.txt' }] },
+    }))).toEqual({ card: { diffs: DIFFS } })
+  })
   it('derives a running card from raw edit arguments', () => {
     expect(diffCardModel(running())).toEqual({
       card: { diffs: [{ path: 'notes/demo.txt', oldText: 'hello', newText: 'hello fixture' }] },
@@ -113,8 +138,8 @@ describe('diffCardModel', () => {
     })
   })
 
-  it('returns null for missing calls, errors, malformed args, unrelated tools, and child dispatches', () => {
-    expect(diffCardModel(settled({ call: null }))).toBeNull()
+  it('returns null for errors, malformed args, unrelated tools, and child dispatches', () => {
+    expect(diffCardModel(settled({ call: null, meta: {} }))).toBeNull()
     expect(diffCardModel(settled({ isError: true }))).toBeNull()
     expect(diffCardModel(running({ argsRaw: '{' }))).toBeNull()
     expect(diffCardModel(running({ name: 'read' }))).toBeNull()
@@ -147,20 +172,20 @@ describe('diffCardModel', () => {
     })
   })
 
-  it('validates mutation escalation fields but accepts unrelated open-root fields', () => {
+  it('leaves escalation fields to the Host and accepts unrelated open-root fields', () => {
     const args = (fields: Record<string, unknown>) => JSON.stringify({
       file_path: 'notes/demo.txt', old_string: 'hello', new_string: 'hello fixture', ...fields,
     })
-    expect(diffCardModel(running({ argsRaw: args({ sandbox_permissions: 7, justification: 'Need access' }) }))).toBeNull()
-    expect(diffCardModel(running({ argsRaw: args({ sandbox_permissions: 'workspace-write' }) }))).toBeNull()
+    expect(diffCardModel(running({ argsRaw: args({ sandbox_permissions: 'workspace-write', justification: '' }) }))).not.toBeNull()
     expect(diffCardModel(running({ argsRaw: args({ extension: { version: 1 } }) }))).not.toBeNull()
   })
 })
 
 describe('chat row diff body', () => {
-  const ownerProps = (block: RunningToolCall | ToolResultNode): GenericToolCardProps => ({
+  const ownerProps = (block: StartedToolCall | ToolResultNode): GenericToolCardProps => ({
+    getFileTriggerProps: () => ({}),
     loadImage: vi.fn(() => Promise.reject(new Error('not used'))),
-    callId: 'c1', toolName: 'edit', block, openFile: vi.fn(), t,
+    useDisclosure, callId: 'c1', toolName: 'edit', ...('kind' in block ? { phase: 'result' as const, block: block } : { phase: block.phase, block: block }), openFile: vi.fn(), t,
   })
 
   it('the expanded body is the applied diff, capped tighter than the panel', () => {
@@ -184,13 +209,14 @@ describe('chat row diff body', () => {
     // A non-file tool name so the row is not single-file (no path link), and its
     // args body is the fallback the diff card must not have replaced.
     const view = render(<GenericToolCard {...{
-      callId: 'c1', toolName: 'some_tool', openFile: vi.fn(),
+      useDisclosure, callId: 'c1', toolName: 'some_tool', openFile: vi.fn(),
       loadImage: vi.fn(() => Promise.reject(new Error('not used'))), t,
-      block: settled({
+      phase: 'result' as const, block: settled({
         call: { name: 'some_tool', argsRaw: '{"foo":"bar"}' },
         meta: undefined,
       }),
-    }} />)
+    }}
+    getFileTriggerProps={() => ({})} />)
     fireEvent.click(view.container.querySelector('[data-expandable]')!)
     expect(view.container.querySelector('[data-diff]')).toBeNull()
     expect(view.getByText(/"foo"/)).toBeTruthy()
@@ -202,19 +228,106 @@ describe('FileMutationRow diff card', () => {
     ids: [SID],
     byId: { [SID]: { id: SID, displayTitle: 'r', running: false, retainedBy: {}, blank: false, updatedAt: 0, cwd: '/w/app' } },
     phase: 'ready',
-    subagentsByParent: {}, jobsBySession: {},
+    projectionsBySession: {},
   })
 
-  const rowProps = (block: RunningToolCall | ToolResultNode, toolName = 'edit'): FileMutationRowProps => ({
-    callId: 'c1', toolName, block, openFile: vi.fn(), cwd: '/w/app',
+  const rowProps = (block: StartedToolCall | ToolResultNode, toolName = 'edit'): FileMutationRowProps => ({
+    useDisclosure, callId: 'c1', toolName, ...('kind' in block ? { phase: 'result' as const, block: block } : { phase: block.phase, block: block }), openFile: vi.fn(), cwd: '/w/app',
+    useContextMenu: contextMenuHook(), resolveFilePath: path => path,
     sessionId: SID, useSessions: bindSnapshotSelector(list()),
     t,
-  } as unknown as FileMutationRowProps)
+  } as FileMutationRowProps)
 
   /** The whole summary row is the expand toggle (ToolRow's unified interaction). */
   const toggleRow = (view: { container: HTMLElement }) => {
     fireEvent.click(view.container.querySelector('[data-expandable]')!)
   }
+
+  it('shows patch titles, applied multi-file diffs, and stopped reasons together', () => {
+    const output = 'Patch stopped after 1 of 3 operations.\nFailed:\nsource removal denied\n  destination b was written; source a remains'
+    const block = settled({ call: { name: 'apply_patch', argsRaw: JSON.stringify({ input: '*** Begin Patch' }) },
+      content: [{ type: 'text', text: output }], meta: { stopped: true, diffs: [
+        { path: 'first', oldText: null, newText: 'created' }, { path: 'b', oldText: 'before', newText: 'after' },
+      ] } })
+    const model = toolRowModel('apply_patch', block)
+    expect(model.variant).toBe('edit')
+    expect(model.titleKey).toBe('tool.title.applyPatch')
+    expect(model.summary).toBe('')
+    expect(model.filePath).toBeUndefined()
+    expect(model.state).toBe('error')
+    expect(model.errorSummary).toBe('Patch stopped after 1 of 3 operations.')
+    const view = render(<FileMutationRow {...rowProps(block, 'apply_patch')} />)
+    expect(view.getByText('编辑')).toBeTruthy()
+    toggleRow(view)
+    expect(view.container.querySelectorAll('[data-diff]').length).toBeGreaterThan(0)
+    expect(view.getByText('created')).toBeTruthy()
+    expect(view.getByText('after')).toBeTruthy()
+    expect(view.container.textContent).toContain(output)
+  })
+
+  it('summarizes a complete patch by the files the executor parser reads', () => {
+    const patchRow = (input: string) => toolRowModel('apply_patch', settled({ call: { name: 'apply_patch', argsRaw: JSON.stringify({ input }) } }), '/w/app')
+    expect(patchRow('*** Begin Patch\n*** Update File: src/a.ts\n@@\n-old\n+new\n*** End Patch')).toMatchObject({
+      summary: 'src/a.ts', filePath: 'src/a.ts', fileTargets: undefined,
+    })
+    expect(patchRow([
+      '*** Begin Patch', '*** Add File: /w/app/docs/new.md', '+hello', '*** Update File: src/a.ts', '*** Move to: src/b.ts',
+      '@@', ' *** Delete File: context.txt', '-old', '+new', '*** Delete File: old.txt  ', '*** End Patch',
+    ].join('\n'))).toMatchObject({ summary: 'docs/new.md, src/a.ts → src/b.ts, old.txt', filePath: undefined, fileTargets: [
+      { id: 2, label: 'docs/new.md', filePath: '/w/app/docs/new.md' },
+      { id: 4, from: 'src/a.ts', label: 'src/b.ts', filePath: 'src/b.ts' },
+      { id: 10, label: 'old.txt', filePath: undefined },
+    ] })
+    expect(patchRow('*** Begin Patch\n*** Delete File: old.txt\n*** End Patch')).toMatchObject({ summary: 'old.txt', filePath: undefined, fileTargets: undefined })
+    expect(patchRow('*** Begin Patch\n*** Update File: a.ts\n*** Move to: b.ts\n@@\n-x\n+y\n*** End Patch')).toMatchObject({
+      summary: 'a.ts → b.ts', filePath: undefined, fileTargets: [{ id: 2, from: 'a.ts', label: 'b.ts', filePath: 'b.ts' }],
+    })
+    // Outside an update section the parser trims header lines, so these headers name files.
+    expect(patchRow('*** Begin Patch\n *** Update File: a.ts\n@@\n-old\n+new\n*** End Patch')).toMatchObject({ summary: 'a.ts', filePath: 'a.ts' })
+    expect(patchRow('*** Begin Patch\n*** Add File: a.md\n+x\n  *** Update File: b.ts\n@@\n-old\n+new\n*** End Patch'))
+      .toMatchObject({ summary: 'a.md, b.ts' })
+    // A Move to after a hunk is hunk content the parser rejects, and so changes no file.
+    expect(patchRow('*** Begin Patch\n*** Update File: a.ts\n@@\n-old\n+new\n*** Move to: b.ts\n*** End Patch'))
+      .toMatchObject({ summary: '', filePath: undefined, fileTargets: undefined })
+  })
+
+  it('keeps only absolute patch paths openable before a successful result', () => {
+    const argsRaw = JSON.stringify({ input: '*** Begin Patch\n*** Add File: /w/app/a.md\n+a\n*** Update File: b.ts\n@@\n-x\n+y\n*** End Patch' })
+    const expected = [{ id: 2, label: 'a.md', filePath: '/w/app/a.md' }, { id: 4, label: 'b.ts', filePath: undefined }]
+    expect(toolRowModel('apply_patch', running({ name: 'apply_patch', argsRaw }), '/w/app').fileTargets).toEqual(expected)
+    expect(toolRowModel('apply_patch', settled({ call: { name: 'apply_patch', argsRaw }, isError: true }), '/w/app').fileTargets).toEqual(expected)
+  })
+
+  it('opens each file a multi-file patch names without toggling the row', () => {
+    const open = vi.fn()
+    const openFile = vi.fn()
+    const input = '*** Begin Patch\n*** Add File: docs/new.md\n+hi\n*** Update File: a.ts\n*** Move to: b.ts\n@@\n-x\n+y\n*** Delete File: old.txt\n*** End Patch'
+    const block = settled({ call: { name: 'apply_patch', argsRaw: JSON.stringify({ input }) } })
+    const view = render(<FileMutationRow {...{ ...rowProps(block, 'apply_patch'), openFile, useContextMenu: contextMenuHook(open) }} />)
+    expect([...view.container.querySelectorAll('button')].map(button => button.textContent)).toEqual(['docs/new.md', 'b.ts'])
+    expect(view.container.textContent).toContain('docs/new.md, a.ts → b.ts, old.txt')
+    // Enter on a link stays with the link: the row does not expand. Activation is the native button's.
+    fireEvent.keyDown(view.getByRole('button', { name: 'docs/new.md' }), { key: 'Enter' })
+    expect(view.container.querySelector('[data-diff]')).toBeNull()
+    fireEvent.click(view.getByRole('button', { name: 'b.ts' }))
+    fireEvent.click(view.getByRole('button', { name: 'docs/new.md' }))
+    expect(openFile.mock.calls).toEqual([['b.ts'], ['docs/new.md']])
+    expect(view.container.querySelector('[data-diff]')).toBeNull()
+    fireEvent.contextMenu(view.getByRole('button', { name: 'docs/new.md' }))
+    expect(open).toHaveBeenCalledWith({ kind: 'file', value: { sessionId: SID, path: 'docs/new.md' } }, expect.anything())
+  })
+
+  it('keeps running and failed multi-file patches as plain summary text', () => {
+    const input = '*** Begin Patch\n*** Add File: /w/app/a.md\n+a\n*** Update File: /w/app/b.ts\n@@\n-x\n+y\n*** End Patch'
+    const argsRaw = JSON.stringify({ input })
+    const live = render(<FileMutationRow {...rowProps(running({ name: 'apply_patch', argsRaw }), 'apply_patch')} />)
+    expect(live.container.querySelectorAll('button')).toHaveLength(0)
+    expect(live.container.textContent).toContain('a.md, b.ts')
+    cleanup()
+    const stopped = settled({ call: { name: 'apply_patch', argsRaw }, meta: { stopped: true, diffs: DIFFS } })
+    const view = render(<FileMutationRow {...rowProps(stopped, 'apply_patch')} />)
+    expect(view.container.querySelectorAll('button')).toHaveLength(0)
+  })
 
   it('collapses to the summary row; expanding reveals the applied diff card', () => {
     const view = render(<FileMutationRow {...rowProps(settled())} />)
@@ -224,7 +337,7 @@ describe('FileMutationRow diff card', () => {
     toggleRow(view)
     expect(view.container.querySelector('[data-diff]')).not.toBeNull()
     expect(view.getByText('hello fixture')).toBeTruthy()
-    expect(view.getByText('复制')).toBeTruthy()
+    expect(view.getByRole('button', { name: '复制' })).toBeTruthy()
   })
 
   it('the summary is a path link that opens the tool path through the host', () => {
@@ -244,10 +357,11 @@ describe('FileMutationRow diff card', () => {
       meta: { diffs: [] },
     }), 'write')} />)
     // The collapsed row already carries the card's +/- totals beside the path.
-    expect(view.getByText('+1 -0')).toBeTruthy()
-    // The footer counts live inside the collapsed diff card.
+    expect(view.container.querySelector('[data-disclosure-row]')?.textContent).toContain('+1 -0')
     toggleRow(view)
-    expect(view.getByText('└ +1 -0 · 1 个文件')).toBeTruthy()
+    expect(view.getAllByText('+1')).toHaveLength(1)
+    expect(view.getAllByText('-0')).toHaveLength(1)
+    expect(view.getByText('hello fixture')).toBeTruthy()
   })
 
   it('reflects the run state on its leading slot', () => {
@@ -256,6 +370,7 @@ describe('FileMutationRow diff card', () => {
     cleanup()
     const errorView = render(<FileMutationRow {...rowProps(settled({ isError: true }))} />)
     expect(errorView.container.querySelector('[data-state="error"]')).not.toBeNull()
+    expect(errorView.container.querySelector('[data-state="error"] svg')).not.toBeNull()
   })
 
   it('a mutation result with no metadata renders the summary row alone', () => {
@@ -299,9 +414,9 @@ describe('FileMutationRow diff card', () => {
       error: { name: 'ToolError', code: 'interrupted' },
     }))} />)
     expect(view.container.querySelector('[data-state="stopped"]')).not.toBeNull()
-    // The amber StateDot is aria-hidden, so ToolRow carries the state to AT as
-    // visually-hidden text; without it a stopped row is a colour-only signal.
-    expect(view.getByText('已停止')).toBeTruthy()
+    expect(view.container.querySelector('[data-state="stopped"] svg')).not.toBeNull()
+    expect(view.getByText('已停止').className).toContain('visuallyHidden')
+    expect(view.container.querySelector('[class*="_stoppedSummary_"]')?.textContent).toBe('notes/demo.txt')
   })
 
   it('renders a plain summary span when the call carries no file path', () => {
@@ -315,7 +430,7 @@ describe('FileMutationRow diff card', () => {
 })
 
 describe('fileMutationToolview registration', () => {
-  it('registers one component under both edit and write, and each disposes', () => {
+  it('registers one component under all file mutation tools, and each disposes', () => {
     const registered: { key: string; locale: unknown; disposed: boolean }[] = []
     const disposers: (() => void)[] = []
     let disposeInjection = (): void => {}
@@ -336,10 +451,10 @@ describe('fileMutationToolview registration', () => {
       },
     }
     fileMutationToolview.apply(ctx as never)
-    expect(registered.map(r => r.key).sort()).toEqual(['edit', 'write'])
-    // Both keys claim the conversation locale seat ToolRow's body copy needs.
-    expect(registered.map(r => r.locale)).toEqual(['conversation', 'conversation'])
-    expect(fileMutationToolview.inject).toEqual(['slots'])
+    expect(registered.map(r => r.key).sort()).toEqual(['apply_patch', 'edit', 'write'])
+    // All keys claim the conversation locale seat ToolRow's body copy needs.
+    expect(registered.map(r => r.locale)).toEqual(['conversation', 'conversation', 'conversation'])
+    expect(fileMutationToolview.inject).toEqual(['slots', 'sessions'])
     // Disposal removes each contribution (packages/AGENTS.md registry contract).
     disposeInjection()
     expect(registered.every(r => r.disposed)).toBe(true)

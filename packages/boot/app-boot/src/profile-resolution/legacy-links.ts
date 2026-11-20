@@ -1,16 +1,13 @@
-/** Legacy profile-link inspection shared by the disk materializer and runtime resolver. */
+/** Package directory and resource canonicalization through the active runtime carrier's filesystem. */
 
-import { lstatSync, readlinkSync, realpathSync } from 'node:fs'
-import { basename, dirname, join, resolve } from 'node:path'
-
-/** Profile-private package links projected into its pnpm-managed node_modules. */
-export const PROFILE_MODULE_FALLBACK_DIR = '.dsh-module-fallback'
+import { lstatSync, realpathSync } from 'node:fs'
+import { basename, dirname, join } from 'node:path'
 
 /**
  * Return whether the process reads application modules from pkg's virtual filesystem.
  * @returns whether pkg owns the module filesystem.
  */
-export function isPackagedExecutable(): boolean {
+function isPackagedExecutable(): boolean {
   return (process as NodeJS.Process & { pkg?: unknown }).pkg !== undefined
 }
 
@@ -23,51 +20,14 @@ export function realModuleDirectory(path: string): string {
   return isPackagedExecutable() ? realpathSync(path) : realpathSync.native(path)
 }
 
-/**
- * Resolve a link target without following the final path component.
- * @param path - candidate path whose parent is canonicalized.
- * @returns the canonical candidate, or undefined when its parent is absent.
+/** Canonicalize a module resource, preserving physical file aliases.
+ * SEA archive files are symlink-free and support stat and reads, while their containing directories support realpath.
+ * @param path Existing module resource path.
+ * @returns Canonical resource path under the active carrier's filesystem.
+ * @throws When the resource or its directory cannot be inspected or resolved.
  */
-export function canonicalLinkPath(path: string): string | undefined {
-  try {
-    return join(realModuleDirectory(dirname(path)), basename(path))
-  } catch (error) {
-    // A missing parent means the candidate cannot identify an existing owned link.
-    /* v8 ignore next 2 -- a non-ENOENT realpath failure requires a host filesystem fault */
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
-    /* v8 ignore next -- see the host-filesystem exception above */
-    throw error
-  }
-}
-
-/**
- * Return whether a symlink or junction points at the same path as `target`.
- * @param link - symlink or junction to inspect.
- * @param target - expected target path.
- * @returns whether both paths identify the same entry.
- */
-export function symlinkPointsTo(link: string, target: string): boolean {
-  const actual = resolve(dirname(link), readlinkSync(link))
-  const canonicalActual = canonicalLinkPath(actual)
-  const canonicalTarget = canonicalLinkPath(resolve(target))
-  return canonicalActual !== undefined && canonicalActual === canonicalTarget
-}
-
-/**
- * Return whether an observed profile package must not claim local precedence.
- * @param profileDir - profile directory containing the package projection.
- * @param packageName - bare package name to inspect.
- * @returns whether the entry is a managed fallback link or disappeared during inspection.
- */
-export function isProfileModuleFallbackLink(profileDir: string, packageName: string): boolean {
-  const link = join(profileDir, 'node_modules', packageName)
-  const target = join(profileDir, PROFILE_MODULE_FALLBACK_DIR, 'node_modules', packageName)
-  try {
-    return lstatSync(link).isSymbolicLink() && symlinkPointsTo(link, target)
-  } catch (error) {
-    /* v8 ignore next 2 -- a vanished candidate cannot claim local precedence */
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true
-    /* v8 ignore next -- non-ENOENT lstat/readlink failures require a host filesystem fault */
-    throw error
-  }
+export function realModuleFile(path: string): string {
+  return !isPackagedExecutable() || lstatSync(path).isSymbolicLink()
+    ? realpathSync(path)
+    : join(realModuleDirectory(dirname(path)), basename(path))
 }

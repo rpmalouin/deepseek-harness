@@ -581,15 +581,15 @@ describe('launchResolved', () => {
         },
       }),
     )).resolves.toBe('launched')
-    // The opener is the shipped Invoke-Item channel; the detached spawner never runs.
+    // The opener is the shipped Explorer channel; the detached spawner never runs.
     expect(spawns).toEqual([])
     expect(commands).toEqual([
-      ['powershell.exe', '-NoProfile', '-Command', "Invoke-Item -LiteralPath 'C:\\w\\dir'"],
+      ['explorer.exe', 'file:///C:/w/dir'],
     ])
   })
 
   it('counts a shell-open opener that outlives the watch window as launched, and a fast failure as failed', async () => {
-    // A cold powershell start can outlive the window: still-running counts launched.
+    // A cold shell opener can outlive the window: still-running counts launched.
     await expect(launchResolved(
       { launch: { kind: 'shell-open' } }, '/w/dir', 25,
       bare({ platform: 'darwin', run: () => new Promise(() => {}) }),
@@ -682,5 +682,24 @@ describe('launchDetachedApp', () => {
       delete process.env.OPEN_IN_APP_SPEC_PLAIN
     }
     expect(JSON.parse(await readFile(witness, 'utf8'))).toEqual([null, 'overridden', '1'])
+  })
+
+  it('does not pass the Desktop Host ELECTRON_RUN_AS_NODE selector to the application in any case', async () => {
+    const root = await tempRoot()
+    const witness = join(root, 'env.json')
+    process.env.ELECTRON_RUN_AS_NODE = '1'
+    process.env.electron_run_as_node = '1'
+    try {
+      await launchDetachedApp(node, [
+        '-e',
+        'require("node:fs").writeFileSync(process.argv[1], JSON.stringify('
+        + 'Object.keys(process.env).filter(name => name.toUpperCase() === "ELECTRON_RUN_AS_NODE")))',
+        witness,
+      ], { watchMs: TIMEOUT_MS })
+    } finally {
+      delete process.env.ELECTRON_RUN_AS_NODE
+      delete process.env.electron_run_as_node
+    }
+    expect(JSON.parse(await readFile(witness, 'utf8'))).toEqual([])
   })
 })

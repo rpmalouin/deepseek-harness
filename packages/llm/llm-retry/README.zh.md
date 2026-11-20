@@ -34,7 +34,7 @@ kind: "package-reference"
 ### 最小配置
 
 ```yaml
-- name: '@deepseek-ai/dsh-llm-deepseek'
+- name: '@deepseek-ai/dsh-llm-deepseek-api-key'
   config:
     apiKeyEnv: DEEPSEEK_API_KEY
     retryPolicy:
@@ -76,11 +76,12 @@ kind: "package-reference"
 | 文件 | 职责 |
 |---|---|
 | [`src/index.ts`](src/index.ts) | 函数插件：waterfall 监听器、策略查找、退避、持久事件追加 |
-| [`src/history.ts`](src/history.ts) | 从会话日志查找持久重试历史 |
 | [`src/types.ts`](src/types.ts) | 浏览器安全的 `llm/retry` 与 `llm/retry-started` 事件载荷类型 |
 | [`src/brand.ts`](src/brand.ts) | 事件载荷共享的 `RetryId` 品牌 |
 
 ### 恢复流程
+
+恢复监听器在等待投影注册前安装。激活期间到达的失败会先等待读取句柄，再应用提供方策略。注册失败会传播给 agent；等待期间取消或释放插件，不会写入重试记录或发起后续尝试。
 
 失败步骤连同其提供方与解析后的策略一起到达 waterfall。always mode 先结算下游恢复，并遵循下游的 `retry` 决定；normal mode 先检查失败 code 是否合格、预算是否未耗尽。插件计算延迟——有效且在边界内的提供方 `Retry-After`，否则带对称抖动的本地有界指数退避——追加 `llm/retry` 事件，在可取消定时器上等待，追加 `llm/retry-started`，然后返回 `{ kind: 'retry' }`。loop 随后在同一个打开的轮次内重跑失败步骤（仍基于同一份持久历史）。
 
@@ -144,6 +145,5 @@ kind: "package-reference"
 本开发备注是不具权威性的工作上下文：维护者备注与开放问题。已交付的行为与既定理由以上文、包代码和相关 Agent Note 为准。
 
 - 重试编号只在同一提供方与完整策略键的事件间延续，因此限额、code 成员或退避不同的路由替换会开启自己的历史；该键包含每个影响行为的字段，并因资格判断使用集合成员而对 normal mode code 排序。
-- 单独发布的 `./invariant` 伴生插件会对照会话日志校验每次计划的重试——点名当前打开轮次与最新闭合步骤、匹配失败请求的持久提供方，并要求每个 `llm/retry-started` 事件点名一次带相同重试 id、轮次、步骤与重试编号的先前计划尝试。
 
 </details>

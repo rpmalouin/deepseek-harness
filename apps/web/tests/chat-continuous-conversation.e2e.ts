@@ -9,7 +9,8 @@ import { join } from 'node:path'
 import type { Browser, Page } from 'playwright'
 import { chromium } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
-import { ToolCallId, expandAssistantStream, type StreamChunk } from '@deepseek-ai/dsh-llm'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import { type ToolCallId, expandAssistantStream, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { ReplayEntry, ReplayOverrideDoc } from '@deepseek-ai/dsh-llm-replay'
 import type { SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 import {
@@ -34,7 +35,7 @@ interface TurnSpec {
   readonly firstMarker: string
   readonly doneMarker: string
   readonly deltas: readonly string[]
-  readonly callId?: ReturnType<typeof ToolCallId>
+  readonly callId?: ToolCallId
   readonly toolResultMarker?: string
 }
 
@@ -83,7 +84,7 @@ function turnSpec(index: number): TurnSpec {
     firstMarker,
     doneMarker,
     deltas,
-    callId: ToolCallId(`continuous-chat-tool-${id}`),
+    callId: brandString<ToolCallId>(`continuous-chat-tool-${id}`),
     toolResultMarker: `CONTINUOUS_CHAT_TOOL_RESULT_${id}`,
   }
 }
@@ -156,10 +157,11 @@ function assistantText(event: Extract<SessionEvent, { type: 'assistant/message' 
 }
 
 function toolResultText(event: Extract<SessionEvent, { type: 'tool/result' }>): string {
-  return event.data.message.content[0].content
-    .filter(block => block.type === 'text')
-    .map(block => block.text)
-    .join('')
+  let text = ''
+  for (const block of event.data.message.content) {
+    if (block.type === 'text') text += block.text
+  }
+  return text
 }
 
 function messageKey(event: SessionEvent<'user/message'>): string {
@@ -315,7 +317,7 @@ describe('web e2e: continuous conversation grown through the composer', () => {
       })
       expect(results[0]?.data.turn).toBe(spec.index)
       expect(results[0]?.data.message.source.callId).toBe(spec.callId)
-      expect(results[0]?.data.message.content[0].isError).toBe(false)
+      expect(results[0]?.data.message.isError).toBe(false)
       expect(toolResultText(results[0]!)).toBe(`${spec.toolResultMarker}\n`)
 
       const toolRow = page.locator(`[data-chat-call-id="${spec.callId}"]`)
@@ -339,9 +341,9 @@ describe('web e2e: continuous conversation grown through the composer', () => {
     ))).toHaveLength(TURN_COUNT)
     expect(sessionEvents.flatMap(event =>
       event.type === 'request/header' ? [event.data.reason] : [])).toEqual(['initial'])
-    expect(await page.getByRole('button', { name: 'System prompt' }).count()).toBe(1)
+    expect(await page.getByRole('button', { name: 'System prompt' }).count()).toBe(0)
     expect(await page.locator(
-      '[data-chat-flow-kind="system-prompt"][hidden="until-found"]',
+      '[data-chat-flow-kind="system-prompt"]',
     ).count()).toBe(0)
     expect(specs.at(-1)?.prompt.length).toBeGreaterThan(4_000)
     expect(sessionEvents.flatMap(event => (

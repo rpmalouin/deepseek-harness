@@ -19,7 +19,7 @@ const PARALLEL_PROBE = '@deepseek-ai/dsh-client-test-parallel-probe'
 /** Declared by ui-sidebar, whose SlotMap merge is outside this package's compilation face. */
 const SIDEBAR_SETTINGS = 'sidebar.settings' as never
 const BRAND = '@deepseek-ai/dsh-client-ui-brand-official'
-const globals = globalThis as { EventSource?: unknown; ResizeObserver?: unknown }
+const globals = globalThis as { ResizeObserver?: unknown; matchMedia?: typeof window.matchMedia }
 /** The whole roster's first boot pays the cold module transform of every plugin package. */
 const COLD_BOOT_TIMEOUT_MS = 60_000
 
@@ -32,6 +32,10 @@ async function started(plan: AssemblyPlan, options?: TestClientOptions): Promise
 
 describe('TestClient (jsdom)', () => {
   it('boots the whole web-app roster, connects, mounts, and disposes with nothing unmatched', async () => {
+    // Exercise missing-API cleanup independently of the suite's browser defaults.
+    vi.stubGlobal('ResizeObserver', undefined)
+    vi.stubGlobal('matchMedia', undefined)
+    onTestFinished(() => { vi.unstubAllGlobals() })
     const mock = RemoteMock.create().load(remoteDefaultResponses)
     const client = await TestClient.start({ roster: webApp }, mock, { mount: true })
     expect(client.connection.state.getSnapshot()).toBe('connected')
@@ -40,26 +44,54 @@ describe('TestClient (jsdom)', () => {
     expect(document.body.contains(container)).toBe(true)
     expect(container.childElementCount).toBeGreaterThan(0)
     expect('__DSH_TRANSPORT__' in globalThis).toBe(false)
-    expect(globals.EventSource).toBeDefined()
     expect(globals.ResizeObserver).toBeDefined()
+    const query = globals.matchMedia!('(pointer: coarse)')
+    expect(query.media).toBe('(pointer: coarse)')
+    expect(query.matches).toBe(false)
+    // oxlint-disable-next-line typescript/no-deprecated -- The shim retains the legacy MediaQueryList methods.
+    query.addListener(null)
+    // oxlint-disable-next-line typescript/no-deprecated -- The shim retains the legacy MediaQueryList methods.
+    query.removeListener(null)
+    expect(document.fonts).toBeInstanceOf(EventTarget)
     await client.dispose()
     expect(document.body.contains(container)).toBe(false)
     expect('__DSH_TRANSPORT__' in globalThis).toBe(false)
-    expect(globals.EventSource).toBeUndefined()
     expect(globals.ResizeObserver).toBeUndefined()
+    expect(globals.matchMedia).toBeUndefined()
+    expect(document.fonts).toBeUndefined()
     await client.dispose()
   }, COLD_BOOT_TIMEOUT_MS)
 
   it('leaves a pre-existing global alone and removes only the shims it installed', async () => {
     const existing = { existing: true }
     vi.stubGlobal('ResizeObserver', existing)
-    onTestFinished(() => { vi.unstubAllGlobals() })
+    const fonts = new EventTarget()
+    Object.defineProperty(document, 'fonts', { configurable: true, value: fonts })
+    onTestFinished(() => {
+      vi.unstubAllGlobals()
+      Reflect.deleteProperty(document, 'fonts')
+    })
     const client = await started({ roster: API_ROSTER })
     expect(globals.ResizeObserver).toBe(existing)
-    expect(globals.EventSource).toBeDefined()
+    expect(globals.matchMedia).toBeDefined()
     await client.dispose()
     expect(globals.ResizeObserver).toBe(existing)
-    expect(globals.EventSource).toBeUndefined()
+    expect(globals.matchMedia).toBeUndefined()
+    expect(document.fonts).toBe(fonts)
+  })
+
+  it('restores an existing undefined fonts property after disposal', async () => {
+    const original = Object.getOwnPropertyDescriptor(document, 'fonts')
+    onTestFinished(() => {
+      if (original === undefined) Reflect.deleteProperty(document, 'fonts')
+      else Object.defineProperty(document, 'fonts', original)
+    })
+    const descriptor = { configurable: true, enumerable: true, writable: true, value: undefined }
+    Object.defineProperty(document, 'fonts', descriptor)
+    const client = await started({ roster: API_ROSTER })
+    expect(document.fonts).toBeInstanceOf(EventTarget)
+    await client.dispose()
+    expect(Object.getOwnPropertyDescriptor(document, 'fonts')).toEqual(descriptor)
   })
 
   it('boots separate client instances against their own mocks and keeps shared shims until the last dispose', async () => {
@@ -72,7 +104,7 @@ describe('TestClient (jsdom)', () => {
     onTestFinished(() => a.dispose())
     onTestFinished(() => b.dispose())
     const rename = async (client: TestClient): Promise<unknown> =>
-      (client.ctx as unknown as { remote: { session: { rename(request: unknown): Promise<unknown> } } }).remote.session.rename({ sessionId: 's', title: 't' })
+      (client.ctx as { remote: { session: { rename(request: unknown): Promise<unknown> } } }).remote.session.rename({ sessionId: 's', title: 't' })
     await expect(rename(a)).resolves.toEqual({ ok: true, value: { title: 'a', seq: 1 } })
     await expect(rename(b)).resolves.toEqual({ ok: true, value: { title: 'b', seq: 1 } })
     expect(mockA.log.calls('session/rename')).toHaveLength(1)
@@ -84,10 +116,12 @@ describe('TestClient (jsdom)', () => {
     expect(mockB.log.calls('session/rename')).toHaveLength(1)
     await a.dispose()
     expect('__DSH_TRANSPORT__' in globalThis).toBe(false)
-    expect(globals.EventSource).toBeDefined()
+    expect(globals.matchMedia).toBeDefined()
+    expect(document.fonts).toBeInstanceOf(EventTarget)
     await b.dispose()
     expect('__DSH_TRANSPORT__' in globalThis).toBe(false)
-    expect(globals.EventSource).toBeUndefined()
+    expect(globals.matchMedia).toBeUndefined()
+    expect(document.fonts).toBeUndefined()
   })
 
   it('boots two plugin trees concurrently instead of serializing the worker', async () => {
@@ -159,7 +193,8 @@ describe('TestClient (jsdom)', () => {
   it('creates no mount element when the roster cannot be loaded', async () => {
     const roster = ClientRoster.of([{ name: '@deepseek-ai/dsh-client-test-runtime-missing', inject: [], immediately: true }])
     const before = document.body.childElementCount
-    await expect(TestClient.start({ roster }, RemoteMock.create(), { mount: true })).rejects.toThrow()
+    await expect(TestClient.start({ roster }, RemoteMock.create(), { mount: true }))
+      .rejects.toThrow('client-test-runtime: cannot import @deepseek-ai/dsh-client-test-runtime-missing/client')
     expect(document.body.childElementCount).toBe(before)
   })
 
@@ -241,6 +276,6 @@ describe('TestClient (jsdom)', () => {
     const mock = RemoteMock.create().stream('$events', openStream([]))
     await expect(TestClient.start({ roster }, mock, { connectTimeoutMs: 300 }))
       .rejects.toThrow(/connection state is \S+ after 300ms; unmatched: \[unary workspace\/follow\]; streams: \[.*\$events \(open\).*\]/)
-    expect(globals.EventSource).toBeUndefined()
+    expect(globals.matchMedia).toBeUndefined()
   })
 })

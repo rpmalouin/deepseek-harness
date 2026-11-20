@@ -4,6 +4,8 @@
  * `useProjection('goal')`. A registrant-private activation hook source owns
  * the live Remote read and event subscription; the inject face carries that
  * hook plus the four mutation verbs through the generated Goal Remote API.
+ * Activation reads retain the Client Session through completion and wait
+ * for its initial history open to succeed before contacting the Host.
  * This plugin does not create goals; deployments may expose /goal separately.
  */
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
@@ -29,14 +31,24 @@ import type { GoalActionResult, GoalBarInjected } from './slots.ts'
 import { createGoalActivationSource } from './activation-source.ts'
 import { GoalDock } from './GoalBar.tsx'
 import { GoalCommandInputView } from './GoalCommandInputView.tsx'
+import { GoalCommandReference } from './GoalCommandReference.tsx'
 import { goalCommandInputDefinition } from './goal-command-input.ts'
-import { en, zh, type GoalKey } from './locales.ts'
+import { goalCommandReferenceRule } from './user-text-rules.ts'
+export type {} from './user-text-rules.ts'
+import { en, ja, es, fr, de, ru, pt, zh, type GoalKey } from './locales.ts'
 
 export { GoalBar, GoalDock } from './GoalBar.tsx'
 export type {
   GoalActionResult, GoalBarActions,
 } from './slots.ts'
 export type { GoalKey } from './locales.ts'
+
+declare module '@deepseek-ai/dsh-api-session-controller/client' {
+  interface SessionReferenceSourceMap {
+    /** A live goal read waiting for initial history and its RPC result. */
+    goalActivation: unknown
+  }
+}
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -57,7 +69,14 @@ export const inject = ['slots', 'sessions', 'remote', 'remote.goals', 'locale', 
  */
 export function apply(ctx: ClientContext): void {
   ctx.uiConversation.events.register(goalCommandInputDefinition)
-  ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'ui-goal: dictionaries')
+  ctx.uiConversation.userText.register(goalCommandReferenceRule)
+  ctx.effect(() => ctx.locale.register(NS, { zh, en, ja, es, fr, de, ru, pt }), 'ui-goal: dictionaries')
+
+  ctx.slots.inject('conversation.user.text.node', () => ctx.slots.register({
+    name: 'conversation.user.text.node',
+    key: 'command',
+    priority: 100,
+  }, GoalCommandReference))
 
   ctx.slots.inject('conversation.chat.node', () => ctx.slots.register({
     name: 'conversation.chat.node',
@@ -91,7 +110,18 @@ export function apply(ctx: ClientContext): void {
       const goalActivation = createGoalActivationSource({
         projection: binding.session.projections.faceOf('goal') as HostObservable<GoalProjection | null | undefined>,
         session: binding.session,
-        getGoal: () => ctx.remote.goals.get(sessionId),
+        getGoal: async () => {
+          if (sessions.binding(sessionId) !== binding) {
+            throw new Error(`ui-goal: session "${sessionId}" is unavailable`)
+          }
+          return sessions.using(sessionId, { source: 'goalActivation' }, async (reference) => {
+            const state = reference.binding.session.getSnapshot()
+            if (state.openState !== 'open') {
+              throw state.openError ?? new Error(`session "${sessionId}" is not open`)
+            }
+            return ctx.remote.goals.get(sessionId)
+          })
+        },
         subscribeActivation: listener => ctx.remote.$on('goal/activation-changed', (event) => {
           if (event.sessionId === sessionId) listener(event.goal)
         }),

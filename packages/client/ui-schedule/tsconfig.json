@@ -9,6 +9,9 @@
   ],
   "references": [
     {
+      "path": "../../util/text-search"
+    },
+    {
       "path": "../../api/session-controller/tsconfig.client.json"
     },
     {
@@ -18,13 +21,28 @@
       "path": "../../schedule/schedule"
     },
     {
-      "path": "../locale"
+      "path": "../locale/tsconfig.client.json"
     },
     {
-      "path": "../ui-conversation"
+      "path": "../ui-conversation/tsconfig.client.json"
     },
     {
       "path": "../ui-primitives"
+    },
+    {
+      "path": "../ui-layout"
+    },
+    {
+      "path": "../ui-sidebar"
+    },
+    {
+      "path": "../ui-sidebar-right"
+    },
+    {
+      "path": "../ui-tool"
+    },
+    {
+      "path": "../ui-workspace/tsconfig.client.json"
     },
     {
       "path": "../ui-renderer"
@@ -34,6 +52,15 @@
     },
     {
       "path": "../ui-slots"
+    },
+    {
+      "path": "../../api/remotes/tsconfig.client.json"
+    },
+    {
+      "path": "../connection/tsconfig.client.json"
+    },
+    {
+      "path": "../../util/values"
     }
   ]
 }

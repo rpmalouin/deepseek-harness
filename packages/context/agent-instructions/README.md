@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-`dsh-agent-instructions` gives agents workspace guidance from user-global and project-level `AGENTS.md`-compatible files. It loads the applicable chain for the first request. It does not watch external edits continuously: successful filesystem operations discover newly relevant nested files and make later changes or removals visible, while session resume reconciles the baseline. `dsh-base` enables this behavior by default, while profiles can disable it. A byte budget bounds the injected context: broader files are omitted before the most specific file is truncated, and an empty chain adds nothing.
+`dsh-agent-instructions` gives agents workspace guidance from user-global and project-level `AGENTS.md`-compatible files. It loads the applicable chain for the first request. It does not watch external edits continuously: successful filesystem operations discover newly relevant nested files and make later changes or removals visible, while session resume reconciles the baseline. `dsh-base` enables this behavior by default, while profiles can disable it. A byte budget bounds the user-global chain and the project chain separately: within each chain, broader files are omitted before the most specific file is truncated, and an empty chain adds nothing.
 
 ## Table of Contents
 
@@ -25,17 +25,21 @@ English | [中文](README.zh.md)
 <a id="use-this-package"></a>
 ## Use this package
 
-Mount this plugin when agents should work from the workspace's own instruction files. `dsh-base` already includes it with a 65,536-byte budget, so base-backed profiles only need to replace the row when they want another `maxBytes`; providerless trees load nothing until a filesystem provider is present.
+Changing the Session's working directory reloads the applicable project instruction chain before the next request.
+
+Mount this plugin when agents should work from the workspace's own instruction files. `dsh-base` already includes it with a 65,536-byte budget for each instruction chain, so base-backed profiles only need to replace the row when they want another `maxBytes`; providerless trees load nothing until a filesystem provider is present.
 
 ### What the agent gets
 
-The first request includes one durable baseline message with the user-global `$DSH_HOME/AGENTS.md` followed by the project chain — every existing candidate file from the project root down to the session working directory, in broad-to-specific order. Sibling files whose content matches after trimming render once, so a `CLAUDE.md` that duplicates its `AGENTS.md` is not repeated. After a successful `read`, `write`, or `edit` call reaches a deeper directory, the next request includes the newly applicable instruction file; a changed file replaces its content, and a file that disappears or duplicates an earlier candidate produces a removal notice.
+The first request includes one durable baseline message with the user-global chain — `$DSH_HOME/AGENTS.md`, then `<agentsHome>/AGENTS.md` — followed by the project chain: every existing candidate file from the project root down to the session working directory, in broad-to-specific order. Within one candidate group, files whose content matches after trimming render once: a `CLAUDE.md` that duplicates its `AGENTS.md` is not repeated, and a shared-root `AGENTS.md` that duplicates the harness-home file collapses behind it. After a successful `read`, `write`, or `edit` call reaches a deeper directory, the next request includes the newly applicable instruction file; a changed file replaces its content, and a file that disappears or duplicates an earlier candidate produces a removal notice.
 
 ### Configuration
 
-The defaults suit a typical checkout: `.git` marks the project root, `AGENTS.md` and `CLAUDE.md` are the base candidates, and `AGENTS.local.md` and `CLAUDE.local.md` are additive local overlays. Only `maxBytes` is required — it caps the complete rendered baseline so each deployment chooses its prompt budget explicitly.
+The defaults suit a typical checkout: `.git` marks the project root, `AGENTS.md` and `CLAUDE.md` are the base candidates, and `AGENTS.local.md` and `CLAUDE.local.md` are additive local overlays. Only `maxBytes` is required — it caps the user-global chain and the project chain separately within each rendered message, so each deployment chooses its prompt budget explicitly; a message that holds both chains is at most twice `maxBytes`.
 
-Root discovery climbs only when a marker probe confirms that the marker is absent. A permission or I/O failure stops discovery and surfaces the host or filesystem-provider error instead of selecting an ancestor project. The [root-marker metadata decision](../../../.agents/notes/implemented/bug-fix/2026-09-03-root-marker-metadata-failures.md) records why discovery fails instead of substituting another root.
+The harness home holding the user-global `AGENTS.md` is process policy rather than row configuration: the plugin resolves `$DSH_HOME`, or `~/.dsh`, through `@deepseek-ai/dsh-home-paths`, so instruction loading always reads the process home. The shared agents root resolves the same way, from `$DSH_AGENTS_HOME` or `~/.agents`. Stray `dshHome` and `agentsHome` row keys are ignored.
+
+Root discovery climbs only when a marker probe confirms that the marker is absent. A permission or I/O failure stops discovery and surfaces the host or filesystem-provider error instead of selecting an ancestor project. The [historical root-marker metadata decision](../../../.agents/notes/archived/bug-fix/2026-09-03-root-marker-metadata-failures.md) records why discovery fails instead of substituting another root.
 
 ```yaml
 - name: '@deepseek-ai/dsh-agent-instructions'
@@ -47,7 +51,6 @@ The accepted fields, at a glance:
 
 ```ts
 export interface Config {
-  dshHome?: string
   projectRootMarkers?: string[]
   maxBytes: number
   maxSourceBytes?: number
@@ -58,18 +61,19 @@ export interface Config {
 
 | Field | Default | Meaning |
 |---|---|---|
-| `maxBytes` | required | Cap on the complete rendered baseline message, in bytes |
+| `maxBytes` | required | Cap on each instruction chain (user-global, project) in one rendered message, in bytes; a message holding both chains is at most twice this size |
 | `maxSourceBytes` | `1048576` | Cap on one source instruction file before rendering |
 | `projectRootMarkers` | `['.git']` | Directory names that mark the project root |
 | `instructionFileCandidates` | `['AGENTS.md', 'CLAUDE.md']` | Base file names loaded in each project directory |
 | `localInstructionFileCandidates` | `['AGENTS.local.md', 'CLAUDE.local.md']` | Local overlay file names loaded after the base files |
-| `dshHome` | `$DSH_HOME` or `~/.dsh` | Directory containing the user-global `AGENTS.md` |
 
 The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-agent-instructions) is the exhaustive source for every accepted field and its JSDoc.
 
 ### Observing the budget
 
-Rendering keeps the most specific files first: it drops whole broader files before truncating the most-specific file, and emits a visible `Workspace instruction budget ...` notice naming the omitted and truncated paths. The rendered bytes never exceed `maxBytes`. An over-budget broad file is ignored; during refresh it is treated as temporarily unavailable rather than removed.
+Rendering budgets the user-global chain and the project chain separately, each under `maxBytes`. Within a chain it keeps the most specific files first: it drops whole broader files, truncates the last remaining file, and then falls back to a compact intro, to the budget notice with that file's empty heading, and finally to the notice alone. User-global files are therefore omitted or truncated only when they exceed their own budget, with the harness-home file omitted before the shared-root file, except in the fallback below. A visible `Workspace instruction budget ...` notice names the omitted and truncated paths of both chains. An over-budget broad file is ignored; during refresh it is treated as temporarily unavailable rather than removed.
+
+When all files fit within `maxBytes` together, the message holds them with no budget notice; when only one chain has files, that chain renders alone under `maxBytes`. Otherwise one `<system-reminder>` frame holds the merged budget notice when a file was omitted or truncated, one intro when a chain kept its frame, and the rendered sections of both chains in their loaded order, which puts user-global files first in a baseline; this message can exceed `maxBytes` and is at most twice that size. When a chain renders without a frame and the merged frame would exceed twice `maxBytes`, all files render as one chain under one `maxBytes` instead, which can omit a user-global file that fit its own budget; this needs a budget of a few hundred bytes or a budget notice that nearly fills or exceeds `maxBytes`. The [per-chain budget decision](../../../.agents/notes/implemented/architecture/2026-10-16-separate-instruction-chain-budgets.md) records why the two chains are budgeted separately.
 
 -----
 
@@ -92,10 +96,9 @@ The plugin is built on one principle: workspace instructions are durable convers
 | [`src/index.ts`](src/index.ts) | Plugin entry: pre-step listener, `tools/result` touch tracking, inbox composition |
 | [`src/config.ts`](src/config.ts) | `Config` schema, budget resolution, baseline identity |
 | [`src/files.ts`](src/files.ts) | Candidate discovery, project-root search, bounded streaming reads |
-| [`src/render.ts`](src/render.ts) | Instruction rendering, budget truncation, change records |
+| [`src/render.ts`](src/render.ts) | Instruction rendering, per-chain budget truncation, change records |
 | [`src/state.ts`](src/state.ts) | Durable message sources, version/digest cache, reconciliation |
-| [`src/digest.ts`](src/digest.ts) | SHA-1 content identity and per-directory duplicate keys |
-| — | No runtime invariant companion is published; replay intentionally tolerates unknown or malformed workspace sources, while focused pipeline tests own its private pending/cache state transitions. |
+| [`src/digest.ts`](src/digest.ts) | SHA-1 content identity and per-candidate-group duplicate keys |
 
 ### Main flow
 
@@ -140,6 +143,10 @@ Instructions from: ~/.dsh/AGENTS.md
 
 <user-global-instructions>
 
+Instructions from: ~/.agents/AGENTS.md
+
+<shared-agents-instructions>
+
 Instructions from: AGENTS.md
 
 <project-instructions>
@@ -148,7 +155,7 @@ Instructions from: AGENTS.md
 
 #### Token effect
 
-The rendered baseline is appended once and remains in derived history until compaction. `maxBytes` bounds the complete message, broader files are omitted before the most-specific file is truncated, and an empty chain contributes zero tokens.
+The rendered baseline is appended once and remains in derived history until compaction. `maxBytes` bounds the user-global chain and the project chain separately, so a baseline that holds both is at most twice `maxBytes`; within each chain, broader files are omitted before the most-specific file is truncated, and an empty chain contributes zero tokens.
 
 #### KV Cache effect
 
@@ -158,7 +165,7 @@ Append-only after the existing reusable prefix. Resume preserves reuse when the 
 
 #### What the model sees
 
-After a successful first-party filesystem call reaches a deeper directory, the next request includes one retained sourced `user/message` with the newly applicable instruction file.
+After a successful first-party filesystem call reaches a deeper directory, the next request includes one retained sourced `user/message` with the newly applicable instruction file. A user-global file discovered after the baseline renders the same section with `These user-global instructions apply to all work.` in place of the scope sentence below, because a user-global scope directory is an internal reconciliation key rather than a project directory.
 
 ##### Additional instruction template
 
@@ -198,7 +205,7 @@ The previously loaded instructions from this file no longer apply.
 
 #### Token effect
 
-Each confirmed change or removal is one retained history message bounded by `maxBytes`. Provider failures add no message, and an update omitted by the budget remains eligible for a later filesystem touch.
+Each batch of confirmed changes or removals is one retained history message. `maxBytes` bounds each instruction chain in it, so a batch with user-global and project changes is at most twice `maxBytes`. Provider failures add no message, and an update omitted by the budget remains eligible for a later filesystem touch.
 
 #### KV Cache effect
 
@@ -213,10 +220,13 @@ These limits define when instruction loading is a poor fit or needs operational 
 
 - **Discovery follows structured fs tools, not shell navigation** — a `bash` command that changes directories does not trigger nested instruction discovery because shell syntax and per-call shell state are not a reliable filesystem seam.
 - **Refresh is touch-driven** — there is no watcher; external edits become visible on the next successful first-party `read`, `write`, or `edit`, when resume reconciles a visible baseline, or when an entering pre-step restores a shadowed baseline.
-- **Candidate semantics stay intentionally small** — lowercase names, `.claude/rules/`, and `@path` imports are not interpreted; project scopes load `AGENTS.local.md`/`CLAUDE.local.md` overlays by default, but the user-global `$DSH_HOME` scope has no local overlay and other custom names require explicit candidate configuration.
-- **Per-directory dedup is content-based** — sibling candidates collapse only when byte-identical after trimming leading and trailing whitespace; a `CLAUDE.md` that symlinks its sibling `AGENTS.md` resolves to the same content and collapses like any duplicate, while a distinct real copy that has drifted from `AGENTS.md` loads in full alongside it.
+- **Candidate semantics stay intentionally small** — lowercase names, `.claude/rules/`, and `@path` imports are not interpreted; project scopes load `AGENTS.local.md`/`CLAUDE.local.md` overlays by default, but neither user-global root has a local overlay and other custom names require explicit candidate configuration. A project directory named like a user-global scope directory renders as `./<name>/...`, so it keeps its own scope instead of resolving to the global root.
+- **Deduplication is content-based within one candidate group** — candidates collapse only when byte-identical after trimming leading and trailing whitespace. The two user-global roots share one group, so the shared-root file collapses behind a matching harness-home file; sibling project candidates collapse the same way, while a distinct real copy that has drifted from `AGENTS.md` loads in full alongside it. A duplicate of budget-retained content stays reconciled: when the retained candidate changes or disappears, the duplicate becomes visible again. Unchanged hidden duplicates, including files removed from visible state as duplicates, use cached metadata instead of content reads.
+- **One candidate group shares failure fate** — when metadata or content cannot be read for any candidate, including a hidden duplicate, the group keeps its last-good state for that pass. An unreadable shared agents root therefore also postpones a harness-home change notice until a later pass observes both roots.
+- **A byte-budget omission does not re-enter reconciliation** — a candidate that its chain's budget dropped from the baseline, including any content duplicate of that candidate, is not probed again while that visible baseline holds; it becomes visible only after the baseline is rebuilt.
 - **Symlinked instruction files are followed across the trust boundary** — a candidate whose final component is a symlink is resolved and its target loaded, so a cloned repository can surface off-tree file content as lower-authority workspace guidance (it never overrides system, developer, or direct user instructions). Confine `ctx.fs` with the filesystem policy gate or an OS sandbox when loading untrusted repositories.
-- **Instruction content is bounded, not summarized** — over-budget broad files are omitted and the most-specific file may be truncated; the plugin never asks a model to compress instruction prose.
+- **Instruction content is bounded, not summarized** — within each chain, over-budget broad files are omitted and the chain's most-specific file may be truncated; the plugin never asks a model to compress instruction prose.
+- **Budget is not shared across chains** — bytes one chain leaves unused do not extend the other, so a 70 KiB user-global file is truncated to fit `maxBytes` even when the project chain uses 1 KiB.
 
 <a id="dev-note"></a>
 ### Dev Note

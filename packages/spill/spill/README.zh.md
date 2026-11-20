@@ -33,13 +33,13 @@ kind: "package-reference"
 
 ### 最小可用组合
 
-把后端与策略一起挂载；设置 `maxInlineBytes` 后，任何过大的纯文本工具结果都会自动变成预览加定位信息。
+把后端与策略一起挂载；设置 `maxInlineTokens` 后，过大的图文工具结果都会自动变成预览加定位信息。
 
 ```yaml
 - name: '@deepseek-ai/dsh-spill-local'
 - name: '@deepseek-ai/dsh-spill-policy'
   config:
-    maxInlineBytes: 50000
+    maxInlineTokens: 12500
 ```
 
 ### 保存文本
@@ -89,7 +89,6 @@ const ref = await ctx.spillStore.saveText({
 |---|---|
 | [`src/index.ts`](src/index.ts) | 插件入口：抽象 `SpillStore` 服务及其 `saveText` 约定 |
 | [`src/types.ts`](src/types.ts) | 词汇：`SaveTextSpill`、`SpillRef`、带品牌类型 `SpillLocator`、`SpillOwner`、`SpillSource` |
-| — | 不发布运行时不变式伴生入口；除归属 seam 强制执行的约定外，本包不暴露独立的事件序列或可变数据关系。 |
 
 ### 数据模型
 

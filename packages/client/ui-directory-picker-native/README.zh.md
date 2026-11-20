@@ -9,7 +9,7 @@ kind: "package-reference"
 
 ## 概述
 
-本包提供 Web GUI 的原生目录拾取表面：当工作区流程请求一个目录时，一个无渲染的浏览器填充会在本地机器上打开操作系统自带的选择器，并回报唯一结果——拾取的路径、取消或失败。它填充 `ui-workspace` 声明的两个目录流程 slot，用一行 `cordis.yml` 组合出原生拾取交互的客户端一侧。当浏览器与 Host 运行在同一台机器上时选择它；进程内与远程浏览器部署则需要 [`-browse`](../ui-directory-picker-browse/README.zh.md) 表面。
+本包提供 Web GUI 的原生目录拾取表面：当工作区流程请求一个目录时，一个无渲染的浏览器填充会在本地机器上打开操作系统自带的选择器，并回报唯一结果——拾取的路径、取消或失败。它填充 `ui-workspace` 声明的三个目录流程 slot，用一行 `cordis.yml` 组合出原生拾取交互的客户端一侧。当浏览器与 Host 运行在同一台机器上时选择它；进程内与远程浏览器部署则需要 [`-browse`](../ui-directory-picker-browse/README.zh.md) 表面。
 
 ## 目录
 
@@ -33,6 +33,8 @@ kind: "package-reference"
 
 当浏览器与 Host 运行在同一台机器上、操作系统对话框可以在那里打开时，选择此表面。当浏览器为远程或进程内、没有本地选择器时，选择 [`-browse`](../ui-directory-picker-browse/README.zh.md) 表面。两个表面填充相同的 slot，因此切换只是组合改动，而非代码改动。
 
+访问控制：三个目录选择流程只在当前 Peer 可以调用 `directoryPicker/pick` 时注册。owner 始终有权限。
+
 -----
 
 <a id="understand-the-implementation"></a>
@@ -41,7 +43,7 @@ kind: "package-reference"
 <details>
 <summary>实现细节——点击展开</summary>
 
-两个 slot 注册经嵌套的 `ctx.slots.inject()` 调用作为一个事务性 effect 安装，因为任一声明条目都可能晚些激活或替换其声明。填充在每个上升沿 `open` 时只武装一次，因此重渲染永远不会再拉起一个选择器；结算结果挂在 ref 上，让答复到达持有方最新的处理器。HMR（热模块替换）导致填充被替换时，卸载会整体丢弃结算：wire 没有按请求中止的机制，因此 Host 侧选择器会一直存活到被答复，而它的答复无处落地。node 半部是一个空 `apply`，让插件留在 Host 名单上。
+三个 slot 注册经嵌套的 `ctx.slots.inject()` 调用作为一个事务性 effect 安装，因为每个声明条目或 Factory 都可能晚些激活或替换其声明。填充在每个上升沿 `open` 时只武装一次，因此重渲染永远不会再拉起一个选择器；结算结果挂在 ref 上，让答复到达持有方最新的处理器。HMR（热模块替换）导致填充被替换时，卸载会整体丢弃结算：wire 没有按请求中止的机制，因此 Host 侧选择器会一直存活到被答复，而它的答复无处落地。node 半部是一个空 `apply`，让插件留在 Host 名单上。
 
 </details>
 
@@ -55,7 +57,7 @@ kind: "package-reference"
 - [dsh-host-directory-picker-native](../../host/directory-picker-native/README.zh.md)——本表面驱动的操作系统选择器后端。
 - [ui-workspace](../ui-workspace/README.zh.md)——声明目录流程 slot 并拥有拾取对话。
 - [ui-directory-picker-browse](../ui-directory-picker-browse/README.zh.md)——面向远程与进程内部署的应用内浏览替代方案。
-- [Web 客户端架构](../../../.agents/notes/implemented/architecture/2026-07-19-gui-web-client-architecture.zh.md)——浏览器插件行如何加载并注册 slot。
+- [Web 客户端架构](../../../docs/subsystems/web-client.zh.md)——浏览器插件行如何加载并注册 slot。
 
 -----
 
@@ -88,5 +90,3 @@ kind: "package-reference"
 无。
 
 </details>
-
-**运行时不变式：** 不发布伴生入口。插件将一个无渲染 flow occupant 作为一个事务性 effect 注册到两个 workspace hole；HMR 安全性规范证明该 effect 的释放行为，并且插件在各次 pick 之间不保留状态。

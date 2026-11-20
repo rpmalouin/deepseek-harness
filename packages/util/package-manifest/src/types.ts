@@ -1,5 +1,5 @@
 /**
- * Shared declarations for the package.json fields used by DSH plugin authors.
+ * Shared declarations for package.json fields and plugin display metadata.
  * Each reader owns JSON validation and resolved defaults.
  * @module @deepseek-ai/dsh-package-manifest/types
  */
@@ -12,10 +12,14 @@ export interface DshPackageManifest {
   version: string
   /** Package summary for discovery and display. */
   description?: string
+  /** SVG, PNG, JPEG, or WebP file relative to this manifest's directory, at most 256 KiB and contained there after realpath resolution. */
+  icon?: string
   /** Prevent npm publication, for example for local profile projects. */
   private?: boolean
   /** Packages installed alongside this package. */
   dependencies?: Record<string, string>
+  /** Packages that may be absent when installation or platform checks skip them. */
+  optionalDependencies?: Record<string, string>
   /** Compatible versions of packages supplied by the consuming project. */
   peerDependencies?: Record<string, string>
   /** Runtime requirements; DSH compatibility is declarative until a reader enforces it. */
@@ -36,6 +40,21 @@ export interface DshManifest {
   client?: DshClientManifest
 }
 
+/** Literal text or translations indexed by lowercase language id, with a required English fallback. */
+export type LocalizedText = string | { readonly en: string; readonly [locale: string]: string }
+
+/** Validated plugin display fields and diagnostics from exported locales, manifests, or icon files. */
+export interface PluginLocalizedMeta {
+  /** Display title; omission preserves the consumer's technical-name fallback. */
+  readonly title?: LocalizedText
+  /** Display introduction after locale and package-field fallback. */
+  readonly description?: LocalizedText
+  /** Base64 image data URL from a package root's manifest icon or an exported `<specifier>/icon`; render as an image, not inline markup. */
+  readonly icon?: string
+  /** Unmodified local metadata diagnostic; the plugin remains manageable. */
+  readonly error?: string
+}
+
 /** Runtime version requirements under `package.json.engines`. */
 export interface DshEnginesManifest {
   /** Compatible DSH versions as a SemVer range, including an exact version. */
@@ -50,8 +69,12 @@ export interface DshEnginesManifest {
 
 /** The configuration layer exported by a bundle package. */
 export interface DshBundleManifest {
-  /** Patch file path relative to the declaring package root. */
-  patch: string
+  /** Supported Node Host platform names; omission allows every operating system. */
+  platforms?: string[]
+  /** One patch file path, or an ordered list applied in sequence, each relative to the declaring package root. */
+  patch: string | string[]
+  /** Show the bundle in GUI lists before the profile enables or installs it; omission means true. */
+  listedByDefault?: boolean
 }
 
 /** The bundle composition declared by a profile directory. */

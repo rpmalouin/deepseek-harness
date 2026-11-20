@@ -17,6 +17,12 @@ export interface SelectConfirmation {
   readonly confirmLabel: string
 }
 
+/** Caller-owned group name and localized heading for popup options. */
+export interface SelectOptionGroup {
+  readonly name: string
+  readonly label: string
+}
+
 /** One option row of a popupSelect shell. */
 export interface SelectOption {
   readonly id: string
@@ -24,6 +30,8 @@ export interface SelectOption {
   /** Optional short marker rendered as a superscript beside the label. */
   readonly badge?: string
   readonly detail?: string
+  /** Equal group names share a sticky heading; groups retain first-occurrence order. */
+  readonly group?: SelectOptionGroup
   /**
    * The row the shell's highlight parks on when the panel opens, so an accept
    * gesture made without looking confirms the value in use. A business package
@@ -35,6 +43,15 @@ export interface SelectOption {
   readonly confirmation?: SelectConfirmation
 }
 
+/** Command-owned search copy, resolved when its popup opens. */
+export interface PopupSearchLabels {
+  readonly placeholder: string
+  /** Empty catalog, before filtering. */
+  readonly empty: string
+  /** Nonempty catalog with no matching rows. */
+  readonly noResults: string
+}
+
 /**
  * Business registration for the popupSelect command kind. Data is
  * self-served: options/onSelect use the business package's own protocol.
@@ -43,6 +60,11 @@ export interface SelectOption {
  */
 export interface PopupSelectSpec {
   readonly kind: 'popupSelect'
+  /**
+   * Supply localized search copy for this opening; omitted uses the shell's generic copy.
+   * @returns search placeholder and empty-state labels.
+   */
+  searchLabels?(): PopupSearchLabels
   options(session: ClientSessionContext, signal: AbortSignal): Promise<readonly SelectOption[]>
   onSelect(option: SelectOption, session: ClientSessionContext): void | Promise<void>
 }

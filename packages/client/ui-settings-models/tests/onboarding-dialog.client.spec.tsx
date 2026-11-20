@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { contextMenuHook } from '@deepseek-ai/dsh-client-test-runtime'
 /** First-run DeepSeek prompt behavior over the shared Models join. */
 import type { GlobalStandardProps } from '@deepseek-ai/dsh-client-ui-slots'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
@@ -6,7 +7,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import Schema from '@deepseek-ai/schemastery'
 import type { SettingsNamespaceView } from '@deepseek-ai/dsh-api-remotes/client'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
-import { bindSnapshotSelector, RemoteError } from '@deepseek-ai/dsh-client-test-runtime'
+import { allowAllAccess, bindSnapshotSelector, RemoteError } from '@deepseek-ai/dsh-client-test-runtime'
+import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import { DeepSeekOnboardingDialog } from '../src/client/DeepSeekOnboardingDialog.tsx'
 import type { DeepSeekOnboardingDialogProps } from '../src/client/DeepSeekOnboardingDialog.tsx'
 import { SettingsDescribeMirror } from '@deepseek-ai/dsh-client-ui-settings/src/client/settings-mirror.ts'
@@ -57,7 +59,7 @@ function deepSeekNamespace(apiKeyEnv: string | null): SettingsNamespaceView {
     value,
     base: value,
     user: {},
-    applies: 'live',
+    autoGenerate: true, applies: 'live',
     secrets: [],
     revision: 0,
   }
@@ -75,6 +77,7 @@ function harness(options: {
   settingsWritable?: boolean
   providersFailure?: string
   setFailure?: string
+  automatic?: boolean
 } = {}) {
   if (document.getElementById('root') === null) {
     const appRoot = document.createElement('div')
@@ -136,28 +139,33 @@ function harness(options: {
     },
   }
   // The page plugin's context, scripted down to the namespaces it reaches.
-  const ctx = { remote: face } as never
+  const ctx = { remote: { ...face, session: { initializeDefaultModel: async () => ({ ok: true, value: undefined }) } } } as never
   const operations = createModelsOperations(ctx)
   const controller = new ModelsSettingsStore(ctx, settingsSchema, new SettingsDescribeMirror(ctx))
   const openSection = vi.fn()
   const complete = vi.fn()
   const unusedHook = (() => { throw new Error('unused standard hook') }) as never
+  const automatic = createSnapshotStore(options.automatic ?? true)
   const props: DeepSeekOnboardingDialogProps = {
     stepId: 'deepseek-official',
     complete,
     openSection,
+    renderSlot: (_name, _props, options) => options?.fallback,
     useSessions: unusedHook,
     useSessionStatus,
     usePanelInfo, useSessionRetainInfo: () => undefined, useResource,
     useWorkspaces: unusedHook,
+    ...allowAllAccess,
+    useContextMenu: contextMenuHook(),
     controller,
     useModels: bindSnapshotSelector(controller.store),
+    useAutomatic: bindSnapshotSelector(automatic),
     operations,
     schema: settingsSchema,
     t: key => en[key],
   }
   return {
-    controller, complete, openSection, props, mutate, set,
+    automatic, controller, complete, openSection, props, mutate, set,
     configure: () => { fileConfigured = true },
   }
 }
@@ -280,4 +288,50 @@ describe('DeepSeekOnboardingDialog', () => {
     await waitFor(() => { expect(screen.queryByRole('dialog')).toBeNull() })
     expect(h.complete).toHaveBeenCalledOnce()
   })
+})
+
+it('offers account choice before reusing the existing API key editor', async () => {
+  const h = harness()
+  h.props.renderSlot = (_name, owner: unknown) => <button onClick={(owner as { useApiKey: () => void }).useApiKey}>Choose API key</button>
+  render(<DeepSeekOnboardingDialog {...h.props} />)
+  await waitFor(() => { expect(screen.getByRole('button', { name: 'Choose API key' })).toBeTruthy() })
+  fireEvent.click(screen.getByRole('button', { name: 'Choose API key' }))
+  expect(screen.getByRole('dialog')).toBeTruthy()
+  expect(h.complete).not.toHaveBeenCalled()
+})
+it('explicit account-menu setup reuses the editor without another login choice', async () => {
+  const h = harness({ configured: () => true })
+  h.props.explicit = true
+  const choice = vi.fn()
+  h.props.renderSlot = (_name, _owner, options) => { choice(); return options?.fallback }
+  render(<DeepSeekOnboardingDialog {...h.props} />)
+  await waitFor(() => { expect(screen.getByRole('dialog')).toBeTruthy() })
+  expect(choice).not.toHaveBeenCalled()
+  expect(h.complete).not.toHaveBeenCalled()
+})
+
+it('keeps an open step after automatic onboarding turns off', async () => {
+  const h = harness()
+  render(<DeepSeekOnboardingDialog {...h.props} />)
+  await waitFor(() => { expect(screen.getByRole('dialog')).toBeTruthy() })
+  act(() => { h.automatic.set(false) })
+  expect(screen.getByRole('dialog')).toBeTruthy()
+  expect(h.complete).not.toHaveBeenCalled()
+})
+
+it('completes without loading when automatic onboarding is off at mount', () => {
+  const h = harness({ automatic: false })
+  const load = vi.spyOn(h.controller, 'load')
+  const { container } = render(<DeepSeekOnboardingDialog {...h.props} />)
+  expect(container.innerHTML).toBe('')
+  expect(h.complete).toHaveBeenCalled()
+  expect(load).not.toHaveBeenCalled()
+})
+
+it('keeps explicit API key setup available when automatic onboarding is disabled', async () => {
+  const h = harness({ automatic: false })
+  h.props.explicit = true
+  render(<DeepSeekOnboardingDialog {...h.props} />)
+  await waitFor(() => { expect(screen.getByRole('dialog')).toBeTruthy() })
+  expect(h.complete).not.toHaveBeenCalled()
 })

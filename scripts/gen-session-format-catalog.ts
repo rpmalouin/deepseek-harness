@@ -203,15 +203,20 @@ export function renderSessionFormatCatalog(
     '',
     "import { KNOWN_SESSION_EVENT_TYPES } from '@deepseek-ai/dsh-session'",
     "import { createSessionFormatCatalog } from '@deepseek-ai/dsh-session-format'",
+    "import type { SessionFormatCatalogOptions } from '@deepseek-ai/dsh-session-format'",
     "import { validateInstalledCurrentSessionArtifact, validateInstalledCurrentSessionHeader } from './current.ts'",
     ...imports,
     '',
-    '/** Physical codec dispatch and complete adjacent chain, independent of mounted plugins. */',
-    'export const sessionFormatCatalog = createSessionFormatCatalog({',
+    '/** Static assembly shared by current reads and parent-specific historical restoration. */',
+    'export const sessionFormatCatalogOptions: SessionFormatCatalogOptions = {',
     `  currentVersion: ${currentVersion},`,
-    `  codecs: [${codecs.join(', ')}],`,
+    '  codecs: [',
+    ...codecs.map(codec => `    ${codec},`),
+    '  ],',
     `  currentEncoder: ${currentCodec},`,
-    `  migrations: [${declarations.map(item => item.migration).join(', ')}],`,
+    '  migrations: [',
+    ...declarations.map(item => `    ${item.migration},`),
+    '  ],',
     '  restoreCurrent(artifact) {',
     `    const restored = ${restorer}(artifact, KNOWN_SESSION_EVENT_TYPES)`,
     '    validateInstalledCurrentSessionArtifact(restored)',
@@ -225,7 +230,10 @@ export function renderSessionFormatCatalog(
     '    validateInstalledCurrentSessionHeader(header)',
     '    return header',
     '  },',
-    '})',
+    '}',
+    '',
+    '/** Physical codec dispatch and complete adjacent chain, independent of mounted plugins. */',
+    'export const sessionFormatCatalog = createSessionFormatCatalog(sessionFormatCatalogOptions)',
     '',
   ].join('\n')
 }
@@ -237,7 +245,7 @@ function main(): void {
   const target = resolve(root, OUT)
   if (process.argv.includes('--check')) {
     let current = ''
-    try { current = readFileSync(target, 'utf8') } catch { /* missing is stale */ }
+    try { current = readFileSync(target, 'utf8') } catch (_catalogUnreadable) { /* A missing or unreadable catalog compares unequal and reports stale. */ }
     if (current !== output) {
       console.error(`gen-session-format-catalog: ${OUT} is stale; run pnpm run gen-session-format-catalog`)
       process.exitCode = 1

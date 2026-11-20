@@ -11,7 +11,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { bindSnapshotSelector } from '@deepseek-ai/dsh-client-test-runtime'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type { SessionRetainInfo } from '@deepseek-ai/dsh-api-session-controller/client'
-import { SessionId } from '@deepseek-ai/dsh-session/types'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { AgentPresetLabel } from '../src/client/AgentPresetLabel.tsx'
 import type { AgentPresetLabelProps } from '../src/client/AgentPresetLabel.tsx'
 import { AgentPresetSeat } from '../src/client/AgentPresetSeat.tsx'
@@ -19,21 +19,21 @@ import type { AgentPresetSeatProps } from '../src/client/AgentPresetSeat.tsx'
 import type { AgentPresetSettingsState } from '../src/client/settings-store.ts'
 import type { AgentPresetSeatState } from '../src/client/seat-store.ts'
 import { en } from '../src/client/locales.ts'
+import { brandString } from '@deepseek-ai/dsh-brand'
 
 afterEach(cleanup)
 
 const ROSTER_READY: AgentPresetSettingsState = {
   status: 'ready',
   error: null,
-  options: [{ id: 'standard', trust: 'system', name: '标准模式' }, { id: 'mine', trust: 'user' }],
+  options: [{ id: 'standard' }, { id: 'mine' }],
 }
 
 const SEAT_READY: AgentPresetSeatState = {
-  showPicker: true,
   current: 'standard',
   options: [
-    { id: 'standard', trust: 'system', name: '标准模式', description: '完整的编码 agent。' },
-    { id: 'mine', trust: 'user' },
+    { id: 'standard' },
+    { id: 'mine' },
   ],
   busy: false,
   error: null,
@@ -54,19 +54,30 @@ function renderSeat(
   state: Partial<AgentPresetSeatState> = {},
   select: () => Promise<string | undefined> = () => Promise.resolve(undefined),
   session?: { id: string; retainInfo: SessionRetainInfo | undefined },
+  enabled = true,
 ) {
   const store = createSnapshotStore<AgentPresetSeatState>({ ...SEAT_READY, ...state })
-  const actions = { load: vi.fn(() => Promise.resolve()), select: vi.fn(select), introduced: vi.fn() }
-  render(<AgentPresetSeat {...({
+  const developerTools = createSnapshotStore(enabled)
+  const actions = {
+    load: vi.fn(() => Promise.resolve()), select: vi.fn(select), introduced: vi.fn(),
+    dismissRefusal: vi.fn((error: AgentPresetSeatState['error']) => {
+      if (store.getSnapshot().error === error && error !== null && typeof error === 'object') {
+        store.set({ ...store.getSnapshot(), error: error.reason })
+      }
+    }),
+  }
+  const props = {
     ...actions,
-    sessionId: session === undefined ? undefined : SessionId(session.id),
+    sessionId: session === undefined ? undefined : brandString<SessionId>(session.id),
+    useDeveloperTools: bindSnapshotSelector(developerTools),
     useAgentPresetSeat: bindSnapshotSelector(store),
     useSessionRetainInfo: session === undefined
       ? useSessionRetainInfo
       : <Selected,>(selector: (value: SessionRetainInfo | undefined) => Selected) => selector(session.retainInfo),
     t: translate,
-  } as unknown as AgentPresetSeatProps)} />)
-  return actions
+  } as AgentPresetSeatProps
+  render(<AgentPresetSeat {...props} />)
+  return { ...actions, developerTools, store }
 }
 
 function renderLabel(
@@ -90,10 +101,52 @@ function renderLabel(
 }
 
 describe('the new-session chip', () => {
-  it('renders nothing while the picker is disabled', () => {
-    renderSeat({ showPicker: false })
+  it.each([false, true])('offers Standard, Creator and custom presets with Developer tools %s', (enabled) => {
+    const actions = renderSeat({ options: [
+      { id: 'standard' }, { id: 'ptc' }, { id: 'minimal' }, { id: 'cordis' }, { id: 'mine' },
+    ] }, undefined, undefined, enabled)
 
-    expect(screen.queryByRole('button')).toBeNull()
+    fireEvent.click(screen.getByRole('button'))
+    expect(screen.getAllByRole('menuitem')).toHaveLength(enabled ? 5 : 3)
+    expect(screen.getByRole('menuitem', { name: /^Standard mode/ })).toBeTruthy()
+    expect(screen.getByRole('menuitem', { name: /^mine/ })).toBeTruthy()
+    expect(screen.queryByRole('menuitem', { name: /^PTC mode/ }) !== null).toBe(enabled)
+    expect(screen.queryByRole('menuitem', { name: /^Minimal mode/ }) !== null).toBe(enabled)
+    fireEvent.click(screen.getByRole('menuitem', { name: /^Creator mode/ }))
+    expect(actions.select).toHaveBeenCalledWith('cordis')
+  })
+
+  it('keeps a named custom preset that overrides a development preset id', () => {
+    renderSeat({ options: [{ id: 'ptc', name: 'My workflow' }] }, undefined, undefined, false)
+    fireEvent.click(screen.getByRole('button'))
+    expect(screen.getByRole('menuitem', { name: /^My workflow/ })).toBeTruthy()
+  })
+
+  it('keeps the current mode visible without opening a picker when all options are hidden', () => {
+    const actions = renderSeat({ current: 'minimal', options: [{ id: 'ptc' }, { id: 'minimal' }] }, undefined, undefined, false)
+    const trigger = screen.getByRole<HTMLButtonElement>('button', { name: en.presetMinimalName })
+    expect(trigger.disabled).toBe(true)
+    fireEvent.click(trigger)
+    expect(trigger.getAttribute('aria-expanded')).toBe('false')
+    expect(screen.queryByRole('menu')).toBeNull()
+    expect(actions.select).not.toHaveBeenCalled()
+  })
+
+  it('closes a picker when its last visible option disappears and keeps it closed when options return', () => {
+    const options = [{ id: 'minimal' }, { id: 'mine' }]
+    const actions = renderSeat({ current: 'minimal', options }, undefined, undefined, false)
+    const trigger = screen.getByRole<HTMLButtonElement>('button', { name: en.presetMinimalName })
+    fireEvent.click(trigger)
+    expect(screen.getByRole('menuitem', { name: /^mine/ })).toBeTruthy()
+    act(() => { actions.store.set({ ...actions.store.getSnapshot(), options: [{ id: 'ptc' }, { id: 'minimal' }] }) })
+    expect(trigger.disabled).toBe(true)
+    expect(trigger.getAttribute('aria-expanded')).toBe('false')
+    expect(screen.queryByRole('menu')).toBeNull()
+    act(() => { actions.store.set({ ...actions.store.getSnapshot(), options }) })
+    expect(trigger.disabled).toBe(false)
+    expect(trigger.getAttribute('aria-expanded')).toBe('false')
+    expect(screen.queryByRole('menu')).toBeNull()
+    expect(actions.select).not.toHaveBeenCalled()
   })
 
   it('renders only for a Session retained by the main view', () => {
@@ -127,6 +180,19 @@ describe('the new-session chip', () => {
     // in for the name.
     expect(screen.getByText(en.noDescription)).toBeTruthy()
     expect(screen.getByText('mine')).toBeTruthy()
+  })
+
+  it('closes the picker immediately when developer tools turn off without changing the staged preset', () => {
+    const actions = renderSeat()
+    fireEvent.click(screen.getByRole('button'))
+    expect(screen.getByText(en.presetStandardDescription)).toBeTruthy()
+    act(() => { actions.developerTools.set(false) })
+    expect(screen.getByRole('button').getAttribute('aria-expanded')).toBe('false')
+    expect(screen.queryByText(en.presetStandardDescription)).toBeNull()
+    expect(actions.select).not.toHaveBeenCalled()
+    act(() => { actions.developerTools.set(true) })
+    expect(screen.getByRole('button').getAttribute('aria-expanded')).toBe('false')
+    expect(screen.getByRole('button').textContent).toContain(en.presetStandardName)
   })
 
   it('falls back to the id when the staged preset published no name', () => {
@@ -184,28 +250,34 @@ describe('the new-session chip', () => {
 })
 
 describe('a refused switch', () => {
-  it('announces the reason instead of letting the label snap back in silence', async () => {
+  it('announces delayed and repeated refusals even without a composed preset or Coding Tools', () => {
     // The banner's own timer has to be a fake one from the start, or the
     // lifetime assertion below would wait out its real nine seconds.
     vi.useFakeTimers({ shouldAdvanceTime: true })
     try {
       const reason = 'failed to import loader entry live-on-mac (@deepseek-ai/dsh-also-gone)'
-      renderSeat({}, () => Promise.resolve(reason))
-
-      fireEvent.click(screen.getByRole('button'))
-      fireEvent.click(screen.getByRole('menuitem', { name: /mine/ }))
+      const actions = renderSeat({ current: '' }, undefined, undefined, false)
+      const refusal = { preset: { id: 'cordis' }, reason }
+      act(() => { actions.store.set({ ...actions.store.getSnapshot(), error: refusal }) })
 
       // The host refuses a mount discovery reported healthy, so this banner is
       // the only place the cause appears — the chip has already reverted and
       // the settings row shows the preset as fine.
-      const banner = await screen.findByRole('alert')
+      const banner = screen.getByRole('alert')
       expect(banner.textContent).toContain(reason)
-      expect(banner.textContent).toContain('mine')
+      expect(banner.textContent).toContain(en.presetCordisName)
+      expect(screen.queryByRole('button')).toBeNull()
+
+      act(() => { vi.advanceTimersByTime(7000) })
+      act(() => { actions.store.set({ ...actions.store.getSnapshot(), error: { ...refusal } }) })
+      act(() => { vi.advanceTimersByTime(2001) })
+      expect(screen.getByRole('alert').textContent).toContain(reason)
 
       // Transient by design: it holds long enough to read a cause that names
       // packages, then leaves rather than sitting over the screen.
       act(() => { vi.advanceTimersByTime(9001) })
       expect(screen.queryByRole('alert')).toBeNull()
+      expect(actions.dismissRefusal).toHaveBeenCalledOnce()
     } finally {
       vi.useRealTimers()
     }
@@ -238,7 +310,7 @@ describe('the chip introduce cue', () => {
     vi.useFakeTimers()
     const actions = renderSeat({
       current: 'creator',
-      options: [{ id: 'creator', trust: 'user', name: 'CreatorMode' }],
+      options: [{ id: 'creator', name: 'CreatorMode' }],
       introduce: true,
     })
 
@@ -264,7 +336,7 @@ describe('the chip introduce cue', () => {
     vi.useFakeTimers()
     renderSeat({
       current: 'creator',
-      options: [{ id: 'creator', trust: 'user', name: '创造模式' }],
+      options: [{ id: 'creator', name: '创造模式' }],
       introduce: true,
     })
 
@@ -280,7 +352,7 @@ describe('the chip introduce cue', () => {
     vi.useFakeTimers()
     const actions = renderSeat({
       current: 'creator',
-      options: [{ id: 'creator', trust: 'user', name: 'C' }],
+      options: [{ id: 'creator', name: 'C' }],
       introduce: true,
     })
 
@@ -301,7 +373,7 @@ describe('the chip introduce cue', () => {
     vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: false })))
     const actions = renderSeat({
       current: 'creator',
-      options: [{ id: 'creator', trust: 'user', name: '' }],
+      options: [{ id: 'creator', name: '' }],
       introduce: true,
     })
 

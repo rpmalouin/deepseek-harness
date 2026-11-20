@@ -9,8 +9,8 @@ import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-test
 import { createUserMessage, LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { SESSION_FORMAT_VERSION } from '@deepseek-ai/dsh-session'
-import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
-import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
+import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import { defineContentToolFixture } from '@deepseek-ai/dsh-tool-testkit'
 import { assertBuiltBenchmarkRuntime } from '../support/built-worker.ts'
 import { PARENT_ID, response, resultText, syntheticHistory, TIME_ZERO, WORKLOAD } from './workload.ts'
 

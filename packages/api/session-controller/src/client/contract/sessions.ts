@@ -14,7 +14,7 @@ import type { SessionSearchResultItem } from '../sessions/manager.ts'
 import type { SessionBinding, SessionListState } from '../sessions/service.ts'
 import type { SessionFace } from './session.ts'
 import type { ObservableSnapshot } from '@deepseek-ai/dsh-client-store'
-import type { SessionReferenceSource } from '../index.ts'
+import type { SessionReferenceSource, SessionRetainFacet } from '../index.ts'
 
 export type { AgentContext } from '../scope.ts'
 
@@ -32,9 +32,20 @@ export interface SessionReference extends Disposable {
   release(): void
 }
 
-/** Consumer identity and optional cancellation of one acquisition waiter. */
+/** Consumer identity, retained facets, and optional cancellation of one acquisition waiter. */
 export interface SessionRetainOptions {
   readonly source: SessionReferenceSource
+  /**
+   * Whether this reference keeps the Session's own event connection and the event window it keeps current, so a
+   * return shows the data at once. Defaults to `true`; `false` keeps only the Session object and its local state,
+   * such as the composer draft. This is not the page's transport connection.
+   */
+  readonly connection?: boolean | undefined
+  /**
+   * Owner-declared facets this reference keeps computing over the Session's data; an absent key is not computed.
+   * The set is fixed for the reference's lifetime.
+   */
+  readonly facets?: Readonly<Partial<Record<SessionRetainFacet, true>>> | undefined
   readonly signal?: AbortSignal | undefined
 }
 
@@ -43,6 +54,13 @@ export interface SessionRetainInfo {
   readonly referenceCount: number
   /** Positive source counts only; a source without references is absent. */
   readonly retainedBy: Readonly<Partial<Record<SessionReferenceSource, number>>>
+  /**
+   * Positive counts of references retaining each facet; absent while no reference retains any facet.
+   * Owners read their facet here, for example `(info.retainedFacets?.conversation ?? 0) > 0`.
+   */
+  readonly retainedFacets?: Readonly<Partial<Record<SessionRetainFacet, number>>>
+  /** Positive count of references keeping the event connection; absent while none does. */
+  readonly connectionCount?: number
 }
 
 /** The sessions-service face injected as `ctx.sessions`. */
@@ -79,33 +97,31 @@ export interface ISessions {
    */
   readonly searchResultLimit: number
   /**
-   * Create or adopt a Session on the Host.
-   * @param opts - target workspace, directory, and optional preallocated identity.
-   * @returns the catalogued identity; retain it before borrowing its binding.
+   * Create a Session for a new conversation on the Host. The Host reuses the
+   * named blank Session while it is reusable and otherwise creates another; the
+   * Session runs the named preset, or the Host default when none is named.
+   * @param opts - target workspace or directory, an optional blank Session to reuse, and an optional Agent preset.
+   * @returns the catalogued identity the Host created or reused; retain it before borrowing its binding.
    */
   create(opts?: {
     workspaceId?: WorkspaceId
     cwd?: string
     sessionId?: SessionId
+    agentPreset?: string
   }): Promise<SessionId>
   /**
    * Resolve an already discovered direct-parent address without opening it.
    * @param id - possible addressed child id.
-   * @returns the retained address, when present.
+   * @returns a retained, catalog-derived, or unknown-mode listed address, without retaining a new selection or scope.
    */
   subagentAddress(id: SessionId): SubagentAddress | undefined
+
   /**
-   * Mark whether a catalog menu is consuming live membership updates.
-   * @param parentSessionId - catalog owner.
-   * @param open - current menu state.
-   */
-  setSubagentCatalogOpen(parentSessionId: SessionId, open: boolean): void
-  /**
-   * Refresh one direct-child catalog.
-   * @param parentSessionId - catalog owner.
+   * Read projections without starting migration; retry failed or migration-deferred reads.
+   * @param sessionId - Session to inspect without opening its conversation.
    * @returns completion of the current or newly started refresh.
    */
-  refreshSubagents(parentSessionId: SessionId): Promise<void>
+  refreshProjections(sessionId: SessionId): Promise<void>
 
   /**
    * Refresh the Host-authoritative Session list.
@@ -124,16 +140,25 @@ export interface ISessions {
     signal: AbortSignal,
   ): Promise<RemoteResult<{ items: SessionSearchResultItem[]; hasMore: boolean }>>
   /**
-   * Fork a session from a completed-turn prefix of the source; on resolution
-   * the child is in the catalog and may be explicitly retained.
-   * @param opts - source session id, the optional event seq anchoring the
-   *   cut (the boundary is the first turn/end at or after it; an in-log
-   *   anchor in an open turn is unavailable rather than clipped backward),
-   *   and whether to increment an inherited durable title before resolving.
+   * Fork a session from an exact inclusive prefix of the source; on
+   * resolution the child is catalogued and can be explicitly retained.
+   * @param opts - source session id, the optional exact inclusive boundary
+   *   seq (a real event seq the caller already knows; a cut inside an open
+   *   turn is balanced Host-side with synthetic closers, and omission selects
+   *   the latest completed-turn prefix), and whether to increment an
+   *   inherited durable title, skipping numbers Host-listed titles already use,
+   *   before resolving. `onCreated` observes the catalogued child before that optional rename.
    * @returns the child session id.
    * @throws when the fork fails, or when a requested child-title rename fails after creation.
    */
-  fork(opts: { sessionId: SessionId; atSeq?: number; increaseTitle?: boolean }): Promise<SessionId>
+  fork(opts: {
+    sessionId: SessionId
+    atSeq?: number
+    increaseTitle?: boolean
+    onCreated?: (childId: SessionId) => void
+    /** False refuses source migration; omission preserves the Host default. */
+    allowMigration?: boolean
+  }): Promise<SessionId>
   /**
    * Borrow an already-retained Agent-scoped Context without extending its lifetime.
    * @param id - session id.

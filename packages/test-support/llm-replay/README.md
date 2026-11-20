@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-`dsh-llm-replay` lets snapshot tests run the real agent without an API key by replaying model streams from recorded Session JSONL fixtures. Each parent and subagent session receives its recorded script in first-call order, while calls within a session advance independently. A `replay.override.json` sidecar represents pre-chunk failures, cancellation, hangs, and injected retries that durable settlements cannot reconstruct. Use it for deterministic ACP, headless, and Web browser scenarios that need real loop behavior with fixed model output.
+`dsh-llm-replay` lets snapshot tests run the real agent without an API key by replaying model streams from recorded Session JSONL fixtures. Each parent and subagent session receives its recorded script in first-call order, while calls within a session advance independently. A `replay.override.json` sidecar supplies scenario behavior absent from the selected fixture, including failures, cancellation, hangs, retries, and authored adaptations of retained programs. Use it for deterministic ACP, headless, and Web browser scenarios that need real loop behavior with fixed model output.
 
 ## Table of Contents
 
@@ -28,6 +28,8 @@ English | [中文](README.zh.md)
 This package gives a keyless test a real agent with a fixed model transcript: mount it in place of a real LLM adapter, point it at a recorded fixture, and run the scenario exactly as if the model had produced the recorded output.
 
 ### Mounting it
+
+Prepared callers require the routed adapter mode. Configure `models[].reasoningEfforts` from least to greatest selectable effort. Configuration functions receive that order during preparation; `defaultReasoningEffort` remains independent of the first entry.
 
 With `providers` configured, the plugin registers a replay-only adapter whose catalog is available to scenarios that exercise model discovery; without `providers`, it installs the catch-all `llm/stream` waterfall used by tests that do not need discovery:
 
@@ -77,11 +79,15 @@ When replay serves `deepseek-official` with `ctx.deepseekLlmApiExtensions`, it p
 
 Two failure modes are not reconstructable from a durable Assistant settlement alone: a pure throw before any chunk has no exception-bearing stream member, and a cancel/hang requires nontermination rather than a replayed finite prefix. A scenario that needs those supplies an optional sidecar (`<scenario>/replay.override.json`) that either replaces the derived script with a bare `ReplayEntry[]` or augments it with `{ patches: [{ at, entry }] }`, which keeps every derived call and swaps the named 0-based call indexes; `at` equal to the derived length appends the retry attempt after an injected transient throw. A `throw` entry accepts DeepSeek request extensions when it has prefix chunks; a zero-chunk throw defaults to pre-2xx non-acceptance and may set `accepted: true` for a post-2xx failure. A `hang` entry may name `readyFile`, which replay writes before waiting for cancellation so an external driver can cancel deterministically.
 
+A scenario pinned to a historical or retired-tool recording may use an authored override to adapt its program to current execution instructions while preserving the retained Session. Mark the adapted scenario as `recording: authored`. Ordinary successful scripts derive from their selected Session.
+
 ### What can go wrong
 
 - **The fixture is not fully consumed** — `assertConsumed()` at teardown turns a scenario that silently drove fewer model calls than recorded into a crisp diagnostic; call it when installing replay directly in a test.
 - **An unrecorded session makes a call** — replay fails loud and tells you to re-record the scenario.
 - **A scripted placeholder matches nothing** — `{{fromRequest:<regex>}}` resolution validates the pattern and the request corpus and fails loud on no match, an invalid pattern, or an unterminated placeholder.
+
+Isolated transcript extraction supplies an explicit empty child-fact set to V3→V4. It retains recorded catalog entries but does not discover related files. Complete historical parent catalog migration belongs to JSONL persistence.
 
 -----
 
@@ -105,7 +111,6 @@ The [committed-corpus test](tests/session-format-corpus.spec.ts) restores each v
 |---|---|
 | [`src/index.ts`](src/index.ts) | Types, fixture derivation, override validation, placeholder resolution, session binding, `installLlmReplay`, and the plugin export |
 | [`tests/session-format-corpus.spec.ts`](tests/session-format-corpus.spec.ts) | Committed-generation restoration and exact historical refusal checks |
-| — | No runtime invariant companion is published; this test-only adapter consumes a fixed replay script; its stream grammar is checked by the LLM companion and fixture derivation tests. |
 
 ### Binding and stream flow
 

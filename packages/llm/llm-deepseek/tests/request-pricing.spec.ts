@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { offloadedImageText, requestImageHandleText, textOnlyImageText } from '@deepseek-ai/dsh-llm'
 import type { ImageBlock } from '@deepseek-ai/dsh-llm'
-import { AttachmentId } from '@deepseek-ai/dsh-attachment'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { AttachmentId } from '@deepseek-ai/dsh-attachment/types'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
-import { deepSeekImageRequestPricing } from '../src/common/request-pricing.ts'
+import { deepSeekImageRequestPricing } from '../src/request-pricing.ts'
 import { resolveAdapterOptions } from '../src/index.ts'
-import type { Config } from '../src/index.ts'
+import type { Options as Config } from '../src/index.ts'
+import { adapter } from './helpers.ts'
 
 const VISION_MODEL = {
   id: 'vision',
@@ -14,7 +16,7 @@ const VISION_MODEL = {
 
 function ref(name: string, width: number, height: number, bytes = 1024): ImageAttachmentRef {
   return {
-    attachmentId: AttachmentId(`sha256:${name.padEnd(8, '0')}`),
+    attachmentId: brandString<AttachmentId>(`sha256:${name.padEnd(8, '0')}`),
     mediaType: 'image/png',
     bytes,
     width,
@@ -133,4 +135,12 @@ describe('DeepSeek request-image pricing', () => {
     ).priceImages([block(oversized)])
     expect(prices.map(price => price.visualTokens)).toEqual([422])
   })
+})
+
+it('exposes the same image dimensions and byte budget used by DeepSeek request preparation', () => {
+  const model = { ...VISION_MODEL, imagePixelBudget: 10_000, imageMaxBytes: 50_000 }
+  const source = ref('screenshot', 1000, 1000, 60_000)
+  const provider = adapter({ models: [model] })
+  expect(provider.imageRequestTarget('deepseek', 'vision', source)).toEqual({ width: 100, height: 100, maxBytes: 50_000 })
+  expect(() => provider.imageRequestTarget('deepseek', 'missing', source)).toThrow('no declared image projection')
 })

@@ -3,13 +3,14 @@ import {
   type FocusEvent, type MouseEvent, type ReactNode,
 } from 'react'
 import {
-  DisclosureRow, IconChevronRightOutline14, StateDot,
+  DisclosureRow, IconChevronRightOutlineRegular, StateDot,
   type DisclosureRowProps, type StateDotState,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type { SessionListState, SessionTarget } from '@deepseek-ai/dsh-api-session-controller/client'
 import { shallowEqual } from '@deepseek-ai/dsh-client-store'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import type { SessionStatusSnapshot } from '@deepseek-ai/dsh-client-ui-session-status/client'
 import type { WorkflowRunKey } from './locales.ts'
 import type {
   WorkflowRunMemberData, WorkflowRunPhaseData, WorkflowRunStatus,
@@ -179,22 +180,23 @@ function phaseStatusSummary(members: readonly WorkflowRunMemberData[], t: Workfl
   return visible.map(status => statusCount(status, count(status), t)).join(' · ')
 }
 
+type ChildMode = Exclude<SessionTarget, SessionId>['mode']
+
 function navigableMembers(
   sessions: SessionListState,
   phases: readonly WorkflowRunPhaseData[],
   parentId: SessionId,
-): readonly SessionId[] {
-  const ordinary = new Set(sessions.ids)
-  const result: SessionId[] = []
+  statuses: SessionStatusSnapshot,
+): ReadonlyMap<SessionId, ChildMode> {
+  const result = new Map<SessionId, ChildMode>()
   for (const phase of phases) {
     for (const member of phase.members) {
-      const summary = sessions.byId[member.childId]
+      const child = sessions.byId[member.childId]
+      const identity = sessions.projectionsBySession[member.childId]?.values.subagent
       if (member.status === 'running'
-        && ordinary.has(member.childId)
-        && summary?.origin === 'subagent'
-        && summary.parentId === parentId
-        && summary.running) {
-        result.push(member.childId)
+        && child?.parentId === parentId && identity !== undefined && identity !== null
+        && (statuses.get(child.id)?.running ?? child.running)) {
+        result.set(member.childId, identity.mode)
       }
     }
   }
@@ -212,7 +214,7 @@ function RunHeader({ children, count, name, onToggle, open, status, t }: {
 }) {
   return (
     <StatusDisclosure
-      icon={<IconChevronRightOutline14 />}
+      icon={<IconChevronRightOutlineRegular />}
       title={t('run.title', { name })}
       open={open}
       onToggle={onToggle}
@@ -220,6 +222,8 @@ function RunHeader({ children, count, name, onToggle, open, status, t }: {
       previewChevron={false}
       keepContentWhenOpen
       rowClassName={css.runHeader}
+      contentClassName={css.headerContent}
+      contentLayoutClassName={css.headerContentLayout}
       leadingClassName={css.runLeading}
       titleClassName={css.runTitle}
       collapsedContent={(
@@ -238,13 +242,14 @@ function RunHeader({ children, count, name, onToggle, open, status, t }: {
   )
 }
 
-function MemberRow({ member, navigable, openSession, parentSessionId, t }: {
+function MemberRow({ member, mode, openSession, parentSessionId, t }: {
   readonly member: WorkflowRunMemberData
-  readonly navigable: boolean
+  readonly mode: ChildMode | undefined
   readonly openSession: WorkflowRunInjected['openSession']
   readonly parentSessionId: SessionId
   readonly t: WorkflowRunPanelProps['t']
 }) {
+  const navigable = mode !== undefined
   const name = readableMember(member.label, t)
   const [focused, setFocused] = useState(false)
   const renderButton = navigable || focused
@@ -269,12 +274,12 @@ function MemberRow({ member, navigable, openSession, parentSessionId, t }: {
       tabIndex={navigable ? undefined : -1}
       onFocus={() => { setFocused(true) }}
       onBlur={() => { setFocused(false) }}
-      onClick={navigable
+      onClick={mode !== undefined
         ? () => {
           openSession({
             parentSessionId,
             childSessionId: member.childId,
-            mode: 'one-shot',
+            mode,
           })
         }
         : undefined}
@@ -294,7 +299,7 @@ function PhaseSection({
   readonly open: boolean
   readonly pendingCleanCollapse: boolean
   readonly phase: WorkflowRunPhaseData
-  readonly navigable: readonly SessionId[]
+  readonly navigable: ReadonlyMap<SessionId, ChildMode>
   readonly openSession: WorkflowRunInjected['openSession']
   readonly parentSessionId: SessionId
   readonly t: WorkflowRunPanelProps['t']
@@ -305,7 +310,7 @@ function PhaseSection({
       onMouseDownCapture={pendingCleanCollapse ? preventPendingHeaderFocus : undefined}
     >
       <StatusDisclosure
-        icon={<IconChevronRightOutline14 />}
+        icon={<IconChevronRightOutlineRegular />}
         title={readablePhase(phase.phase, t)}
         open={open}
         onToggle={onToggle}
@@ -313,6 +318,8 @@ function PhaseSection({
         previewChevron={false}
         keepContentWhenOpen
         rowClassName={css.phaseHeader}
+        contentClassName={css.headerContent}
+        contentLayoutClassName={css.headerContentLayout}
         leadingClassName={css.phaseLeading}
         titleClassName={css.phaseTitle}
         collapsedContent={(
@@ -328,7 +335,7 @@ function PhaseSection({
             <MemberRow
               key={member.seq}
               member={member}
-              navigable={navigable.includes(member.childId)}
+              mode={navigable.get(member.childId)}
               openSession={openSession}
               parentSessionId={parentSessionId}
               t={t}
@@ -341,7 +348,7 @@ function PhaseSection({
 }
 
 /** Render one durable workflow run with status-driven run and phase disclosure. */
-export function WorkflowRunPanel({ node, sessionId, useSessions, openSession, t }: WorkflowRunPanelProps) {
+export function WorkflowRunPanel({ node, sessionId, useSessions, useSessionStatus, openSession, t }: WorkflowRunPanelProps) {
   const phaseFacts = useMemo(() => node.data.phases.map(phase => (
     [phase.key, phaseDisclosureFacts(phase)] as const
   )), [node.data.phases])
@@ -356,8 +363,9 @@ export function WorkflowRunPanel({ node, sessionId, useSessions, openSession, t 
   }))
   const runContentRef = useRef<HTMLDivElement>(null)
   const phaseContentRefs = useRef(new Map<string, HTMLDivElement>())
+  const statuses = useSessionStatus(value => value)
   const navigable = useSessions(
-    sessions => navigableMembers(sessions, node.data.phases, sessionId),
+    sessions => navigableMembers(sessions, node.data.phases, sessionId, statuses),
     shallowEqual,
   )
 

@@ -1,6 +1,7 @@
 /** Generic unary RPC contracts shared by the Host and Client Connection halves. */
 
 import type { Branded } from '@deepseek-ai/dsh-brand'
+import type { PeerScope, Principal } from '@deepseek-ai/dsh-typert-protocol'
 
 /** Correlation id minted by a caller and echoed by the Connection response. */
 export type RpcId = Branded<'rpc-id'>
@@ -24,6 +25,24 @@ export interface ConnectionRpcFailure {
 /** Carrier-neutral result returned by one logical RPC endpoint. */
 export type ConnectionRpcResult<T> =
   | { readonly ok: true; readonly value: T }
+  | { readonly ok: false; readonly error: ConnectionRpcFailure }
+
+/** One binary value separated from a successful RPC result before transport framing. */
+export interface ConnectionRpcAttachment {
+  /** Result-relative path occupied by the attachment's `null` placeholder. */
+  readonly path: readonly (string | number)[]
+  /** Byte view carried outside the JSON response metadata. */
+  readonly bytes: Uint8Array
+}
+
+/** Successful or failed handler result ready for Connection transport framing. */
+export type ConnectionRpcHandlerResult =
+  | {
+    readonly ok: true
+    readonly value: unknown
+    /** Binary fields already projected by the handler that owns the result protocol. */
+    readonly attachments?: readonly ConnectionRpcAttachment[]
+  }
   | { readonly ok: false; readonly error: ConnectionRpcFailure }
 
 /** Historical short name for a generic Connection result. */
@@ -79,29 +98,40 @@ export type RpcMessage = ClientRequest | ServerResponse
 export interface ConnectionTrustRequest {
   /** Request headers supplied by either the Fetch or node:http representation. */
   readonly headers: Headers | Readonly<Record<string, string | readonly string[] | undefined>>
-}
-
-/** HTTP status returned before dispatch, or undefined when the request may proceed. */
-export type ConnectionRequestRejection = 401 | 403 | undefined
-
-/** Root/index request facts used by the browser-token exchange. */
-export interface ConnectionIndexRequest extends ConnectionTrustRequest {
+  /** Cancellation of a Fetch request. */
+  readonly signal?: AbortSignal | undefined
+  /** Current disconnection state of a Node carrier. */
+  readonly socket?: { readonly destroyed: boolean } | undefined
+  /** Method and target supplied by the HTTP carrier. */
   readonly method?: string | undefined
   readonly url?: string | undefined
 }
 
-/** Root/index response operations owned by the browser-token exchange. */
-export interface ConnectionIndexResponse {
-  writeHead(status: number, headers?: Readonly<Record<string, string>>): unknown
-  end(body?: string): unknown
+/** A credential verifier returning the existing Peer this request may represent. */
+export interface AuthenticationProvider {
+  /**
+   * Verify one request using this implementation's credentials.
+   * @param request - current request headers and cancellation facts.
+   * @returns a provider-owned Peer, or undefined to try the next provider.
+   */
+  authenticate(request: ConnectionTrustRequest): PeerScope | undefined
 }
 
-/** Handler invoked after Connection has decoded the transport envelope. */
+/** Outcome of admitting one request: the Peer it speaks for, or the status refusing it. */
+export type PeerAdmission =
+  | { readonly peer: PeerScope }
+  | { readonly rejection: 401 | 403 | 503 }
+
+/**
+ * Handler invoked after Connection has decoded the transport envelope.
+ * `peer` is the Peer the carrier admitted or the in-process caller supplied.
+ */
 export type ConnectionRpcHandler = (
   endpoint: string,
   payload: unknown,
   signal: AbortSignal,
-) => Promise<ConnectionRpcResult<unknown>>
+  peer: PeerScope,
+) => Promise<ConnectionRpcHandlerResult>
 
 /** Synchronous ownership test for one endpoint on a shared RPC channel. */
 export type ConnectionRpcEndpointMatcher = (endpoint: string) => boolean
@@ -120,7 +150,11 @@ export interface ConnectionFetchRoute {
   readonly methods: readonly ConnectionFetchMethod[]
   /** Buffered requests obey the configured JSON cap; streaming requests arrive with backpressure and no aggregate cap. */
   readonly requestBody: ConnectionRequestBodyMode
-  /** Handle one request after the physical carrier has applied its trust and authentication policy. */
+  /**
+   * Handle one request after the physical carrier has applied its trust and
+   * authentication policy. Only owner Peers reach an exact route; the shared
+   * handler answers 403 for every other principal.
+   */
   readonly fetch: (request: Request) => Promise<Response>
 }
 
@@ -161,12 +195,20 @@ export interface HostConnectionRpc {
   ): () => Promise<void>
 }
 
-/** Host `ctx.connection` shape consumed by transport-independent adapters. */
+/** Host `ctx.connection` members consumed by transport-independent adapters. */
 export interface HostConnectionHandle {
   /** Generic RPC channel registry. */
   readonly rpc: HostConnectionRpc
   /** Exact Fetch routes for streaming or browser-native responses. */
   readonly fetch: HostConnectionFetch
+  /** Connection-owned Peer for trusted in-process callers, not network authentication. */
+  readonly browserPeer: PeerScope
+
+  /**
+   * Whether this deployment accepts authorities beyond loopback: true only
+   * when a validated `trustedHosts` entry names a non-loopback hostname.
+   */
+  readonly allowsRemoteAuthorities: boolean
 
   /**
    * Compose exact Fetch routes and the shared-channel RPC interceptor.
@@ -176,27 +218,20 @@ export interface HostConnectionHandle {
   createSharedFetchHandler(channel: '/api'): ConnectionFetchHandler
 
   /**
-   * Apply Connection's Host/Origin checks and browser authentication to
-   * another Web route.
+   * Apply Host/Origin checks and admit the first live Peer returned by a registered credential verifier.
    * @param request - request headers from the HTTP or upgrade request.
-   * @returns rejection status, or undefined when the route may accept the request.
+   * @returns the credential's Peer, or the rejection status.
    */
-  requestRejection(request: ConnectionTrustRequest): ConnectionRequestRejection
+  admit(request: ConnectionTrustRequest): PeerAdmission
 
   /**
-   * Authenticate one frontend index request, owning a token redirect or 401.
-   * @param request - root or configured-index HTTP request.
-   * @param response - response owned when the result is false.
-   * @returns true only when the frontend may serve index.html.
+   * Create an independent in-process Peer, disposed with the Context that read `ctx.connection`.
+   * @param options - fixed principal and interaction participation (default answer).
+   * @returns a new Peer distinct from every other Peer.
    */
-  authorizeIndex(request: ConnectionIndexRequest, response: ConnectionIndexResponse): boolean
+  createPeer(options: { readonly principal: Principal; readonly interactions?: 'answer' | 'none' }): PeerScope
 
-  /**
-   * Add the fresh process token to an ordinary Web application URL.
-   * @param baseUrl - clean canonical browser origin.
-   * @returns root URL accepted by {@link authorizeIndex} for initial login.
-   */
-  authenticatedUrl(baseUrl: string): string
+
 }
 
 /** Transport-independent Fetch handler used by HTTP and worker carriers. */
@@ -211,9 +246,10 @@ export interface ConnectionFetchHandler {
   /**
    * Dispatch one already-authenticated request.
    * @param request - Fetch request below the shared channel.
-   * @returns the registered response or a 404 response.
+   * @param peer - Peer to dispatch as; required, never defaulted.
+   * @returns the registered response, a 403 response for an exact route and a non-owner Peer, or a 404 response.
    */
-  fetch(request: Request): Promise<Response>
+  fetch(request: Request, peer: PeerScope): Promise<Response>
 }
 
 /** Client caller for logical RPC channels carried by the current transport. */
@@ -240,6 +276,7 @@ export interface ClientConnectionRpc {
    * @param endpoint - channel-relative endpoint such as `session/follow`.
    * @param payload - channel-owned request payload.
    * @param signal - caller cancellation for this logical stream.
+   * @param uplink - Client uplink items the Host method reads through `invocation.uplink()`.
    * @returns decoded stream values from the in-process carrier.
    */
   readonly open?: (
@@ -247,5 +284,6 @@ export interface ClientConnectionRpc {
     endpoint: string,
     payload: unknown,
     signal: AbortSignal,
+    uplink?: AsyncIterable<unknown>,
   ) => AsyncIterable<unknown>
 }

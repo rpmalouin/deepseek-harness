@@ -12,7 +12,7 @@ Session format v2 的推出改变了两条成本随模型输出增长的路径�
 
 ## 决定
 
-Linux pull request 运行必需的 `node 24 / benchmarks` job，执行 `pnpm run check:ci:bench` → `pnpm run test:bench`。私有 `@deepseek-ai/dsh-benchmarks` workspace 拥有 benchmark 专属依赖。该命令先构建 workspace library 和 `benchmarks/.dsh-build/` 下的专用 worker，再调用 `vitest.bench.config.ts`。[标准托管运行器决策](2026-09-06-standard-hosted-benchmark-runner.zh.md)拥有运行器选择及外层 job 超时。该 job 单独运行 benchmark lane；Vitest 逐文件运行，只负责准备输入、启动测量子进程、汇总结果和执行预算断言。每条被计时的 Node CPU 路径都以纯 Node 执行编译后的 JavaScript，并移除 `NODE_OPTIONS` 且不加载 TypeScript runtime；workspace 裸导入因此从 `benchmarks/node_modules` 通过 package exports 解析到构建后的 `lib/` 入口。
+Linux pull request 运行必需的 `node 24 / benchmarks` job，执行 `pnpm run check:ci:bench` → `scripts/run-ci-bench.ts`。其临时 library 构建按 [PR 产物构建政策](../process/2026-10-05-pr-artifact-typechecks.zh.md)省略重复的 TypeScript 诊断；必需的完整构建保留这些诊断。私有 `@deepseek-ai/dsh-benchmarks` workspace 拥有 benchmark 专属依赖。该命令先构建 workspace library 和 `benchmarks/.dsh-build/` 下的专用 worker，再调用 `vitest.bench.config.ts`。[标准托管运行器说明](../../../../.github/workflows/ci.yml)拥有运行器选择及外层 job 超时。该 job 单独运行 benchmark lane；Vitest 逐文件运行，只负责准备输入、启动测量子进程、汇总结果和执行预算断言。每条被计时的 Node CPU 路径都以纯 Node 执行编译后的 JavaScript，并移除 `NODE_OPTIONS` 且不加载 TypeScript runtime；workspace 裸导入因此从 `benchmarks/node_modules` 通过 package exports 解析到构建后的 `lib/` 入口。
 
 必需性能 gate 位于顶层 `benchmarks/`，按被测用户路径而非 package 归属组织。Host 文件使用 `*.bench.ts`，Client 面文件使用 `*.bench.client.ts`，场景专属 worker 与 fixture 留在对应 benchmark 旁且不带 benchmark 后缀。包内 `.perf.ts` 文件仍是非门禁诊断；`scripts/` 负责编排而不承载 benchmark case。
 
@@ -77,6 +77,22 @@ PR #3640 的标准双 CPU 运行 (run 34023970384, job 101461539961)使用 Node 
 | Client fold 绝对时间 | 16 ms | 40 ms |
 | Client fold delta 缩放比 | 2.5× | 3.125× |
 | 受限 old space | — | 128 MB |
+
+### 按索引遍历持久化 JSON 数组
+
+JSONL backend 在 memo 化前冻结解码后的 event graph。原生 decoder 与固定 migration catalog 产出无环 JSON graph，其中数组只包含索引值。按数字索引遍历数组仍会冻结每个嵌套对象和数组，同时避免枚举 compact stream 中 125,000 个文本条目和 124,600 个时间差值的字符串键。对象遍历继续保留自有的 `__proto__` 和 `constructor` 数据。Admission、关系校验、解码与冻结都仍在被测 open 终点前完成；浅层 `Object.isFrozen()` 结果不会跳过后代遍历。
+
+在 Apple M4 Pro、Node 24.19.0 上，仅覆盖 open 的 CPU profile 将约 4.2 ms 归因于完整 event 冻结。独立的全新进程 V4 运行得到以下结果；末列恢复并重新构建完全相同的原始遍历，作为负对照：
+
+| Reopen 测量项 | 原始遍历 | 索引遍历 | 恢复原始遍历 |
+|---|---|---|---|
+| `open` 样本（ms） | 22.2, 22.4, 22.8, 22.6, 22.9 | 17.7, 18.4, 17.4, 17.8, 17.6 | 21.7, 22.4, 22.2, 21.7, 21.6 |
+| `open` 中位数（ms） | 22.6 | 17.7 | 21.7 |
+| 首屏历史中位数（ms） | 35.0 | 30.6 | 33.6 |
+| Agent resume 中位数（ms） | 30.5 | 26.8 | 29.8 |
+| Agent 保留堆（MB） | 4.5 | 4.5 | 4.5 |
+
+每次运行的全部 17 个 Session 用例均通过，包括 128 MB 完成性检查。原始实现在本机仍低于 63 ms；恢复原始遍历展示了被移除的成本，而托管 benchmark 仍负责给出必须满足的预算结果。工作负载、时间上限、内存上限、冷进程准备与测量终点保持不变。JSONL owner 测试覆盖历史 V3 和当前读取中的嵌套不透明 JSON、修改拒绝及不可变 event 共享。这些测量确认了 reopen 改善，但没有确认一致的 first-open 改善或托管运行器耗时。
 
 ## 考虑过的替代方案
 

@@ -63,7 +63,7 @@ An invocation policy on every skill decides which surfaces may advertise and loa
 
 ### Observable success and failures
 
-A skill that any provider reports appears in the merged catalog, and loading it by its exact kebab-case name returns the body; an invalid name returns no skill rather than throwing. A provider that fails discovery is logged and skipped, and the observation is reported incomplete so consumers keep their last-good catalog; an explicit incomplete observation still contributes its candidates. A malformed candidate fails fast — the registry validates names, descriptions, invocation booleans, and provider ownership before caching or returning anything.
+A skill that any provider reports appears in the merged catalog, and loading it by its exact kebab-case name returns the body; an invalid name returns no skill rather than throwing. A provider that fails discovery is logged and skipped, and the observation is reported incomplete so consumers can distinguish failed discovery from confirmed absence; an explicit incomplete observation still contributes its candidates. A malformed candidate, catalog observation, or loaded definition fails fast as `SkillError` with `SKILL_INVALID_DEFINITION` — the registry validates names, descriptions, invocation booleans, and provider ownership before caching or returning anything. `SkillError` also carries the `skill` tool's `SKILL_NOT_FOUND` and `SKILL_NOT_MODEL_INVOCABLE` failures and a provider's `SKILL_READ_FAILED`.
 
 Skill summaries retain the winning provider’s optional instruction-file `path` for discovery consumers that offer file previews. Listing still reads no skill body, and model-facing catalogs continue to select only their owned routing fields.
 
@@ -88,7 +88,6 @@ The registry is host+per-scope layered, the shape the tools registry established
 | File | Role |
 |---|---|
 | [`src/index.ts`](src/index.ts) | Plugin entry, `SkillRegistry` service, candidate and definition validation, shared model-facing rendering |
-| — | No runtime invariant companion is published; provider/runtime maps and revisioned caches mutate atomically inside the registry, which exposes no independent change event or snapshot for cross-checking them. |
 
 ### Catalog collection
 
@@ -115,7 +114,7 @@ Read these pages when the package-level contract is not enough. They move from t
 - [skill-filesystem package](../skill-filesystem/README.md) — the shipped local provider that discovers skills from disk.
 - [tool-skill package](../tool-skill/README.md) — the consumer that renders the session catalog and the `skill` tool.
 - [Generated configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-skill) — every config field and its source declaration.
-- [Skill invocation policy Agent Note](../../../.agents/notes/implemented/feature/2026-07-28-skill-invocation-policy.md) — the rationale for the model and user invocation controls.
+- [historical Skill invocation policy Agent Note](../../../.agents/notes/archived/feature/2026-07-28-skill-invocation-policy.md) — the rationale for the model and user invocation controls.
 
 -----
 

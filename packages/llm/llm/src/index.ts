@@ -11,6 +11,7 @@ import { Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typer
 import { deepFreeze } from '@deepseek-ai/dsh-util-values'
 import type {
   GenerateOptions,
+  RequestMessage,
   LlmConfigurableProvider,
   LlmDiscoveredModel,
   LlmFailure,
@@ -23,33 +24,38 @@ import type {
   ModelModality,
   StreamChunk,
   SystemPromptUpdate,
+  ToolSchema,
+  ToolUpdate,
 } from './types.ts'
-import { freezeMessage, type Message } from './message.ts'
+import { freezeMessage } from './message.ts'
 import { resolveRetryPolicy } from './retry-policy.ts'
 import type { ResolvedRetryPolicy } from './retry-policy.ts'
 import type { ProviderRequestId } from './brand.ts'
 import { callConfigEquals } from './call-config.ts'
-import type { LlmCallConfig, LlmCallConfigAdapterDefaults } from './call-config.ts'
-import { HarnessError, INVALID_CREDENTIAL_CODE } from './error.ts'
+import type { ConfigureCall, LlmCallConfig, LlmCallConfigAdapterDefaults } from './call-config.ts'
+import { HarnessError } from './error.ts'
+import type { BuiltinLlmFailureCode } from './error.ts'
 import { normalizeLlmFailure } from './adapter-failure.ts'
-import { normalizeApiKey } from './api-key.ts'
 import {
-  contentHasFile, contentHasImage, fileHandleText, projectFilesToText, projectImagesForTextModel,
+  contentHasFile, contentHasImage, fileHandleText, projectFilesToText, projectImagesForTextModel, projectToolUpdates,
 } from './content.ts'
-import type { FileAttachmentRef } from '@deepseek-ai/dsh-attachment'
+import type { FileAttachmentRef, ImageAttachmentRef, ImageRequestTarget } from '@deepseek-ai/dsh-attachment'
 
 export * from './attribution.ts'
 export * from './brand.ts'
 export * from './error.ts'
-export * from './api-key.ts'
-export * from './types.ts'
+export type * from './types.ts'
 export * from './content.ts'
 export * from './assistant-stream.ts'
-export * from './message.ts'
+export type * from './message.ts'
+export {
+  CONTEXT_SUMMARY_MAX_CHARS, boundContextSummary, createAssistantMessage, createDeveloperMessage, createMessage,
+  createSystemMessage, createToolResultMessage, createUserMessage, freezeMessage,
+} from './message.ts'
 export * from './retry-policy.ts'
 export { BlockAssembler } from './assembler.ts'
 export { callConfigEquals, isAgentLoopRequest, markAgentLoopRequest } from './call-config.ts'
-export type { LlmCallConfig, LlmCallConfigAdapterDefaults } from './call-config.ts'
+export type { ConfigureCall, LlmCallConfig, LlmCallConfigAdapterDefaults, LlmCallControls } from './call-config.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -65,8 +71,8 @@ declare module '@deepseek-ai/cordis' {
      *   process-local {@link markAgentLoopRequest} identity and arrives deep-frozen
      *   (mutation throws): its content is a pure function of the session log (the
      *   reconstructability Agent Note), so listeners read it, never rewrite it.
-     *   Hand-built calls do not carry that marker; their messages already obey
-     *   the immutable creation contract.
+     *   Hand-built calls do not carry that marker; callers own their request
+     *   inputs and must keep them unchanged until the stream settles.
      * @mode waterfall
      */
     'llm/stream'(this: LlmRuntime, options: GenerateOptions, next: () => AsyncIterable<StreamChunk>): AsyncIterable<StreamChunk>
@@ -89,6 +95,9 @@ export interface LlmErrorOptions extends ErrorOptions {
 /**
  * Typed error for LLM-related failures. Extends {@link HarnessError}, so the
  * `code` string (e.g. `AUTH`, `RATE_LIMIT`, `NO_ADAPTER`) is shared taxonomy.
+ * The constructor takes only a {@link BuiltinLlmFailureCode}; a failure from
+ * another provider, whose code may be any string, is re-raised through
+ * {@link LlmError.fromFailure}.
  */
 export class LlmError extends HarnessError {
   /** Serializable facts retained beside this live Error. */
@@ -96,10 +105,10 @@ export class LlmError extends HarnessError {
 
   /**
    * @param message - non-empty human-readable failure summary.
-   * @param code - non-empty stable provider-neutral machine code.
+   * @param code - built-in stable provider-neutral machine code.
    * @param options - optional cause and validated serializable provider facts.
    */
-  constructor(message: string, code: string, options?: LlmErrorOptions) {
+  constructor(message: string, code: BuiltinLlmFailureCode, options?: LlmErrorOptions) {
     if (typeof message !== 'string' || message.length === 0) throw new Error('LlmError message must be a non-empty string')
     if (typeof code !== 'string' || code.length === 0) throw new Error('LlmError code must be a non-empty string')
     if (options?.status !== undefined
@@ -125,41 +134,17 @@ export class LlmError extends HarnessError {
       ...options?.offloadImages === undefined ? {} : { offloadImages: options.offloadImages },
     })
   }
-}
 
-/**
- * Accept one supplied credential, or refuse it as unusable.
- *
- * A stored key arrives from the credentials seam, a `.env` line, or a shell
- * export, all of which pick up surrounding whitespace, so trimming is silent.
- * Anything else fails here rather than inside `fetch`, whose ByteString
- * refusal names a UTF-16 code point instead of the setting to change. The key
- * never enters the message: `ref` names where to fix it, and echoing any part
- * of a secret into a log or a UI is the failure this diagnosis avoids.
- *
- * Lives beside {@link LlmError} rather than in `./api-key.ts` so the predicate
- * module stays dependency-free; both adapters share this one diagnosis instead
- * of keeping near-identical local copies.
- * @param raw - the credential exactly as supplied.
- * @param pkg - the refusing package name, prefixed to the diagnostic.
- * @param ref - the credential reference the value resolved through.
- * @returns the trimmed, usable key.
- */
-export function assertUsableApiKey(raw: string, pkg: string, ref: string): string {
-  const checked = normalizeApiKey(raw)
-  if (checked.ok) return checked.value
-  // The Models page is named as the writer it usually is, not as the only one:
-  // the same value can arrive from a hand-edited .env or a shell export in a
-  // composition that mounts no credentials seam at all, where directing the
-  // user to a page that deployment does not serve would be a dead end.
-  throw new LlmError(
-    checked.reason === 'empty'
-      ? `${pkg}: the API key resolved from ${ref} is blank; set ${ref} to the raw key`
-        + ' (the web Models page writes it) or export it in the launching environment'
-      : `${pkg}: the API key resolved from ${ref} contains characters no HTTP header can carry;`
-        + ` set ${ref} to the raw key alone (the web Models page writes it)`,
-    INVALID_CREDENTIAL_CODE,
-  )
+  /**
+   * Raise an observed failure again with its own code, which any provider may have chosen.
+   * @param failure - the serializable failure, typically from a stream's terminal chunk.
+   * @param options - optional cause.
+   * @returns an error carrying the failure's message, code, and provider facts.
+   */
+  static fromFailure(failure: LlmFailure, options?: ErrorOptions): LlmError {
+    // The constructor validates the code at runtime; the built-in type constrains only codes raised here.
+    return new LlmError(failure.message, failure.code as BuiltinLlmFailureCode, { ...failure, ...options })
+  }
 }
 
 /** One model call whose config and adapter registration were resolved together. */
@@ -174,6 +159,8 @@ export interface PreparedLlmCall {
   readonly inputModalities?: readonly ModelModality[]
   /** Exact model system prompt update mode captured with the adapter dispatch generation. */
   readonly systemPromptUpdate?: SystemPromptUpdate
+  /** Exact model tool update mode captured with the adapter dispatch generation. */
+  readonly toolUpdate?: ToolUpdate
   /** Config fields materialized by the captured adapter rather than proposed by the caller. */
   readonly adapterDefaults: LlmCallConfigAdapterDefaults
   /**
@@ -233,9 +220,22 @@ export abstract class LlmAdapter {
   }
 
   /**
+   * Resolve the image dimensions and byte target this adapter sends to the model.
+   * The default preserves normalized images; adapters that resize must override it.
+   * @param _provider - registered provider route.
+   * @param _model - exact model id.
+   * @param image - normalized image whose request projection is being resolved.
+   * @returns the same target used by request serialization, before provider-internal processing.
+   */
+  imageRequestTarget(_provider: string, _model: string, image: ImageAttachmentRef): ImageRequestTarget {
+    return { width: image.width, height: image.height, maxBytes: image.bytes }
+  }
+
+  /**
    * List models this adapter can currently advertise for one owned provider.
-   * The result is advisory: an adapter may accept unlisted model ids, and
-   * consumers must not turn absence into request rejection.
+   * Core routing accepts unlisted model ids; catalog-driven entry points such
+   * as the GUI may require membership. Adapters used there must advertise
+   * their available models; the base empty catalog offers no GUI selection.
    * @param _provider - one provider route owned by this adapter.
    * @returns discoverable models in adapter-preferred order.
    */
@@ -349,28 +349,21 @@ export class LlmRuntime extends TypertRemoteService {
   private emitAdaptersUpdated(): void {
     // Cordis emit uses Array.map: one synchronous throw starves later
     // listeners. Registry notifications are non-vetoing, so contain each
-    // callback independently; INVARIANT-coded failures still surface.
-    let invariantFailure: unknown
+    // callback independently.
     for (const listener of this.ctx.events.dispatch('emit', ['llm/adapters-updated']) as Array<() => unknown>) {
       try {
         const returned = listener()
         if (returned != null && typeof (returned as PromiseLike<unknown>).then === 'function') {
           // An emit listener may still be an async function; its rejection
-          // cannot reach the synchronous INVARIANT rethrow below, so it is
-          // contained here instead of becoming an unhandled rejection.
+          // is contained here instead of becoming an unhandled rejection.
           void Promise.resolve(returned as PromiseLike<unknown>).then(undefined, (error: unknown) => {
             this.warnAdaptersListenerFailure(error)
           })
         }
       } catch (error) {
-        if ((error as { code?: unknown } | null)?.code === 'INVARIANT') {
-          invariantFailure ??= error
-          continue
-        }
         this.warnAdaptersListenerFailure(error)
       }
     }
-    if (invariantFailure !== undefined) throw invariantFailure as Error
   }
 
   /** Contained-listener diagnostic shared by the sync and async failure paths. */
@@ -505,7 +498,7 @@ export class LlmRuntime extends TypertRemoteService {
           || detached.some(seen => seen.provider === entry.provider)) {
           throw new LlmError(`configurable provider "${entry.provider}" is already declared`, 'DUPLICATE_DIRECTORY')
         }
-        detached.push({ ...entry, settingsPath: [...entry.settingsPath] })
+        detached.push(detachDirectoryEntry(entry))
       }
       for (const entry of held) this.directory.delete(entry.provider)
       for (const entry of detached) this.directory.set(entry.provider, entry)
@@ -542,7 +535,7 @@ export class LlmRuntime extends TypertRemoteService {
    */
   @Remote
   listConfigurableProviders(): LlmConfigurableProvider[] {
-    return [...this.directory.values()].map(entry => ({ ...entry, settingsPath: [...entry.settingsPath] }))
+    return [...this.directory.values()].map(detachDirectoryEntry)
   }
 
   /**
@@ -672,6 +665,17 @@ export class LlmRuntime extends TypertRemoteService {
   }
 
   /**
+   * Resolve the image projection for an exact registered model route.
+   * @param provider - registered provider route.
+   * @param model - exact model id.
+   * @param image - normalized image reference.
+   * @returns dimensions and byte target used by the adapter's request serializer.
+   */
+  imageRequestTarget(provider: string, model: string, image: ImageAttachmentRef): ImageRequestTarget {
+    return this.registration(provider).adapter.imageRequestTarget(provider, model, image)
+  }
+
+  /**
    * Resolve the exact text one durable file occurrence contributes to every
    * provider request in the current execution environment.
    * @param ref - durable verbatim file reference from model history.
@@ -688,7 +692,8 @@ export class LlmRuntime extends TypertRemoteService {
 
   /**
    * Discover models advertised by one registered provider. Catalog membership
-   * is advisory and never changes routing or request validation.
+   * does not constrain core routing. Catalog-driven entry points may restrict
+   * selection and submission to the advertised models.
    * @param provider - registered provider route to inspect.
    * @returns detached model metadata in adapter-preferred order.
    */
@@ -711,12 +716,16 @@ export class LlmRuntime extends TypertRemoteService {
       }
       seen.add(model.id)
       const inputModalities = this.detachedModalities(model.inputModalities)
+      const badge = model.badge
       return {
         provider: model.provider,
         id: model.id,
         name: model.name,
         ...model.description === undefined ? {} : { description: model.description },
         ...inputModalities === undefined ? {} : { inputModalities },
+        ...badge === undefined ? {} : {
+          badge: { text: typeof badge.text === 'string' ? badge.text : { ...badge.text }, tone: badge.tone },
+        },
       }
     })
   }
@@ -786,6 +795,14 @@ export class LlmRuntime extends TypertRemoteService {
         'INVALID_MODEL_INFO',
       )
     }
+    // Widened for the same reason: catalog config supplies the tool update mode as text.
+    const toolUpdate: string | undefined = resolved.toolUpdate
+    if (toolUpdate !== undefined && toolUpdate !== 'in-history' && toolUpdate !== 'addition-only') {
+      throw new LlmError(
+        `adapter returned invalid tool update mode for provider "${provider}" model "${model}"`,
+        'INVALID_MODEL_INFO',
+      )
+    }
     const defaultMaxTokens = resolved.defaultMaxTokens
     if (defaultMaxTokens !== undefined
       && (!Number.isSafeInteger(defaultMaxTokens) || defaultMaxTokens <= 0)) {
@@ -803,6 +820,7 @@ export class LlmRuntime extends TypertRemoteService {
       ...context === undefined ? {} : { context: { contextWindow: context.contextWindow } },
       ...defaultMaxTokens === undefined ? {} : { defaultMaxTokens },
       ...resolved.systemPromptUpdate === undefined ? {} : { systemPromptUpdate: resolved.systemPromptUpdate },
+      ...resolved.toolUpdate === undefined ? {} : { toolUpdate: resolved.toolUpdate },
     }
     const reasoning = resolved.reasoning
     if (reasoning === undefined) return info
@@ -913,24 +931,39 @@ export class LlmRuntime extends TypertRemoteService {
    * Resolve one call under its current adapter registration. The returned
    * one-shot handle keeps that registration across header logging and dispatch,
    * so HMR cannot combine one adapter's capability result with another adapter.
-   * @param config - provider/model route and optional request controls.
+   * An optional synchronous callback selects concrete controls using captured
+   * model metadata. Defaults and validation apply to its result. Callback
+   * failures and cancellation reject preparation before dispatch.
+   * @param config - provider/model route and optional concrete request controls.
    * @param signal - optional cancellation for adapter-owned capability lookup.
+   * @param configure - pure control selection, called once before defaults and validation.
    * @returns a prepared config and its registration-bound stream entry point.
    */
-  async prepareCall(config: LlmCallConfig, signal?: AbortSignal): Promise<PreparedLlmCall> {
-    const registration = this.registration(config.provider)
-    const adapterCall = await registration.adapter.prepareCall(config.provider, config.model, signal)
-    const modelInfo = this.normalizeModelInfo(registration, config.model, adapterCall.model)
-    const resolved = this.resolveCallWithInfo(config, modelInfo)
+  async prepareCall(
+    config: LlmCallConfig,
+    signal?: AbortSignal,
+    configure?: ConfigureCall,
+  ): Promise<PreparedLlmCall> {
+    signal?.throwIfAborted()
+    const { provider, model, ...controls } = config
+    const registration = this.registration(provider)
+    const adapterCall = await registration.adapter.prepareCall(provider, model, signal)
+    signal?.throwIfAborted()
+    const modelInfo = this.normalizeModelInfo(registration, model, adapterCall.model)
+    const proposed = configure === undefined
+      ? config
+      : { ...configure(deepFreeze(structuredClone(controls)), deepFreeze(modelInfo)), provider, model }
+    signal?.throwIfAborted()
+    const resolved = this.resolveCallWithInfo(proposed, modelInfo)
     const resolvedConfig = deepFreeze(structuredClone(resolved.config))
     const context = resolved.context === undefined
       ? undefined
       : deepFreeze(structuredClone(resolved.context))
     const adapterDefaults = deepFreeze<LlmCallConfigAdapterDefaults>({
-      ...config.reasoningEffort === undefined && resolvedConfig.reasoningEffort !== undefined
+      ...proposed.reasoningEffort === undefined && resolvedConfig.reasoningEffort !== undefined
         ? { reasoningEffort: true }
         : {},
-      ...config.maxTokens === undefined && resolvedConfig.maxTokens !== undefined
+      ...proposed.maxTokens === undefined && resolvedConfig.maxTokens !== undefined
         ? { maxTokens: true }
         : {},
     })
@@ -944,6 +977,7 @@ export class LlmRuntime extends TypertRemoteService {
         ? {}
         : { inputModalities: Object.freeze([...modelInfo.inputModalities]) },
       ...modelInfo.systemPromptUpdate === undefined ? {} : { systemPromptUpdate: modelInfo.systemPromptUpdate },
+      ...modelInfo.toolUpdate === undefined ? {} : { toolUpdate: modelInfo.toolUpdate },
       stream: (options: GenerateOptions): AsyncIterable<StreamChunk> => {
         if (dispatched) {
           throw new LlmError('a prepared LLM call can only be dispatched once', 'INVALID_PREPARED_CALL')
@@ -973,9 +1007,10 @@ export class LlmRuntime extends TypertRemoteService {
 
   /** Remove replay state whose historical route is owned by another adapter. */
   private forAdapter(options: GenerateOptions, adapter: LlmAdapter): GenerateOptions {
-    const messages: Message[] = options.messages.map((message) => {
+    const messages: RequestMessage[] = options.messages.map((message) => {
+      if (message.role !== 'assistant') return message
       const source = message.source
-      if (message.role !== 'assistant' || source.kind !== 'model' || source.replayState === undefined) return message
+      if (source.replayState === undefined) return message
       if (this.adapters.get(source.provider)?.adapter === adapter) return message
       return freezeMessage({
         ...message,
@@ -1045,7 +1080,7 @@ export class LlmRuntime extends TypertRemoteService {
           ? deepFreeze({ ...options, ...resolvedConfig })
           : { ...options, ...resolvedConfig }
       // Files are never dispatched natively: every route receives handle text.
-      let projectedMessages: readonly Message[] = resolvedOptions.messages
+      let projectedMessages: readonly RequestMessage[] = resolvedOptions.messages
       if (projectedMessages.some(message => contentHasFile(message.content))) {
         projectedMessages = projectFilesToText(projectedMessages, ref => this.fileReadPath(ref))
       }
@@ -1054,11 +1089,18 @@ export class LlmRuntime extends TypertRemoteService {
         && projectedMessages.some(message => contentHasImage(message.content))) {
         projectedMessages = projectImagesForTextModel(projectedMessages)
       }
-      const projectedOptions = projectedMessages === resolvedOptions.messages
-        ? resolvedOptions
-        : Object.isFrozen(resolvedOptions)
-          ? deepFreeze({ ...resolvedOptions, messages: projectedMessages as Message[] })
-          : { ...resolvedOptions, messages: projectedMessages as Message[] }
+      // Tool changes are logged on every route; the route's declared mode selects what it receives.
+      const projectedTools = projectToolUpdates(projectedMessages, resolvedOptions.tools, modelInfo.toolUpdate, resolvedOptions.toolHistory)
+      projectedMessages = projectedTools.messages
+      let projectedOptions = resolvedOptions
+      if (projectedMessages !== resolvedOptions.messages || projectedTools.tools !== resolvedOptions.tools) {
+        projectedOptions = {
+          ...resolvedOptions,
+          messages: projectedMessages as RequestMessage[],
+          ...projectedTools.tools === undefined ? {} : { tools: projectedTools.tools as ToolSchema[] },
+        }
+        if (Object.isFrozen(resolvedOptions)) deepFreeze(projectedOptions)
+      }
       const stream = dispatch(this.forAdapter(projectedOptions, adapter))
       iterator = stream[Symbol.asyncIterator]()
     } catch (error: unknown) {
@@ -1132,6 +1174,17 @@ function adapterFailureChunk(error: unknown, signal?: AbortSignal): StreamChunk 
     reason: signal?.aborted || failure.code === 'ABORTED'
       ? { kind: 'aborted', failure }
       : { kind: 'error', failure },
+  }
+}
+
+/** Copy a directory entry, including its arrays, so neither side can mutate the other's copy. */
+function detachDirectoryEntry(entry: LlmConfigurableProvider): LlmConfigurableProvider {
+  const { nativeAuth } = entry
+  return {
+    ...entry,
+    settingsPath: [...entry.settingsPath],
+    ...entry.baseURLEnv === undefined ? {} : { baseURLEnv: [...entry.baseURLEnv] },
+    ...(nativeAuth === undefined ? {} : { nativeAuth: { ...nativeAuth, env: [...nativeAuth.env] } }),
   }
 }
 

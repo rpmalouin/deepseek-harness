@@ -6,7 +6,7 @@ Status: implemented
 
 ## 问题
 
-共享 preset 为每个 Agent（智能体）分别安装工具与提示词段。安装可能要等待插件激活，外部 SessionStart 钩子也可能异步产生上下文。创建方必须知道这些贡献已完成，才能允许 Agent 发起首次模型请求。
+针对单个 Agent（智能体）的插件可能异步安装工具，外部 SessionStart 钩子也可能异步产生上下文。创建方必须知道这些贡献已完成，才能允许 Agent 发起首次模型请求。
 
 ## 决策
 
@@ -16,7 +16,7 @@ AgentLoop 在 setup 与创建分发期间保留现有的维护活动。初始化
 
 创建分发在监听器等待期间保留作用域与 Session。Dispose（资源释放）会取消初始化，并在释放这些资源前等待分发结束。监听器不得等待自身 Agent 的空闲状态或自身所有者的 dispose，因为两者都要等待该监听器完成。另一个 Agent 上的后台工作遵循该 Agent 自己的初始化生命周期。
 
-本决策拥有异步创建时序。[作用域运行时决策](2026-07-12-agent-scope-runtime-design.zh.md)继续拥有注册表身份与 teardown 归属，[拦截决策](../feature/2026-06-30-interception-extension-points.zh.md)继续拥有策略与工具事件语义。
+本决策拥有异步创建时序。[作用域运行时参考](../../../../packages/core/agent-loop/README.zh.md)继续拥有注册表身份与 teardown 归属，[拦截参考](../../../../docs/tool-execution-pipeline.zh.md)继续拥有策略与工具事件语义。
 
 ## 考虑过的替代方案
 
@@ -28,4 +28,6 @@ AgentLoop 在 setup 与创建分发期间保留现有的维护活动。初始化
 
 创建延迟包括异步插件与 SessionStart 工作。初始化器失败成为调用方可见的创建失败，取消依赖监听器协作结算。已经送达的通知无法撤回；回滚会为其配对销毁通知。
 
-作用域安装器测试验证回滚，生命周期测试验证有序完成与取消，SDK serial-created 场景验证异步提示词上下文进入首次请求。钩子测试覆盖需等待的上下文注入与子进程 dispose。
+生命周期测试验证初始化回滚、有序完成与取消，SDK serial-created 场景验证异步提示词上下文进入首次请求。钩子测试覆盖需等待的上下文注入与子进程 dispose。
+
+委派工具使用[预设共享注册](../bug-fix/2026-10-25-shared-preset-delegation-tools.zh.md)，无须按 Agent 安装。此事件仍负责异步 Agent 初始化。

@@ -1,8 +1,9 @@
+import { SHIPPED_LOCALE_IDS } from '../../../../scripts/shipped-locales.ts'
 /** locale apply wiring: service + dictionaries provision, declaration-aware
  * Language row registration, snapshot projection into the row store, and
  * recovery after an HMR collapse of the declaring entry. */
 import { Context } from '@deepseek-ai/cordis'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import { SlotRegistry } from '@deepseek-ai/dsh-client-ui-renderer/client'
 import { apply as settingsApply, inject as settingsInject } from '@deepseek-ai/dsh-client-ui-settings/client'
 import { TestRemote } from '@deepseek-ai/dsh-client-test-runtime'
@@ -15,17 +16,17 @@ import { LanguageRow } from '../src/client/LanguageRow.tsx'
 import type { createLanguageRowStore } from '../src/client/settings-store.ts'
 
 const SLOT = 'settings.general.item'
+afterEach(() => { vi.unstubAllGlobals() })
 
-async function bench() {
+async function bench(preference?: string) {
   const ctx = new Context()
   await ctx.plugin(SlotRegistry).await()
-  let preference: string | undefined
   let revision = 0
   const namespace = () => ({
     ns: LOCALE_SETTINGS_NAMESPACE,
     schema: LocaleSettingsSchema.toJSON(),
     value: preference === undefined ? {} : { preference },
-    applies: 'live' as const,
+    autoGenerate: true, applies: 'live' as const,
     secrets: [],
     revision,
   })
@@ -65,13 +66,59 @@ function faceOf(slots: SlotRegistry) {
 }
 
 describe('locale apply', () => {
+  it.each(['resolve', 'reject'] as const)('contains a late native initialization %s after unloading', async (outcome) => {
+    const b = await bench()
+    const ready = Promise.withResolvers<unknown>()
+    const read = vi.fn(() => ready.promise)
+    const onChange = vi.fn()
+    vi.stubGlobal('__DSH_LOCALE__', { read, onChange })
+    const fiber = b.ctx.plugin({ inject: [...inject], apply })
+    try {
+      await vi.waitFor(() => { expect(read).toHaveBeenCalledOnce() })
+      const disposal = fiber.dispose()
+      if (outcome === 'resolve') ready.resolve({ languages: ['zh-CN'], preference: null })
+      else ready.reject(new Error('native window closed'))
+      await disposal
+      expect(b.ctx.get('locale')).toBeUndefined()
+      expect(onChange).not.toHaveBeenCalled()
+    } finally {
+      ready.resolve({ languages: ['zh-CN'], preference: null })
+      await b.ctx.fiber.dispose()
+    }
+  })
+
+  it('awaits native initialization and reports later changes only while mounted', async () => {
+    const b = await bench('zh')
+    const ready = Promise.withResolvers<unknown>()
+    const onChange = vi.fn()
+    vi.stubGlobal('__DSH_LOCALE__', { read: () => ready.promise, onChange })
+    const fiber = b.ctx.plugin({ inject: [...inject], apply })
+    try {
+      expect(b.ctx.get('locale')).toBeUndefined()
+      ready.resolve({ languages: ['en-US'], preference: 'zh' })
+      await fiber.await()
+      const locale = b.ctx.get('locale') as LocaleRuntime
+      expect(locale.getSnapshot().active).toBe('zh')
+      expect(onChange).toHaveBeenLastCalledWith('zh')
+      locale.setLocale('en')
+      expect(onChange).toHaveBeenLastCalledWith('en')
+      await fiber.dispose()
+      const calls = onChange.mock.calls.length
+      b.ctx.emit('locale/change', { active: 'zh', locales: [], revision: 99 })
+      expect(onChange).toHaveBeenCalledTimes(calls)
+    } finally {
+      ready.resolve({ languages: ['en-US'], preference: 'zh' })
+      await b.ctx.fiber.dispose()
+    }
+  })
+
   // These are wiring specs, not default-language specs. A fresh LocaleRuntime
   // with no jsdom `window` skips browser detection and opens on FALLBACK_LOCALE
   // (en); each test that reads localized copy stages its locale explicitly via
   // setLocale/Host preference instead of leaning on a dead browser pin.
 
   it('declares the slot service', () => {
-    expect(inject).toEqual(['slots', 'remote', 'settingsScope'])
+    expect(inject).toEqual(['slots', 'remote', 'configForms'])
   })
 
   it('provides the service with base + settings dictionaries and registers the row (declaration before or after apply)', async () => {
@@ -109,7 +156,7 @@ describe('locale apply', () => {
     const { entry, instance, face } = faceOf(b.slots)
     // The inject-time re-sync sealed the init window: the mirror is current.
     expect(instance.getSnapshot().active).toBe('en')
-    expect(instance.getSnapshot().options.map(o => o.id)).toEqual(['zh', 'en'])
+    expect(instance.getSnapshot().options.map(o => o.id).sort()).toEqual([...SHIPPED_LOCALE_IDS].sort())
     // Copy rides the standard locale seat: the entry declares the namespace.
     expect(entry.locale).toBe(SETTINGS_NS)
     expect(locale.bind(SETTINGS_NS)('language.title')).toBe('Language')
@@ -130,7 +177,7 @@ describe('locale apply', () => {
     const languagePack = b.ctx.plugin({
       inject: ['locale'],
       apply: packCtx => packCtx.effect(
-        () => packCtx.locale.addLanguage({ id: 'ja', label: '日本語', fallback: 'en' }),
+        () => packCtx.locale.addLanguage({ id: 'it', label: 'Italiano', fallback: 'en' }),
         'test language pack registration',
       ),
     })
@@ -139,10 +186,47 @@ describe('locale apply', () => {
       { id: 'zh', label: '中文' },
       { id: 'en', label: 'English' },
       { id: 'ja', label: '日本語' },
+      { id: 'es', label: 'Español' },
+      { id: 'fr', label: 'Français' },
+      { id: 'de', label: 'Deutsch' },
+      { id: 'ru', label: 'Русский' },
+      { id: 'pt', label: 'Português' },
+      { id: 'it', label: 'Italiano' },
     ])
 
     await languagePack.dispose()
-    expect(instance.getSnapshot().options.map(option => option.id)).toEqual(['zh', 'en'])
+    expect(instance.getSnapshot().options.map(option => option.id)).toEqual(['zh', 'en', 'ja', 'es', 'fr', 'de', 'ru', 'pt'])
+  })
+
+  it.each([
+    ['ja', '日本語', '言語', 'キャンセル'],
+    ['es', 'Español', 'Idioma', 'Cancelar'],
+    ['fr', 'Français', 'Langue', 'Annuler'],
+    ['de', 'Deutsch', 'Sprache', 'Abbrechen'],
+    ['ru', 'Русский', 'Язык', 'Отмена'],
+    ['pt', 'Português', 'Idioma', 'Cancelar'],
+  ])('restores %s from the Host and releases its language and dictionaries on unload', async (id, label, languageTitle, cancel) => {
+    const b = await bench(id)
+    onTestFinished(() => b.ctx.fiber.dispose())
+    declareItems(b.slots)
+    const fiber = b.ctx.plugin({ inject: [...inject], apply })
+    await fiber.await()
+    const locale = b.ctx.get('locale') as LocaleRuntime
+    const { instance, face } = faceOf(b.slots)
+    expect(instance.getSnapshot().active).toBe(id)
+    expect(locale.bind(SETTINGS_NS)('language.title')).toBe(languageTitle)
+    expect(locale.bind('common')('cancel')).toBe(cancel)
+    face.setLocale('en')
+    face.setLocale(id)
+    await vi.waitFor(() => { expect(b.mutate).toHaveBeenCalledTimes(2) })
+    expect(b.mutate.mock.calls.at(-1)?.[1]).toEqual([{ op: 'set', path: ['preference'], value: id }])
+    await fiber.dispose()
+    expect(locale.getSnapshot().locales.map(option => option.id)).toEqual(['zh', 'en'])
+    expect(() => { locale.setLocale(id) }).toThrow('not registered')
+    const remove = locale.addLanguage({ id, label, fallback: 'en' })
+    locale.setLocale(id)
+    expect(locale.bind('common')('cancel')).toBe('cancel')
+    remove()
   })
 
   it('loads and refreshes the explicit Host preference after nonblocking activation', async () => {

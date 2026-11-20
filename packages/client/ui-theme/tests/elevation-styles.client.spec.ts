@@ -22,6 +22,8 @@ const NEUTRAL_BORDER = /--dsw-alias-border-/
 
 const sheetCss = readFileSync(
   fileURLToPath(new URL('../src/styles/gradient-shadow-text.css', import.meta.url)), 'utf8')
+const platformCss = readFileSync(
+  fileURLToPath(new URL('../src/styles/design-platform.css', import.meta.url)), 'utf8')
 
 describe('elevation tokens', () => {
   const rules = parseRules(sheetCss)
@@ -51,6 +53,90 @@ describe('elevation tokens', () => {
     for (const name of ['--dsw-elevation-panel', '--dsw-elevation-prominent', '--dsw-elevation-soft']) {
       expect(perElement.get(name), name).toMatch(/^var\(--dsw-elevation-stroke\), 0 /)
       expect(bodyOnly.has(name), name).toBe(false)
+    }
+  })
+
+  it('defines the translucent menu material for both palettes', () => {
+    expect(bodyOnly.get('--dsw-mask-blur')).toBe('none')
+    expect(bodyOnly.get('--dsw-menu-backdrop-filter')).toBe('blur(40px) saturate(150%)')
+    const platformRules = parseRules(platformCss)
+    const value = (selector: string, token = '--dsw-menu-surface-fill'): string | undefined => platformRules
+      .filter(rule => rule.selectors.includes(selector))
+      .flatMap(rule => rule.declarations)
+      .findLast(([property]) => property === token)?.[1]
+    expect(value('body')).toBe('rgba(252, 253, 254, 0.7)')
+    expect(value('body[data-ds-dark-theme]')).toBe('rgba(48, 49, 54, 0.64)')
+    expect(value('body', '--dsw-specific-menu')).toBe('var(--dsw-menu-surface-fill)')
+    expect(value("html[data-platform='darwin'] body", '--dsw-specific-menu')).toBe('rgba(248, 249, 250, 0.94)')
+    expect(value("html[data-platform='darwin'] body[data-ds-dark-theme]", '--dsw-specific-menu')).toBe('rgba(48, 49, 54, 0.94)')
+  })
+})
+
+/** Elevated or isolated-background menu-fill rules that omit the shared backdrop filter. */
+function translucentMenusWithoutBackdrop(css: string): string[] {
+  return parseRules(css)
+    .filter(rule => rule.declarations.some(([property, value]) =>
+      (property === 'background' || property === 'background-color')
+      && /^var\(--dsw-(?:specific-menu|menu-surface-fill)\)$/.test(value)))
+    .filter(rule => rule.declarations.some(([property, value]) =>
+      property === 'box-shadow' && ELEVATED_SHADOW.test(value))
+      || rule.selectors.some(selector => /::(?:before|after)$/.test(selector)))
+    .filter(rule => !rule.declarations.some(([property, value]) =>
+      property === 'backdrop-filter' && value === 'var(--dsw-menu-backdrop-filter)'))
+    .map(rule => rule.selectors.join(', '))
+}
+
+describe('translucent menu surfaces pair fill and filter', () => {
+  it('rejects a menu fill without the shared backdrop filter', () => {
+    expect(translucentMenusWithoutBackdrop(
+      '.a { background: var(--dsw-specific-menu); box-shadow: var(--dsw-elevation-panel); }',
+    )).toEqual(['.a'])
+    expect(translucentMenusWithoutBackdrop(
+      '.a { background: var(--dsw-specific-menu); box-shadow: var(--dsw-elevation-panel); backdrop-filter: var(--dsw-menu-backdrop-filter); }',
+    )).toEqual([])
+    expect(translucentMenusWithoutBackdrop(
+      '.a::before { background: var(--dsw-specific-menu); }',
+    )).toEqual(['.a::before'])
+    expect(translucentMenusWithoutBackdrop(
+      '.a::before { background: var(--dsw-specific-menu); backdrop-filter: var(--dsw-menu-backdrop-filter); }',
+    )).toEqual([])
+  })
+
+  it('rejects a backed menu fill without the shared backdrop filter', () => {
+    expect(translucentMenusWithoutBackdrop(
+      '.a { background: var(--dsw-menu-surface-fill); box-shadow: var(--dsw-elevation-panel); }',
+    )).toEqual(['.a'])
+    expect(translucentMenusWithoutBackdrop(
+      '.a { background: var(--dsw-menu-surface-fill); box-shadow: var(--dsw-elevation-panel); backdrop-filter: var(--dsw-menu-backdrop-filter); }',
+    )).toEqual([])
+  })
+
+  it('covers every package menu-fill consumer', () => {
+    const missing = packageStylesheets().flatMap(file =>
+      translucentMenusWithoutBackdrop(readFileSync(file, 'utf8'))
+        .map(selectors => `${file} ${selectors}`))
+    expect(missing).toEqual([])
+  })
+
+  it('keeps backdrop filtering on background layers when descendants use fixed positioning', () => {
+    const surfaces = [
+      ['packages/client/ui-primitives/src/MenuSurface.module.css', '.surface', '.material'],
+      ['packages/client/ui-goal/src/client/GoalBar.module.css', '.bar', '.bar::before'],
+      ['packages/client/ui-conversation/src/client/queue/QueueDock.module.css', '.panel', '.panel::before'],
+      ['packages/extensions/ui-cordis/src/client/CordisPanel.module.css', '.panel', '.panel::before'],
+    ] as const
+    const files = packageStylesheets()
+    for (const [suffix, container, background] of surfaces) {
+      const file = files.find(candidate => candidate.endsWith(suffix))
+      expect(file, suffix).toBeDefined()
+      const rules = parseRules(readFileSync(file!, 'utf8'))
+      const declarations = (selector: string) => new Map(rules
+        .filter(rule => rule.selectors.length === 1 && rule.selectors[0] === selector)
+        .flatMap(rule => rule.declarations))
+      expect(declarations(container).has('backdrop-filter'), container).toBe(false)
+      expect(declarations(background).get('background'), background).toBe(container === '.surface' ? 'var(--dsw-menu-surface-fill)' : 'var(--dsw-specific-menu)')
+      expect(declarations(background).get('backdrop-filter'), background)
+        .toBe('var(--dsw-menu-backdrop-filter)')
     }
   })
 })
@@ -116,6 +202,15 @@ function wideNeutralBorders(css: string, exempt: Set<string> = new Set()): strin
   return wide
 }
 
+/** Centered, zero-blur inset strokes with literal widths and neutral border colors. */
+function wideNeutralInsetShadows(css: string): string[] {
+  return parseRules(css).flatMap(rule => rule.declarations
+    .filter(([property, value]) => property === 'box-shadow'
+      && [...value.matchAll(/\binset\s+(?:0(?:px)?\s+){3}(\d*\.?\d+)([a-z%]+)\s+var\(--dsw-alias-border-[\w-]+\)/g)]
+        .some(([, width, unit]) => unit !== 'px' || Number(width) > 0.5))
+    .map(([property, value]) => `${rule.selectors.join(', ')} ${property}: ${value}`))
+}
+
 /**
  * Filled divider lines (a border-token background on a 1px-tall or 1px-wide
  * box) that keep the pre-hairline weight.
@@ -144,7 +239,6 @@ describe('neutral solid borders are hairlines', () => {
    */
   const RING_TRACKS = new Set([
     'boot-page.module.css .spinner',
-    'TrajectoryTable.module.css .historyLoadingSpinner',
   ])
 
   it('rejects a wide neutral border and a wide filled divider', () => {
@@ -167,6 +261,24 @@ describe('neutral solid borders are hairlines', () => {
       return wideNeutralBorders(readFileSync(file, 'utf8'), exempt)
         .map(line => `${file} ${line}`)
     })
+    expect(wide).toEqual([])
+  })
+
+  it('rejects thick neutral inset strokes while allowing hairlines and state colors', () => {
+    expect(wideNeutralInsetShadows('.a { box-shadow: inset 0 0 0 1px var(--dsw-alias-border-l2); }'))
+      .toEqual(['.a box-shadow: inset 0 0 0 1px var(--dsw-alias-border-l2)'])
+    expect(wideNeutralInsetShadows('.a { box-shadow: inset 0 0 0 1em var(--dsw-alias-border-l2); }'))
+      .toEqual(['.a box-shadow: inset 0 0 0 1em var(--dsw-alias-border-l2)'])
+    expect(wideNeutralInsetShadows('.a { box-shadow: inset 0px 0px 0px 0.5px var(--dsw-alias-border-l2); }')).toEqual([])
+    expect(wideNeutralInsetShadows('.a { box-shadow: inset 0 0 0 var(--dsh-hairline-width, 0.5px) var(--dsw-alias-border-l2); }')).toEqual([])
+    expect(wideNeutralInsetShadows('.a { box-shadow: inset 0 0 0 2px var(--dsw-alias-state-business-primary); }')).toEqual([])
+    expect(wideNeutralInsetShadows('.a { box-shadow: inset 0 0 0 0.5px var(--dsw-alias-border-l2), inset 0 0 0 2px var(--dsw-alias-border-l3); }'))
+      .toEqual(['.a box-shadow: inset 0 0 0 0.5px var(--dsw-alias-border-l2), inset 0 0 0 2px var(--dsw-alias-border-l3)'])
+  })
+
+  it('keeps literal neutral inset strokes at or below 0.5px under packages/', () => {
+    const wide = packageStylesheets().flatMap(file =>
+      wideNeutralInsetShadows(readFileSync(file, 'utf8')).map(line => `${file} ${line}`))
     expect(wide).toEqual([])
   })
 

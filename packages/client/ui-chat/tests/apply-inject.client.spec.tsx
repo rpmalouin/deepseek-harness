@@ -1,29 +1,40 @@
+import { syncedConfig } from '@deepseek-ai/dsh-client-test-runtime'
+import type { AssistantNodeInjected } from '../src/client/chat/AssistantNodeView.tsx'
+import type { MessageId } from '@deepseek-ai/dsh-llm/types'
+import { apply as applyMenus, inject as injectMenus } from '@deepseek-ai/dsh-client-ui-context-menu/client'
 // @vitest-environment jsdom
 /** Chat inject factories exercised over independently mounted Conversation and Chat plugins. */
+import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import { describe, expect, it, vi } from 'vitest'
-import { AttachmentId } from '@deepseek-ai/dsh-attachment'
+import type { AttachmentId } from '@deepseek-ai/dsh-attachment/types'
+import { brandString } from '@deepseek-ai/dsh-brand'
 import type { ISession, SessionReference } from '@deepseek-ai/dsh-api-session-controller/client'
 import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
 import {
-  SlotTestRuntime, stubSettingsScope, usePinnedBrowserLanguages,
+  SlotTestRuntime, stubConfigForm, usePinnedBrowserLanguages,
 } from '@deepseek-ai/dsh-client-test-runtime'
 import type { SessionBehaviorOverrides } from '@deepseek-ai/dsh-client-test-runtime'
 import type { ClientRemote } from '@deepseek-ai/dsh-api-remotes/client'
+import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client'
 import {
   apply as applyConversation, inject as injectConversation,
+  type GroupKey,
 } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import {
-  apply as applyChat, inject as injectChat, type ChatViewInjected,
+  apply as applyChat, inject as injectChat, type ChatFlowDataInjected, type ChatViewInjected,
 } from '@deepseek-ai/dsh-client-ui-chat/client'
 import { SessionSeq, type SessionId } from '@deepseek-ai/dsh-session/types'
 import type { WorkspaceId } from '@deepseek-ai/dsh-workspace/types'
 import { createChatStore } from '../src/client/stores.ts'
+import { CHAT_SETTINGS_NAMESPACE, type ChatSettings } from '../src/chat-settings.ts'
+import type { LinkOpeningRowInjected } from '../src/client/settings/LinkOpeningRow.tsx'
+import type { TranscriptViewRowInjected } from '../src/client/settings/TranscriptViewRow.tsx'
 
 usePinnedBrowserLanguages('zh-CN')
 
 const ROOT = 'root-1' as SessionId
 const ATTACHMENT = {
-  attachmentId: AttachmentId('image-1'),
+  attachmentId: brandString<AttachmentId>('image-1'),
   mediaType: 'image/png',
   bytes: 1,
   width: 1,
@@ -36,6 +47,7 @@ type ChatActions = ChatInstance['actions']
 function sessionFakeFor() {
   return {
     loadOlder: vi.fn<ISession['loadOlder']>(() => Promise.resolve()),
+    consumeOlder: vi.fn<ISession['consumeOlder']>(() => true),
     loadThrough: vi.fn<ISession['loadThrough']>(() => Promise.resolve()),
     readAttachment: vi.fn<ISession['readAttachment']>(() => Promise.resolve({
       ok: true,
@@ -46,21 +58,30 @@ function sessionFakeFor() {
   } satisfies SessionBehaviorOverrides
 }
 
-async function bench() {
+async function bench(initialSettings?: ChatSettings, withBrowserRegistry = true, withProcessGroups = true) {
   const runtime = await SlotTestRuntime.create()
-  runtime.ctx.provide('settingsScope', { bind: () => stubSettingsScope().scope } as never)
+  const chatSettings = stubConfigForm<ChatSettings>()
+  if (initialSettings !== undefined) chatSettings.publish({ value: initialSettings })
+  runtime.ctx.provide('configForms', {
+    developerTools: { enabled: createSnapshotStore(true) },
+    get: (id: string) => id === CHAT_SETTINGS_NAMESPACE ? chatSettings.scope : stubConfigForm().scope,
+  } as never)
   const layout = { closeRightbar: vi.fn(), openRightbar: vi.fn() }
+  runtime.ctx.provide('connection', { state: createSnapshotStore('connected') } as never)
+  runtime.ctx.provide('fileDrag', { actions: fileDrag, read: () => undefined })
   runtime.ctx.provide('layout', layout as never)
   const sidebarRight = {
     openResource: vi.fn<(address: string) => void>(),
     openTab: vi.fn<(kind: string, options?: unknown) => void>(),
   }
   runtime.ctx.provide('sidebarRight', sidebarRight as never)
+  const browserAvailable = createSnapshotStore(true)
   const sidebarRightTabs = {
-    get: vi.fn<(kind: string) => object | undefined>(() => ({})),
+    get: vi.fn<(kind: string) => object | undefined>(() => browserAvailable.getSnapshot() ? {} : undefined),
+    subscribe: (listener: () => void) => browserAvailable.subscribe(listener),
     register: vi.fn(() => () => {}),
   }
-  runtime.ctx.provide('sidebarRightTabs', sidebarRightTabs as never)
+  if (withBrowserRegistry) runtime.ctx.provide('sidebarRightTabs', sidebarRightTabs as never)
   runtime.ctx.provide('resources', { register: vi.fn(() => () => {}) } as never)
   const openWorkspacePath = vi.fn<ClientRemote['session']['openWorkspacePath']>(
     () => Promise.resolve({ ok: true, value: { opened: true } }),
@@ -85,11 +106,17 @@ async function bench() {
   const locale = new LocaleRuntime(runtime.ctx)
   runtime.ctx.provide('locale', locale)
   runtime.slots.installLocale(locale)
+  runtime.ctx.provide('shortcuts', { catalog: createSnapshotStore([]) })
+  await runtime.mount({ inject: [...injectMenus], apply: applyMenus }, syncedConfig({ resolutionTimeoutMs: 1000 }))
   await runtime.root.declare({
     'main': { kind: 'keyed', scope: 'root' },
+    'settings.general.item': { kind: 'list', scope: 'root' },
   }, (_props: { renderSlot?: unknown }) => null)
-  await runtime.mount({ inject: [...injectConversation], apply: applyConversation })
-  await runtime.mount({ inject: [...injectChat], apply: applyChat })
+  await runtime.mount({ inject: [...injectConversation], apply: applyConversation }, syncedConfig({ busyEnter: 'queue', maxConcurrentFileUploads: 2 }))
+  const registerGroups = withProcessGroups ? undefined
+    : vi.spyOn(runtime.ctx.uiConversation.groups, 'register').mockImplementation(() => () => {})
+  const chat = await runtime.mount({ inject: [...injectChat], apply: applyChat })
+  registerGroups?.mockRestore()
   runtime.renderRoot()
 
   const chatViewApi = (reference: SessionReference) => {
@@ -102,33 +129,171 @@ async function bench() {
     ) => ChatViewInjected)(id, instance.actions)
     return { instance, injected }
   }
+  const chatFlowApi = (reference: SessionReference) => {
+    const entry = runtime.slots.entries('conversation.chat.flow')[0]!
+    const instance = runtime.storeOf('conversation.chat.flow', reference) as ChatInstance
+    const injectFlow = entry.inject as (sessionId: SessionId) => ChatFlowDataInjected
+    return { instance, injected: injectFlow(reference.sessionId) }
+  }
   return {
-    runtime, layout, openWorkspacePath, sidebarRight, sidebarRightTabs, session, chatViewApi, rootReference, openSession,
+    get linkPreference() {
+      const row = runtime.slots.entries('settings.general.item').find(entry => entry.options.id === 'link-opening')!
+      const preference: object = row.inject!()
+      return preference as LinkOpeningRowInjected
+    },
+    runtime, chat, chatSettings, browserAvailable,
+    layout, openWorkspacePath, sidebarRight, sidebarRightTabs, session, chatViewApi, chatFlowApi, rootReference, openSession,
   }
 }
 
 describe('Chat inject API', () => {
+  it('routes text gestures from each Chat view to the registered consumer with its own Session', async () => {
+    const b = await bench()
+    try {
+      const secondId = await b.runtime.sessions.add({ id: 'second-chat' })
+      using secondReference = b.runtime.sessions.retain(secondId)
+      await secondReference.ready
+      const first = b.chatViewApi(b.rootReference).injected
+      const second = b.chatViewApi(secondReference).injected
+      const received: { sessionId: SessionId; text: string | null }[] = []
+      const dispose = b.runtime.ctx.uiConversation.interactions.register({
+        id: 'selection-menu',
+        onInteraction(request) {
+          received.push({ sessionId: request.sessionId, text: request.readText() })
+          if (request.trigger !== 'contextmenu') return
+          request.preventDefault()
+          request.open()
+        },
+      })
+      expect(first.hooks.interactionIds.getSnapshot()).toEqual(['selection-menu'])
+      expect(second.hooks.interactionIds.getSnapshot()).toEqual(['selection-menu'])
+      const nativeMenu = vi.fn()
+      expect(first.dispatchInteraction({
+        trigger: 'selection', hasSelection: true, readText: () => 'first selection', preventDefault: nativeMenu,
+      })).toBeNull()
+      expect(nativeMenu).not.toHaveBeenCalled()
+      const contextMenu = {
+        trigger: 'contextmenu' as const, hasSelection: true,
+        readText: () => 'second selection', preventDefault: nativeMenu,
+      }
+      expect(second.dispatchInteraction(contextMenu)).toBe('selection-menu')
+      expect(nativeMenu).toHaveBeenCalledOnce()
+      expect(received).toEqual([
+        { sessionId: ROOT, text: 'first selection' },
+        { sessionId: secondId, text: 'second selection' },
+      ])
+      dispose()
+      expect(first.hooks.interactionIds.getSnapshot()).toEqual([])
+      expect(second.dispatchInteraction(contextMenu)).toBeNull()
+      expect(nativeMenu).toHaveBeenCalledOnce()
+    } finally {
+      await b.runtime.dispose()
+    }
+  })
+
+  it('projects independent Settings choices and saves timing to Host settings', async () => {
+    const b = await bench()
+    try {
+      const row = b.runtime.slots.entries('settings.general.item')
+        .find(entry => entry.options.id === 'transcript-view')!
+      const preference = row.inject!()
+      const setCollapseTiming = preference.setCollapseTiming as TranscriptViewRowInjected['setCollapseTiming']
+      const { injected } = b.chatViewApi(b.rootReference)
+      const presentation = injected.hooks.presentation
+      expect(presentation.getSnapshot()).toMatchObject({ mode: 'detailed', collapseTiming: 'completion' })
+      setCollapseTiming('next-input')
+      expect(presentation.getSnapshot()).toMatchObject({ mode: 'detailed', collapseTiming: 'next-input' })
+      expect(b.chatSettings.set).toHaveBeenCalledWith('collapseTiming', 'next-input')
+      b.chatSettings.publish({ status: 'ready', value: { linkOpening: 'sidebar', transcriptView: 'standard', performanceUsage: 'detailed', collapseTiming: 'next-input' }, revision: 1, writable: true })
+      expect(presentation.getSnapshot()).toMatchObject({ mode: 'standard', collapseTiming: 'next-input' })
+      setCollapseTiming('completion')
+      expect(presentation.getSnapshot()).toMatchObject({ mode: 'standard', collapseTiming: 'completion' })
+      expect(b.chatSettings.set).toHaveBeenLastCalledWith('collapseTiming', 'completion')
+      const setFoldedReplies = preference.setFoldedReplies as TranscriptViewRowInjected['setFoldedReplies']
+      expect(presentation.getSnapshot()).toMatchObject({ foldedReplies: 'all' })
+      setFoldedReplies('final')
+      expect(presentation.getSnapshot()).toMatchObject({ mode: 'standard', collapseTiming: 'completion', foldedReplies: 'final' })
+      expect(b.chatSettings.set).toHaveBeenLastCalledWith('foldedReplies', 'final')
+      expect(b.session.prompt).not.toHaveBeenCalled()
+      expect(b.session.cancel).not.toHaveBeenCalled()
+    } finally {
+      await b.runtime.dispose()
+    }
+  })
+
+  it('resolves keyed Group sources across registration, activation, and removal', async () => {
+    const b = await bench(undefined, true, false)
+    try {
+      const { injected } = b.chatFlowApi(b.rootReference)
+      const key = 'injected-group' as GroupKey
+      expect(injected.keyedHooks.chatGroup(key)).toBeUndefined()
+      const conversation = b.runtime.ctx.uiConversation
+      const remove = conversation.groups.register({
+        kind: 'test-group', target: 'chat',
+        create: () => null,
+        update: () => null,
+        buildGroups: () => ({
+          entries: [{ kind: 'group', key }],
+          groups: { kind: 'replace', snapshots: [{
+            key, data: { turn: 1, closed: true, summary: { counts: [], running: undefined, runningDetail: '' } }, members: [],
+          }] },
+        }),
+      })
+      await Promise.resolve()
+      conversation.binding(b.rootReference.binding).activate('chat')
+      const source = injected.keyedHooks.chatGroup(key)
+      expect(source?.getSnapshot()?.data.turn).toBe(1)
+      expect(injected.keyedHooks.chatGroup(key)).toBe(source)
+      remove()
+      await Promise.resolve()
+      expect(source?.getSnapshot()).toBeUndefined()
+      expect(injected.keyedHooks.chatGroup(key)).toBeUndefined()
+    } finally {
+      await b.runtime.dispose()
+    }
+  })
+
   it('loads older history and forks through the Session Controller', async () => {
     const b = await bench()
     const { injected } = b.chatViewApi(b.rootReference)
     injected.loadOlder()
-    expect(b.session.loadOlder).toHaveBeenCalledOnce()
+    expect(b.session.loadOlder).toHaveBeenCalledExactlyOnceWith({ deferConsumption: true })
+    expect(injected.consumeOlder()).toBe(true)
+    expect(b.session.consumeOlder).toHaveBeenCalledOnce()
 
     void injected.loadThrough(SessionSeq(42))
     expect(b.session.loadThrough).toHaveBeenCalledWith(42)
 
+    const track = vi.fn()
+    b.runtime.ctx.provide('productAnalytics', { track } as never)
+    const forkCreated = vi.spyOn(b.runtime.sessions, 'fork').mockImplementation(async (input) => { input.onCreated?.(ROOT); return ROOT })
+    injected.forkAt(17)
+    expect(track).toHaveBeenCalledWith('branch_session_click', { session_id: ROOT, parent_session_id: ROOT, click_position: 'footer' })
+    await b.runtime.sessions.replaceEvents(ROOT, [
+      { type: 'event', event: { type: 'turn/start', seq: SessionSeq(10), time: 10, data: { turn: 1 } } },
+      { type: 'event', event: { type: 'step/start', seq: SessionSeq(11), time: 11, data: { turn: 1, step: 1 } } },
+      { type: 'event', event: { type: 'assistant/message', seq: SessionSeq(12), time: 12, surfaceOp: 'append', data: {
+        turn: 1, step: 1, stream: [], message: { id: brandString<MessageId>('reply'), role: 'assistant', content: [{ type: 'text', text: 'answer' }], source: { kind: 'model', provider: 'fixture', model: 'fixture' } },
+      } } },
+      { type: 'event', event: { type: 'turn/end', seq: SessionSeq(17), time: 17, data: { turn: 1, reason: { kind: 'completed' } } } },
+    ])
+    injected.forkAt(17)
+    expect(track).toHaveBeenLastCalledWith('branch_session_click', { session_id: ROOT, parent_session_id: ROOT, parent_message_id: 'reply', click_position: 'footer' })
+    forkCreated.mockRestore()
     injected.forkAt(17)
     await vi.waitFor(() => {
       expect(b.openSession).toHaveBeenCalledWith(ROOT)
     })
     expect(b.runtime.sessions.calls).toContainEqual({
-      method: 'fork', args: [{ sessionId: ROOT, atSeq: 17, increaseTitle: true }],
+      method: 'fork', args: [{ sessionId: ROOT, atSeq: 17, increaseTitle: true, onCreated: expect.any(Function) as (childId: SessionId) => void }],
     })
 
     const fork = vi.spyOn(b.runtime.sessions, 'fork').mockRejectedValueOnce(new Error('fork failed'))
     injected.forkAt(18)
     await vi.waitFor(() => {
-      expect(fork).toHaveBeenCalledWith({ sessionId: ROOT, atSeq: 18, increaseTitle: true })
+      expect(fork).toHaveBeenCalledWith({
+        sessionId: ROOT, atSeq: 18, increaseTitle: true, onCreated: expect.any(Function) as (childId: SessionId) => void,
+      })
     })
     await b.runtime.dispose()
   })
@@ -153,6 +318,32 @@ describe('Chat inject API', () => {
     // A line travels as the `file` type's navigation parameter, not in the address.
     await injected.openFile('src/a.ts', { line: 7 })
     expect(b.sidebarRight.openResource).toHaveBeenLastCalledWith('dsh-resource://file/session/root-1/src/a.ts', { params: { line: 7 } })
+    await b.runtime.dispose()
+  })
+
+  it('resolves relative file paths against the Session\'s current working directory', async () => {
+    const b = await bench()
+    const { injected } = b.chatViewApi(b.rootReference)
+    vi.spyOn(b.runtime.ctx.contextMenus, 'open')
+    await b.runtime.sessions.setProjection(ROOT, 'workingDirectory', '/proj/.agents/worktrees/w')
+    // The address is relative to the same directory the Host resolves it from.
+    await injected.openFile('src/a.ts')
+    expect(b.sidebarRight.openResource).toHaveBeenLastCalledWith('dsh-resource://file/session/root-1/src/a.ts')
+    expect(injected.resolveFilePath('src/a.ts')).toBe('/proj/.agents/worktrees/w/src/a.ts')
+    await b.runtime.sessions.setProjection(ROOT, 'workingDirectory', null)
+    expect(injected.resolveFilePath('file.ts')).toBe('/proj/file.ts')
+    await b.runtime.sessions.setProjection(ROOT, 'workingDirectory', '/proj/.agents/worktrees/w')
+
+    // A leading `./` names the same file, so the Sidebar reuses its tab.
+    await injected.openFile('./src/a.ts')
+    expect(b.sidebarRight.openResource).toHaveBeenLastCalledWith('dsh-resource://file/session/root-1/src/a.ts')
+
+    // Outside the Session's directory, the address carries the absolute path after the Session id.
+    await injected.openFile('/proj/src/a.ts')
+    expect(b.sidebarRight.openResource).toHaveBeenLastCalledWith('dsh-resource://file/session/root-1//proj/src/a.ts')
+    await b.runtime.sessions.setProjection(ROOT, 'workingDirectory', '/elsewhere')
+    await injected.openFile('src/a.ts')
+    expect(b.sidebarRight.openResource).toHaveBeenLastCalledWith('dsh-resource://file/session/root-1/src/a.ts')
     await b.runtime.dispose()
   })
 
@@ -183,20 +374,114 @@ describe('Chat inject API', () => {
     }
   })
 
-  it('routes sent skill previews through the viewed Session source and tolerates an absent provider', async () => {
+  it('applies restored and live link destinations without remounting the Chat view', async () => {
+    const settings: ChatSettings = { transcriptView: 'compact', performanceUsage: 'detailed', linkOpening: 'new-tab' }
+    const b = await bench(settings)
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null)
+    try {
+      const { injected } = b.chatViewApi(b.rootReference)
+      const source = b.linkPreference.hooks.linkOpening
+      expect(source.getSnapshot()).toBe('new-tab')
+      injected.openExternalLink('https://example.test/restored')
+      expect(open).toHaveBeenLastCalledWith('https://example.test/restored', '_blank', 'noopener,noreferrer')
+      expect(b.sidebarRight.openTab).not.toHaveBeenCalled()
+
+      b.chatSettings.publish({ value: { ...settings, linkOpening: 'sidebar' } })
+      expect(source.getSnapshot()).toBe('sidebar')
+      injected.openExternalLink('http://example.test/live')
+      expect(b.sidebarRight.openTab).toHaveBeenLastCalledWith('browser', { params: { url: 'http://example.test/live' } })
+
+      b.linkPreference.setLinkOpening('new-tab')
+      expect(b.chatSettings.set).toHaveBeenCalledWith('linkOpening', 'new-tab')
+      injected.openExternalLink('http://example.test/selected')
+      expect(open).toHaveBeenLastCalledWith('http://example.test/selected', '_blank', 'noopener,noreferrer')
+
+      await b.chat.dispose()
+      expect(b.runtime.slots.entries('settings.general.item').some(row => row.options.id === 'link-opening')).toBe(false)
+      b.chatSettings.publish({ value: { ...settings, linkOpening: 'sidebar' } })
+      expect(source.getSnapshot()).toBe('new-tab')
+    } finally {
+      open.mockRestore()
+      await b.runtime.dispose()
+    }
+  })
+
+  it('follows browser registration and routes absent browsers externally', async () => {
     const b = await bench()
-    const { injected } = b.chatViewApi(b.rootReference)
-    injected.openSkill('review')
-    const openReference = vi.fn(() => true)
-    const sessionOf = vi.fn(() => ({ openReference }))
-    b.runtime.ctx.provide('inputTriggers', { sessionOf } as never)
-    injected.openSkill('review')
-    expect(sessionOf).toHaveBeenCalledWith(b.runtime.sessions.scope(ROOT))
-    expect(openReference).toHaveBeenCalledWith('skill', { ref: '/review' })
-    vi.spyOn(b.runtime.sessions, 'scope').mockReturnValueOnce(undefined)
-    injected.openSkill('review')
-    expect(openReference).toHaveBeenCalledTimes(1)
-    await b.runtime.dispose()
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null)
+    const available = b.linkPreference.hooks.browserAvailable
+    const changed = vi.fn()
+    const unsubscribe = available.subscribe(changed)
+    try {
+      const { injected } = b.chatViewApi(b.rootReference)
+      expect(available.getSnapshot()).toBe(true)
+      b.browserAvailable.set(false)
+      expect(available.getSnapshot()).toBe(false)
+      expect(changed).toHaveBeenCalledOnce()
+      injected.openExternalLink('https://example.test/disabled')
+      expect(open).toHaveBeenCalledWith('https://example.test/disabled', '_blank', 'noopener,noreferrer')
+      b.browserAvailable.set(true)
+      injected.openExternalLink('https://example.test/enabled')
+      expect(b.sidebarRight.openTab).toHaveBeenCalledWith('browser', { params: { url: 'https://example.test/enabled' } })
+      expect(b.linkPreference.hooks.linkOpening.getSnapshot()).toBe('sidebar')
+    } finally {
+      unsubscribe()
+      open.mockRestore()
+      await b.runtime.dispose()
+    }
+  })
+
+  it('keeps Chat available while the optional tab registry appears and leaves', async () => {
+    const b = await bench(undefined, false)
+    try {
+      expect(b.runtime.slots.entries('conversation.view')).toHaveLength(1)
+      expect(b.runtime.slots.entries('settings.general.item').some(row => row.options.id === 'link-opening')).toBe(false)
+      const registry = await b.runtime.mount({
+        apply(ctx) { ctx.provide('sidebarRightTabs', b.sidebarRightTabs as never) },
+      })
+      await vi.waitFor(() => {
+        expect(b.runtime.slots.entries('settings.general.item').some(row => row.options.id === 'link-opening')).toBe(true)
+      })
+      await registry.dispose()
+      expect(b.runtime.slots.entries('settings.general.item').some(row => row.options.id === 'link-opening')).toBe(false)
+      expect(b.runtime.slots.entries('conversation.view')).toHaveLength(1)
+    } finally {
+      await b.runtime.dispose()
+    }
+  })
+
+  it('keeps local link choices usable when settings cannot persist', async () => {
+    const b = await bench()
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null)
+    try {
+      const { injected } = b.chatViewApi(b.rootReference)
+      b.chatSettings.publish({ status: 'unavailable' })
+      b.chatSettings.set.mockResolvedValueOnce(false)
+      b.linkPreference.setLinkOpening('new-tab')
+      b.chatSettings.publish({ value: undefined })
+      injected.openExternalLink('https://example.test/local')
+      expect(open).toHaveBeenCalledWith('https://example.test/local', '_blank', 'noopener,noreferrer')
+      expect(b.sidebarRight.openTab).not.toHaveBeenCalled()
+
+      b.chatSettings.set.mockRejectedValueOnce(new Error('settings unavailable'))
+      b.linkPreference.setLinkOpening('sidebar')
+      await Promise.resolve()
+      injected.openExternalLink('https://example.test/local-sidebar')
+      expect(b.sidebarRight.openTab).toHaveBeenCalledWith('browser', { params: { url: 'https://example.test/local-sidebar' } })
+    } finally {
+      open.mockRestore()
+      await b.runtime.dispose()
+    }
+  })
+
+  it('leaves skill preview injection to the skill reference owner', async () => {
+    const b = await bench()
+    try {
+      const { injected } = b.chatViewApi(b.rootReference)
+      expect(injected).not.toHaveProperty('openSkill')
+    } finally {
+      await b.runtime.dispose()
+    }
   })
 
   it('keeps a relative path under the Session without a cwd, and addresses a path outside the workspace absolutely', async () => {
@@ -228,6 +513,9 @@ describe('Chat inject API', () => {
     ) => ChatViewInjected
     expect(() => injectView('never-listed' as SessionId, {} as ChatActions))
       .toThrow(/unknown session/)
+    const flowEntry = b.runtime.slots.entries('conversation.chat.flow')[0]!
+    const injectFlow = flowEntry.inject as (sessionId: SessionId) => ChatFlowDataInjected
+    expect(() => injectFlow('never-listed' as SessionId)).toThrow(/unknown session/)
     await b.runtime.dispose()
   })
 
@@ -236,15 +524,24 @@ describe('Chat inject API', () => {
     const { injected } = b.chatViewApi(b.rootReference)
     const owner = {} as never
 
-    expect(injected.keyedHooks.chatNode('missing')).toBeDefined()
-    expect(injected.keyedHooks.chatNodeProcess('missing')).toBeDefined()
+    const flow = b.chatFlowApi(b.rootReference)
+    expect(flow.instance).toBe(b.chatViewApi(b.rootReference).instance)
+    expect(flow.injected.keyedHooks.chatNode('missing')).toBe(injected.keyedHooks.chatNode('missing'))
+    expect(flow.injected.keyedHooks.chatNodeProcess('missing')).toBe(injected.keyedHooks.chatNodeProcess('missing'))
+    expect(flow.injected.keyedHooks.chatNodeBottom('missing')).toBe(injected.keyedHooks.chatNodeBottom('missing'))
+    expect(flow.injected.hooks.connectionState).toBe((b.runtime.ctx.get('connection') as ConnectionHandle).state)
+    expect(flow.injected.hooks.presentation).toBe(injected.hooks.presentation)
 
-    expect(injected.fileMentions(owner)).toBeUndefined()
+    const entry = b.runtime.slots.entries('conversation.chat.node').find(entry => entry.options.key === 'assistant-step')!
+    const assistant = entry.inject!(ROOT as never)
+    const fileMentions = assistant.fileMentions as AssistantNodeInjected['fileMentions']
+    const getFileTriggerProps = vi.fn(() => ({}))
+    expect(fileMentions(owner, getFileTriggerProps)).toBeUndefined()
     const mentions = { resolve: vi.fn() } as never
     const forClosing = vi.fn(() => mentions)
     b.runtime.ctx.provide('chatFileMentions', { forClosing } as never)
-    expect(injected.fileMentions(owner)).toBe(mentions)
-    expect(forClosing).toHaveBeenCalledWith(owner, ROOT)
+    expect(fileMentions(owner, getFileTriggerProps)).toBe(mentions)
+    expect(forClosing).toHaveBeenCalledWith(owner, ROOT, getFileTriggerProps)
 
     expect(injected.chatScroll.read()).toBeNull()
     const position = { anchorKey: 'node-1', anchorTop: 4, scrollTop: 12 }
@@ -255,8 +552,10 @@ describe('Chat inject API', () => {
 
     const loaded = await injected.loadImage(ATTACHMENT)
     expect(loaded).toEqual(expect.any(String))
-    expect(b.session.readAttachment).toHaveBeenCalledWith(ATTACHMENT.attachmentId)
+    expect(b.session.readAttachment).toHaveBeenCalledWith(ATTACHMENT)
     expect(injected.loadImage.peek?.(ATTACHMENT)).toBe(loaded)
     await b.runtime.dispose()
   })
 })
+
+const fileDrag = { prepare: vi.fn(async () => ({ start: () => true, release: () => {} })), reportFailure: vi.fn() }

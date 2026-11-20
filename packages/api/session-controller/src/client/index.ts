@@ -32,7 +32,7 @@ export type {
   SessionListPhase,
   SessionListSnapshot,
   SessionSearchResultItem,
-  SubagentCatalogSnapshot,
+  SessionProjectionSnapshot,
 } from './sessions/manager.ts'
 export type { Session } from './sessions/session.ts'
 export type {
@@ -86,6 +86,15 @@ export interface SessionReferenceSourceMap {
 
 /** Declaration-merge-extensible labels carried by independent Client references. */
 export type SessionReferenceSource = Extract<keyof SessionReferenceSourceMap, string>
+
+/**
+ * Owner-declared parts of a retained Session beyond its history stream, each counted independently.
+ * Owners extend it by augmenting this package's canonical `/client` module specifier; the Controller assigns no meaning to a key.
+ */
+export interface SessionRetainFacetMap {}
+
+/** Declaration-merge-extensible facet names a reference may retain. */
+export type SessionRetainFacet = Extract<keyof SessionRetainFacetMap, string>
 
 declare module '@deepseek-ai/cordis' {
   interface Context {

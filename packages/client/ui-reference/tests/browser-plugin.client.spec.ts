@@ -4,10 +4,18 @@
  * round-trip, and registration lifecycle.
  */
 import { Context, Service } from '@deepseek-ai/cordis'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
+import { SlotRegistry } from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type { PropsRenderSlots } from '@deepseek-ai/dsh-client-ui-slots'
+import { UiConversation } from '@deepseek-ai/dsh-client-ui-conversation/src/client/conversation/assembly.ts'
+import {
+  FileReference, FolderReference, type FileReferenceInjected, type PathPresenceInjected,
+} from '../src/client/FileReference.tsx'
+import type { PathStat } from '../src/client/path-presence.ts'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
-import { RemoteError } from '@deepseek-ai/dsh-client-test-runtime'
+import { RemoteError, TestSessions } from '@deepseek-ai/dsh-client-test-runtime'
+import type { SessionFixture } from '@deepseek-ai/dsh-client-test-runtime'
 import type {
   CandidateRequest, ClientSessionContext, InputTriggerCandidate, InputTriggerSource,
 } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
@@ -55,6 +63,19 @@ function request(
   }
 }
 
+function TextSlotDeclaration(_props: PropsRenderSlots<'conversation.user.text.node'>): null {
+  return null
+}
+
+async function installTextSlots(ctx: Context, sessions: TestSessions): Promise<void> {
+  new UiConversation(ctx, sessions)
+  await ctx.plugin(SlotRegistry).await()
+  ctx.slots.register({
+    name: 'root',
+    children: { 'conversation.user.text.node': { kind: 'keyed', scope: 'session' } },
+  }, TextSlotDeclaration)
+}
+
 async function bench(
   files: RemoteLookup<FileReferenceCandidate> = vi.fn(() => Promise.resolve({
     ok: true as const,
@@ -80,7 +101,9 @@ async function bench(
     parentId?: SessionId
     projectionValues?: { title?: string | null }
   }> = {},
-): Promise<{ ctx: Context; fiber: ReturnType<Context['plugin']>; source: InputTriggerSource }> {
+  opening: Pick<SessionFixture, 'initialOpen' | 'snapshot'> = {},
+  stat: PathStat = vi.fn<PathStat>(() => new Promise(() => {})),
+) {
   const ctx = new Context()
   ctx.provide('sidebarRight', { openResource: vi.fn() })
   let source: InputTriggerSource | undefined
@@ -100,23 +123,43 @@ async function bench(
   new RemoteService(ctx)
   ctx.provide('remote.fileReferences', { list: files })
   ctx.provide('remote.sessionReferenceResolver', { candidates: sessions })
+  ctx.provide('remote.workspaceFiles', { stat })
   ctx.provide('locale', new LocaleRuntime(ctx))
-  ctx.provide('sessions', { list: { getSnapshot: () => ({ byId: listed }) } })
+  const sessionStore = new TestSessions(async (action) => { await action() }, ctx)
+  onTestFinished(async () => {
+    await sessionStore.disposeScopes()
+    await ctx.fiber.dispose()
+  })
+  ctx.provide('sessions', sessionStore)
+  const summary = listed[session.sessionId]
+  await sessionStore.add({ id: session.sessionId, ...opening, ...summary === undefined ? {} : { summary } })
+  for (const [id, summary] of Object.entries(listed)) {
+    if (id !== session.sessionId) await sessionStore.add({ id, summary })
+  }
+  await installTextSlots(ctx, sessionStore)
+  const owner = sessionStore.retainFor(ctx, session.sessionId)
   const fiber = ctx.plugin({ inject: [...inject], apply })
   await fiber.await()
   if (source === undefined) throw new Error('reference source was not registered')
-  return { ctx, fiber, source }
+  return { ctx, fiber, source, sessions: sessionStore, owner }
+}
+
+/** The Session-bound presence face a file or folder text node entry injects. */
+function injectedPresence(ctx: Context, key: 'file' | 'folder'): (id: SessionId) => PathPresenceInjected {
+  const entry = ctx.slots.entries('conversation.user.text.node').find(candidate => candidate.options.key === key)!
+  return entry.inject as NonNullable<typeof entry.inject> & ((id: SessionId) => PathPresenceInjected)
 }
 
 describe('apply', () => {
   it('declares its services and releases the @ reference registration on disposal', async () => {
     expect(inject).toEqual([
       'inputTriggers', 'locale', 'sessions', 'remote', 'remote.fileReferences',
-      'remote.sessionReferenceResolver', 'sidebarRight',
+      'remote.sessionReferenceResolver', 'remote.workspaceFiles', 'sidebarRight', 'slots', 'uiConversation',
     ])
     const { fiber } = await bench()
     let registered: InputTriggerSource | undefined
     const ctx = new Context()
+    onTestFinished(() => ctx.fiber.dispose())
     ctx.provide('sidebarRight', { openResource: vi.fn() })
     ctx.provide('inputTriggers', {
       registerSource(source: InputTriggerSource) {
@@ -134,13 +177,25 @@ describe('apply', () => {
     new RemoteService(ctx)
     ctx.provide('remote.fileReferences', { list: () => Promise.resolve({ ok: true, value: [] }) })
     ctx.provide('remote.sessionReferenceResolver', { candidates: () => Promise.resolve({ ok: true, value: [] }) })
+    ctx.provide('remote.workspaceFiles', { stat: vi.fn() })
     ctx.provide('locale', new LocaleRuntime(ctx))
-    ctx.provide('sessions', { list: { getSnapshot: () => ({ byId: {} }) } })
+    const sessions = new TestSessions(async (action) => { await action() }, ctx)
+    onTestFinished(() => sessions.disposeScopes())
+    ctx.provide('sessions', sessions)
+    await installTextSlots(ctx, sessions)
     const ownFiber = ctx.plugin({ inject: [...inject], apply })
     await ownFiber.await()
     expect(registered).toMatchObject({ trigger: '@', name: 'reference', showGroupTitle: false })
+    expect(ctx.uiConversation.userText.entries().map(rule => rule.id)).toEqual(['file', 'folder'])
+    expect(ctx.slots.entries('conversation.user.text.node')).toMatchObject([
+      { options: { key: 'file' }, component: FileReference },
+      { options: { key: 'folder' }, component: FolderReference },
+    ])
+    expect(ctx.slots.entries('conversation.user.text.node')[0]?.inject).toBeTypeOf('function')
     await ownFiber.dispose()
     expect(registered).toBeUndefined()
+    expect(ctx.uiConversation.userText.entries()).toHaveLength(0)
+    expect(ctx.slots.entries('conversation.user.text.node')).toHaveLength(0)
     await fiber.dispose()
   })
 
@@ -150,6 +205,68 @@ describe('apply', () => {
 })
 
 describe('candidates', () => {
+  it('waits for initial history before both lookups and releases its reference after they settle', async () => {
+    const opened = Promise.withResolvers<undefined>()
+    const response = Promise.withResolvers<RemoteEnvelope<FileReferenceCandidate[]>>()
+    const files = vi.fn(() => response.promise)
+    const lookup = vi.fn(() => Promise.resolve({ ok: true as const, value: [] }))
+    const b = await bench(files, lookup, {}, { initialOpen: () => opened.promise })
+    try {
+      const pending = b.source.candidates(session, request(''))
+      expect(b.sessions.retainInfo(session.sessionId).getSnapshot().retainedBy.referenceCandidates).toBe(1)
+      expect(files).not.toHaveBeenCalled()
+      expect(lookup).not.toHaveBeenCalled()
+      opened.resolve(undefined)
+      await vi.waitFor(() => { expect(files).toHaveBeenCalledOnce() })
+      expect(lookup).toHaveBeenCalledOnce()
+      expect(b.sessions.retainInfo(session.sessionId).getSnapshot().referenceCount).toBe(2)
+      response.resolve({ ok: true, value: [] })
+      await expect(pending).resolves.toEqual([])
+      expect(b.sessions.retainInfo(session.sessionId).getSnapshot().referenceCount).toBe(1)
+    } finally {
+      opened.resolve(undefined)
+      response.resolve({ ok: true, value: [] })
+    }
+  })
+
+  it.each([true, false])('refuses an unsuccessful history open (reported error: %s)', async (reported) => {
+    const error = new RemoteError('gateway/internal', 'history unavailable', {})
+    const files = vi.fn(() => Promise.resolve({ ok: true as const, value: [] }))
+    const lookup = vi.fn(() => Promise.resolve({ ok: true as const, value: [] }))
+    const b = await bench(files, lookup, {}, { snapshot: { openState: 'error', openError: reported ? error : null } })
+    await expect(b.source.candidates(session, request(''))).rejects.toThrow(reported ? 'history unavailable' : 'is not open')
+    expect(files).not.toHaveBeenCalled()
+    expect(lookup).not.toHaveBeenCalled()
+    expect(b.sessions.retainInfo(session.sessionId).getSnapshot().referenceCount).toBe(1)
+  })
+
+  it('does not reopen a released Session for candidates', async () => {
+    const b = await bench()
+    b.owner.release()
+    await expect(b.source.candidates(session, request(''))).rejects.toThrow('require a retained session')
+    expect(b.sessions.binding(session.sessionId)).toBeUndefined()
+  })
+
+  it('cancels a query waiting for history without starting either lookup', async () => {
+    const opened = Promise.withResolvers<undefined>()
+    const controller = new AbortController()
+    const files = vi.fn(() => Promise.resolve({ ok: true as const, value: [] }))
+    const lookup = vi.fn(() => Promise.resolve({ ok: true as const, value: [] }))
+    const b = await bench(files, lookup, {}, { initialOpen: () => opened.promise })
+    try {
+      const pending = b.source.candidates(session, request('', { signal: controller.signal }))
+      const reason = new Error('query cancelled')
+      const rejected = expect(pending).rejects.toBe(reason)
+      controller.abort(reason)
+      await rejected
+      expect(files).not.toHaveBeenCalled()
+      expect(lookup).not.toHaveBeenCalled()
+      expect(b.sessions.retainInfo(session.sessionId).getSnapshot().referenceCount).toBe(1)
+    } finally {
+      opened.resolve(undefined)
+    }
+  })
+
   it('starts both Remote lookups together and renders files before sessions with stable labels', async () => {
     let releaseFiles!: () => void
     let releaseSessions!: () => void
@@ -194,7 +311,7 @@ describe('candidates', () => {
     }))
     const { source } = await bench(files, sessions, { source: { updatedAt: UPDATED_AT } })
     const pending = source.candidates(session, request('re'))
-    expect(files).toHaveBeenCalledTimes(1)
+    await vi.waitFor(() => { expect(files).toHaveBeenCalledTimes(1) })
     expect(sessions).toHaveBeenCalledTimes(1)
     releaseSessions()
     releaseFiles()
@@ -269,9 +386,13 @@ describe('candidates', () => {
 
   it('drops a completed result when the query signal was superseded', async () => {
     const controller = new AbortController()
-    const { source } = await bench()
+    const gate = Promise.withResolvers<RemoteEnvelope<FileReferenceCandidate[]>>()
+    const files = vi.fn(() => gate.promise)
+    const { source } = await bench(files)
     const pending = source.candidates(session, request('', { signal: controller.signal }))
+    await vi.waitFor(() => { expect(files).toHaveBeenCalledOnce() })
     controller.abort()
+    gate.resolve({ ok: true, value: [] })
     await expect(pending).resolves.toEqual([])
   })
 
@@ -562,6 +683,23 @@ describe('pick and codec', () => {
     await expect(source.codec?.serialize(mention, new AbortController().signal)).resolves.toBe(mention)
   })
 
+  it('confirms settled file and folder picks for the picking Session; a drill confirms nothing', async () => {
+    const stat = vi.fn<PathStat>(() => new Promise(() => {}))
+    const { ctx, source } = await bench(undefined, undefined, {}, {}, stat)
+    const [directory, file] = await source.candidates(session, request(''))
+    const folderFace = injectedPresence(ctx, 'folder')
+    const fileFace = injectedPresence(ctx, 'file')
+    drill(source, directory!)
+    expect(folderFace(session.sessionId).keyedHooks.pathPresence('src/').getSnapshot()).toBeUndefined()
+    pick(source, directory!)
+    pick(source, file!)
+    expect(folderFace(session.sessionId).keyedHooks.pathPresence('src/').getSnapshot()).toBe('present')
+    expect(fileFace(session.sessionId).keyedHooks.pathPresence('docs/a b.md').getSnapshot()).toBe('present')
+    expect(folderFace(sid('other')).keyedHooks.pathPresence('src/').getSnapshot()).toBeUndefined()
+    folderFace(session.sessionId).keyedHooks.pathPresence('src/').subscribe(vi.fn())
+    expect(stat).not.toHaveBeenCalled()
+  })
+
   it('ignores candidates that do not carry a source-owned value', async () => {
     const { source } = await bench()
     expect(pick(source, { name: 'foreign candidate' })).toBeUndefined()
@@ -569,6 +707,35 @@ describe('pick and codec', () => {
 })
 
 describe('reference preview', () => {
+  it('stats each mention through its rendering Session and aborts outstanding stats on disposal', async () => {
+    const stat = vi.fn<PathStat>(() => new Promise(() => {}))
+    const { ctx, fiber } = await bench(undefined, undefined, {}, {}, stat)
+    injectedPresence(ctx, 'file')(session.sessionId).keyedHooks.pathPresence('LICENSE').subscribe(vi.fn())
+    injectedPresence(ctx, 'folder')(sid('other')).keyedHooks.pathPresence('docs/').subscribe(vi.fn())
+    expect(stat.mock.calls.map(([id, path]) => [id, path])).toEqual([['target', 'LICENSE'], ['other', 'docs/']])
+    expect(stat.mock.calls.some(([, , signal]) => signal.aborted)).toBe(false)
+    await fiber.dispose()
+    expect(stat.mock.calls.every(([, , signal]) => signal.aborted)).toBe(true)
+  })
+
+  it('binds each inline file action to its originating Session', async () => {
+    const { ctx, sessions } = await bench()
+    const entry = ctx.slots.entries('conversation.user.text.node').find(candidate => candidate.options.key === 'file')!
+    const factory = entry.inject as NonNullable<typeof entry.inject> & ((id: SessionId) => FileReferenceInjected)
+    const openResource = vi.spyOn(ctx.sidebarRight, 'openResource')
+    factory(session.sessionId).openFile('docs/a b.md')
+    factory(sid('other')).openFile('notes.md')
+    const file = factory(session.sessionId)
+    await sessions.updateSummary(session.sessionId, { cwd: '/workspace' })
+    await sessions.setProjection(session.sessionId, 'workingDirectory', '/workspace/elsewhere')
+    expect(file.resolveFilePath('docs/a b.md')).toBe('/workspace/elsewhere/docs/a b.md')
+    expect(factory(sid('other')).resolveFilePath('/absolute.md')).toBe('/absolute.md')
+    expect(openResource.mock.calls).toEqual([
+      ['dsh-resource://file/session/target/docs/a%20b.md'],
+      ['dsh-resource://file/session/other/notes.md'],
+    ])
+  })
+
   it('opens plain and quoted file references without treating folders or sessions as files', async () => {
     const { ctx, source, fiber } = await bench()
     const openResource = vi.spyOn(ctx.sidebarRight, 'openResource')

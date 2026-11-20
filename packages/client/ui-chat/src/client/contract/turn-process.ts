@@ -17,21 +17,6 @@ export interface TurnProcessSpec {
   readonly subagentCount: number
 }
 
-const TURN_PROCESS_INDEPENDENT_KIND_LIST = [
-  'system-prompt',
-  'user',
-  'steering',
-  'turn-process',
-  'turn-error',
-  'turn-max-tokens',
-  'turn-tail',
-] as const satisfies readonly ChatNode['kind'][]
-
-/** Chat Node kinds that remain independent of a Turn's process disclosure. */
-export const TURN_PROCESS_INDEPENDENT_KINDS: ReadonlySet<string> = new Set(
-  TURN_PROCESS_INDEPENDENT_KIND_LIST,
-)
-
 /**
  * Compare immutable Turn-process specifications by their published fields.
  * @param left - previous specification.
@@ -58,4 +43,16 @@ export function sameTurnProcessSpec(left: TurnProcessSpec, right: TurnProcessSpe
  */
 export function isSubagentDelegationTool(name: string): boolean {
   return name === 'subagent' || name.startsWith('subagent_')
+}
+
+/**
+ * Keep live, stopped, and failed Turns open.
+ * @param node - Node carrying the owning Turn.
+ * @returns whether whole-Turn collapse is unavailable.
+ */
+export function turnProcessAlwaysOpen(node: ChatNode | undefined): boolean {
+  const location = node?.location
+  if (location?.kind !== 'turn' && location?.kind !== 'step') return false
+  const reason = location.turn.end?.data.reason.kind
+  return location.turn.status === 'open' || reason === 'aborted' || reason === 'interrupted' || reason === 'error'
 }

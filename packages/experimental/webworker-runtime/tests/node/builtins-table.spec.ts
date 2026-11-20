@@ -13,7 +13,7 @@
  * evaluates at load, which is why nothing here asserts that a factory is
  * unevaluated.
  */
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createNodeBuiltins, REPLACED_PREFIXES } from '../../src/node/builtins.ts'
 import { WorkerModuleLoader, type WorkerRequire } from '../../src/module-system/module-loader.ts'
 import { MemoryVfs } from '../../src/storage/memory.ts'
@@ -60,6 +60,26 @@ describe('the replacement table', () => {
 })
 
 describe('module identity through the loader', () => {
+  afterEach(() => { vi.restoreAllMocks() })
+
+  it('loads the Pi SDK replacement from an empty image and refuses agent operations', () => {
+    const require = loaderRequire()
+    const sdk = require('@earendil-works/pi-coding-agent') as { createAgentSessionServices(): never }
+    expect(require('@earendil-works/pi-coding-agent')).toBe(sdk)
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    expect(() => sdk.createAgentSessionServices()).toThrow(expect.objectContaining({
+      code: 'ERR_FEATURE_UNAVAILABLE_ON_PLATFORM',
+    }))
+  })
+
+  it('resolves REPL imports for image loading and refuses unsupported evaluation', () => {
+    const require = loaderRequire()
+    const repl = require('node:repl') as typeof import('node:repl')
+    expect(require('repl')).toBe(repl)
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    expect(() => repl.start()).toThrow(expect.objectContaining({ code: 'ERR_FEATURE_UNAVAILABLE_ON_PLATFORM' }))
+  })
+
   it('exposes async and synchronous resolution through the Cordis internal seam', async () => {
     const vfs = new MemoryVfs()
     vfs.seedDirectory('/dsh/node_modules/example')
@@ -87,6 +107,28 @@ describe('module identity through the loader', () => {
     expect(require('events')).toBe(require('node:events'))
     expect(require('fs')).toBe(require('node:fs'))
     expect(require('tty')).toBe(require('node:tty'))
+  })
+
+  it('shares promise stream helpers and observes completion and errors through the loader', async () => {
+    const require = loaderRequire()
+    const stream = require('node:stream') as typeof import('node:stream')
+    const promises = require('node:stream/promises') as typeof import('node:stream/promises')
+    expect(require('stream/promises')).toBe(promises)
+    expect(promises.finished).toBe(stream.promises.finished)
+    expect(promises.pipeline).toBe(stream.promises.pipeline)
+
+    const output = new stream.Writable({ write(_chunk, _encoding, callback) { callback() } })
+    const baseline = output.listenerCount('error')
+    const completed = promises.finished(output, { cleanup: true })
+    output.end('done')
+    await completed
+    expect(output.listenerCount('error')).toBe(baseline)
+
+    const failed = new stream.Writable({ write(_chunk, _encoding, callback) { callback(new Error('write failed')) } })
+    const rejected = expect(promises.finished(failed, { cleanup: true })).rejects.toThrow('write failed')
+    failed.end('broken')
+    await rejected
+    expect(failed.listenerCount('error')).toBe(0)
   })
 
   it('reports that worker file descriptors are not terminals', () => {

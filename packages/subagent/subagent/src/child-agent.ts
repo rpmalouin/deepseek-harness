@@ -1,9 +1,7 @@
 /**
  * Shared in-process child composition: the delegation-depth budget, the
  * durable session metadata, the resolved child `AgentOptions`, the delegated
- * policy seed, and the scoped setup a child agent needs. Both the one-shot
- * provider driver and the continuation manager compose children this way, so
- * depth accounting, lineage stamping, and delegation policy have one home.
+ * policy seed, and the scoped setup used by local activations.
  *
  * @module @deepseek-ai/dsh-subagent/child-agent
  */
@@ -11,7 +9,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentOptions, CreateAgentOptions } from '@deepseek-ai/dsh-agent'
 import type { SandboxMode } from '@deepseek-ai/dsh-sandbox'
-import type { Session, SessionId } from '@deepseek-ai/dsh-session'
+import type { Session } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type { ToolRestriction } from '@deepseek-ai/dsh-tools'
 // Type-only: make `ctx.get('sandboxPolicy')`, `ctx.get('approval')`, and
@@ -26,13 +24,14 @@ import type {} from '@deepseek-ai/dsh-permission-presets'
 // documented `ctx.get` pattern), never as a hard dep. A rosterless deployment
 // keeps its model-facing rows on the host plane, where the child already sees
 // them through the tool registry's global layer.
-import type {} from '@deepseek-ai/dsh-agent-presets'
+import type {} from '@deepseek-ai/dsh-agent-preset-registry'
 import { delegationDepthOf } from './depth.ts'
+import { SubagentError } from './error.ts'
 
-/** Thrown when starting a child would exceed the requested depth cap. */
-export class SubagentDepthError extends Error {
+/** Thrown when starting a child would exceed the requested depth cap; `code` is `DEPTH_EXCEEDED`. */
+export class SubagentDepthError extends SubagentError {
   constructor(public readonly attemptedDepth: number, public readonly maxDepth: number) {
-    super(`subagent depth ${attemptedDepth} exceeds maxDepth ${maxDepth}`)
+    super(`subagent depth ${attemptedDepth} exceeds maxDepth ${maxDepth}`, 'DEPTH_EXCEEDED')
     this.name = 'SubagentDepthError'
   }
 }
@@ -45,12 +44,12 @@ export class SubagentDepthError extends Error {
  * @param maxDepth - optional absolute cap the resolved depth must not exceed.
  * @returns the child's non-negative safe-integer depth.
  * @throws {SubagentDepthError} when the resolved depth exceeds `maxDepth`.
- * @throws {RangeError} when the resolved depth leaves the safe-integer range.
+ * @throws {SubagentError} `INVALID_DEPTH` when the resolved depth leaves the safe-integer range.
  */
 export function resolveChildDepth(parent: Agent, maxDepth: number | undefined): number {
   const childDepth = delegationDepthOf(parent) + 1
   if (!Number.isSafeInteger(childDepth)) {
-    throw new RangeError('subagent child depth exceeds the safe-integer range')
+    throw new SubagentError('subagent child depth exceeds the safe-integer range', 'INVALID_DEPTH')
   }
   if (maxDepth !== undefined && childDepth > maxDepth) {
     throw new SubagentDepthError(childDepth, maxDepth)
@@ -125,24 +124,22 @@ export function resolveChildAgentOptions(
  * survive persistence, the seed boundary that separates inherited parent
  * history from child work, and the composition the child runs under.
  *
- * The preset is read from the parent's LIVE scope chain rather than from its
- * header, because a parent that switched preset while blank runs on the newer
- * composition and its header still names the older one. Recording it is what
- * makes a child's history reconstructable: without it a cold read of the child
- * resolves the deployment default and rebuilds turns under a tool set the
- * child never had.
+ * Omitted selection uses the parent's live composition, including any switch
+ * made while the parent was blank.
  * @param parent - the delegating parent agent.
  * @param childDepth - the resolved delegation depth to persist.
  * @param isSeeded - whether this child inherits a parent-log prefix, including an explicitly empty one.
+ * @param selectedPreset - independent selection, or omission to inherit the parent.
  * @returns the `meta` for `ctx.agents.create()`.
  */
 export function childSessionMeta(
   parent: Agent,
   childDepth: number,
   isSeeded: boolean,
+  selectedPreset?: string,
 ): NonNullable<CreateAgentOptions['meta']> {
   const parentHeader = parent.session.header
-  const agentPreset = parent.ctx.get('agentPresets')?.composedPreset(parent.ctx)
+  const agentPreset = selectedPreset ?? parent.ctx.get('agentPresets')?.composedPreset(parent.ctx)
   return {
     ...parentHeader.cwd !== undefined ? { cwd: parentHeader.cwd } : {},
     ...agentPreset === undefined ? {} : { agentPreset },
@@ -158,14 +155,16 @@ export function childSessionMeta(
 
 /** The scoped composition a child agent's creation window applies. */
 export interface ChildComposition {
-  /** Per-child persona shadowing the deployment persona. */
+  /** Preset to mount; omission shares a supplied creator or uses host composition. */
+  readonly agentPreset?: string | undefined
+  /** Historical descriptor persona reapplied only during cold resume. */
   readonly persona?: string | undefined
-  /** Per-child tool scoping. */
+  /** Historical descriptor tool restriction reapplied only during cold resume. */
   readonly toolFilter?: ToolRestriction | undefined
 }
 
 /**
- * Model-facing delegation-scope statement for every in-process child. A
+ * Model-facing delegation-scope and message-authorship statement for every in-process child. A
  * runtime-context contribution rather than a system-prompt section, so the
  * deployment's system prompt stays uniform across parents and children.
  */
@@ -173,36 +172,42 @@ export const SUBAGENT_DELEGATION_CONTEXT
   = 'You are a delegated subagent: your permission scope was fixed when you were started and cannot be '
     + 'widened from inside this session — operations that require approval are rejected automatically. '
     + 'When the task needs access beyond that scope, do not retry the denied operation; state the '
-    + 'limitation in your reply so the delegating agent can handle it.'
+    + 'limitation in your reply so the delegating agent can handle it. Messages from other agents begin with '
+    + '"Agent <name> sent a message:". Other user messages come from the human user, who reads this conversation '
+    + 'directly. You can still message other agents to coordinate, but answer the human user in your reply.'
 
 /**
- * Compose one child inside its creation window: join its parent's preset,
- * register the fixed delegation-scope statement, then apply the child's own
- * shadowing persona section and tool restriction, all owned by the child's
- * scope and therefore invisible to its parent and siblings. Creation and cold
- * resume both pass through here.
- *
- * The join comes first and the child's own registrations second, which is the
- * order the layering already implies — the nearest scope wins a name, and a
- * per-child restriction intersects with everything its chain admits — but
- * stating it here keeps the two steps from being read as independent.
- *
- * The join and the per-child registrations live in ONE call because a child
- * composed without the join is exactly the defect this function exists to
- * prevent: with every model-facing row on the agent plane, a child that joins
- * no preset sees an empty tool registry and none of its parent's prompt
- * sections. Taking the parent as a parameter is what makes that omission
- * unrepresentable at the call sites.
+ * Compose a child before publication and restore historical descriptor overrides.
+ * Explicit selection mounts the named preset. Omission joins a supplied creator's
+ * current generation; a restored child without a saved preset uses host composition.
+ * Registrations belong to the child's scope.
  * @param childCtx - the child agent's scoped creation context.
- * @param parent - the delegating parent whose composition the child joins.
- * @param composition - the per-child persona and tool filter to install.
+ * @param parent - creator for fresh delegation; absent during target-only restoration.
+ * @param composition - independent preset and any overrides read from a historical descriptor.
+ * @returns A promise when mounting an independent preset; otherwise completes synchronously.
+ * @throws {SubagentError} `PRESET_UNAVAILABLE` when a preset is selected but the preset
+ *   service is absent. An unknown or unloadable selected preset rejects with the registry's
+ *   `RemoteError` code.
  */
 export function applyChildComposition(
   childCtx: Context,
-  parent: Agent,
+  parent: Agent | undefined,
   composition: ChildComposition,
-): void {
-  childCtx.get('agentPresets')?.composeFrom(childCtx, parent.ctx)
+): void | Promise<void> {
+  if (composition.agentPreset !== undefined) {
+    const presets = childCtx.get('agentPresets')
+    if (presets === undefined) {
+      throw new SubagentError('selecting a child agent preset requires the agent-presets service', 'PRESET_UNAVAILABLE')
+    }
+    return presets.mount(childCtx, composition.agentPreset).then(() => {
+      applyChildOverrides(childCtx, composition)
+    })
+  }
+  if (parent !== undefined) childCtx.get('agentPresets')?.composeFrom(childCtx, parent.ctx)
+  applyChildOverrides(childCtx, composition)
+}
+
+function applyChildOverrides(childCtx: Context, composition: ChildComposition): void {
   childCtx.systemPrompt.context({
     name: 'subagent:delegation',
     order: childCtx.systemPrompt.getContextOrder('SUBAGENT_DELEGATION'),
@@ -220,7 +225,10 @@ export function applyChildComposition(
 
 /** Policy seeded onto a child session's log at the delegation boundary. */
 export interface DelegatedPolicyOverrides {
-  /** The shared-bundle preset identity when the parent currently runs in Auto or Full access. */
+  /**
+   * The parent's current preset identity when it runs in Auto or Full access;
+   * the child keeps it under the pinned `never` approval policy.
+   */
   readonly permissionPreset: 'auto' | 'danger-full-access' | undefined
   /** The parent session's explicit sandbox-mode override, or `undefined` without one. */
   readonly sandboxMode: SandboxMode | undefined
@@ -254,11 +262,11 @@ export function captureDelegatedPolicyOverrides(parent: Agent): DelegatedPolicyO
 
 /**
  * Append the captured delegation policy onto the child's own log as
- * `source: 'delegation'` events inside the unpublished creation window, so the
+ * `source: 'delegation'` events after Session announcement and before Agent registration, so the
  * child's effective policy is reconstructable from its log alone. Appends land
  * after any fork seed, so fresh policy wins stale seed state; later child
  * switches still win over these events.
- * @param childSession - the unpublished child's session.
+ * @param childSession - the child's announced, writable Session.
  * @param overrides - the policy captured at delegation.
  */
 export function appendDelegatedPolicyOverrides(
@@ -274,16 +282,4 @@ export function appendDelegatedPolicyOverrides(
   if (overrides.permissionPreset !== undefined) {
     childSession.append('permission/preset', { preset: overrides.permissionPreset })
   }
-}
-
-/** Identity and lineage inputs shared by every in-process child creation. */
-export interface ChildCreateInputs {
-  /** The child's reserved session id. */
-  readonly sessionId: SessionId
-  /** The delegating parent agent. */
-  readonly parent: Agent
-  /** The resolved delegation depth. */
-  readonly childDepth: number
-  /** How many leading seed events came from the parent's log. */
-  readonly lineageSeedLength: number
 }

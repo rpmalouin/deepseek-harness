@@ -3,14 +3,11 @@ import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
-import InvariantRegistry from '@deepseek-ai/dsh-invariants'
-import { CommandId } from '@deepseek-ai/dsh-commands/brand'
-import * as SessionInvariant from '@deepseek-ai/dsh-session/invariant'
-import * as AgentInvariant from '@deepseek-ai/dsh-agent/invariant'
-import * as AgentLoopInvariant from '@deepseek-ai/dsh-agent-loop/invariant'
-import * as CompactionInvariant from '@deepseek-ai/dsh-compaction/invariant'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { CommandId } from '@deepseek-ai/dsh-commands/types'
 import { BasicCompactionEngine } from '@deepseek-ai/dsh-compaction-basic'
-import { CompactionId, isCompactCheckpointSource, ManualCompactionError } from '@deepseek-ai/dsh-compaction'
+import type { CompactionId } from '@deepseek-ai/dsh-compaction/types'
+import { isCompactCheckpointSource, ManualCompactionError } from '@deepseek-ai/dsh-compaction'
 import type { CompactionResult } from '@deepseek-ai/dsh-compaction'
 import {
   createAssistantMessage,
@@ -21,18 +18,28 @@ import type {
   ContentBlock,
   LlmResolvedModelInfo,
   Message,
+  RequestMessage,
   StreamChunk,
   TokenUsage,
 } from '@deepseek-ai/dsh-llm'
-import SessionStore, { Session, SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
+import SessionStore, { buildForkSeed, Session, type SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import LlmRuntime from '@deepseek-ai/dsh-llm'
+import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {
   SummarizationInput,
   SummaryResult,
 } from '@deepseek-ai/dsh-compaction-basic/src/summarizer.ts'
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'listener': { kind: 'listener' } & ContextFormed
+    'rival': { kind: 'rival' } & ContextFormed
+    'test': { kind: 'test' } & ContextFormed
+  }
+}
 
 const MODEL = 'mock'
 const SIGNAL = new AbortController().signal
@@ -69,7 +76,7 @@ class GatedCompactionEngine extends BasicCompactionEngine {
 
 /** One text answer per request, with a context window large enough to avoid pressure. */
 class TextAdapter extends LlmAdapter {
-  readonly requests: Message[][] = []
+  readonly requests: RequestMessage[][] = []
 
   override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
     return Promise.resolve({
@@ -80,7 +87,7 @@ class TextAdapter extends LlmAdapter {
     })
   }
 
-  override async * stream(options: { messages: readonly Message[] }): AsyncIterable<StreamChunk> {
+  override async * stream(options: { messages: readonly RequestMessage[] }): AsyncIterable<StreamChunk> {
     this.requests.push([...options.messages])
     yield { type: 'block-start', index: 0, blockType: 'text' }
     yield { type: 'block-end', index: 0, block: { type: 'text', text: 'answer' } }
@@ -96,22 +103,17 @@ interface LoopHarness {
   readonly log: string[]
 }
 
-/** Real loop, session store, and invariant companions around manual compaction. */
+/** Real loop and session store around manual compaction. */
 async function loopHarness(): Promise<LoopHarness> {
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx)
   ctx.sessions.registerMessageProjection(imageOffloadProjection)
-  await ctx.plugin(InvariantRegistry)
-  await ctx.plugin(SessionInvariant)
-  await ctx.plugin(AgentInvariant)
-  await ctx.plugin(AgentLoopInvariant)
-  await ctx.plugin(CompactionInvariant)
   await ctx.plugin(AgentLoop, { agents: [] })
   await ctx.plugin(TokenMeter)
   const adapter = new TextAdapter()
   ctx.llm.registerAdapter([MODEL], adapter)
   const compact = new GatedCompactionEngine(ctx, { auto: false })
-  const agent = await ctx.agentLoop.create(SessionId('manual-compact'), { provider: MODEL, model: MODEL })
+  const agent = await ctx.agentLoop.create(brandString<SessionId>('manual-compact'), { provider: MODEL, model: MODEL })
   const log: string[] = []
   ctx.on('session/event', (_session, event) => {
     if (event.type === 'turn/start') log.push('turn/start')
@@ -171,7 +173,7 @@ function deferred(): { promise: Promise<undefined>; resolve: () => void } {
 
 /** A closed-tail session with compactable exchanges and no live agent. */
 function closedConversation(turns = 2, lastTurnNumber = turns): Session {
-  const session = Session.create(SessionId(`closed-${turns}-${lastTurnNumber}`))
+  const session = Session.create(brandString<SessionId>(`closed-${turns}-${lastTurnNumber}`))
   for (let index = 1; index <= turns; index += 1) {
     const turn = index === turns ? lastTurnNumber : index
     session.append('turn/start', { turn })
@@ -312,7 +314,7 @@ describe('compactNow through the real loop', () => {
     compact.duringSummary = () => {
       agent.inject(createUserMessage({
         content: [{ type: 'text', text: 'INJECTED CONTEXT' }],
-        source: { kind: 'plugin', plugin: 'test' },
+        source: { kind: 'test' },
       }))
     }
 
@@ -321,7 +323,7 @@ describe('compactNow through the real loop', () => {
     expect(result).not.toBeNull()
     const start = agent.session.snapshotEvents().findLast(event => event.type === 'compaction/start')
     const injected = agent.inbox.nextStep.find(message =>
-      message.source.kind === 'plugin' && message.source.plugin === 'test')
+      message.source.kind === 'test')
     const end = agent.session.snapshotEvents().findLast(event => event.type === 'compaction/end')
     expect(start).toBeDefined()
     expect(injected).toBeDefined()
@@ -350,7 +352,7 @@ describe('compactNow through the real loop', () => {
       attempts.push(event.type)
       agent.inject(createUserMessage({
         content: [{ type: 'text', text: `from ${event.type}` }],
-        source: { kind: 'plugin', plugin: 'listener' },
+        source: { kind: 'listener' },
       }))
     })
 
@@ -361,7 +363,7 @@ describe('compactNow through the real loop', () => {
     expect(agent.session.deriveMessages()[0]?.role).toBe('system')
     expect(derivedText(agent.session)[1]).toContain('checkpoint')
     expect(agent.session.snapshotEvents().filter(event => event.type === 'user/message'
-      && event.data.source.kind === 'plugin' && event.data.source.plugin === 'listener')).toHaveLength(0)
+      && event.data.source.kind === 'listener')).toHaveLength(0)
     const types = compactEvents(agent.session).map(event => event.type)
     expect(types).toEqual(['compaction/start', 'compaction/summary', 'compaction/end'])
   })
@@ -409,7 +411,7 @@ describe('compactNow through the real loop', () => {
 describe('compactNow transaction and failure classification', () => {
   it('returns null without writing a bracket for history that cannot be compacted', async () => {
     const { compact } = detachedService()
-    const session = Session.create(SessionId('empty'))
+    const session = Session.create(brandString<SessionId>('empty'))
     let released = 0
     const agent = fakeAgent(session, () => () => { released += 1 })
 
@@ -423,7 +425,7 @@ describe('compactNow transaction and failure classification', () => {
     const { compact, flushes } = detachedService()
     const session = closedConversation(2, 7)
     const agent = fakeAgent(session, () => () => undefined)
-    const commandId = CommandId('manual-compact-command')
+    const commandId = brandString<CommandId>('manual-compact-command')
 
     const result = await compact.compactNow(agent, SIGNAL, commandId)
 
@@ -449,7 +451,7 @@ describe('compactNow transaction and failure classification', () => {
     const { compact } = detachedService()
     const session = closedConversation(2)
     session.append('compaction/start', {
-      compactionId: CompactionId('live-manual-compaction'),
+      compactionId: brandString<CompactionId>('live-manual-compaction'),
       turn: null,
     })
     const agent = fakeAgent(session, () => () => undefined)
@@ -464,10 +466,10 @@ describe('compactNow transaction and failure classification', () => {
     const { compact } = detachedService()
     const original = closedConversation(2)
     original.append('compaction/start', {
-      compactionId: CompactionId('stale-manual-compaction'),
+      compactionId: brandString<CompactionId>('stale-manual-compaction'),
       turn: null,
     })
-    const reloaded = Session.create(SessionId('stale-orphan'), original.snapshotEvents())
+    const reloaded = Session.create(brandString<SessionId>('stale-orphan'), original.snapshotEvents())
     const boundary = reloaded.snapshotEvents().findLast(event => event.type === 'session/end-seed')
     const orphan = reloaded.snapshotEvents().find(event => event.type === 'compaction/start')
     const agent = fakeAgent(reloaded, () => () => undefined)
@@ -477,16 +479,38 @@ describe('compactNow transaction and failure classification', () => {
     expect(compact.calls).toHaveLength(1)
   })
 
+  it('ignores an unmatched bracket a mid-turn fork seed cut open', async () => {
+    // A fork boundary inside the source's live compaction bracket: the seed
+    // keeps the unmatched compaction/start and balances only the turn with
+    // forked closers — never a synthetic compaction/end. The child's end-seed
+    // marker proves the inherited lock stale, so compaction is not blocked.
+    const { compact } = detachedService()
+    const original = closedConversation(2)
+    original.append('turn/start', { turn: 3 })
+    original.append('compaction/start', {
+      compactionId: brandString<CompactionId>('forked-manual-compaction'),
+      turn: 3,
+    })
+    const seed = buildForkSeed(original.snapshotEvents(), original.snapshotEvents().at(-1)!.seq)
+    expect(seed.filter(event => event.type === 'compaction/end')).toEqual([])
+    expect(seed.at(-1)).toMatchObject({ type: 'turn/end', data: { reason: { kind: 'forked' } } })
+    const child = Session.create(brandString<SessionId>('forked-orphan'), seed)
+    const agent = fakeAgent(child, () => () => undefined)
+
+    await expect(compact.compactNow(agent, SIGNAL)).resolves.not.toBeNull()
+    expect(compact.calls).toHaveLength(1)
+  })
+
   it('scans a stale orphan independently of later repaired turn state', async () => {
     const { compact } = detachedService()
     const original = closedConversation(2)
     original.append('compaction/start', {
-      compactionId: CompactionId('reloaded-manual-compaction'),
+      compactionId: brandString<CompactionId>('reloaded-manual-compaction'),
       turn: null,
     })
     original.append('turn/start', { turn: 3 })
     original.append('turn/end', { turn: 3, reason: { kind: 'interrupted' } })
-    const reloaded = Session.create(SessionId('reloaded-orphan'), original.snapshotEvents())
+    const reloaded = Session.create(brandString<SessionId>('reloaded-orphan'), original.snapshotEvents())
     const agent = fakeAgent(reloaded, () => () => undefined)
 
     await expect(compact.compactNow(agent, SIGNAL)).resolves.not.toBeNull()
@@ -521,7 +545,7 @@ describe('compactNow transaction and failure classification', () => {
       const [head] = session.surface.nodes
       session.append('user/message', createUserMessage({
         content: [{ type: 'text', text: 'competing replacement' }],
-        source: { kind: 'plugin', plugin: 'rival' },
+        source: { kind: 'rival' },
       }), {
         surfaceOp: { op: 'replace', startSeq: head!, endSeq: head! },
         sourceEventSeqs: [head!],
@@ -542,7 +566,7 @@ describe('compactNow transaction and failure classification', () => {
       const middle = session.surface.nodes[1]
       session.append('user/message', createUserMessage({
         content: [{ type: 'text', text: 'rewritten middle node' }],
-        source: { kind: 'plugin', plugin: 'rival' },
+        source: { kind: 'rival' },
       }), {
         surfaceOp: { op: 'replace', startSeq: middle!, endSeq: middle! },
         sourceEventSeqs: [middle!],
@@ -573,7 +597,7 @@ describe('compactNow transaction and failure classification', () => {
       queueMicrotask(() => {
         session.append('user/message', createUserMessage({
           content: [{ type: 'text', text: 'late competing replacement' }],
-          source: { kind: 'plugin', plugin: 'rival' },
+          source: { kind: 'rival' },
         }), {
           surfaceOp: { op: 'replace', startSeq: head, endSeq: head },
           sourceEventSeqs: [head],
@@ -698,7 +722,7 @@ describe('compactNow transaction and failure classification', () => {
 
   it('compacts a session with no durable turn boundary without creating one', async () => {
     const { compact } = detachedService()
-    const session = Session.create(SessionId('turnless'))
+    const session = Session.create(brandString<SessionId>('turnless'))
     for (const text of [PROMPT, 'recent tail']) {
       session.append('user/message', createUserMessage({
         content: [{ type: 'text', text }],
@@ -732,7 +756,7 @@ describe('compactNow transaction and failure classification', () => {
   it('lets a pre-aborted signal win before reservation, measurement, or summarization', async () => {
     const cases = [
       { name: 'busy', session: closedConversation(2), release: undefined },
-      { name: 'empty', session: Session.create(SessionId('pre-aborted-empty')), release: () => undefined },
+      { name: 'empty', session: Session.create(brandString<SessionId>('pre-aborted-empty')), release: () => undefined },
       { name: 'compactable', session: closedConversation(2, 9), release: () => undefined },
     ] as const
 
@@ -858,17 +882,23 @@ describe('compactNow transaction and failure classification', () => {
     const { compact } = detachedService()
     const session = closedConversation(2)
     const agent = fakeAgent(session, () => () => undefined)
-    compact.gate = new Promise<undefined>((resolve) => {
-      setTimeout(() => { resolve(undefined) }, 5)
-    })
+    const openedAt = Date.now()
+    const originalNow = Date.now
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(openedAt)
+    try {
+      compact.duringSummary = () => { clock.mockReturnValue(openedAt + 25) }
 
-    await compact.compactNow(agent, SIGNAL)
+      await compact.compactNow(agent, SIGNAL)
 
-    const start = session.snapshotEvents().findLast(event => event.type === 'compaction/start')
-    const end = session.snapshotEvents().findLast(event => event.type === 'compaction/end')
-    expect(start).toBeDefined()
-    expect(end).toBeDefined()
-    expect(end!.time - start!.time).toBeGreaterThan(0)
+      const start = session.snapshotEvents().findLast(event => event.type === 'compaction/start')
+      const end = session.snapshotEvents().findLast(event => event.type === 'compaction/end')
+      expect(start?.time).toBe(openedAt)
+      expect(end?.time).toBe(openedAt + 25)
+      expect(end!.time - start!.time).toBe(25)
+    } finally {
+      clock.mockRestore()
+    }
+    expect(Date.now).toBe(originalNow)
   })
 
   it('excludes concurrent automatic and manual compaction of one session', async () => {

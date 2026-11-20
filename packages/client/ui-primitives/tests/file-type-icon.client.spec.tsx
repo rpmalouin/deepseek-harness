@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   classifyFileType, fileExtension, FileTypeIcon, type FileTypeKind,
 } from '@deepseek-ai/dsh-client-ui-primitives'
+import { classifyCodeFileType } from '../src/code-file-types.ts'
 import css from '../src/FileTypeIcon.module.css'
 
 afterEach(cleanup)
@@ -26,10 +27,15 @@ describe('classifyFileType', () => {
   it.each([
     ['src/index.TSX', 'react'],
     ['site/index.html', 'html'],
-    ['data/export.CSV', 'code'],
+    ['data/export.CSV', 'excel'],
+    ['data/export.tsv', 'excel'],
     ['shots/hero.png', 'image'],
     ['notes/README.MDX', 'markdown'],
     ['report.xlsm', 'excel'],
+    ['report.xlsb', 'excel'],
+    ['template.xltx', 'excel'],
+    ['sheet.ods', 'excel'],
+    ['template.ots', 'excel'],
     ['budget.numbers', 'excel'],
     ['deck.key', 'ppt'],
     ['letter.rtf', 'word'],
@@ -50,6 +56,30 @@ describe('classifyFileType', () => {
     ['archive.tar/.hidden', 'other'],
   ] as [string, Exclude<FileTypeKind, 'folder'>][])('%s → %s', (path, type) => {
     expect(classifyFileType(path)).toBe(type)
+  })
+})
+
+describe('Object.prototype key names', () => {
+  const keys = ['constructor', '__proto__', 'toString', 'hasOwnProperty']
+
+  it.each(keys.flatMap(key => [
+    [key, 'other'],
+    [`src/${key.toUpperCase()}`, 'other'],
+    [`archive.${key}`, 'other'],
+    [`${key}.md`, 'markdown'],
+    [`${key}.ts`, 'typescript'],
+  ] as [string, Exclude<FileTypeKind, 'folder'>][]))('%s → %s', (path, type) => {
+    expect(classifyFileType(path)).toBe(type)
+  })
+
+  it.each(keys)('%s misses the code-file name and extension tables', (key) => {
+    expect(classifyCodeFileType(key, key)).toBeNull()
+    expect(classifyCodeFileType(key, 'ts')).toBe('typescript')
+  })
+
+  it.each(keys.flatMap(key => [key, `notes.${key}`]))('%s renders the generic file glyph', (path) => {
+    const { container } = render(<FileTypeIcon path={path} />)
+    expect(container.querySelector('svg')!.classList.contains(css.other!)).toBe(true)
   })
 })
 
@@ -103,7 +133,7 @@ describe('FileTypeIcon', () => {
     expect(new Set(paths).size).toBe(types.length)
   })
 
-  it.each(['code', 'folder', 'html', 'image', 'video'] as const)(
+  it.each(['folder', 'html', 'image', 'video'] as const)(
     'enlarges the %s center mark without scaling the file shell',
     (type) => {
       const { container } = render(<FileTypeIcon kind={type} />)
@@ -112,7 +142,7 @@ describe('FileTypeIcon', () => {
     },
   )
 
-  it.each(['excel', 'markdown', 'pdf', 'ppt', 'word'] as const)(
+  it.each(['markdown', 'pdf', 'ppt', 'word'] as const)(
     'gives the %s center mark the larger emphasis scale',
     (type) => {
       const { container } = render(<FileTypeIcon kind={type} />)
@@ -120,6 +150,14 @@ describe('FileTypeIcon', () => {
       expect(container.querySelector('svg > path')?.getAttribute('transform')).toBeNull()
     },
   )
+
+  it('uses the supplied unscaled 1.2px table grid for spreadsheet files', () => {
+    const { container } = render(<FileTypeIcon kind="excel" />)
+    const mark = container.querySelector('[data-file-type-mark]')
+    expect(mark?.getAttribute('transform')).toBeNull()
+    expect(mark?.querySelector('path')?.getAttribute('stroke')).toBe('currentColor')
+    expect(mark?.querySelector('path')?.getAttribute('stroke-width')).toBe('1.2')
+  })
 
   it('keeps the generic file glyph without an invented center mark', () => {
     const { container } = render(<FileTypeIcon kind="other" />)

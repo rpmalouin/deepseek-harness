@@ -1,8 +1,8 @@
 /**
- * Positional pricing shared by measurement and the context-breakdown fold:
- * measurement retains attachment details for route pricing; breakdown keeps
- * only retained node identities, heuristic prices, and system classification.
- * The occupancy projection uses the scalar shadow-price protocol instead.
+ * Positional pricing for measurement: each retained node keeps its identity,
+ * heuristic price, and the attachment details route pricing replaces. The
+ * occupancy and context-breakdown projections use the scalar shadow-price
+ * protocol instead.
  *
  * The fold is a plan/commit pair: {@link planSurfaceTokens} runs every
  * fallible step read-only and {@link commitSurfaceTokens} mutates in place,
@@ -64,10 +64,6 @@ function collectProjectedAttachments(
     } else if (block.type === 'file') {
       files.push(block.attachment)
       fileTokens += estimateStructuralBlock(block)
-    } else if (block.type === 'tool-result') {
-      const nested = collectProjectedAttachments(block.content, images, files)
-      imageTokens += nested.imageTokens
-      fileTokens += nested.fileTokens
     }
   }
   return { imageTokens, fileTokens }

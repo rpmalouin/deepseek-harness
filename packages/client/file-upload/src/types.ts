@@ -1,6 +1,6 @@
 /** Browser-safe request and receipt types for staged file uploads. */
 
-import type { FileAttachmentRef } from '@deepseek-ai/dsh-attachment/types'
+import type { FileAttachmentRef, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment/types'
 import type { Branded } from '@deepseek-ai/dsh-brand'
 
 /** Canonical encoded upload accepted by the Remote fallback. */
@@ -18,16 +18,34 @@ export interface FileUploadValue {
   readonly file: FileAttachmentRef
 }
 
+/** Durable receipt for one staged image upload. */
+export interface ImageUploadValue {
+  /** Per-upload authority accepted only inside the receiving Agent scope. */
+  readonly receiptId: FileUploadReceiptId
+  /** The normalized prompt image the Host stored. */
+  readonly image: ImageAttachmentRef
+}
+
+/**
+ * Durable attachment one staged receipt names: a verbatim file, or a
+ * normalized prompt image with `encodedBytes` holding the byte length of its
+ * upload, which counts toward the per-message image byte limit.
+ */
+export type StagedAttachment =
+  | { readonly type: 'file'; readonly attachment: FileAttachmentRef }
+  | { readonly type: 'image'; readonly attachment: ImageAttachmentRef; readonly encodedBytes: number }
+
 /** Host-minted authority for one staged file upload in one Agent scope. */
 export type FileUploadReceiptId = Branded<'file-upload-receipt-id'>
 
 /**
  * Fetch-shaped carrier installed by a page that owns its Host transport.
- * @param input - absolute same-origin upload URL.
+ * @param input - document-relative upload route; a carrier that needs an
+ * absolute URL resolves it against its own base.
  * @param init - raw request body, headers, and cancellation signal.
  * @returns the Host response.
  */
-export type FileUploadFetch = (input: URL, init: RequestInit) => Promise<Response>
+export type FileUploadFetch = (input: string | URL, init: RequestInit) => Promise<Response>
 
 /** Pre-Cordis hook supplied by a page whose Host runs in another execution context. */
 export interface ClientFileUploadHooks {

@@ -1,7 +1,8 @@
 import { Context } from '@deepseek-ai/cordis'
 import type { Agent, Inbox, InboxState } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { SessionId } from '@deepseek-ai/dsh-session'
+import type { ContextFormed } from '@deepseek-ai/dsh-llm'
+import type { SessionId } from '@deepseek-ai/dsh-session'
 import { afterEach, describe, expect, it } from 'vitest'
 import { SessionControlController } from '../src/control.ts'
 import type { SessionControlFrame } from '../src/types.ts'
@@ -9,6 +10,13 @@ import {
   mountAgentLoopTestDependencies,
   mountAgentLoopTestHarness,
 } from '@deepseek-ai/dsh-agent-loop-testkit'
+import { brandString } from '@deepseek-ai/dsh-brand'
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'fixture': { kind: 'fixture' } & ContextFormed
+  }
+}
 
 const ownedContexts = new Set<Context>()
 afterEach(async () => {
@@ -26,14 +34,14 @@ async function harness(): Promise<{
   ownedContexts.add(ctx)
   await mountAgentLoopTestDependencies(ctx)
   const loop = await mountAgentLoopTestHarness(ctx)
-  const agent = await loop.create(SessionId('queue-session'))
+  const agent = await loop.create(brandString<SessionId>('queue-session'))
   return { ctx, control: new SessionControlController(ctx), agent, inbox: agent.inbox }
 }
 
 function message(text: string, source: 'user' | 'plugin' = 'user') {
   return createUserMessage({
     content: [{ type: 'text', text }],
-    source: source === 'user' ? { kind: 'user' } : { kind: 'plugin', plugin: 'fixture' },
+    source: source === 'user' ? { kind: 'user' } : { kind: 'fixture' },
   })
 }
 
@@ -45,8 +53,13 @@ describe('Session control Inbox projection', () => {
     for (;;) {
       const next = await iterator.next()
       if (next.done) throw new Error('stream ended before an Inbox value')
-      if (next.value.type === 'projection' && next.value.key === 'inbox') return next.value
+      if (next.value.type === 'projection' && next.value.changes.some(change => change.key === 'inbox')) return next.value
     }
+  }
+
+  /** The Inbox value one projection frame carries. */
+  function inboxValue(frame: Extract<SessionControlFrame, { type: 'projection' }>): unknown {
+    return frame.changes.find(change => change.key === 'inbox')?.val
   }
 
   it('projects both pending lists in baselines and live replacement frames', async () => {
@@ -75,10 +88,10 @@ describe('Session control Inbox projection', () => {
     const replacement = message('replacement')
     inbox.append('next-turn', replacement)
     const replaced = await nextInboxFrame(iterator)
-    expect(replaced.value).toMatchObject({ 'next-turn': [queued, replacement] })
+    expect(inboxValue(replaced)).toMatchObject({ 'next-turn': [queued, replacement] })
     inbox.remove(steering.id)
     const removed = await nextInboxFrame(iterator)
-    expect(removed.value).toMatchObject({ 'next-step': [context] })
+    expect(inboxValue(removed)).toMatchObject({ 'next-step': [context] })
 
     abort.abort()
     await iterator.next()
@@ -90,7 +103,7 @@ describe('Session control Inbox projection', () => {
     await mountAgentLoopTestDependencies(ctx)
     const loop = await mountAgentLoopTestHarness(ctx)
     const control = new SessionControlController(ctx)
-    const agent = await loop.create(SessionId('late-projection-queue'))
+    const agent = await loop.create(brandString<SessionId>('late-projection-queue'))
     const { inbox } = agent
     const abort = new AbortController()
     const iterator = control.control(abort.signal)[Symbol.asyncIterator]()
@@ -102,11 +115,27 @@ describe('Session control Inbox projection', () => {
     await expect(iterator.next()).resolves.toMatchObject({
       value: {
         type: 'projection',
-        key: 'inbox',
-        value: { 'next-turn': [{ id: pending.id }], 'next-step': [] },
+        changes: [{ key: 'inbox', val: { 'next-turn': [{ id: pending.id }], 'next-step': [] } }],
       },
     })
 
+    abort.abort()
+    await iterator.next()
+  })
+
+  it('projects inbox state for live and cold sessions', async () => {
+    const { ctx, control, inbox } = await harness()
+    inbox.append('next-turn', message('queued'))
+    const cold = ctx.sessions.create(brandString<SessionId>('cold-session'))
+
+    const abort = new AbortController()
+    const iterator = control.control(abort.signal)[Symbol.asyncIterator]()
+    const opened = await iterator.next()
+    if (opened.done || opened.value.type !== 'baseline') throw new Error('missing baseline')
+    expect(opened.value.value.projections[cold.id]?.values.inbox).toEqual({ 'next-turn': [], 'next-step': [] })
+    expect(opened.value.value.projections['queue-session' as SessionId]?.values.inbox).toMatchObject({
+      'next-turn': [expect.objectContaining({ content: [{ type: 'text', text: 'queued' }] })],
+    })
     abort.abort()
     await iterator.next()
   })
@@ -137,15 +166,15 @@ describe('Session control Inbox projection', () => {
     const abort = new AbortController()
     const iterator = control.control(abort.signal)[Symbol.asyncIterator]()
     await iterator.next()
-    const session = ctx.sessions.create(SessionId('unattached-inbox'))
+    const session = ctx.sessions.create(brandString<SessionId>('unattached-inbox'))
     const pending = message('unattached')
     session.append('agent/inbox/spliced', {
       target: 'next-turn', start: 0, inserted: [pending],
     })
     expect(ctx.agents.get(session.id)).toBeUndefined()
-    await expect(nextInboxFrame(iterator)).resolves.toMatchObject({
-      sessionId: session.id, value: { 'next-turn': [pending], 'next-step': [] },
-    })
+    const frame = await nextInboxFrame(iterator)
+    expect(frame.sessionId).toBe(session.id)
+    expect(inboxValue(frame)).toMatchObject({ 'next-turn': [pending], 'next-step': [] })
     abort.abort()
     await iterator.next()
   })
@@ -173,14 +202,14 @@ describe('Session control Inbox projection', () => {
     inbox.append('next-turn', first)
     inbox.append('next-turn', second)
 
-    const values: InboxState[] = []
+    const values: unknown[] = []
     ownedContexts.delete(ctx)
     await ctx.fiber.dispose()
     for (;;) {
       const next = await iterator.next()
       if (next.done) break
-      if (next.value.type === 'projection' && next.value.key === 'inbox') values.push(next.value.value as unknown as InboxState)
+      if (next.value.type === 'projection' && next.value.changes.some(change => change.key === 'inbox')) values.push(inboxValue(next.value))
     }
-    expect(values.map(value => value['next-turn'].map(item => item.id))).toEqual([[first.id], [first.id, second.id]])
+    expect(values).toMatchObject([{ 'next-turn': [{ id: first.id }] }, { 'next-turn': [{ id: first.id }, { id: second.id }] }])
   })
 })

@@ -5,12 +5,12 @@
   height: 32px;
   padding: 0 8px;
   border: 0.5px solid var(--dsw-alias-border-l4);
-  border-radius: 8px;
+  border-radius: var(--dsw-radius-md);
   background: var(--dsw-alias-bg-layer-1);
 }
 
 .wrap:focus-within {
-  border-color: var(--dsw-alias-brand-primary);
+  border-color: var(--dsw-alias-state-business-primary);
 }
 
 .icon {
@@ -34,5 +34,11 @@
 }
 
 .input::placeholder {
-  color: var(--dsw-alias-label-dimmed);
+  color: var(--dsw-alias-label-tertiary);
+}
+
+@media (pointer: coarse) {
+  .input {
+    font-size: 16px;
+  }
 }

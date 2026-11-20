@@ -76,7 +76,7 @@ This section explains how the command parses input and renders output; the obser
 ### Design
 
 - **Grammar, not free text.** The parser recognizes only the exact control words (`clear`, `pause`, `resume`, `edit`) when they fill the whole input; every other non-empty suffix is an objective. `edit` alone is invalid, and `edit` refuses to replace an unfinished goal directly.
-- **Domain rejections become stable errors.** `GoalError` outcomes are converted into direct command errors with a fixed message; unexpected failures rethrow so adapters report a command failure rather than a domain result. Rendered output never exposes branded ids or revisions.
+- **Domain rejections become stable errors.** `GoalError` outcomes other than `GOAL_STATE_CORRUPT` are converted into direct command errors with a fixed message; corrupt goal state and unexpected failures rethrow so adapters report a command failure rather than a domain result. Rendered output never exposes branded ids or revisions.
 - **Attachments accompany the objective.** On a successful create or edit, the command submits one user followup carrying the admitted image and file blocks in selection order plus the fixed text `Reference attachments for the goal objective.` Every other path submits nothing, so the dispatching composer keeps the draft and cards.
 
 ### Source map
@@ -84,7 +84,6 @@ This section explains how the command parses input and renders output; the obser
 | File | Role |
 |---|---|
 | [`src/index.ts`](src/index.ts) | Plugin entry: command grammar, status rendering, attachment submission |
-| — | No runtime invariant companion is published; this command adapter owns no event stream or state projection; accepted mutations are checked by the goal domain and command dispatch behavior is covered by package tests. |
 
 </details>
 
@@ -97,7 +96,7 @@ The command is a thin adapter over the goal domain; read these pages for the sta
 
 - [Goal service](../goal/README.md) — the state and lifecycle the command mutates.
 - [Commands service](../../interaction/commands/README.md) — the command registry contract and dispatch.
-- [Harness-level goal-execution Agent Note](../../../.agents/notes/implemented/feature/2026-07-16-harness-level-loop.md) — the UX and composition decisions.
+- [historical Harness-level goal-execution Agent Note](../../../.agents/notes/archived/feature/2026-07-16-harness-level-loop.md) — the UX and composition decisions.
 
 -----
 

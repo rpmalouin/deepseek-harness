@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { Context } from '@deepseek-ai/cordis'
+import { Context, Service } from '@deepseek-ai/cordis'
 import { describe, expect, expectTypeOf, it } from 'vitest'
 import {
   bindTypertRemote,
@@ -12,6 +12,7 @@ import {
   type TypertContext,
   type TypertForwardableEvent,
   type TypertForwardableEventEntry,
+  type TypertResource,
   type TypertLookup,
   type TypertRemoteEvent,
 } from '@deepseek-ai/dsh-typert-protocol'
@@ -69,6 +70,11 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
   interface TypertContextMap {
     metaFixture: TypertContext<string>
     otherFixture: TypertContext<string>
+  }
+
+  interface TypertResourceMap {
+    /** Test-only resource kind read from fixture event payloads. */
+    'meta-fixture-id': TypertResource<string>
   }
 
   interface TypertRemoteEventSelection extends
@@ -240,6 +246,63 @@ describe('typert-protocol Remote declarations', () => {
     expect(remoteMethods(prototypeLess)).toEqual([])
   })
 
+  it('records the stream mode on the Remote marker', () => {
+    class Jobs {
+      follow(): void {}
+    }
+    const initializers: Array<(this: Jobs) => void> = []
+    Remote<Jobs, unknown[], unknown>({ mode: 'stream' })(Reflect.get(Jobs.prototype, 'follow'), methodContext('follow', initializers))
+    const jobs = new Jobs()
+    for (const initialize of initializers) initialize.call(jobs)
+    expect(remoteMethods(jobs)).toEqual([
+      { method: 'follow', mode: 'stream', invocation: { kind: 'direct' } },
+    ])
+  })
+
+  it('registers the invocation accessor once per tree, on the root', async () => {
+    const root = new Context()
+    class First extends TypertRemoteService {
+      constructor(ctx: Context) {
+        super(ctx, 'first')
+      }
+
+      outside(): unknown {
+        return this.ctx.invocation
+      }
+    }
+    class Second extends TypertRemoteService {
+      constructor(ctx: Context) {
+        super(ctx, 'second')
+      }
+    }
+    await root.plugin(First)
+    const second = root.plugin(Second)
+    await second
+    const child = root.plugin(() => {})
+    await child
+    expect(child.ctx.invocation).toBeUndefined()
+    expect((root.get('first') as First).outside()).toBeUndefined()
+    // The accessor belongs to the root, so a Remote Service leaving does not take it along.
+    await second.dispose()
+    expect(child.ctx.invocation).toBeUndefined()
+  })
+
+  it('provides the invocation accessor for a plain Service bound with bindTypertRemote', async () => {
+    const root = new Context()
+    expect(Object.hasOwn(root.reflect.props, 'invocation')).toBe(false)
+    class Plain extends Service {
+      readonly typertRemote = bindTypertRemote(this, 'plain')
+
+      constructor(ctx: Context) {
+        super(ctx, 'plain')
+      }
+    }
+    await root.plugin(Plain)
+    expect(Object.hasOwn(root.reflect.props, 'invocation')).toBe(true)
+    expect(root.invocation).toBeUndefined()
+    expect((root.get('plain') as Plain).typertRemote.namespace).toBe('plain')
+  })
+
   it('rejects malformed decorator calls and targets', () => {
     const method: (this: object) => void = function (this: object): void {}
     expect(() => { (Remote as unknown as (value: typeof method) => void)(method) }).toThrow('context is missing')
@@ -248,8 +311,12 @@ describe('typert-protocol Remote declarations', () => {
     expect(() => Remote('bad name')).toThrow('export name')
     expect(() => Remote('.')).toThrow('export name')
     expect(() => Remote('..')).toThrow('export name')
-    expect(() => Remote({ mode: 'unary' } as unknown as { mode: 'stream' })).toThrow('exactly mode')
-    expect(() => Remote({ mode: 'stream', extra: true } as unknown as { mode: 'stream' })).toThrow('exactly mode')
+    expect(() => Remote({ mode: 'unary' } as unknown as { mode: 'stream' })).toThrow('Remote options require')
+    expect(() => Remote({ mode: 'stream', extra: true } as unknown as { mode: 'stream' })).toThrow('Remote options require')
+    const bogusMode: string = 'duplex'
+    expect(() => Remote({ mode: bogusMode } as { mode: 'stream' }))
+      .toThrow('Remote options require name, mode: "stream", or resources')
+    expect(() => Remote({})).toThrow('Remote options require')
     expect(() => RemoteScope('' as 'metaFixture')).toThrow('Scope key')
     expect(() => RemoteScope('metaFixture', 'bad/name')).toThrow('export name')
 
@@ -260,6 +327,23 @@ describe('typert-protocol Remote declarations', () => {
     ]) {
       expect(() => { Remote(method, context) })
         .toThrow('public instance method')
+    }
+  })
+
+  it('retains transport identity and mode for renamed streams', async () => {
+    const ctx = new Context()
+    class ItemsService extends TypertRemoteService {
+      constructor(owner: Context) { super(owner, 'itemsFixture') }
+
+      @Remote({ name: 'items', mode: 'stream' })
+      async *read(): AsyncIterable<string> { yield 'first' }
+    }
+    try {
+      expect(remoteMethods(new ItemsService(ctx))).toEqual([{
+        method: 'read', exportName: 'items', mode: 'stream', invocation: { kind: 'direct' },
+      }])
+    } finally {
+      await ctx.fiber.dispose()
     }
   })
 
@@ -328,6 +412,12 @@ describe('typert-protocol Remote declarations', () => {
     expect(() => { directSecond[0]!.call(reverseService) }).toThrow('conflicting invocation markers')
   })
 
+  it('leaves bindings without a Cordis Context free of an invocation accessor', () => {
+    const service = { ctx: {} }
+    expect(bindTypertRemote(service, 'plain')).toEqual({ service, serviceKey: 'plain', namespace: 'plain' })
+    expect(Object.hasOwn(service.ctx, 'invocation')).toBe(false)
+  })
+
   it('rejects ambiguous binding names', () => {
     expect(() => bindTypertRemote({}, '')).toThrow('service key')
     expect(() => bindTypertRemote({}, 'goals', { namespace: 'api/goals' })).toThrow('namespace')
@@ -351,6 +441,25 @@ describe('typert-protocol Remote declarations', () => {
       .toExtend<TypertForwardableEventEntry>()
     expectTypeOf<{ event: 'meta-fixture/waterfall'; mode: 'emit' }>()
       .not.toExtend<TypertForwardableEventEntry>()
+  })
+
+  it('types the resource readers of an emit entry by its own event parameters', () => {
+    const entries = [
+      {
+        event: 'meta-fixture/forwardable',
+        mode: 'emit',
+        resources: { 'meta-fixture-id': (value) => { expectTypeOf(value).toEqualTypeOf<string>(); return value } },
+      },
+      { event: 'meta-fixture/waterfall', mode: 'waterfall' },
+    ] as const satisfies readonly TypertForwardableEventEntry[]
+    const wrong = [{
+      event: 'meta-fixture/forwardable',
+      mode: 'emit',
+      // @ts-expect-error -- a reader returns the kind's identity type, not the payload's length.
+      resources: { 'meta-fixture-id': value => value.length },
+    }] as const satisfies readonly TypertForwardableEventEntry[]
+    expect(entries[0].resources['meta-fixture-id']('s1')).toBe('s1')
+    expect(wrong).toHaveLength(1)
   })
 
   it('derives Client Context arguments from the selected Cordis waterfall declaration', () => {

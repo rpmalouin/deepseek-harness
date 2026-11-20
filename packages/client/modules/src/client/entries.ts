@@ -2,9 +2,12 @@
 import type { FiberState } from '@deepseek-ai/cordis'
 import type { Entry, Loader } from '@deepseek-ai/cordis-plugin-loader'
 import type { ObservableSnapshot } from '@deepseek-ai/dsh-client-store'
-import { parseBootManifest } from './manifest.ts'
+import { parseBootManifest, readRelease } from './manifest.ts'
 import type { BootManifest, ClientModuleLoader } from './manifest.ts'
-import { removeOwnedStyles, tearDownEntryFiber } from './entry-lifecycle.ts'
+import { ReleaseChangeGate, type ClientReleaseChange } from './release-change.ts'
+import { notifySubscribers } from './notify.ts'
+import { tearDownEntryFiber } from './entry-lifecycle.ts'
+import { SyncedConfigEntry } from './synced-config.ts'
 
 /** Page-local failures do not change the Host's bundle enablement. */
 export interface ClientEntryState {
@@ -17,7 +20,10 @@ export interface ClientEntryState {
 /** Module-table capabilities used within serialized entry operations. */
 interface ModuleIndex {
   update(manifest: BootManifest, managed: Iterable<string>): void
+  /** Reset a package's code while its previous records stay active for the runtime that is still running. */
   invalidateForReplacement(id: string, rev: string): void
+  /** Release the previous records once the replaced runtime has been torn down. */
+  releaseReplaced(id: string): void
   prune(roots: Iterable<string>): void
 }
 
@@ -43,7 +49,11 @@ export class ClientEntries {
   // The modules bootstrap factory cannot request platform libraries before the shell supplies its seed.
   private snapshot: ClientEntryState = { syncing: false, failures: [] }
   private readonly listeners = new Set<() => void>()
+  /** Admits only Host graphs of the page's boot release. */
+  private readonly release: ReleaseChangeGate
   private readonly managed = new Map<string, Entry>()
+  /** Latest synced values per package that has appeared in the graph, and the Config object of its current activation. */
+  private readonly synced = new Map<string, SyncedConfigEntry>()
   private readonly revisions = new Map<string, string>()
   private loader: Loader | undefined
   private queue: Promise<void> = Promise.resolve()
@@ -58,10 +68,23 @@ export class ClientEntries {
    */
   constructor(private readonly modules: ClientModuleLoader, private readonly index: ModuleIndex) {
     this.desired = modules.manifest
+    this.release = new ReleaseChangeGate(modules.manifest.release)
+  }
+
+  /** Host release change to announce; undefined while the Host serves the page's boot release or a dismissed one. */
+  get releaseChange(): ObservableSnapshot<ClientReleaseChange | undefined> {
+    return this.release.change
+  }
+
+  /** Stop announcing the connected Host's release; updates stay paused until the Host returns to the boot release or the page reloads. */
+  dismissRelease(): void {
+    this.release.dismiss()
   }
 
   /**
    * Create the initial roster and retain its entry identities for subsequent reconciliation.
+   * As the Host Loader group does, a row whose creation rejects (for example a module that exports no
+   * plugin) is logged and stays an inactive entry, so one row cannot abort startup before the boot audit.
    * @param loader - Page Loader, already configured with the module system.
    * @param manifest - Initial roster audited by the boot caller.
    * @returns after initial entries and their activation settle; boot owns its activation audit.
@@ -70,6 +93,29 @@ export class ClientEntries {
     if (this.loader !== undefined) throw new Error('client-modules: entries already started')
     this.loader = loader
     this.desired = manifest
+    this.applyConfig(manifest)
+    // Prepended so the Loader's interpolation runs inside this listener and cannot copy the returned object.
+    loader.ctx.on('internal/config', (fiber, next) => {
+      const config: unknown = next()
+      // As the Loader's own listener does, skip fibers that are not an entry's root plugin (a child plugin inherits
+      // its parent's entry) and keep their explicit config.
+      if (fiber.entry === undefined || fiber.parent.fiber.entry === fiber.entry) return config
+      const id = fiber.entry.options.name
+      const synced = this.synced.get(id)
+      if (synced === undefined) return config
+      // A Client face with its own schema keeps Cordis's ordinary configuration; it must not also receive synced values.
+      if (fiber.runtime?.Config === undefined) {
+        // Resolving a candidate for the running instance (as `fiber.update()` does) keeps its object, as the Host keeps
+        // an active instance's volatile references; only an activation receives a new one.
+        if (synced.config !== undefined && fiber.effectiveConfig === synced.config) return synced.config
+        const activation = synced.activate()
+        // However the instance unloads (replacement, removal, a withdrawn dependency), its object stops receiving values.
+        fiber.ctx.effect(() => () => { synced.release(activation) }, 'client-modules: synced configuration activation')
+        return activation
+      }
+      if (synced.empty) return config
+      throw new Error(`client-modules: the Client face of ${id} exports a Config schema; synced configuration requires the Host schema alone`)
+    }, { prepend: true })
     loader.ctx.effect(() => () => {
       this.stopped = true
       this.generation++
@@ -77,7 +123,7 @@ export class ClientEntries {
     }, 'client-modules: entry reconciliation')
     return this.enqueue(async () => {
       await Promise.all(this.desired.plugins.map(async ({ id }) => {
-        await this.create(loader, id)
+        await this.create(loader, id).catch((error: unknown) => { loader.ctx.logger.error(error) })
       }))
       await loader.await()
       for (const row of this.modules.manifest.modules) this.revisions.set(row.id, row.rev)
@@ -86,13 +132,18 @@ export class ClientEntries {
 
   /**
    * Validate and apply the latest full Host graph. Changed targets cancel obsolete mounts; identical targets share pending loads.
+   * The release is compared before the rest of the graph is validated: a graph of another release, including one whose
+   * format this page cannot read, is not applied and {@link releaseChange} announces it.
    * @param graph - JSON-decoded graph received from the Host.
-   * @returns after the queued reconciliation; per-package failures remain available in {@link state}.
+   * @returns after the queued reconciliation, or at once for another release; per-package failures remain available in {@link state}.
    */
   sync(graph: unknown): Promise<void> {
+    if (!this.release.observe(readRelease(graph))) return Promise.resolve()
     const manifest = parseBootManifest(graph)
     if (entryTargets(manifest) !== entryTargets(this.desired)) this.generation++
     this.desired = manifest
+    // Configuration is not code: it applies at once, before queued entry work creates or replaces any entry.
+    if (this.loader !== undefined) this.applyConfig(manifest)
     const generation = this.generation
     return this.enqueue(() => this.reconcile(generation))
   }
@@ -109,11 +160,13 @@ export class ClientEntries {
   /**
    * Replace one entry's code in the same queue as graph updates; duplicate revisions are ignored.
    * Entries missing after a failed import are reconciled; bootstrap replacement fails before teardown.
+   * Ignored while the connected Host serves another release than the page's boot release.
    * @param id - Package id from a rebuilt frame.
    * @param rev - Opaque revision selecting the rebuilt artifact.
    * @returns after queued work; replacement errors reject, while per-package reconciliation errors remain in {@link state}.
    */
   reload(id: string, rev: string): Promise<void> {
+    if (!this.release.matches) return Promise.resolve()
     this.desired = {
       ...this.desired,
       modules: this.desired.modules.map(row => row.id === id ? { ...row, rev } : row),
@@ -124,7 +177,6 @@ export class ClientEntries {
       const entry = this.managed.get(id)
       if (entry === undefined) {
         this.modules.invalidate(id, desired.rev)
-        removeOwnedStyles(id)
         await this.reconcile(this.generation)
         return
       }
@@ -135,16 +187,37 @@ export class ClientEntries {
     }, id)
   }
 
+  /**
+   * The synced Config object of a package's current plugin activation, as that activation's `apply` received it.
+   * Each activation receives a new object, so the result changes when the plugin is replaced.
+   * @param packageName - graph row id.
+   * @returns the object, or undefined while no activation of the package is running.
+   */
+  resolveConfigByPackage(packageName: string): object | undefined {
+    return this.synced.get(packageName)?.config
+  }
+
+  /** An activation's teardown begins: like a Host fiber that is no longer active, it receives no later values. */
+  private releaseConfig(id: string): void {
+    this.synced.get(id)?.release()
+  }
+
+  /**
+   * Write each row's values into its package's current activation. A row absent from the graph keeps its values: its
+   * entry is being removed, and removal releases the activation without writing to it.
+   */
+  private applyConfig(manifest: BootManifest): void {
+    for (const row of manifest.plugins) {
+      const values = row.config ?? {}
+      const synced = this.synced.get(row.id)
+      if (synced === undefined) this.synced.set(row.id, new SyncedConfigEntry(values))
+      else synced.update(values)
+    }
+  }
+
   private publish(snapshot: ClientEntryState): void {
     this.snapshot = snapshot
-    for (const listener of [...this.listeners]) {
-      try {
-        listener()
-      } catch (error) {
-        // The page controller has no owning plugin Context for a scoped logger.
-        console.error('client-modules: synchronization subscriber failed', error)
-      }
-    }
+    notifySubscribers(this.listeners, 'synchronization')
   }
 
   private enqueue(task: () => Promise<void>, subject = 'graph'): Promise<void> {
@@ -178,8 +251,9 @@ export class ClientEntries {
     this.index.invalidateForReplacement(id, rev)
     await this.modules.prefetch(id)
     if (!this.current(generation)) return
+    this.releaseConfig(id)
     await tearDownEntryFiber(entry)
-    removeOwnedStyles(id)
+    this.index.releaseReplaced(id)
     if (!this.current(generation)) return
     await this.modules.import(id, '', {})
     if (!this.current(generation)) return
@@ -201,6 +275,7 @@ export class ClientEntries {
     for (const [id, entry] of this.managed) {
       if (wanted.has(id)) continue
       const fiber = entry.fiber
+      this.releaseConfig(id)
       loader.remove(entry.id)
       this.managed.delete(id)
       this.revisions.delete(id)
@@ -223,7 +298,8 @@ export class ClientEntries {
         } else if (entry.fiber === undefined) {
           await this.replace(entry, row.id, row.rev, generation)
         } else if (entry.fiber.state === FAILED) {
-          entry.fiber.update(entry.options.config)
+          // A retry with unchanged config is not a configuration change to persist.
+          await entry.fiber.update(entry.options.config, true)
         }
       } catch (error) {
         failures.push({ id: row.id, message: String(error) })

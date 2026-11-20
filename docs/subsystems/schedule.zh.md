@@ -1,192 +1,314 @@
-# 仅限 Session 内的 Schedule
+# 宿主级 Schedule
 
 [English](schedule.md) | 中文
 
-Schedule 拥有持久提醒；这些提醒会作为普通的后续对话轮次返回原 live Session。[持久 Schedule Agent Note](../../.agents/notes/implemented/feature/2026-08-05-durable-web-schedule.zh.md) 负责持久化、生命周期与活动状态呈现，[显式时区边界](../../.agents/notes/implemented/simplification/2026-08-09-explicit-schedule-time-zone.zh.md) 负责浏览器本地解释。本页记录 [`packages/schedule/schedule/src/types.ts`](../../packages/schedule/schedule/src/types.ts) 中的持久数据形状和面向模型的数据形状；[包 README](../../packages/schedule/schedule/README.zh.md) 负责组合、工具行为与确切的提醒 framing。
+Schedule 独立于 Session 的激活状态存储宿主任务。同一管理 API 按 id 操作任务，同一求值器处理七种权威时间类型：`after`、`at`、`every`、`daily`、`weekly`、`cron` 和 `rrule`。目标可以复用已有 Session、创建一个 Session 后复用，或每次投递创建 Session。[包 README](../../packages/schedule/schedule/README.zh.md) 负责组合与提醒格式；完整值类型和请求类型以 [`types.ts`](../../packages/schedule/schedule/src/types.ts) 为准。
 
-## 持久记录
+<a id="durable-tasks"></a>
+## 持久任务
 
-`ScheduleId` 是[品牌化 id](core.zh.md#branded-ids)，在单个 Session 内唯一且绝不复用。版本 1 支持正的安全整数 `after_seconds` 延时、显式的绝对 `at` 目标，或至少五分钟的安全整数 `every_seconds` 间隔。创建操作会将每个初始目标规范化为使用四位年份的 RFC 3339 UTC `scheduledAt`；`after` 记录会保留提交的延时，`at` 记录只存储结果时点，`every` 记录则保留固定间隔和下一个目标。
+插件 README 拥有当前 [v2 任务 schema、v1 默认值与持久 JSON 示例](../../packages/schedule/schedule/README.zh.md#storage-format)。领域保留名称、路由和整单元布局。七种时间类型均保持权威性；规范化保留已提交发生时点，不将 Cron 转为 RRULE。
 
-```ts type-equiv
-/** Durable one-shot reminder created from a positive delay. */
-interface AfterScheduleRecord {
-  /** Session-local stable identity. */
-  readonly id: ScheduleId
-  /** Rule discriminator for a delayed one-shot reminder. */
-  readonly kind: 'after'
-  /** Trimmed reminder content supplied at creation. */
-  readonly prompt: string
-  /** Positive safe-integer delay accepted at creation. */
-  readonly afterSeconds: number
-  /** Four-digit-year RFC 3339 UTC target. */
-  readonly scheduledAt: string
-}
-```
+损坏的存储、无效行、与任务身份不一致的键及不支持的版本在任务激活前拒绝。打开失败不改变介质。文件不存在时从空域开始。目标 Session 缺失的任务仍在管理界面中可见；读取任务从不激活其 Session。
 
-```ts type-equiv
-/** Durable one-shot reminder created from an absolute instant. */
-interface AtScheduleRecord {
-  /** Session-local stable identity. */
-  readonly id: ScheduleId
-  /** Rule discriminator for an absolute one-shot reminder. */
-  readonly kind: 'at'
-  /** Trimmed reminder content supplied at creation. */
-  readonly prompt: string
-  /** Four-digit-year RFC 3339 UTC target. */
-  readonly scheduledAt: string
-}
-```
+<a id="storage-versioning"></a>
+## 存储版本
 
-```ts type-equiv
-/** Durable fixed-rate reminder whose next target remains creation-anchor-aligned. */
-interface EveryScheduleRecord {
-  /** Session-local stable identity. */
-  readonly id: ScheduleId
-  /** Rule discriminator for a fixed-rate recurring reminder. */
-  readonly kind: 'every'
-  /** Trimmed reminder content supplied at creation. */
-  readonly prompt: string
-  /** Fixed safe-integer interval, never below five minutes. */
-  readonly everySeconds: number
-  /** Earliest anchor-aligned occurrence not yet dispatched. */
-  readonly scheduledAt: string
-}
-```
+README 定义[任务何时升级](../../packages/schedule/schedule/README.zh.md#storage-format)、SQLite 不变的物理 schema、修改成本以及未来兼容 v3。`compatibleVersions` 允许旧单元版本戳进入当前解码；正常编辑与投递持久化当前行。读取保持存储不变。共享的[领域版本策略](storage.zh.md#domain-versioning)同时适用于 JSON 和 SQLite。
 
-```ts type-equiv
-/** One-shot record variants that terminate on an id-only dispatch. */
-type OneShotScheduleRecord = AfterScheduleRecord | AtScheduleRecord
-```
+<a id="recurrence-rules"></a>
+## 重复规则
 
-```ts type-equiv
-/** The v1 durable reminder record union. */
-type ScheduleRecord = OneShotScheduleRecord | EveryScheduleRecord
-```
+[`dsh-util-time`](../../packages/util/time/README.zh.md) 负责可复用的 `Cron`、`RRule` 解析及有界发生时点计算。两种解析值均暴露其权威表达式、时区、`next(after)` 和 `resolve(scheduledAt, acceptedAt)`。解析器返回接受值或拒绝原因；Schedule 将原因映射为自身输入错误，并负责记录验证、准入限制、持久化与投递。
 
+每个已存 `scheduledAt` 都是带毫秒精度、年份为 0001 至 9999 的规范 RFC 3339 UTC 时刻。解码不会根据当前时区数据重新计算它。只追赶最新一次的策略保留该已提交下界，投递最新到期时点一次，再提交第一个未来时点。规则耗尽后任务以 `ended` 状态保留。
+
+| 类型 | 权威时间字段 |
+|---|---|
+| `after` | 正整数 `afterSeconds` 和已提交的一次性 UTC 目标。 |
+| `at` | 已提交的一次性 UTC 目标。输入接受显式偏移时刻，或本地日期、时间与显式时区。 |
+| `every` | 不小于 60 的整数 `everySeconds`；发生时点始终对齐已提交的间隔锚点。 |
+| `daily` | `HH:mm:ss.SSS` 形式的本地 `time` 与显式 `timeZone`。 |
+| `weekly` | Daily 字段加非空、唯一、升序的 ISO `weekdays` 集合，周一为 1、周日为 7。 |
+| `cron` | 规范五字段 `expression` 与显式 `timeZone`。 |
+| `rrule` | `rrule` 中一条规范 `DTSTART` 和一条 `RRULE` 行；`DTSTART` 提供锚点与时区。 |
+
+本地日历规则跳过不存在的墙钟时间，并在重叠时选择较早的时刻。固定间隔保留经过时间的含义。一次性延迟可短于一分钟；首次投递之后仍适用单任务最小投递间隔。
+
+<a id="absolute-time-input"></a>
 ## 绝对时间输入
 
-`at` 选择器可以是严格且带偏移量的 RFC 3339 字符串，也可以是精确的本地日历对象。本地形式让这种解释在工具边界保持显式：
+`at` 选择器接受带显式 `Z` 或数字偏移的 RFC 3339 时刻，或 `{ date, time, time_zone }`。本地日期使用 `YYYY-MM-DD`；本地时间使用 `HH:mm:ss`，可带一至三位小数秒。歧义或不存在的日历值通过共享时间工具验证。新的绝对目标必须严格位于未来且可表示。
 
-```ts type-equiv
-/** Structured local-calendar input accepted by `schedule_create`. */
-interface LocalAtInput {
-  /** Four-digit ISO calendar date. */
-  readonly date: string
-  /** Local wall-clock time with optional one-to-three digit milliseconds. */
-  readonly time: string
-  /** Explicit UTC or IANA Area/Location zone. */
-  readonly time_zone: string
-}
+<a id="daily-wall-clock-input"></a>
+## 每日与每周输入
+
+Daily 输入提供 `{ time, time_zone }`；Weekly 另加显式 `weekdays`。创建时选择第一个严格位于未来的实际发生时点。追赶选择最新实际到期时点，并推进到之后匹配的本地日期。等价编辑保留已存 IANA 别名和固定 UTC 目标，包括毫秒。
+
+<a id="fixed-rate-input-and-catch-up"></a>
+## 固定频率输入与追赶
+
+Every 输入提供 `every_seconds`。新间隔从接受时间开始；修改间隔会在编辑被接受时建立新锚点。不变的间隔或名称／指令编辑保留原锚点。停机后合并错过的间隔，而非逐次重放。
+
+<a id="cron-wall-clock-input"></a>
+## Cron 输入
+
+Cron 输入提供 `{ expression, time_zone }`。五个数字字段依次为分钟、小时、月内日期、月份和星期。支持的原子形式为 `*`、单值、闭区间、星号或区间步长，以及逗号分隔列表。周日接受 0 或 7，规范为 0。拒绝名称、宏、秒字段和单值后跟步长的形式。
+
+Cron 保留 Vixie 的日期匹配方式：两个日期字段都受限时，月内日期**或**星期任意一个匹配即可；任一字段以 `*` 开头（包括带步长的星号）时，两组匹配值均须匹配。规范化保留此差异。搜索受一个 400 年公历周期和四位 UTC 年份范围约束。启用时拒绝没有可表示未来时点的规则。
+
+Cron 记录从不转换为 RRULE。读取、描述性编辑、重新指定目标和重启均保留其已存表达式与时区作为权威来源。自定义编辑器接受五字段 Cron 表达式，并显示显式时区选择器。
+
+<a id="rrule-input"></a>
+## RRULE 输入
+
+RRULE 接受有界的 RFC 5545 子集，以共享的 [`rrule.ts` 解析器](../../packages/util/time/src/rrule.ts)为准。输入恰好包含两条非空内容行：先 `DTSTART`，再 `RRULE`。开始时间为真实的 `YYYYMMDDTHHMMSS` 日期时间，使用 UTC `Z` 或显式 IANA `TZID`；拒绝浮动本地时间、数字偏移、仅日期值及额外内容行。引擎使用 `rrule` 2.8.1，支持 `MINUTELY`、`HOURLY`、`DAILY`、`WEEKLY`、`MONTHLY` 和 `YEARLY`。一次性投递使用 `COUNT=1`。
+
+只接受 `FREQ`、`INTERVAL`、`COUNT`、`UNTIL`、`WKST`、`BYSECOND`、`BYMINUTE`、`BYHOUR`、`BYDAY`、`BYMONTHDAY`、`BYYEARDAY`、`BYWEEKNO`、`BYMONTH` 和 `BYSETPOS`；字段名和列表值必须唯一。`INTERVAL` 为正安全整数。`WKST` 为 `MO` 至 `SU` 中的星期，默认 `MO`。数字列表须在解析器规定的范围内。分钟／小时规则不接受 `BY` 部分。`BYMONTHDAY` 和带序数的 `BYDAY` 仅用于每月或每年；`BYYEARDAY` 和 `BYWEEKNO` 仅用于每年。带序数的 `BYDAY` 不能与 `BYWEEKNO` 组合，`BYSETPOS` 必须搭配另一项 `BY`。
+
+验证发生在枚举之前。拒绝 `SECONDLY`、多个 `BYSECOND` 值及一个频率周期中超过 10,080 个可能候选时点的规则。`COUNT` 为 1 至 1,000，不能与 `UNTIL` 共存；`UNTIL` 为以 `Z` 结尾的绝对 UTC 日期时间。开始与截止年份为 0100 至 9999。集合位置至多 31 个，每个位置为 −366 至 −1 或 1 至 366，且必须在有界周期内。较严格的新规则编写检查还会在周期至多有一个候选时点时拒绝 `BYSETPOS`；解码和恢复未改变的受支持规则仍使用正常求值器。
+
+不存在的本地 `DTSTART` 会被拒绝。后续不存在的本地发生时点会跳过，且不消耗 `COUNT`；重叠时间选择较早时刻。即使正负集合位置选中同一时点，`COUNT` 也仅计数一次。
+
+自定义 RRULE 文本保留其 `DTSTART` 时区。面向模型的工具继续指导并接受 RRULE；共享管理 API 则显式接受每种时间类型。
+
+<a id="delivery-targets"></a>
+## 投递目标
+
+| 目标 | 投递行为 |
+|---|---|
+| `session` | 投递到一个已有 Session。启用时在管理 FIFO 内检查其存在、未归档且不属于委托子 Agent。投递时再次检查归档状态。 |
+| `new_once` | 首次投递前预留 Session id，需要时创建该 Session，然后保存为 `session` 并复用。重试和重启保留该预留标识。 |
+| `new` | 每次投递创建 Session。创建前持久化 `pendingDelivery.targetSessionId`，使失败尝试重用同一 Session。 |
+
+创建时省略目标则默认 `new_once`。新增或替换 `new`、`new_once` 目标需要嵌入环境提供 Session 创建能力。SDK 组合缺少该能力时，在保存前以 `invalid_rule` 拒绝这些请求；已有 `session` 目标仍可使用。创建值 `cwd` 和 `agentPreset` 可省略，使用 Host 默认值。创建的 Session 会加入其目录已注册的 Workspace（如有），且尚无标题时使用任务标题；`new` 另加该规则时区中的创建分钟。加入或重命名失败会记录日志，但不阻断投递。
+
+<a id="task-management"></a>
+## 任务管理
+
+所有调用方使用相同的 `ScheduleCreateRequest`、`ScheduleCatalogEntry`、`ScheduleTiming` 和 `ScheduleEditRequest`。浏览器安全类型来自 `@deepseek-ai/dsh-schedule/client`。不存在 Session 绑定的管理入口或第二套类型别名。
+
+| 操作 | 行为 |
+|---|---|
+| `create(request, actorSessionId?, signal?)` | 分配 id 并保存标题、指令、带类型的 `timing` 及可选目标。 |
+| `list(request?)` | 分页读取；默认 100、最多 500，可选 `active` 过滤及非负 `offset`。 |
+| `catalog()` / `view({ id })` | 无分页上限读取所有任务，或读取一个任务。 |
+| `history({ id, limit, before? })` | 不激活 Session 地读取已保存投递；limit 为 1 至 100。 |
+| `edit(request, actorSessionId?, signal?)` | 按 id 原子应用 `update` patch 或 `delete`。 |
+| `deleteInactive()` | 一次批量写入仅删除 `ended` 任务，保留活动和暂停任务，返回 `{ deleted }`。空集合不写入。 |
+| `run({ id }, signal?)` | 经正常准入立即投递，不改变已计划发生时点或生命周期。 |
+| `deliveryLimits()` | 读取 `new` 目标的配置最小间隔。 |
+
+Remote 路由提供 `create`、`list`、`catalog`、`view`、`history`、`edit`、`deleteInactive`、`run` 和 `deliveryLimits`；传输包装器委托给相同管理方法。Remote 验证失败使用带 Schedule 输入码的 `schedule/input-invalid`。原生调用方收到 `ScheduleInputError`。
+
+非空的 `deleteInactive` 批量写入成功后发出 `schedule/changed`，供读取方刷新；不向 Agent 排入通知。批量写入被拒绝时也发出该事件，让读取方丢弃旧状态。正常失败保留全部行；`unknown-state` 失败可能已移除行，并隔离领域直到重新打开。失败调用以拒绝结束，不返回删除数量。
+
+更新可以替换标题、指令、带类型时间、目标或活动状态。省略字段保留原值。规则改变或显式恢复时，在 FIFO 接受时刻计算未来时点；等价时间及描述性编辑保留已提交目标。已投递的一次性任务需要新的未来时间才能恢复。重新指定目标不要求转换时间类型。
+
+`expectedUpdatedAt` 是可选的乐观比较。字符串与已存修订比较；显式 `null` 与缺失的修订比较。不一致时返回 `schedule_conflict`。编辑没有修订的行会创建修订；即使时钟回拨，后续修订仍单调递增。开始写入前检查取消，已经开始的持久写入不回滚。
+
+<a id="timing-edits"></a>
+## 时间编辑
+
+`timing` 判别字段只选择其匹配的载荷，例如 `{ kind: "cron", cron: { expression: "0 9 * * 1-5", time_zone: "Asia/Shanghai" } }` 或 `{ kind: "rrule", rrule: "DTSTART:20990101T090000Z\nRRULE:FREQ=DAILY" }`。其他选择器使用 `after_seconds`、`at`、`every_seconds`、`daily` 或 `weekly`。持久化前拒绝无效组合。UI 经相同 API 保存带类型的 Cron/RRULE 输入，并保留未修改的时间规则。
+
+<a id="saved-delivery-records"></a>
+## 已保存投递记录
+
+回执记录 `scheduledAt`、`deliveredAt`、`messageId` 和 `targetSessionId`；它确认持久 Session 收件箱写入，而非模型完成。已保存记录还可含不可变的已发送 `prompt`。旧回执缺少目标 id 时，在任何重新指定目标的编辑之前使用已解析的可复用目标，因此后续目标不会重写其历史。 回执既没有显式目的地也没有已知复用目标时，拒绝解码；新默认预留不能证明历史目的地。
+
+新任务从已知的空历史开始。旧行没有 `deliveryHistory` 时，暴露其最新回执（如有），并设置 `earlierRecordsUnavailable: true`；不会编造丢失的历史或指令快照。省略的 `earlierRecordsPruned` 读为 false。消息 id 重复，或最新保存记录与 `lastDelivery` 不一致，均拒绝解码。
+
+历史按追加顺序排列，不受时钟回拨影响。确认在同一任务提交中追加并裁剪，默认保留最多 200 条、30 天，同时保留最新回执。查询页从新到旧，使用不含游标自身的消息 id 游标。硬删除移除任务及历史，不移除已入队的 Session 消息。
+
+<a id="host-delivery"></a>
+## 宿主投递
+
+一个 Host 定时器驱动活动任务。运行时与管理写入共用一个 FIFO。已有和预留 Session 通过 `schedule/resolve-agent` 解析，由嵌入环境拥有激活，已注入的 Web 控制器作为后备。复用 Session 的任务占用执行槽，直到目标 Agent 空闲；期间发生的时点会合并。`new` 目标允许多个执行并行。到期且投向相同已有 Session 的重复记录共享一条消息；`after` 和 `at` 单独投递。
+
+定时与手动投递均遵守单任务 60 秒最小间隔。`newSessionIntervalSeconds` 可为 `new` 目标提高间隔，最多一周。已存后继时点保持间隔时，下界从上次发生时点计算；否则从上次确认计算，因此投递延迟不会移动规则锚点。读取仅在适用时暴露 `executionActive` 和 `deliveryFloorEndsAt`。
+
+Session 收件箱持久化先于任务回执写入，因此两份存储之间崩溃可能重复投递。Host 必须运行。指向某 Session 的活动任务会参与其归档准入；归档停止操作会删除这些活动任务。
+
+管理变更提交后，Schedule 向除操作者之外的每个已加载相关 Agent 排队发送尽力而为的通知。通知加入下一模型步骤，不开启新轮次；其 Session I/O 不占用管理／投递队列。每次投递新建的 Session 不会累积到相关元数据中。
+
+<a id="historical-session-changes"></a>
+## 历史 Session 变更
+
+历史版本 1 的 `schedule/change` 事件保留冻结的 `LegacyScheduleRecord` 类型：`after`、`at`、`every`，包括原来的可选标题。它们仍是已保存的 Session 数据，Schedule 不为其保留解释器、警告钩子、导入器或定时器。`schedule.json` 中已有的 Host 任务仍使用正常的解码器与求值器。
+
+<!-- BEGIN GENERATED cordis-surface (gen-cordis-catalog.ts) — do not edit between markers -->
+
+<a id="cordis-surface"></a>
+
+## Cordis API
+
+Generated from source by `scripts/gen-cordis-catalog.ts` (verified fresh by `pnpm run verify-cordis-catalog` in doc-sync; regenerate with `pnpm run gen-cordis-catalog`) — the language sides differ only in locale-specific paired document paths. Signature blocks use a `ts cordis-catalog` fence and keep the original source JSDoc; dispatch modes are defined in the [primer](../cordis-primer.zh.md#dispatch-modes), and the framework-inherited `ctx` API lives in [cordis-api/inherited.md](../cordis-api/inherited.md).
+
+<a id="ctxschedule--scheduleservice"></a>
+
+### `ctx.schedule` — `ScheduleService`
+
+Shared management service; reads and management writes never activate a Session, and only delivery creates or resumes one.
+
+`sessionPersistence` supplies header-only target validation and the `session/flush` listener that acknowledges durable inbox delivery through `ctx.sessions.flush()`.
+
+```ts cordis-catalog
+/** Read effective delivery limits without loading or activating a task.
+ * @returns The configured minimum spacing between deliveries that each create a Session, in seconds.
+ */
+@Remote('deliveryLimits') deliveryLimits(): { readonly newSessionIntervalSeconds: number }
+
+/**
+ * Create one task with a Host-generated identity for a human Remote caller.
+ * @param request - Title, prompt, recurrence, and delivery destination.
+ * @param signal - Cancellation checked before the durable write begins, including after FIFO waits.
+ * @returns The stored task. Cancellation does not roll back an in-flight write.
+ */
+@Remote('create') async remoteCreate(request: ScheduleCreateRequest, signal?: AbortSignal): Promise<ScheduleCatalogEntry>
+
+/**
+ * Create one task and record the acting Agent's Session as involved; the Remote form omits that Session.
+ *
+ * The record is built from the clock reading taken before the request joins the serialized queue. A `session`
+ * target must exist and must not belong to a delegated child; a `new_once` target reserves its Session identity.
+ * @param request - Title, prompt, recurrence, and delivery destination.
+ * @param actorSessionId - Session of the acting Agent, or undefined for a human caller.
+ * @param signal - Cancellation checked before the durable write begins, including after FIFO waits.
+ * @returns The stored task. Cancellation does not roll back an in-flight write.
+ */
+async create( request: ScheduleCreateRequest, actorSessionId?: SessionId, signal?: AbortSignal, ): Promise<ScheduleCatalogEntry>
+
+/**
+ * Read one page of Host tasks without activating target Sessions.
+ * @param request - Optional activity filter, page size, and offset.
+ * @returns The requested page and total matching task count.
+ */
+async list(request: ScheduleListRequest = {}): Promise<ScheduleListResult>
+
+/**
+ * Remote form of the shared Host-wide list.
+ * @param request - Optional activity filter, page size, and offset.
+ * @returns The requested page and total matching task count.
+ */
+@Remote('list') async remoteList(request: ScheduleListRequest): Promise<ScheduleListResult>
+
+/**
+ * Read every Host task without a page bound or Session activation.
+ * @returns All tasks, active first, with target and execution metadata.
+ */
+@Remote('catalog') async catalog(): Promise<ScheduleCatalogEntry[]>
+
+/**
+ * Read one task without activating its target Sessions.
+ * @param request - Task identity.
+ * @returns The task, or a non-mutating miss.
+ */
+@Remote('view') async view(request: ScheduleViewRequest): Promise<ScheduleViewResult>
+
+/**
+ * Read one page of saved deliveries without activating or reading a target Session.
+ * @param request - Task identity, explicit page size, and optional exclusive cursor.
+ * @returns Newest-first saved deliveries, or a task/cursor lookup failure.
+ */
+async history(request: ScheduleDeliveryHistoryRequest): Promise<ScheduleDeliveryHistoryResult>
+
+/**
+ * Remote form of the target-based {@link ScheduleService.history}; an invalid limit rejects with
+ * `schedule/input-invalid`.
+ * @param request - Task identity, explicit limit, and optional exclusive message cursor.
+ * @returns Newest-first deliveries in append order, or a task/cursor lookup failure.
+ */
+@Remote('history') async remoteHistory(request: ScheduleDeliveryHistoryRequest): Promise<ScheduleDeliveryHistoryResult>
+
+/**
+ * Deliver one task now without consuming or moving its scheduled occurrence; an archived destination Session rejects
+ * with `schedule/target-archived`.
+ * @param request - Task identity.
+ * @param signal - Cancellation checked after entering the delivery transaction and before delivery.
+ * @returns Task state after Session persistence acknowledged the delivery, `schedule_execution_pending` while
+ * another execution of the task is queued, running, or inside its delivery floor, or a non-mutating miss.
+ */
+@Remote('run') async run(request: ScheduleRunRequest, signal?: AbortSignal): Promise<ScheduleRunResult>
+
+/**
+ * Delete every ended Host task, leaving active tasks armed.
+ *
+ * Ended tasks never schedule another delivery, so the removal changes no pending
+ * target and no timer is recomputed. Rows are enumerated and removed in one FIFO
+ * slot, so a delivery ordered behind this call ends its task after the
+ * enumeration rather than during it. The batch is one domain write: a normal
+ * failure rejects with every listed row still stored, while a backend
+ * `unknown-state` failure may have removed rows and quarantines the Host
+ * domain, so later schedule operations reject until the domain is reopened.
+ * A successful nonempty batch emits `schedule/changed` without Agent notices.
+ * A rejected batch announces `schedule/changed` because it does not establish
+ * which rows landed, and clients then re-read the catalog.
+ * @returns Count of removed rows; zero when the Host held no ended task.
+ */
+@Remote('deleteInactive') async deleteInactive(): Promise<ScheduleDeleteInactiveResult>
+
+/**
+ * Update or delete one task for a human Remote caller; an invalid patch rejects with `schedule/input-invalid`.
+ * @param request - Task identity and one update or delete operation.
+ * @param signal - Cancellation checked before the durable write begins, including after FIFO waits.
+ * @returns The updated task, the deletion outcome, or a non-mutating miss or conflict.
+ */
+@Remote('edit') async remoteEdit(request: ScheduleEditRequest, signal?: AbortSignal): Promise<ScheduleEditResult>
+
+/**
+ * Update or delete one task and record the acting Agent's Session as involved; the Remote form omits that Session.
+ *
+ * An update applies every patch field in one write and recomputes the next occurrence when the rule changes or
+ * the task resumes. A supplied `expectedUpdatedAt` that differs from the stored value returns `schedule_conflict`.
+ * @param request - Task identity and one update or delete operation.
+ * @param actorSessionId - Session of the acting Agent, or undefined for a human caller.
+ * @param signal - Cancellation checked before the durable write begins, including after FIFO waits.
+ * @returns The updated task, the deletion outcome, or a non-mutating miss or conflict.
+ */
+async edit( request: ScheduleEditRequest, actorSessionId?: SessionId, signal?: AbortSignal, ): Promise<ScheduleEditResult>
 ```
 
-```ts type-equiv
-/** Absolute selector accepted by `schedule_create`. */
-type AtInput = string | LocalAtInput
+Types: [SessionId](core.zh.md)
+
+Source: [`packages/schedule/schedule/src/index.ts`](../../packages/schedule/schedule/src/index.ts)
+
+<a id="schedule-events"></a>
+
+### `schedule/*` events
+
+<a id="schedulechanged--emit"></a>
+
+#### `schedule/changed` — emit
+
+Durable task set changed; clients refetch global task and Session-active catalogs.
+
+```ts cordis-catalog
+/** Durable task set changed; clients refetch global task and Session-active catalogs.
+ * @mode emit
+ */
+'schedule/changed'(): void
 ```
 
-官方 Web overlay 会为每条提示词采样浏览器的 IANA 时区。当 open turn 只有一个无歧义的浏览器时区时，Time-context 会告诉模型按该请求本地时区解释未明确限定时区的自然语言日期和时间；浏览器时区记录混合或缺失时，则告诉模型询问用户。该指引不是持久 Session 默认值：模型仍必须在字符串形式中传入偏移量，或在本地形式中传入 `time_zone`；Schedule 绝不会读取浏览器、Session、进程或模型上下文。
+Source: [`packages/schedule/schedule/src/types.ts`](../../packages/schedule/schedule/src/types.ts)
 
-Schedule 会拒绝无效偏移量与时区、不带偏移量的字符串、非未来目标，以及落在夏令时缺口内的本地时间。遇到夏令时重叠时，会选择第一次出现的较早时点。创建成功后只存储规范化后的 UTC `scheduledAt`，因此回放绝不依赖环境时区状态。
+<a id="scheduleresolve-agent--waterfall"></a>
 
-## 固定速率输入与补偿
+#### `schedule/resolve-agent` — waterfall
 
-`every_seconds` 是每条记录单独拥有且至少为 300 秒的间隔，以创建时间为锚点。它只提供固定速率重复调度：协议不包含日历规则或 Cron 表达式、重复调度时区、共享冷却时间或跨记录准入门禁。
+Restore a reminder's Session through its embedding's owning controller. Call next() to use the Web Session controller.
 
-如果一个 Session 在多个目标到期期间处于 cold 或 busy 状态，一条 Every 记录只会贡献其中最新的一次到期触发。dispatch 会直接将记录推进到 dispatch 判断时刻之后第一个与创建锚点对齐的目标，而不会枚举、持久化或回放错过的间隔。如果下一个目标无法落在四位数年份的 UTC 范围内，最后一次 dispatch 将终结该记录。
-
-当多条彼此不同的 Every 记录均已到期，且没有一次性提醒到期时，每条记录都会向同一个 follow-up 批次贡献一次触发，并按目标时间和创建顺序排列。每条 Every 记录的状态互相独立，但该获准批次中的所有 dispatch 都使用同一个判断时刻。批处理限制模型轮次数量；五分钟下限限制每条记录的 timer 频率。
-
-## 持久变更与回放
-
-版本 1 的 `schedule/change` 会话事件是 Schedule 唯一的持久权威。create 保存完整记录，delete 是终结性且仅含 id 的转换。一次性提醒的 dispatch 同样是终结性且仅含 id。Every dispatch 携带用于选择最新到期触发的墙钟判断时刻，通常推进活动记录而不终结它。dispatch 表示 follow-up 已同步入队，而不表示模型答复成功或用户已读取答复。
-
-```ts type-equiv
-/** Creates one durable reminder record. */
-interface ScheduleCreateChange {
-  readonly version: 1
-  readonly operation: 'create'
-  readonly schedule: ScheduleRecord
-}
+```ts cordis-catalog
+/**
+ * Restore a reminder's Session through its embedding's owning controller.
+ * Call next() to use the Web Session controller.
+ * @param sessionId - Original Session receiving the reminder.
+ * @mode waterfall
+ */
+'schedule/resolve-agent'(sessionId: SessionId, next: () => Promise<Agent>): Promise<Agent>
 ```
 
-```ts type-equiv
-/** Deletes one currently active reminder. */
-interface ScheduleDeleteChange {
-  readonly version: 1
-  readonly operation: 'delete'
-  readonly id: ScheduleId
-}
-```
+Types: [Agent](core.zh.md) · [SessionId](core.zh.md)
 
-```ts type-equiv
-/** Records that one active one-shot reminder entered the durable dispatch history. */
-interface OneShotScheduleDispatchChange {
-  readonly version: 1
-  readonly operation: 'dispatch'
-  readonly id: ScheduleId
-}
-```
-
-```ts type-equiv
-/** Records one fixed-rate decision and advances directly past missed occurrences. */
-interface EveryScheduleDispatchChange {
-  readonly version: 1
-  readonly operation: 'dispatch'
-  readonly id: ScheduleId
-  /** Wall-clock decision time used to select the latest due occurrence. */
-  readonly acceptedAt: string
-}
-```
-
-```ts type-equiv
-/** Durable dispatch shapes supported by the current rule set. */
-type ScheduleDispatchChange = OneShotScheduleDispatchChange | EveryScheduleDispatchChange
-```
-
-```ts type-equiv
-/** Strict version-1 durable Schedule mutation union. */
-type ScheduleChange = ScheduleCreateChange | ScheduleDeleteChange | ScheduleDispatchChange
-```
-
-严格 decoder 与 fold 会拒绝未知版本、额外字段、复用 id、不匹配的一次性提醒或 Every dispatch 形状，以及针对非活动记录的 delete 或 dispatch 转换。普通 Session 折叠完整事件流。fork 只折叠精确 `inheritedEventCount` 位置及其后的事件，因此保留历史，但不会接管父 Session 的活动提醒。Projection 初始化会在不可变 header 旁接收该 cut，复用共享 transition，并持久化 cut、活动记录与已使用 id 历史，使缓存恢复继续保持严格回放。`schedule/change` 声明和源码位置也编入[持久化目录](../persistence-catalog.zh.md#schedulechange--log-only)。
-
-## 活动视图与管理
-
-工具值将持久记录与根据当前墙钟派生的交付状态组合起来。`session-local` 表示原 Session 必须处于 live 状态：不存在外部通知渠道或 cold Session scheduler。
-
-```ts type-equiv
-/** Current delivery timing derived from the durable record and wall clock. */
-type ScheduleState = 'scheduled' | 'overdue'
-```
-
-```ts type-equiv
-/** Fixed v1 delivery boundary: the original session must be live. */
-type ScheduleDeliveryMode = 'session-local'
-```
-
-```ts type-equiv
-/** Complete model-facing view of one active reminder. */
-type ScheduleView = ScheduleRecord & {
-  /** Whether the target remains in the future. */
-  readonly state: ScheduleState
-  /** Reminder delivery never leaves the owning session. */
-  readonly deliveryMode: ScheduleDeliveryMode
-}
-```
-
-生成的[工具目录](../tool-catalog.zh.md#deepseek-aidsh-schedule)负责 `schedule_create`、`schedule_list` 和 `schedule_delete` 的参数与结果 schema。一条 Agent-scoped 队列将管理调用与到期工作串行化。每次读取或判断都会先等待共享的 Session 持久化 barrier；create 与实际执行的 delete 在追加后还会再次等待。barrier 失败会报告 `persistence_uncertain`，而不是猜测 eager write 是否已提交。其他稳定错误代码是 `invalid_prompt`、`invalid_selector`、`invalid_rule`、`invalid_time_zone`、`not_future`、`time_out_of_range`、`frequency_too_high`、`corrupt_schedule_log` 和 `internal_error`。
-
-## 只读 Web 目录
-
-可选 Session projection 注册表存在时，Schedule 会注册客户端可见的 `schedule` key，其值是完整的活动 `ScheduleRecord[]`。live、cache、history 与 detached 读取共用同一套 header-aware 严格 fold；畸形权威输入会使既有读取路径失败，而不会发布部分值。
-
-shipped Web bundle 默认禁用 `ui-schedule`，显式 Schedule overlay 则把它与 Host 能力一同启用。[`dsh-client-ui-schedule`](../../packages/client/ui-schedule/README.zh.md)拥有 header 交互，[`dsh-client-ui-workspace`](../../packages/client/ui-workspace/README.zh.md)拥有列表行呈现，持久 Schedule Agent Note 拥有二者共享的活动状态边界。共享值只表示当前活动状态，绝不表示交付历史或回执；到期提醒仍通过下文所述的普通 Assistant 输出出现。
-
-## Live 交付
-
-进程内 owner 根据持久 fold 派生最早的 timer，并在每次有界等待后重新读取墙钟。cold Session 不执行任何工作；重新打开后会重建 timer，并使已经过去的目标进入 overdue 状态。到期的一次性提醒享有优先级，每次只进入一个后续轮次。当没有一次性提醒到期时，所有 overdue 的 Every 记录会组成上述单个批次。
-
-到期工作会先等待 Agent 完全 idle 并认领 maintenance phase，再重新折叠状态、采样本次判断、将一个 `followup()` 排入队列，并追加对应的 dispatch 变更。它绝不会调用 `steer()`，也绝不会中断当前轮次。
-
-获得准入的一次性提醒或固定速率批次会启动一个普通的后续轮次，且只通过普通对话 transcript（文本记录）出现；Schedule 不提供独立的持久 Web 回执。上面的只读活动目录绝不表示交付成功。如果 framing 构造或同步队列准入失败，则不会记录 dispatch，提醒仍保持活动。队列准入后、持久 dispatch 前的狭窄崩溃窗口可能使提醒内容在恢复后重复，因此该边界提供的是尽力而为的至少一次交付，而非恰好一次交付。
+Source: [`packages/schedule/schedule/src/index.ts`](../../packages/schedule/schedule/src/index.ts)
+<!-- END GENERATED cordis-surface -->

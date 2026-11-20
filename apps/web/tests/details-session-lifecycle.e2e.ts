@@ -10,7 +10,7 @@ import {
   fixtureUserPrompts, launchWebScaffold, seedSession, watchConsole, webSnapshotMode,
   type WebScaffold,
 } from './scaffold.ts'
-import { connectFreshWorkspace, newEnglishPage, saveFailureShot } from './support.ts'
+import { connectFreshWorkspace, fullscreenBox, newEnglishPage, saveFailureShot } from './support.ts'
 
 const SNAPSHOT_DIR = fileURLToPath(new URL('../../../snapshots/web/details-session-lifecycle', import.meta.url))
 const HANDLES_EXPECTED = join(SNAPSHOT_DIR, 'handles.expected.md')
@@ -71,19 +71,30 @@ async function columns(page: Page): Promise<number[]> {
     getComputedStyle(element).gridTemplateColumns.split(' ').map(value => Math.round(Number.parseFloat(value))))
 }
 
+/** Select panes by visual column rather than retained-host DOM order. */
+function paneAt(column: Locator, index: number): Locator {
+  return column.locator(`[data-dockkit-pane][data-dockkit-column="${index}"]`)
+}
+
 /** Tab order and selection inside each docked pane, independent of generated ids. */
 async function paneSnapshot(page: Page) {
-  return await page.locator('[data-rightbar-col] [data-dockkit-pane]').evaluateAll(panes => panes.map(pane => ({
-    active: pane.hasAttribute('data-dockkit-pane-active'),
-    tabs: [...pane.querySelectorAll('[data-dockkit-tab]')].map(tab => ({
-      title: tab.querySelector('[data-dockkit-tab-title]')?.textContent?.trim(),
-      selected: tab.getAttribute('aria-selected') === 'true',
-    })),
-  })))
+  return await page.locator('[data-rightbar-col] [data-dockkit-pane]').evaluateAll(panes => panes
+    .sort((left, right) => Number(left.getAttribute('data-dockkit-column')) - Number(right.getAttribute('data-dockkit-column')))
+    .map(pane => ({
+      active: pane.hasAttribute('data-dockkit-pane-active'),
+      tabs: [...pane.querySelectorAll('[data-dockkit-tab]')].map(tab => ({
+        title: tab.querySelector('[data-dockkit-tab-title]')?.textContent?.trim(),
+        selected: tab.getAttribute('aria-selected') === 'true',
+      })),
+    })))
 }
 
 /** Product-visible geometry, pane state, and expanded Files directories at a settled checkpoint. */
 async function sidebarSnapshot(page: Page) {
+  // A toggle holds data-animating until transitionend or its 600ms fallback
+  // (ui-layout AppFrame); computed transition values are stable only after it
+  // drops, so capturing earlier races the settle window.
+  await expect.poll(() => appFrame(page).evaluate(frame => frame.hasAttribute('data-animating'))).toBe(false)
   const geometry = await appFrame(page).evaluate((frame) => {
     const panel = frame.querySelector<HTMLElement>('[data-sidebar-right-panel]')
     if (panel === null) throw new Error('Sidebar panel is not mounted')
@@ -99,10 +110,10 @@ async function sidebarSnapshot(page: Page) {
       mode: panel.getAttribute('data-sidebar-right-panel'),
       panelContentWidth: expanded ? Math.round(Number.parseFloat(style.width)) : 0,
       panelOuterWidth: expanded ? Math.round(rect.width) : 0,
-      coversViewport: expanded && rect.x === 0 && rect.y === 0
-        && Math.round(rect.width) === window.innerWidth && Math.round(rect.height) === window.innerHeight,
+      coversViewport: expanded && rect.x === -1 && rect.y === 0
+        && Math.round(rect.width) === window.innerWidth + 1 && Math.round(rect.height) === window.innerHeight,
       resizeHandleWidth: handle === null ? 0 : Math.round(handle.getBoundingClientRect().width),
-      expandedDirectories: [...panel.querySelectorAll('[data-files-entry="directory"] > button[aria-expanded="true"]')]
+      expandedDirectories: [...panel.querySelectorAll('[data-files-entry="directory"] button[aria-expanded="true"]')]
         .map(button => button.textContent?.trim()),
     }
   })
@@ -175,15 +186,31 @@ describe.skipIf(MODE === 'record')('web e2e: details panel follows the current S
     const blankViewport = page.viewportSize()!
     try {
       await blankColumn.locator('[data-sidebar-right-toggle]').click()
+      await blankColumn.locator('[data-dockkit-pane]').first().waitFor({ state: 'hidden' })
       await page.setViewportSize({ width: 767, height: blankViewport.height })
+      await expect.poll(() => columns(page)).toEqual([0, 767, 0])
       await page.locator('[data-sidebar-right-expand]').click()
+      // The fullscreen shell keeps its viewport box while its docked content closes.
+      await expect.poll(() => blankColumn.locator('[data-sidebar-right-open]').count()).toBe(1)
+      await expect.poll(() => blankColumn.locator('[data-dockkit-host="dock"]:not([hidden])').evaluate(element => getComputedStyle(element).transform))
+        .toBe('none')
       await expect.poll(() => blankColumn.locator('[data-sidebar-right-panel]').boundingBox())
-        .toEqual({ x: 0, y: 0, width: 767, height: blankViewport.height })
+        .toEqual(fullscreenBox({ width: 767, height: blankViewport.height }))
+      // A preview the files page opened starts with its tree hidden; shown, the tree fills the viewport.
+      const treeToggle = blankColumn.locator('[data-files-navigator-toggle]')
+      await expect.poll(() => treeToggle.getAttribute('aria-expanded')).toBe('false')
+      await treeToggle.click()
+      await blankColumn.locator('[data-files-navigator]').waitFor({ state: 'visible' })
+      expect(await blankColumn.locator('[data-textpreview-body]').evaluate(node => getComputedStyle(node).visibility)).toBe('hidden')
+      await treeToggle.click()
+      await expect.poll(() => treeToggle.getAttribute('aria-expanded')).toBe('false')
       await blankColumn.getByText('Workspace preview is available.', { exact: true }).waitFor()
       await blankColumn.locator('[data-sidebar-right-toggle]').click()
+      await blankColumn.locator('[data-dockkit-pane]').first().waitFor({ state: 'hidden' })
     } finally {
       await page.setViewportSize(blankViewport)
     }
+    await expect.poll(() => columns(page)).toEqual([280, blankViewport.width - 280, 0])
     await page.locator('[data-sidebar-right-expand]').click()
     await blankColumn.locator('[data-dockkit-add-tab]').click()
     await blankColumn.locator('[data-sidebar-right-guide-entry="terminal"]')
@@ -307,16 +334,15 @@ describe.skipIf(MODE === 'record')('web e2e: details panel follows the current S
         await Promise.allSettled(frame.getAnimations().map(animation => animation.finished))
       })
       await expect.poll(() => detailsTrack(page)).toBe(0)
-      await panel.waitFor({ state: 'hidden' })
+      await panel.locator('[data-dockkit-pane]').first().waitFor({ state: 'hidden' })
     }
 
     await select(original, 'LIGHTHOUSE')
     await open()
     await column.locator('[data-sidebar-right-guide-entry="files"]').click()
-    // The content-box panel adds its one rendered border pixel outside the
-    // CSS width assigned by the grid solver.
+    // Pane borders stay inside the grid width; the shared panel owns no border.
     await expect.poll(() => sidebarSnapshot(page), { timeout: 5_000 })
-      .toMatchObject({ mode: 'push', panelContentWidth: normalWidth, panelOuterWidth: normalWidth + 1, resizeHandleWidth: 8 })
+      .toMatchObject({ mode: 'push', panelContentWidth: normalWidth, panelOuterWidth: normalWidth, resizeHandleWidth: 8 })
     await expect.poll(async () => ({
       filesVisible: await column.locator('[data-files-state="tree"]').isVisible(),
       errors: tripwire.pageErrors,
@@ -326,15 +352,15 @@ describe.skipIf(MODE === 'record')('web e2e: details panel follows the current S
     await expect.poll(() => split.isDisabled()).toBe(false)
     await split.click()
     await expect.poll(() => panes.count()).toBe(2)
-    await panes.last().locator('[data-sidebar-right-guide-entry="files"]').click()
-    await panes.first().locator('[data-dockkit-tab]').filter({ hasText: 'Files' }).click()
-    await expect.poll(() => panes.first().locator('[data-files-state="tree"]').count()).toBe(1)
+    await paneAt(column, 1).locator('[data-sidebar-right-guide-entry="files"]').click()
+    await paneAt(column, 0).locator('[data-dockkit-tab]').filter({ hasText: 'Files' }).click()
+    await expect.poll(() => paneAt(column, 0).locator('[data-files-state="tree"]').count()).toBe(1)
     const retainedA = await paneSnapshot(page)
     expect(retainedA.map(pane => pane.tabs.map(tab => tab.title))).toEqual([['Files', 'Start'], ['Files']])
     await checkpoint('A normal: two panes')
 
     await column.locator('[data-sidebar-right-mode="fullscreen"]').click()
-    await expect.poll(() => panel.boundingBox()).toEqual({ x: 0, y: 0, ...viewport })
+    await expect.poll(() => panel.boundingBox()).toEqual(fullscreenBox(viewport))
     expect(await columns(page)).toEqual(normalColumns)
     expect(await sidebarSnapshot(page)).toMatchObject({ mode: 'fullscreen', resizeHandleWidth: 0, coversViewport: true })
     expect(await paneSnapshot(page)).toEqual(retainedA)
@@ -351,7 +377,8 @@ describe.skipIf(MODE === 'record')('web e2e: details panel follows the current S
     expect(await panel.getAttribute('data-sidebar-right-panel')).toBe('push')
     await column.locator('[data-sidebar-right-guide-entry="files"]').click()
     await column.locator('[data-files-state="tree"]').waitFor({ timeout: 15_000 })
-    const workspaceDirectory = column.locator('[data-files-entry="directory"] > button').filter({ hasText: /^workspace$/ })
+    const workspaceDirectory = column.locator('[data-files-entry="directory"] button')
+      .and(column.getByRole('button', { name: 'workspace', exact: true }))
     await workspaceDirectory.waitFor({ timeout: 15_000 })
     await workspaceDirectory.click()
     await expect.poll(() => workspaceDirectory.getAttribute('aria-expanded')).toBe('true')
@@ -368,7 +395,7 @@ describe.skipIf(MODE === 'record')('web e2e: details panel follows the current S
     expect(await panel.getAttribute('data-sidebar-right-panel')).toBe('fullscreen')
     expect(await paneSnapshot(page)).toEqual(retainedA)
     await open()
-    await expect.poll(() => panel.boundingBox()).toEqual({ x: 0, y: 0, ...viewport })
+    await expect.poll(() => panel.boundingBox()).toEqual(fullscreenBox(viewport))
     expect(await paneSnapshot(page)).toEqual(retainedA)
     await checkpoint('A restored: manual fullscreen, tabs, and panes')
     await column.locator('[data-sidebar-right-mode="push"]').click()
@@ -379,9 +406,10 @@ describe.skipIf(MODE === 'record')('web e2e: details panel follows the current S
     expect(await panel.getAttribute('data-sidebar-right-panel')).toBe('push')
     expect(await paneSnapshot(page)).toEqual(retainedB)
     await open()
-    await expect.poll(() => workspaceDirectory.getAttribute('aria-expanded')).toBe('false')
+    // B stayed a recent view while A was shown, so its Files tree keeps the expanded directory.
+    await expect.poll(() => workspaceDirectory.getAttribute('aria-expanded')).toBe('true')
     expect(await paneSnapshot(page)).toEqual(retainedB)
-    await checkpoint('B restored: normal mode and collapsed Files directory')
+    await checkpoint('B restored: normal mode and expanded Files directory')
     await close()
     await select(original, 'LIGHTHOUSE')
     await expect.poll(() => columns(page)).toEqual(normalColumns)
@@ -406,8 +434,8 @@ describe.skipIf(MODE === 'record')('web e2e: details panel follows the current S
       await page.locator('[data-sidebar-right-expand]').click()
       await expect.poll(() => columns(page)).toEqual([420, viewport.width - 420 - normalWidth, normalWidth])
       await page.setViewportSize({ width: 767, height: viewport.height })
-      await expect.poll(() => panel.boundingBox()).toEqual({ x: 0, y: 0, width: 767, height: viewport.height })
-      await expect.poll(() => columns(page)).toEqual([56, 711, 0])
+      await expect.poll(() => panel.boundingBox()).toEqual(fullscreenBox({ width: 767, height: viewport.height }))
+      await expect.poll(() => columns(page)).toEqual([0, 767, 0])
       expect(await sidebarSnapshot(page)).toMatchObject({ mode: 'fullscreen', resizeHandleWidth: 0, coversViewport: true })
       await checkpoint('A automatic fullscreen at 767px')
       await column.locator('[data-sidebar-right-mode="push"]').click()

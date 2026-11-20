@@ -25,7 +25,11 @@ kind: "package-reference"
 <a id="use-this-package"></a>
 ## 使用本包
 
-`standard`、`ptc` 与 `cordis` Agent preset 挂载本插件。创建文件后，以 `files: [{ path, description? }]` 调用 `present`。文件必须是 Session 文件系统可访问的普通文件。相对路径按 Session 工作目录解析；绝对路径可以指向工作区外的文件，包括 `/tmp` 或 Downloads。文件缺失、为目录、最终路径为符号链接或提供方拒绝访问时，调用失败。Shell 沙箱私有 `/tmp` 中的文件需要先写入 Session 文件系统可访问的位置。
+共用的输出与文件链接指导由 [`dsh-deliverable-file-references`](../deliverable-file-references/README.zh.md) 提供，Web 与 SDK bundle 单独挂载该插件。
+
+`present` 按 Session 的当前工作目录校验路径并记录绝对路径，因此后续目录切换不会让已交付文件指向其他位置。
+
+`standard`、`ptc` 与 `cordis` Agent preset 挂载本插件。创建文件后，以 `files: [{ path, description? }]` 调用 `present`。文件必须是 Session 文件系统可访问的普通文件。相对路径按 Session 工作目录解析；绝对路径可以指向工作区外的文件，包括 `/tmp` 或 Downloads。文件缺失、为目录、最终路径为符号链接或提供方拒绝访问时，调用以 `FsError` 失败，错误码如 `FS_NOT_FOUND`、`FS_NOT_REGULAR_FILE` 与 `FS_PERMISSION_DENIED`；路径为空或文件数量不在 1 到 `maxFiles` 之间时报告 `ToolArgsError`（`INVALID_ARGS`），缺少 agent Session 或打开的 turn 时报告 `ToolContextUnavailableError`（`TOOL_CONTEXT_UNAVAILABLE`）。Shell 沙箱私有 `/tmp` 中的文件需要先写入 Session 文件系统可访问的位置。
 
 在 Agent 的 Cordis 组合中挂载，并提供 `tools`、`fs` 和 `turnBoundary` Session 投影：
 
@@ -51,9 +55,7 @@ kind: "package-reference"
 
 工具通过配置的文件系统提供方解析路径，检查普通文件元数据，不读取内容。成功的最终 `tools/result` 通知追加 `deliverables/presented`，嵌套调用也适用。外层程序随后失败不会撤销已完成的声明。被阻止的结果不发布声明。每个插件实例只记录其实际执行的调用；同名作用域工具不能通过其他实例发布交付。
 
-纯 `./types` 入口声明 `PresentedFile` 与 Session 事件，不导入 Host 运行时代码。Web 消费方在展示或打开文件前校验持久声明。事件不保存 Session ID，因此 fork 历史中的相对路径按当前查看的 Session 工作区解析。
-
-**运行时不变式：** 不发布伴生入口。工具与事件注册归 effect 所有，Session 日志拥有文件声明；插件不维护独立的文件内容存储。
+纯 `./types` 入口声明 `PresentedFile` 与 Session 事件，不导入 Host 运行时代码。Web 消费方在展示或打开文件前校验持久声明。新声明保存绝对路径。历史相对路径声明继续以当前查看的 Session 原始工作区作为基准。
 
 </details>
 
@@ -73,7 +75,7 @@ kind: "package-reference"
 
 #### 模型看到的内容
 
-[present schema](../../../docs/tool-catalog.zh.md#present)要求已有且可访问的文件：“Declare existing files accessible through the Session filesystem as final deliverables. When a file you create or update is an output the user asked to receive, you must call present after writing it and before your final response, including files created through Bash or code execution. Mentioning its path in your reply does not replace this call. The files must already exist. The user opens the current source files; their contents are not copied or preserved.” 每个文件的结果为 `Presented <path>`；程序结果和持久事件包含路径及可选说明。
+[present schema](../../../docs/tool-catalog.zh.md#present)要求已有且可访问的文件：“Declare existing files as final deliverables for the user. Hosts may show presented files only after your turn ends, so call it once the files are final. If the user needs to review files earlier, such as before a tool call that waits for their answer, link them in your message instead. Use it when the user needs a separate file, especially Office documents, spreadsheets, and slide decks; prefer your final response when that suffices. The user opens the current files; their contents are not copied.” `files` 参数要求选择 1-2 个最重要的交付物，每次调用最多 4 个。每个文件的结果为 `Presented <path>`；程序结果和持久事件包含路径及可选说明。
 
 #### Token 影响
 

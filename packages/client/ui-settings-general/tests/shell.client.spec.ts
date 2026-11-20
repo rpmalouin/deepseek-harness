@@ -11,11 +11,12 @@ import { createClientTest, type TestClient, webApp } from '@deepseek-ai/dsh-clie
 import { inject } from '../src/client/index.ts'
 import type { SettingsRootInjected } from '../src/client/shell-contract.ts'
 import { SettingsRoot } from '../src/client/SettingsRoot.tsx'
-import type { DesktopUpdatePresentation } from '../src/client/desktop-update-bridge.ts'
+import type { DesktopUpdatePresentation } from '../src/types.ts'
 
 const SELF = '@deepseek-ai/dsh-client-ui-settings-general'
 const SIDEBAR = '@deepseek-ai/dsh-client-ui-sidebar'
 const it = createClientTest({ roster: webApp })
+const withoutSettingsAccess = createClientTest({ roster: webApp }, { access: action => action !== 'settings/describe' })
 /** The whole roster's first boot pays the cold module transform of every plugin package. */
 const COLD_BOOT_TIMEOUT_MS = 60_000
 
@@ -24,23 +25,26 @@ function injectedOf(c: TestClient): SettingsRootInjected {
   return (entry.inject as () => SettingsRootInjected)()
 }
 
-/** The shell's child declarations (chrome, actions, sections, and onboarding overlays). */
+/** The slots this package declares, through the shell or the `settings.section.view` Factory. */
 const CHILD_SPECS = {
+  'settings.launcher': { kind: 'single', scope: 'root' },
+  'settings.notice': { kind: 'single', scope: 'root' },
   'settings.trigger': { kind: 'single', scope: 'root' },
   'settings.header': { kind: 'single', scope: 'root' },
   'settings.action': { kind: 'list', scope: 'root' },
   'settings.close': { kind: 'single', scope: 'root' },
   'settings.section': { kind: 'list', scope: 'root' },
+  'settings.section.icon': { kind: 'list', scope: 'root', inline: true },
   'settings.onboarding': { kind: 'list', scope: 'root' },
 } as const
 const CHILD_NAMES = Object.keys(CHILD_SPECS) as Array<keyof typeof CHILD_SPECS>
 
 /**
  * Section ids the web-app roster registers, in nav order: this package, then
- * ui-settings-models, ui-settings-plugins, ui-agent-preset, and
- * ui-settings-unarchive-sessions. A plugin adding a section changes this list.
+ * ui-settings-models, ui-plugin-manager, and ui-agent-preset. A plugin
+ * adding a section changes this list.
  */
-const PRODUCT_SECTIONS: readonly string[] = ['general', 'models', 'plugins', 'agent-presets', 'archived-sessions']
+const PRODUCT_SECTIONS: readonly string[] = ['general', 'models', 'plugins', 'agent-presets']
 /** Onboarding steps the web-app roster registers, in coordinator order; both come from ui-settings-models. */
 const PRODUCT_ONBOARDING: readonly { id: string; order: number }[] = [
   { id: 'welcome-notice', order: -100 },
@@ -76,7 +80,7 @@ describe('ui-settings-general shell', () => {
   }, COLD_BOOT_TIMEOUT_MS)
 
   it('declares its services', () => {
-    expect(inject).toEqual(['slots', 'locale', 'connection', 'remote', 'remote.settings', 'settingsScope'])
+    expect(inject).toEqual(['slots', 'locale', 'connection', 'remote', 'remote.settings', 'configForms', 'shortcuts', 'modules', 'remoteAccess'])
   })
 
   it('occupies sidebar.settings, declared by ui-sidebar, and declares every child slot', async ({ start }) => {
@@ -85,12 +89,16 @@ describe('ui-settings-general shell', () => {
     for (const name of CHILD_NAMES) expect(c.ctx.slots.spec(name)).toEqual(CHILD_SPECS[name])
   }, COLD_BOOT_TIMEOUT_MS)
 
+  withoutSettingsAccess('leaves sidebar.settings unoccupied while the current Peer may not read the settings description', async ({ start }) => {
+    const c = await start()
+    expect(c.ctx.slots.entries('sidebar.settings')).toEqual([])
+  }, COLD_BOOT_TIMEOUT_MS)
+
   it('projects the section ledger: product sections in order, defaults for bare rows, stable snapshots', async ({ start }) => {
     const c = await start()
     const { sections } = injectedOf(c).hooks
     const product = sections.getSnapshot()
     expect(product.map(row => row.id)).toEqual(PRODUCT_SECTIONS)
-    expect(product[0]).toEqual({ id: 'general', order: 0, label: expect.any(String) as string })
     c.ctx.slots.register({ name: 'settings.section', id: 'z', order: 1_000, label: 'Z' } as never, () => null)
     // No order and no label: both projection defaults apply, and order 0 sorts among the product rows.
     c.ctx.slots.register({ name: 'settings.section', id: 'a' } as never, () => null)
@@ -107,6 +115,21 @@ describe('ui-settings-general shell', () => {
     expect(listener).toHaveBeenCalled()
     expect(sections.getSnapshot()).not.toBe(rows)
     off()
+  })
+
+  it('shows Account first only while signed in and removes it on sign-out', async ({ start }) => {
+    const c = await start()
+    const { sections } = injectedOf(c).hooks
+    await c.mock.streams.opened('account/watch', 1)
+    expect(sections.getSnapshot().map(row => row.id)).toEqual(PRODUCT_SECTIONS)
+    c.mock.streams.push('account/watch', { type: 'snapshot', state: { status: 'credential-stored', attempt: null } })
+    await vi.waitFor(() => {
+      expect(sections.getSnapshot().map(row => row.id)).toEqual(['account', ...PRODUCT_SECTIONS])
+    })
+    c.mock.streams.push('account/watch', { type: 'snapshot', state: { status: 'credential-stored', attempt: null } })
+    await vi.waitFor(() => { expect(sections.getSnapshot().filter(row => row.id === 'account')).toHaveLength(1) })
+    c.mock.streams.push('account/watch', { type: 'snapshot', state: { status: 'signed-out', attempt: null } })
+    await vi.waitFor(() => { expect(sections.getSnapshot().map(row => row.id)).toEqual(PRODUCT_SECTIONS) })
   })
 
   it('projects the roster Connection control without copying its state; reconnect opens a new $events generation', async ({ start }) => {

@@ -1,18 +1,25 @@
 /** Agent controls use the same manager methods as the Web and bound inventory reads. */
+import { executeToolFixture } from '@deepseek-ai/dsh-tool-testkit'
+import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
+import { setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
 import { Context } from '@deepseek-ai/cordis'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
-import ToolRuntime from '@deepseek-ai/dsh-tools'
-import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import ToolRuntime, { type ToolExecutionResult } from '@deepseek-ai/dsh-tools'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { ToolCallId } from '@deepseek-ai/dsh-llm/types'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import SandboxPolicy, { setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
-import { Session, SessionId, SESSION_FORMAT_VERSION } from '@deepseek-ai/dsh-session'
+import SandboxPolicy from '@deepseek-ai/dsh-sandbox-policy'
+import { Session, type SessionId, SESSION_FORMAT_VERSION } from '@deepseek-ai/dsh-session'
 import SessionProjections from '@deepseek-ai/dsh-session-projection'
 import ApprovalService, { type ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
 import { expect, it, onTestFinished, vi } from 'vitest'
 import type PluginManager from '../src/index.ts'
+import type { BundleInfo } from '../src/types.ts'
 import * as tool from '../src/tools.ts'
+import { PluginManagerError } from '../src/error.ts'
+import { FileLockError } from '@deepseek-ai/dsh-atomic-write'
 
-function resultText(result: Awaited<ReturnType<ToolRuntime['execute']>>): string {
+function resultText(result: ToolExecutionResult): string {
   if (typeof result.value !== 'string') throw new Error('Expected a serialized manager result')
   return result.value
 }
@@ -27,23 +34,26 @@ async function fixture(mode: 'read-only' | 'workspace-write' | 'danger-full-acce
     setBundleEnabled: vi.fn(async () => ({ changed: true, application: 'applied' })),
     installBundle: vi.fn(async () => ({ changed: true, application: 'restart-required' })),
     removeBundle: vi.fn(async () => ({ changed: false, application: 'failed' })),
+    listVersionExemptions: vi.fn(() => ({ exemptions: { 'example@1.2.3': ['0.1.7-alpha.1'] }, warnings: [] })),
+    setVersionExemption: vi.fn(async () => ({ changed: true, application: 'applied' })),
   }
   ctx.provide('pluginManager', manager as unknown as PluginManager)
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
+  await ctx.plugin(NativeToolExecutor)
   await ctx.plugin(SessionProjections)
   await ctx.plugin(SandboxPolicy, { mode })
   if (approval !== undefined) await ctx.plugin(ApprovalService, { policy: approval })
   const fiber = await ctx.plugin(tool)
-  const call = (args: unknown, agent?: Agent, signal = new AbortController().signal) => ctx.tools.execute({ name: 'plugin_manager', arguments: args,
+  const call = (args: unknown, agent?: Agent, signal = new AbortController().signal) => executeToolFixture(ctx, { name: 'plugin_manager', arguments: args,
     ...agent === undefined ? {} : { agent },
-    callId: ToolCallId('manager-call'), signal })
+    callId: brandString<ToolCallId>('manager-call'), signal })
   return { ctx, manager, call, fiber }
 }
 
 it.each(['read-only', 'workspace-write'] as const)('denies every management action in %s before accessing the manager', async (mode) => {
   const { call, manager } = await fixture(mode)
-  for (const action of ['list_plugins', 'list_bundles', 'set_plugin', 'set_bundle', 'install_bundle', 'remove_bundle']) {
+  for (const action of ['list_plugins', 'list_bundles', 'set_plugin', 'set_bundle', 'install_bundle', 'remove_bundle', 'list_version_exemptions', 'set_version_exemption']) {
     const result = await call({ action, target: 'bundle', enabled: true })
     expect(result.isError).toBe(true)
     expect(JSON.stringify(result.content)).toContain('requires approval, but no approval service is composed')
@@ -51,9 +61,70 @@ it.each(['read-only', 'workspace-write'] as const)('denies every management acti
   for (const method of Object.values(manager)) expect(method).not.toHaveBeenCalled()
 })
 
+it('preserves selected bundle load errors in the agent list result', async () => {
+  const { manager, call } = await fixture()
+  const bundles = [{
+    name: 'bundle', enabled: true,
+    error: { code: 'operation-error', diagnostic: 'bundle patch is unreadable' }, rows: [], overrides: [],
+  }]
+  manager.listBundles.mockResolvedValue(bundles)
+  expect(JSON.parse(resultText(await call({ action: 'list_bundles' })))).toMatchInlineSnapshot(`
+    {
+      "entries": [
+        {
+          "enabled": true,
+          "error": {
+            "code": "operation-error",
+            "diagnostic": "bundle patch is unreadable",
+          },
+          "name": "bundle",
+          "overrides": [],
+          "rows": [],
+        },
+      ],
+      "nextOffset": null,
+      "total": 1,
+    }
+  `)
+})
+
+it('exposes an absent Official bundle installation target without display metadata', async () => {
+  const { manager, call } = await fixture()
+  const offered: BundleInfo = {
+    name: '@deepseek-ai/dsh-subagent-codex', official: true, availability: 'missing',
+    installed: false, enabled: false, optional: false, removable: false, rows: [], overrides: [],
+    installTarget: { spec: '@deepseek-ai/dsh-subagent-codex@1.2.3', version: '1.2.3' },
+    meta: { title: 'Codex subagent' },
+  }
+  manager.listBundles.mockResolvedValue([offered])
+  expect(JSON.parse(resultText(await call({ action: 'list_bundles' })))).toMatchInlineSnapshot(`
+    {
+      "entries": [
+        {
+          "availability": "missing",
+          "enabled": false,
+          "installTarget": {
+            "spec": "@deepseek-ai/dsh-subagent-codex@1.2.3",
+            "version": "1.2.3",
+          },
+          "installed": false,
+          "name": "@deepseek-ai/dsh-subagent-codex",
+          "official": true,
+          "optional": false,
+          "overrides": [],
+          "removable": false,
+          "rows": [],
+        },
+      ],
+      "nextOffset": null,
+      "total": 1,
+    }
+  `)
+})
+
 it('checks the calling session on each execution, including after permission is revoked', async () => {
   const { call, manager } = await fixture()
-  const id = SessionId('manager-permissions')
+  const id = brandString<SessionId>('manager-permissions')
   const session = Session.create(id, undefined, { version: SESSION_FORMAT_VERSION, id, createdAt: 0, isSeeded: false })
   const agent = { session } as unknown as Agent
   setSandboxMode(session, 'workspace-write')
@@ -67,7 +138,7 @@ it('checks the calling session on each execution, including after permission is 
 })
 
 function activeAgent(): Agent {
-  const id = SessionId('manager-approval')
+  const id = brandString<SessionId>('manager-approval')
   const session = Session.create(id, undefined, { version: SESSION_FORMAT_VERSION, id, createdAt: 0, isSeeded: false })
   session.append('turn/start', { turn: 1 })
   return { session } as unknown as Agent
@@ -78,14 +149,14 @@ it.each(['read-only', 'workspace-write'] as const)('approves each action once in
   const agent = activeAgent()
   const prompted = vi.fn(async () => 'allowed-once' as const)
   const dispose = ctx.on('approval/request', prompted)
-  for (const action of ['list_plugins', 'list_bundles', 'set_plugin', 'set_bundle', 'install_bundle', 'remove_bundle']) {
-    expect((await call({ action, target: 'bundle', enabled: true }, agent)).isError).toBe(false)
+  for (const action of ['list_plugins', 'list_bundles', 'set_plugin', 'set_bundle', 'install_bundle', 'remove_bundle', 'list_version_exemptions', 'set_version_exemption']) {
+    expect((await call({ action, target: 'bundle@1.0.0', enabled: true, runtimeVersion: '0.1.7-alpha.1', acceptRisk: true }, agent)).isError).toBe(false)
   }
-  expect(prompted).toHaveBeenCalledTimes(6)
+  expect(prompted).toHaveBeenCalledTimes(8)
   for (const method of Object.values(manager)) expect(method).toHaveBeenCalledTimes(1)
   expect(ctx.sandboxPolicy.resolve({ session: agent.session }).mode).toBe(mode)
   const audit = agent.session.snapshotEvents().filter(event => event.type.startsWith('approval/'))
-  expect(audit).toHaveLength(12)
+  expect(audit).toHaveLength(16)
   expect(audit[0]).toMatchObject({ type: 'approval/asked', data: {
     toolName: 'plugin_manager', callId: 'manager-call',
   } })
@@ -158,6 +229,21 @@ it('paginates inventories with an explicit continuation and total', async () => 
   expect(resultText(await call({ action: 'list_bundles' }))).toContain('"name":"bundle"')
 })
 
+it('keeps UI translation and listing metadata out of model-facing plugin and bundle lists', async () => {
+  const { call, manager } = await fixture()
+  const meta = { title: { en: 'Plugin', zh: '插件' }, error: 'UI-only diagnostic' }
+  manager.listPlugins.mockImplementationOnce(async () => [{ entryId: 'include:plugin', enabled: true, meta }])
+  expect(JSON.parse(resultText(await call({ action: 'list_plugins' })))).toEqual({
+    entries: [{ entryId: 'include:plugin', enabled: true }], total: 1, nextOffset: null,
+  })
+  manager.listBundles.mockImplementationOnce(async () => [{
+    name: 'bundle', source: 'bundle@^1.0.0', enabled: true, listedByDefault: false, meta, rows: [{ rowId: 'plugin', moduleName: 'plugin', meta }],
+  }])
+  expect(JSON.parse(resultText(await call({ action: 'list_bundles' })))).toEqual({
+    entries: [{ name: 'bundle', source: 'bundle@^1.0.0', enabled: true, rows: [{ rowId: 'plugin', moduleName: 'plugin' }] }], total: 1, nextOffset: null,
+  })
+})
+
 it('forwards all mutation actions and renders the returned outcome', async () => {
   const { call, manager } = await fixture()
   await call({ action: 'set_plugin', target: 'include:1', enabled: false })
@@ -170,6 +256,8 @@ it('forwards all mutation actions and renders the returned outcome', async () =>
   expect(manager.installBundle).toHaveBeenLastCalledWith('bundle', { enabled: false })
   await call({ action: 'install_bundle', target: 'bundle', approvedBuilds: ['native'] })
   expect(manager.installBundle).toHaveBeenLastCalledWith('bundle', { approvedBuilds: ['native'] })
+  await call({ action: 'install_bundle', target: 'bundle', registry: 'https://registry.npmmirror.com/' })
+  expect(manager.installBundle).toHaveBeenLastCalledWith('bundle', { registry: 'https://registry.npmmirror.com/' })
   expect(resultText(await call({ action: 'remove_bundle', target: 'bundle' }))).toContain('"application":"failed"')
   expect(manager.removeBundle).toHaveBeenCalledWith('bundle')
 })
@@ -184,9 +272,24 @@ it.each([
   { action: 'set_plugin', enabled: true },
   { action: 'set_bundle', target: 'bundle' },
   { action: 'install_bundle' }, { action: 'remove_bundle' },
+  { action: 'set_version_exemption', enabled: true, runtimeVersion: '1.0.0' },
+  { action: 'set_version_exemption', target: 'plugin@1.0.0', enabled: true },
+  { action: 'set_version_exemption', target: 'plugin@1.0.0', runtimeVersion: '1.0.0' },
 ])('rejects incomplete or unbounded tool inputs: %j', async (args) => {
   const { call } = await fixture()
-  expect((await call(args)).isError).toBe(true)
+  const result = await call(args)
+  expect(result.isError).toBe(true)
+  expect(result.error?.info).toEqual({ name: 'ToolArgsError', code: 'INVALID_ARGS' })
+})
+
+it('reports profile read, lock, and disposal failures with their error codes', async () => {
+  const { manager, call } = await fixture()
+  manager.listBundles.mockRejectedValueOnce(new PluginManagerError('plugin-manager: failed to read the profile: bad JSON', 'PLUGIN_MANAGER_PROFILE_READ_FAILED'))
+  manager.setBundleEnabled.mockRejectedValueOnce(new FileLockError('/profile/package.json.lock'))
+  manager.removeBundle.mockRejectedValueOnce(new PluginManagerError('plugin-manager: the manager is disposed', 'PLUGIN_MANAGER_UNAVAILABLE'))
+  expect((await call({ action: 'list_bundles' })).error?.info).toEqual({ name: 'PluginManagerError', code: 'PLUGIN_MANAGER_PROFILE_READ_FAILED' })
+  expect((await call({ action: 'set_bundle', target: 'bundle', enabled: false })).error?.info).toEqual({ name: 'FileLockError', code: 'FILE_LOCK_TIMEOUT' })
+  expect((await call({ action: 'remove_bundle', target: 'bundle' })).error?.info).toEqual({ name: 'PluginManagerError', code: 'PLUGIN_MANAGER_UNAVAILABLE' })
 })
 
 it('presents reads and changes distinctly and disposes its registration', async () => {
@@ -196,4 +299,28 @@ it('presents reads and changes distinctly and disposes its registration', async 
   expect(definition.presentCall?.({ action: 'remove_bundle', target: 'bundle' })).toMatchObject({ kind: 'other' })
   await fiber.dispose()
   expect(ctx.tools.get('plugin_manager')).toBeUndefined()
+})
+
+it('tells the agent the next step for each change outcome it can act on', async () => {
+  const { manager, call } = await fixture()
+  const outcome = async (result: object): Promise<unknown> => {
+    manager.setBundleEnabled.mockResolvedValueOnce(result as never)
+    return (JSON.parse(resultText(await call({ action: 'set_bundle', target: 'bundle', enabled: true }))) as { nextStep?: string }).nextStep
+  }
+  expect(await outcome({ changed: true, application: 'applied' })).toBeUndefined()
+  expect(await outcome({ changed: false, application: 'cancelled' })).toContain('nothing changed')
+  expect(await outcome({ changed: true, application: 'overridden' })).toContain('higher-priority layer')
+  expect(await outcome({ changed: true, application: 'restart-required', restartReason: 'host-module' }))
+    .toBe('Tell the user to restart DSH to apply this change: the change reaches modules DSH itself loaded.')
+  expect(await outcome({ changed: true, application: 'restart-required' })).toBe('Tell the user to restart DSH to apply this change.')
+  expect(await outcome({ changed: false, application: 'failed', packageResult: { kind: 'build-blocked' } })).toContain('approvedBuilds')
+  // A refusal code is more specific than the package manager's failure kind.
+  expect(await outcome({ changed: false, application: 'failed', packageResult: { kind: 'network' }, error: { code: 'stale-approval' } }))
+    .toContain('without approvedBuilds')
+  // A failure kind without its own step falls back to the refusal code.
+  expect(await outcome({ changed: false, application: 'failed', packageResult: { kind: 'unknown' }, error: { code: 'operation-error' } }))
+    .toContain('Report the diagnostic')
+  expect(await outcome({ changed: false, application: 'failed' })).toContain('Report the diagnostic')
+  expect(await outcome({ changed: false, application: 'failed', error: { code: 'unsupported-platform' } }))
+    .toBe('This bundle cannot run on the current Host platform; ask the user to use a supported Host.')
 })

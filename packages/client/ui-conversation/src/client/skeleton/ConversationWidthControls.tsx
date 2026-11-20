@@ -1,4 +1,4 @@
-import { useCallback, useLayoutEffect, useRef, useState } from 'react'
+import { useCallback, useLayoutEffect, useRef } from 'react'
 import type { ConversationWidthControlsProps } from '../contract/slots.ts'
 import css from './ConversationRoot.module.css'
 
@@ -24,7 +24,7 @@ function readWidthPreference(): number | null {
 function resolveContentWidth(columnWidth: number, preference: number | null): number {
   const max = Math.max(CONTENT_MIN, columnWidth - CONTENT_EDGE_BUDGET)
   if (preference !== null) return Math.min(Math.max(preference, CONTENT_MIN), max)
-  return Math.max(680, Math.min(columnWidth * 0.64, 920))
+  return Math.max(680, Math.min(columnWidth * 0.64, 880))
 }
 
 /** Convert a wheel event's vertical delta to scrollport pixels. */
@@ -45,7 +45,7 @@ function WidthHandle(props: {
   onCommit: (width: number) => void
   onEnd: () => void
 }) {
-  const [dragging, setDragging] = useState(false)
+  const dragging = useRef(false)
   const base = useRef(0)
   const origin = useRef(0)
   const latest = useRef(0)
@@ -68,12 +68,14 @@ function WidthHandle(props: {
     origin.current = event.clientX
     latest.current = event.clientX
     base.current = callbacks.current.onStart()
-    setDragging(true)
+    dragging.current = true
+    event.currentTarget.toggleAttribute('data-dragging', true)
   }, [])
   const onPointerMove = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragging.current) return
+    if (!event.currentTarget.hasPointerCapture(event.pointerId)) return
     const box = event.currentTarget.getBoundingClientRect()
     event.currentTarget.style.setProperty('--dsh-width-handle-pointer-y', `${event.clientY - box.top}px`)
-    if (!event.currentTarget.hasPointerCapture(event.pointerId)) return
     latest.current = event.clientX
     frame.current ??= requestAnimationFrame(() => {
       frame.current = null
@@ -81,27 +83,31 @@ function WidthHandle(props: {
     })
   }, [])
   const onPointerUp = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragging.current) return
     if (!event.currentTarget.hasPointerCapture(event.pointerId)) return
+    dragging.current = false
+    event.currentTarget.toggleAttribute('data-dragging', false)
     event.currentTarget.releasePointerCapture(event.pointerId)
     cancelFrame()
     latest.current = event.clientX
     // A press-only gesture must not overwrite a wider preference with its window-clamped display value.
     if (latest.current !== origin.current) callbacks.current.onCommit(outwardWidth())
-    setDragging(false)
     callbacks.current.onEnd()
   }, [])
-  const onPointerCancel = useCallback(() => {
+  const onPointerCancel = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragging.current) return
+    dragging.current = false
+    event.currentTarget.toggleAttribute('data-dragging', false)
     // Cancellation abandons persistence and restores the saved width through onEnd.
     cancelFrame()
-    setDragging(false)
     callbacks.current.onEnd()
   }, [])
   const onWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
     const body = event.currentTarget.parentElement
     /* v8 ignore next -- a width handle renders only inside the Conversation body. */
     if (body === null) return
-    const scrollport = body.querySelector<HTMLElement>(':scope > [data-conversation-scroll]')
-    /* v8 ignore next -- the Conversation body always contains its direct scroll element. */
+    const scrollport = body.querySelector<HTMLElement>('[data-conversation-scroll]')
+    /* v8 ignore next -- the Conversation body always contains its scroll element. */
     if (scrollport === null) return
     if (event.ctrlKey || event.deltaY === 0) return
     scrollport.scrollBy({ top: wheelDeltaY(event, scrollport) })
@@ -112,7 +118,6 @@ function WidthHandle(props: {
       className={css.widthHandle}
       data-side={props.side}
       data-width-handle={props.side}
-      data-dragging={dragging || undefined}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}

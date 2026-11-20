@@ -8,6 +8,7 @@ import email
 import json
 import os
 import re
+import runpy
 import shutil
 import stat
 import subprocess
@@ -53,11 +54,6 @@ def runtime_filenames(executable_name: str) -> tuple[str, ...]:
         return (executable_name, f"{executable_name.removesuffix('.exe')}-rg.exe")
     names = (executable_name, f"{executable_name}-rg")
     return (*names, f"{executable_name}-spawn-helper") if "-macos-" in executable_name else names
-
-
-def office_sidecar_name(executable_name: str) -> str:
-    """Return the complete Office dependency directory for one executable."""
-    return f"{executable_name.removesuffix('.exe')}-office"
 
 
 def main() -> None:
@@ -148,18 +144,21 @@ def validate_release_tag(tag: str | None, version: str) -> None:
 
 
 def copy_package(source: Path, destination: Path) -> None:
+    generated_parent = source / "src" / "deepseek_harness_runtime"
+    ignore_files = shutil.ignore_patterns(
+        ".venv", ".pytest_cache", "__pycache__", "*.pyc", "dist", "node_modules",
+    )
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        ignored = ignore_files(directory, names)
+        if Path(directory) == generated_parent:
+            ignored.add("runtime")
+        return ignored
+
     shutil.copytree(
         source,
         destination,
-        ignore=shutil.ignore_patterns(
-            ".venv",
-            ".pytest_cache",
-            "__pycache__",
-            "*.pyc",
-            "dist",
-            "node_modules",
-            "deepseek-harness-sdk-runtime-*",
-        ),
+        ignore=ignore,
     )
 
 
@@ -225,44 +224,9 @@ def stage_runtime(destination: Path, version: str, executable: Path, executable_
     source_directory = executable.parent
     for filename in runtime_filenames(executable_name):
         shutil.copy2(source_directory / filename, runtime_dir / filename)
-    office = office_sidecar_name(executable_name)
-    shutil.copytree(source_directory / office, runtime_dir / office)
-
-
-def verify_office_payload(archive: zipfile.ZipFile, office_modules: str, platform_tag: str) -> None:
-    """Check packaged engine assets and native helper executable permissions."""
-    names = set(archive.namelist())
-    adapter = f"{office_modules}/@deepseek-ai/libreoffice-kit/package.json"
-    if adapter not in names:
-        raise RuntimeError("Office dependency is missing: libreoffice-kit")
-    engines = f"{office_modules}/@deepseek-ai"
-    target = next(name for name, value in PLATFORMS.items() if value[0] == platform_tag)
-    native_target = target.replace("win-", "win32-").replace("macos-", "darwin-")
-    declared = json.loads(archive.read(adapter)).get("optionalDependencies", {})
-    selected = native_target if f"@deepseek-ai/libreoffice-kit-{native_target}" in declared else "wasm"
-    for required in (f"libreoffice-kit-{selected}/prebuilds.json",):
-        if f"{engines}/{required}" not in names:
-            raise RuntimeError(f"Office dependency is missing: {required}")
-    manifests = (
-        name for name in names
-        if name.startswith(f"{engines}/libreoffice-kit-")
-        and name.endswith("/prebuilds.json")
-        and name.count("/") == engines.count("/") + 2
-    )
-    for manifest_path in manifests:
-        if manifest_path != f"{engines}/libreoffice-kit-{selected}/prebuilds.json":
-            raise RuntimeError(f"Unexpected Office engine for {platform_tag}: {manifest_path}")
-        manifest = json.loads(archive.read(manifest_path))
-        engine = manifest["engine"]
-        native = engine["kind"] == "native"
-        fields = ("executable",) if native else ("loader", "wasm", "data", "metadata")
-        for field in fields:
-            asset = f"{manifest_path.rsplit('/', 1)[0]}/{engine[field]}"
-            if asset not in names:
-                raise RuntimeError(f"Office engine asset is missing: {asset}")
-            mode = archive.getinfo(asset).external_attr >> 16
-            if native and platform_tag != "win_amd64" and mode & stat.S_IXUSR == 0:
-                raise RuntimeError(f"Office helper lost its executable bit: {asset}")
+    resources = executable_name.removeprefix("deepseek-harness-sdk-runtime-").removesuffix(".exe")
+    # Wheels materialize interpreter aliases because pip does not restore symlinks.
+    shutil.copytree(source_directory / resources, runtime_dir / resources)
 
 
 def verify_wheel(
@@ -271,17 +235,20 @@ def verify_wheel(
     version: str,
     platform: tuple[str, str] | None,
 ) -> None:
+    if wheel.stat().st_size > 100_000_000:
+        raise RuntimeError(f"{wheel} is {wheel.stat().st_size} bytes and exceeds the PyPI single-file limit of 100000000 bytes")
     expected_tag = "py3-none-any" if platform is None else f"py3-none-{platform[0]}"
+    expected_distribution = SDK_DISTRIBUTION if package == "sdk" else RUNTIME_DISTRIBUTION
+    dist_info = f"{expected_distribution.replace('-', '_')}-{version}.dist-info"
     with zipfile.ZipFile(wheel) as archive:
-        wheel_metadata_path = next(name for name in archive.namelist() if name.endswith(".dist-info/WHEEL"))
-        metadata_path = next(name for name in archive.namelist() if name.endswith(".dist-info/METADATA"))
+        wheel_metadata_path = f"{dist_info}/WHEEL"
+        metadata_path = f"{dist_info}/METADATA"
         wheel_metadata = email.message_from_bytes(archive.read(wheel_metadata_path))
         metadata = email.message_from_bytes(archive.read(metadata_path))
         if wheel_metadata.get_all("Tag") != [expected_tag]:
             raise RuntimeError(f"{wheel} has wrong WHEEL tags: {wheel_metadata.get_all('Tag')}")
         if metadata.get("Version") != version:
             raise RuntimeError(f"{wheel} has version {metadata.get('Version')}, expected {version}")
-        expected_distribution = SDK_DISTRIBUTION if package == "sdk" else RUNTIME_DISTRIBUTION
         if metadata.get("Name") != expected_distribution:
             raise RuntimeError(
                 f"{wheel} has distribution name {metadata.get('Name')}, expected {expected_distribution}"
@@ -297,17 +264,18 @@ def verify_wheel(
                 f"{wheel} has license files {license_files}, expected {expected_license_files}"
             )
         runtime_payload = [
-            name for name in archive.namelist() if "/runtime/deepseek-harness-sdk-runtime-" in name
+            name for name in archive.namelist() if name.startswith("deepseek_harness_runtime/runtime/")
         ]
         if package == "runtime":
             assert platform is not None
-            office = office_sidecar_name(platform[1])
-            expected_files = sorted((*runtime_filenames(platform[1]), office))
+            resources = platform[1].removeprefix("deepseek-harness-sdk-runtime-").removesuffix(".exe")
+            expected_files = sorted((*runtime_filenames(platform[1]), resources))
             found_files = sorted({name.split("/runtime/", 1)[1].split("/", 1)[0] for name in runtime_payload})
             if found_files != expected_files:
                 raise RuntimeError(f"{wheel} runtime payload must be {expected_files}, found {found_files}")
-            office_modules = f"deepseek_harness_runtime/runtime/{office}/node_modules"
-            verify_office_payload(archive, office_modules, platform[0])
+            validate = runpy.run_path(str(ROOT / "python/sdk-runtime/src/deepseek_harness_runtime/_resources.py"))["validate_downloads"]
+            target = next(name for name, value in PLATFORMS.items() if value == platform)
+            validate(zipfile.Path(archive, f"deepseek_harness_runtime/runtime/{resources}/"), target)
             for runtime_file in runtime_payload:
                 if "/" in runtime_file.split("/runtime/", 1)[1]:
                     continue

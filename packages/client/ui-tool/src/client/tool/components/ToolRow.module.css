@@ -11,58 +11,12 @@
   flex-direction: column;
 }
 
-.row {
-  position: relative; /* sweep-glare overlay anchor */
-  overflow: hidden;
-}
-
-/* Running sweep (deepsuite ShimmerText pattern): a fixed-width glare band —
-   theme background at 60% — glides over the row content from off-left to
-   off-right, washing glyphs and icon toward the background as it passes.
-   ease-out with a 10% end hold gives each pass a beat before the next. */
-.root[data-state='running'] .row::after {
-  content: '';
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 0;
-  width: 300px;
-  background: linear-gradient(
-    90deg,
-    transparent 0%,
-    color-mix(in srgb, var(--dsw-alias-bg-base) 60%, transparent) 55%,
-    transparent 100%
-  );
-  animation: dsh-tool-row-sweep 2.6s ease-out infinite;
-  pointer-events: none;
-}
-
-@keyframes dsh-tool-row-sweep {
-  0% { left: -300px; }
-  90%, 100% { left: 100%; }
-}
-
 .leading {
   flex-shrink: 0;
 }
 
-/* Cordis lifecycle tools retain their generic row mechanics while carrying a
-   shared product accent and tool-owned action title. */
-.root[data-tool^='cordis_'] .leading,
-.root[data-tool^='cordis_'] .title {
-  color: var(--dsw-alias-state-business-primary);
-}
-
 .root[data-tool^='cordis_'] .title {
   font-weight: 500;
-}
-
-.root[data-tool^='cordis_'] .sep {
-  background: var(--dsw-alias-state-business-primary);
-}
-
-.chevron {
-  color: var(--dsw-alias-label-secondary);
 }
 
 .title {
@@ -86,7 +40,6 @@
   white-space: nowrap;
   font-size: var(--dsh-content-font-size-secondary, 13px);
   line-height: calc(24px + var(--dsh-content-font-delta, 0px));
-  color: var(--dsw-alias-label-tertiary);
 }
 
 /* Trailing summary fragment kept out of .summary's ellipsis, for a count whose
@@ -100,22 +53,39 @@
   white-space: nowrap;
   font-size: var(--dsh-content-font-size-secondary, 13px);
   line-height: calc(24px + var(--dsh-content-font-delta, 0px));
-  color: var(--dsw-alias-label-tertiary);
 }
 
 /* Diff-row +/- totals: the code font, matching the diff body the numbers
    summarize; a wider gap keeps the digits from reading as part of the path.
    Two px under the secondary tier (still riding the axis): mono digits read
-   optically larger than the sans path at the same size. Caption, one step
-   dimmer than the suffix's tertiary, so the digits stay behind the path. The
+   optically larger than the sans path at the same size. The
    half-pixel nudge closes the baseline gap the size difference leaves under
    the row's box-centering (a transform, so flex layout is untouched). */
 .diffStat {
   margin-left: 10px;
   font-family: var(--ds-font-family-code);
   font-size: calc(var(--dsh-content-font-size-secondary, 13px) - 2px);
-  color: var(--dsw-alias-label-caption);
   transform: translateY(0.5px);
+}
+
+.row[aria-expanded='true'] .diffAdded {
+  color: var(--dsw-alias-state-success-primary);
+}
+
+@media (hover: hover) {
+  .row:hover .diffAdded {
+    color: var(--dsw-alias-state-success-primary);
+  }
+}
+
+.row[aria-expanded='true'] .diffRemoved {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+@media (hover: hover) {
+  .row:hover .diffRemoved {
+    color: var(--dsw-alias-state-error-primary);
+  }
 }
 
 /* File-tool path: same type as .summary, with a persistent link affordance.
@@ -137,22 +107,69 @@
   text-align: left;
   font-size: var(--dsh-content-font-size-secondary, 13px);
   line-height: calc(24px + var(--dsh-content-font-delta, 0px));
-  color: var(--dsw-alias-label-secondary);
+  color: inherit;
+}
+
+/* Multi-file patch summary: one ellipsized line of plain separators and per-file
+   links. Shrink-to-fit like .fileLink, so the row's empty remainder stays the
+   expand/collapse toggle. */
+.fileLinks {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--dsh-content-font-size-secondary, 13px);
+  line-height: calc(24px + var(--dsh-content-font-delta, 0px));
+}
+
+/* One file inside .fileLinks: .fileLink's affordance without its own box, so the
+   line keeps flowing and the parent's ellipsis applies. */
+.fileTargetLink {
+  display: inline;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  font: inherit;
+  color: inherit;
+}
+
+/* Path link affordance shared by the whole-summary and per-file links. */
+.fileLink,
+.fileTargetLink {
   text-decoration: underline dotted;
-  text-decoration-color: var(--dsw-alias-label-tertiary);
+  text-decoration-color: currentColor;
   text-decoration-thickness: 1px;
   text-underline-offset: 3px;
   cursor: pointer;
 }
 
-.fileLink:hover {
-  color: var(--dsw-alias-label-primary);
-  text-decoration-color: currentColor;
+/* Pointing at one file of a multi-file patch brightens that file alone: the
+   row keeps its idle color and diff totals instead of the whole-row hover. */
+@media (hover: hover) {
+  .row:has(.fileTargetLink:hover) {
+    color: var(--dsw-alias-label-tertiary);
+  }
+
+  .row:not([aria-expanded='true']):has(.fileTargetLink:hover) .diffAdded,
+  .row:not([aria-expanded='true']):has(.fileTargetLink:hover) .diffRemoved {
+    color: inherit;
+  }
+
+  .fileTargetLink:hover {
+    color: var(--dsw-alias-label-secondary);
+  }
 }
 
 /* Error row's collapsed summary: the failure's first line in the error color. */
 .errorSummary {
   color: var(--dsw-alias-state-error-primary);
+}
+
+/* Interrupted rows retain their business glyph and replace the summary with a visible warning. */
+.stoppedSummary {
+  color: var(--dsw-alias-state-warn-label);
 }
 
 /* Expanded body + Inspect pill wrapper (sibling of .row: clicks never toggle). */
@@ -186,15 +203,33 @@
   transition: opacity 100ms ease;
 }
 
-.root:hover .inspectButton,
 .inspectButton:focus-visible {
   opacity: 1;
 }
 
+@media (hover: hover) {
+  .root:hover .inspectButton {
+    opacity: 1;
+  }
+}
+
+.detailsBodyWrap {
+  position: relative;
+}
+
+.detailsBodyWrap .inspectButton {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  margin: 0;
+}
+
 /* Solid hover fill (a translucent token would let content bleed through). */
-.inspectButton:hover {
-  background: var(--dsw-alias-interactive-bg-hover-solid);
-  color: var(--dsw-alias-label-primary);
+@media (hover: hover) {
+  .inspectButton:hover {
+    background: var(--dsw-alias-interactive-bg-hover-solid);
+    color: var(--dsw-alias-label-primary);
+  }
 }
 
 /* Expanded-body scroll wrapper for the run_code CodeBlock; the IN/OUT card
@@ -210,11 +245,12 @@
    column — the padding and the IN/OUT gutter-label grid live on each section
    so the divider spans the full card width and each section scrolls alone. */
 .ioCard {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  column-gap: 14px;
   margin: 4px 0 4px 4px;
   border: 0.5px solid var(--dsw-alias-border-l1);
-  border-radius: 12px;
+  border-radius: var(--dsw-radius-lg);
   background: var(--dsw-alias-markdown-code-block);
   font: var(--dsw-font-markdown-code-block-small);
 }
@@ -223,8 +259,8 @@
    independently so a long input never buries a short output (and vice versa). */
 .ioSection {
   display: grid;
-  grid-template-columns: max-content 1fr;
-  column-gap: 14px;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
   align-items: baseline;
   padding: 12px 16px;
   max-height: 150px;
@@ -237,7 +273,7 @@
 .ioSection::-webkit-scrollbar-thumb {
   border: 2px solid transparent;
   background-clip: padding-box;
-  border-radius: 6px;
+  border-radius: var(--dsw-radius-sm);
 }
 
 /* Track end-margins keep the thumb's travel out of the rounded corners. */
@@ -260,7 +296,7 @@
 /* l2 hairline between the IN and OUT sections, spanning the full card width
    (it sits between the padded sections, not inside their grid). */
 .ioDivider {
-  flex: none;
+  grid-column: 1 / -1;
   height: 0.5px;
   background: var(--dsw-alias-border-l2);
 }
@@ -306,32 +342,27 @@
   color: var(--dsw-alias-label-tertiary);
 }
 
-/* The image card's in-card label: the view's replacement title, else the
-   shortened path — the same role ReadBlock's own label plays, so the presentation
-   contract's replacement-title rule is honoured here too. */
-.imageLabel {
-  margin-bottom: 4px;
+/* The image card's full path and size lines under the gallery, in the small
+   code font of the expanded IN/OUT card. When the attachment slot renders
+   nothing, these lines are the only evidence an image was returned. pre-wrap
+   keeps repeated whitespace in a path. The enclosing .imageBody already carries
+   the row indent. */
+.imageMeta {
+  margin-top: 4px;
+  white-space: pre-wrap;
   overflow-wrap: anywhere;
-  font: var(--dsw-font-sm-13);
-  color: var(--dsw-alias-label-secondary);
+  font: var(--dsw-font-markdown-code-block-small);
+  color: var(--dsw-alias-label-tertiary);
 }
 
-/* The image card's own result text (media type, dimensions, byte size) under the
-   gallery, in the same muted tone the search recovery footer uses. Always
-   rendered: the attachment presentation slot is optional, so when nothing
-   occupies it the gallery is empty and this line is the only evidence an image
-   was returned. The enclosing .imageBody already carries the row indent. */
-.imageMeta {
+/* Text blocks other than the envelope (for example, appended by a post-execute
+   hook), in the muted tone the search recovery footer uses. */
+.imageExtra {
+  margin-top: 4px;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   font: var(--dsw-font-xs-13);
   color: var(--dsw-alias-label-tertiary);
-}
-
-/* In-row code renders at the smaller code size (12/18) via each primitive's
-   rebindable content-font seam; standalone markdown code blocks keep 13/22. */
-.codeBody {
-  --dsl-code-block-content-font: var(--dsw-font-markdown-code-block-small);
 }
 
 /* The terminal card scrolls its OUTPUT inside its own surface (same l1
@@ -341,11 +372,12 @@
   --dsl-terminal-font: var(--dsw-font-markdown-code-block-small);
   --dsl-terminal-line-height: 18px;
   --dsl-terminal-output-max-height: 224px;
+  --dsl-terminal-command-whitespace: pre-wrap;
   border: 0.5px solid var(--dsw-alias-border-l1);
 }
 
-/* Visually hidden run-state label for assistive technology: the StateDot and
-   the running sweep are aria-hidden / colour-only, so the text carries the
+/* Visually hidden run-state label for assistive technology: the business icon
+   and animated text treatment do not name the state, so this text carries the
    running/failed/interrupted state to a screen reader. */
 .visuallyHidden {
   position: absolute;
@@ -354,4 +386,8 @@
   overflow: hidden;
   clip: rect(0 0 0 0);
   white-space: nowrap;
+}
+
+@media (hover: none) {
+  .inspectButton { opacity: 1; }
 }

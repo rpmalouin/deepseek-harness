@@ -11,7 +11,7 @@ import {
   assertFixtureInventory, captureStableAria, compareOrRefreshGolden,
   launchWebScaffold, seedSession, watchConsole, webSnapshotMode, type WebScaffold,
 } from './scaffold.ts'
-import { expandOwningTurnProcess, newEnglishPage, saveFailureShot } from './support.ts'
+import { expandOwningTurnProcess, newEnglishPage, saveFailureShot, WEB_FIXTURE_TIME } from './support.ts'
 
 import { AUTO_REVIEW_FIXTURE, captureAutoReviewState } from './auto-review-fixture.ts'
 
@@ -52,9 +52,10 @@ describe.skipIf(MODE === 'record')('web e2e: cold Auto-review denial', () => {
     expect(result?.data).not.toHaveProperty('callId')
 
     scaffold = await launchWebScaffold(AUTO_REVIEW_FIXTURE)
-    await seedSession(scaffold, fixture, SEED_ID)
+    await seedSession(scaffold, fixture, SEED_ID, undefined, { createdAt: WEB_FIXTURE_TIME })
     browser = await chromium.launch()
     page = await newEnglishPage(browser)
+    await page.clock.setFixedTime(WEB_FIXTURE_TIME)
     tripwire = watchConsole(page)
     await page.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })
     await page.waitForSelector('[class*="frame"]', { timeout: 30_000 })
@@ -91,7 +92,7 @@ describe.skipIf(MODE === 'record')('web e2e: cold Auto-review denial', () => {
 
     const access = page.locator('button[aria-label^="Access mode"]').first()
     await expect.poll(() => access.getAttribute('aria-label'), { timeout: 10_000 })
-      .toBe('Access mode, current: Auto review EXP')
+      .toBe('Access mode, current: Auto review')
 
     await captureAutoReviewState(page, 'deny-collapsed')
     const collapsed = (await captureStableAria(page, '[class*="centerCol"]', scaffold.workspaceCwd))
@@ -118,13 +119,16 @@ describe.skipIf(MODE === 'record')('web e2e: cold Auto-review denial', () => {
     await ledger.locator('table[data-scroll-ready="true"]').waitFor({ timeout: 15_000 })
     const nativeRecord = ledger.locator('tr[data-kind="tool"]').filter({ hasText: 'mystery' })
     const innerRecord = ledger.locator('tr[data-kind="subtool"]').filter({ hasText: 'bash' })
-    await expect.poll(() => nativeRecord.textContent()).toContain('AUTO_REVIEW_DENIED')
-    await expect.poll(() => innerRecord.textContent()).toContain('AUTO_REVIEW_DENIED')
+    await expect.poll(() => nativeRecord.textContent()).toContain('Error: Auto review rejected tool "mystery"; its body was not executed')
+    await expect.poll(() => innerRecord.textContent()).toContain('Error: Auto review rejected tool "bash"; its body was not executed')
     await innerRecord.click()
-    await page.getByRole('tab', { name: 'Result', exact: true }).click()
-    await page.getByRole('tabpanel', { name: 'Result' })
-      .getByText('AutoReviewDeniedError: AUTO_REVIEW_DENIED', { exact: true })
-      .waitFor({ state: 'visible' })
+    for (const tab of ['Summary', 'Result']) {
+      await page.getByRole('tab', { name: tab, exact: true }).click()
+      const panel = page.getByRole('tabpanel', { name: tab })
+      await panel.getByText('Error: Auto review rejected tool "bash"; its body was not executed', { exact: true })
+        .waitFor({ state: 'visible' })
+      expect(await panel.getByText('AutoReviewDeniedError: AUTO_REVIEW_DENIED', { exact: true }).count()).toBe(0)
+    }
     await captureAutoReviewState(page, 'deny-trajectory')
     const trajectory = (await captureStableAria(page, '[class*="centerCol"]', scaffold.workspaceCwd))
       .split(SEED_ID).join('{{seededId}}')

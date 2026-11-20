@@ -24,6 +24,9 @@
 - insert:
     - id: llm-replay
       name: '@deepseek-ai/dsh-llm-replay'
+      config:
+        providers:
+          - id: deepseek-official
 
     # Hold the parent's second step until the manager notice enters its inbox.
     - id: settlement-fence
@@ -32,3 +35,9 @@
 - id: session-log-deepseek
   config:
     enabled: false
+
+- id: sandbox-policy
+  inject: []
+  config:
+    mode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'
+    workspaceRoot: !!js process.cwd()

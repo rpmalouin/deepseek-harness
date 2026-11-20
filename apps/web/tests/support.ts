@@ -1,17 +1,121 @@
 // Shared plumbing for the web smoke tests (dist location, free port, failure shots).
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Browser, Locator, Page } from 'playwright'
+import { expect, vi, type MockInstance } from 'vitest'
+import type { RegionRect } from '@deepseek-ai/dsh-client-web/src/window-drag/regions.ts'
 
 /** The built page under test; `pnpm run test:web` rebuilds it before running. */
 export const DIST_INDEX = fileURLToPath(new URL('../dist/index.html', import.meta.url))
 
 export const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url))
 
+/** A visible control, including controls that declare no native window region. */
+interface WindowControlBox extends Omit<RegionRect, 'draggable'> {
+  /** Sample points where the browser hit test reaches this control or its content. */
+  readonly hits: readonly (readonly [number, number])[]
+}
+
+/** Native region owners and optional control probes from one browser evaluation. */
+export interface CollectedWindowSurface {
+  readonly regions: readonly RegionRect[]
+  /** Empty when no control probe was requested. */
+  readonly controls: readonly WindowControlBox[]
+}
+
+/** Controls to probe alongside the native region owners. */
+interface WindowControlProbe {
+  readonly selector: string
+  /** Containers whose nested drag rows own their pixels independently of the container. */
+  readonly containersWithDragRows: string
+}
+
+/**
+ * Collect visible native window regions in DOM order and optionally probe controls in the same frame.
+ * Controls with computed `none` contribute no native rectangle but still receive hit-test probes.
+ * @param page - Page whose current layout is sampled.
+ * @param controlProbe - Control selectors; omit when only native regions are needed.
+ * @returns Native regions with unclipped bounds and independently sampled controls.
+ */
+export async function collectWindowSurface(page: Page, controlProbe?: WindowControlProbe): Promise<CollectedWindowSurface> {
+  return page.evaluate((probe) => {
+    const regions: RegionRect[] = []
+    const controls: WindowControlBox[] = []
+    for (const element of document.querySelectorAll('*')) {
+      const style = getComputedStyle(element)
+      const region = style.getPropertyValue('-webkit-app-region')
+      if (style.visibility === 'hidden' || style.display === 'none') continue
+      const rect = element.getBoundingClientRect()
+      if (rect.width === 0 || rect.height === 0) continue
+      const box = { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+      if (region === 'drag' || region === 'no-drag') regions.push({ ...box, draggable: region === 'drag' })
+      if (probe === undefined || !element.matches(probe.selector)) continue
+      const insetX = Math.min(2, rect.width / 4)
+      const insetY = Math.min(2, rect.height / 4)
+      const samples: [number, number][] = [
+        [rect.x + rect.width / 2, rect.y + rect.height / 2],
+        [rect.x + insetX, rect.y + insetY],
+        [rect.x + rect.width - insetX, rect.y + insetY],
+        [rect.x + insetX, rect.y + rect.height - insetY],
+        [rect.x + rect.width - insetX, rect.y + rect.height - insetY],
+      ]
+      const hits = samples.filter(([x, y]) => {
+        const top = document.elementFromPoint(x, y)
+        const strip = top?.closest('[data-window-drag]')
+        if (element.matches(probe.containersWithDragRows) && strip != null && element.contains(strip)) return false
+        return top !== null && (top === element || element.contains(top))
+      })
+      controls.push({ ...box, hits })
+    }
+    return { regions, controls }
+  }, controlProbe)
+}
+
+/**
+ * Read the `meta.description` an experimental bundle's plugin page shows for one locale.
+ * @param bundle - Package directory under `packages/experimental`.
+ * @param locale - Locale resource name, such as `en` or `zh`.
+ * @returns The description text from `locale/<locale>.json`.
+ */
+export function experimentalBundleDescription(bundle: string, locale: string): string {
+  const resource = JSON.parse(readFileSync(join(REPO_ROOT, 'packages/experimental', bundle, 'locale', `${locale}.json`), 'utf8')) as { meta: { description: string } }
+  return resource.meta.description
+}
+
 const installationRequire = createRequire(join(REPO_ROOT, 'apps/cli/package.json'))
+
+/**
+ * Check the shared warning title, theme color, and compact body alignment.
+ * @param dialog - visible warning dialog under test.
+ */
+export async function assertWarningDialogLayout(dialog: Locator): Promise<void> {
+  const layout = await dialog.evaluate((element) => {
+    const title = element.querySelector('h2')!
+    const icon = title.querySelector('svg')!
+    const paragraph = element.querySelector('p')!
+    const titleRect = title.getBoundingClientRect()
+    const bodyRect = paragraph.getBoundingClientRect()
+    const color = getComputedStyle(icon).color
+    const previous = icon.style.color
+    icon.style.color = 'var(--dsw-alias-state-warn-primary)'
+    const warningColor = getComputedStyle(icon).color
+    icon.style.color = previous
+    return {
+      decorative: icon.getAttribute('aria-hidden'),
+      matchesWarningColor: color === warningColor,
+      leftGap: Math.abs(bodyRect.left - titleRect.left),
+      topGap: bodyRect.top - titleRect.bottom,
+    }
+  })
+  expect(layout.decorative).toBe('true')
+  expect(layout.matchesWarningColor).toBe(true)
+  expect(layout.leftGap).toBeLessThan(1)
+  expect(layout.topGap).toBeGreaterThanOrEqual(0)
+  expect(layout.topGap).toBeLessThanOrEqual(16)
+}
 
 /**
  * The built copy of a workspace package, as the dsh installation resolves it.
@@ -37,6 +141,71 @@ export function requireBuilt(name: string): unknown {
  */
 export const ZH_BROWSER_LOCALE = 'zh-CN'
 
+/** Same-day anchor for seeded event times and the Asia/Shanghai browser clock. */
+export const WEB_FIXTURE_TIME = Date.parse('2026-01-15T12:00:00+08:00')
+
+/**
+ * Budget for a plugin-manager switch to republish its state after a click: the
+ * click starts a Host profile write, and the store's follow-up `load()` re-reads
+ * its inventory before the switch shows the new value. That chain measured
+ * 0.5-0.8 s on an idle host and 2.0-4.8 s across 32 samples in a 16-worker lane,
+ * so Vitest's 1-second `expect.poll` default expires first.
+ */
+export const PLUGIN_TOGGLE_SETTLE_MS = 10_000
+
+/**
+ * Pin the Host clock to the shared fixture day for one scenario suite.
+ *
+ * A rendered message clock gains a `clock.md` / `clock.ymd` date prefix as soon
+ * as the message's local day differs from the renderer's, so a scenario whose
+ * message times are stamped by the Host wall clock — a live composer send, or a
+ * seed anchored from `Date.now()` — renders a different aria line once the run
+ * spans `Asia/Shanghai` midnight. Reading the fixture day on both clocks makes
+ * that calendar fact part of the scenario rather than of the run.
+ *
+ * The pinned clock advances with real elapsed time, so turn deadlines, session
+ * ordering, and durations keep running.
+ * @returns the installed `Date.now` spy, restored by the caller in teardown.
+ */
+export function pinHostClock(): MockInstance<typeof Date.now> {
+  const startedAt = performance.now()
+  return vi.spyOn(Date, 'now').mockImplementation(() =>
+    WEB_FIXTURE_TIME + Math.floor(performance.now() - startedAt))
+}
+
+/**
+ * Pin a scenario page's calendar to the shared fixture day, advancing with real
+ * time. Pair it with {@link pinHostClock} for a scenario that stamps its own
+ * message times, and with `seedSession`'s `createdAt` for a seeded one.
+ *
+ * Only the page's `Date` reads the fixture day; native timers and
+ * `requestAnimationFrame` keep their real scheduling. Playwright's
+ * `page.clock` is not used: its server records clock state with the Vitest
+ * worker's `Date.now`, which {@link pinHostClock} replaces, so after a
+ * navigation the page clock replays the gap between the real and fixture days
+ * and hands the resulting negative delay to native `setTimeout`. The browser
+ * truncates that delay to a 32-bit integer, and in about half of the dates the
+ * result is a positive delay of weeks that stops every page timer. The `Date`
+ * override is installed for every later document and on the current one, and
+ * stays until the page closes.
+ * @param page - page whose calendar is pinned.
+ */
+export async function pinBrowserClock(page: Page): Promise<void> {
+  // The worker's `new Date()` keeps the real clock even when `Date.now` is pinned.
+  const offset = WEB_FIXTURE_TIME - new Date().getTime()
+  const install = (offset: number): void => {
+    const NativeDate = Date
+    const now = (): number => NativeDate.now() + offset
+    globalThis.Date = new Proxy(NativeDate, {
+      construct: (target, args, newTarget): Date => Reflect.construct(target, args.length === 0 ? [now()] : args, newTarget) as Date,
+      apply: () => new NativeDate(now()).toString(),
+      get: (target, property, receiver): unknown => property === 'now' ? now : Reflect.get(target, property, receiver),
+    })
+  }
+  await page.addInitScript(install, offset)
+  await page.evaluate(install, offset)
+}
+
 /**
  * Open the standard browser-test page advertising English before client boot.
  * This keeps role locators and goldens deterministic while leaving the Host
@@ -53,32 +222,62 @@ export async function newEnglishPage(browser: Browser, height = 1000): Promise<P
 }
 
 /**
- * Expand every currently eligible Turn-process group so a Tool-focused
+ * Scroll a locator whose rendered element can be replaced during layout.
+ * @param target - locator resolved again when its previous element detached.
+ */
+export async function scrollIntoView(target: Locator): Promise<void> {
+  await expect.poll(() => target.evaluate((element) => {
+    if (!element.isConnected) return false
+    element.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' })
+    return true
+  }), { timeout: 10_000 }).toBe(true)
+}
+
+/**
+ * Request one earlier page without scrolling the transcript to its automatic pagination threshold.
+ * @param page - Page showing the English Chat history control.
+ */
+export async function loadEarlierChatPage(page: Page): Promise<void> {
+  await page.getByRole('button', { name: 'Load earlier', exact: true }).evaluate((button) => {
+    button.focus({ preventScroll: true })
+  })
+  await page.keyboard.press('Enter')
+}
+
+/**
+ * Expand every eligible Turn process and secondary group so a Tool-focused
  * scenario can exercise the original row contract beneath product-default
  * compact Chat presentation.
  * @param page - page containing the Chat view.
  */
 export async function expandTurnProcesses(page: Page): Promise<void> {
-  const controls = page.locator('[data-turn-process]')
+  const controls = page.locator('[data-turn-process], [data-process-activity]')
   await controls.first().waitFor({ state: 'visible', timeout: 10_000 })
   const count = await controls.count()
   for (let index = 0; index < count; index++) {
     const control = controls.nth(index)
-    if (await control.getAttribute('aria-expanded') !== 'true') await control.click()
+    if (await control.isVisible() && await control.getAttribute('aria-expanded') === 'false') await control.click()
   }
 }
 
 /**
- * Expand the Turn-process group containing one possibly hidden descendant.
+ * Expand the settled Turn process and secondary group containing a hidden descendant.
  * @param page - page containing the Chat view.
- * @param target - descendant whose owning Turn process should open.
+ * @param target - descendant whose outer process disclosures should open.
  */
 export async function expandOwningTurnProcess(page: Page, target: Locator): Promise<void> {
+  if (await target.isVisible()) return
   const turn = await target.evaluate(element => element.closest<HTMLElement>('[data-chat-turn]')?.dataset.chatTurn)
-  if (turn === undefined || await target.isVisible()) return
-  const control = page.locator(`[data-turn-process="${turn}"]`)
-  await control.waitFor({ state: 'visible', timeout: 10_000 })
-  if (await control.getAttribute('aria-expanded') !== 'true') await control.click()
+  if (turn !== undefined) {
+    const control = page.locator(`[data-turn-process="${turn}"]`)
+    if (await control.count() > 0) {
+      await control.waitFor({ state: 'visible', timeout: 10_000 })
+      if (await control.getAttribute('aria-expanded') === 'false') await control.click()
+    }
+  }
+  const group = target.locator('xpath=ancestor::*[@data-chat-group-key][1]')
+  const header = group.locator('[data-process-activity]').first()
+  if (await header.isVisible() && await header.getAttribute('aria-expanded') === 'false') await header.click()
 }
 
 /** Fail loud on a stale checkout instead of testing yesterday's bundle. */
@@ -105,6 +304,23 @@ export function probeFreePort(): Promise<number> {
 }
 
 /**
+ * Open collapsed mobile navigation before using a sidebar action.
+ * @param page - browser page with the mounted sidebar.
+ * @param locale - current UI language.
+ */
+export async function revealNavigationDrawer(page: Page, locale: 'en' | 'zh' | 'ja' | 'de'): Promise<void> {
+  const drawer = await page.evaluate(() => window.innerWidth < 768
+    && !document.documentElement.hasAttribute('data-windows-titlebar'))
+  await page.waitForFunction(expected => Boolean(document.querySelector('[data-sidebar-drawer]')) === expected, drawer)
+  const closed = page.locator('[data-sidebar-drawer][data-sidebar-collapsed]')
+  if (await closed.count() === 0) return
+  await page.locator('[data-shell-leading]').getByRole('button', {
+    name: { en: 'Open sidebar', zh: '打开侧边栏', ja: 'サイドバーを開く', de: 'Seitenleiste öffnen' }[locale], exact: true,
+  }).click()
+  await closed.waitFor({ state: 'detached' })
+}
+
+/**
  * Drive the hero's workspace picker through the composed directory dialog
  * until the live composer unlocks. A fresh world has no Workspace, so the boot
  * lands in the Workspace-trigger view state (startup auto-selection has nothing to
@@ -123,7 +339,8 @@ export function probeFreePort(): Promise<number> {
  */
 export async function connectFreshWorkspace(page: Page, root: string, name = 'workspace'): Promise<void> {
   mkdirSync(join(root, name), { recursive: true })
-  await page.getByRole('textbox', { name: 'Choose workspace' }).click()
+  await revealNavigationDrawer(page, 'en')
+  await page.getByRole('button', { name: 'Add workspace', exact: true }).click()
   const dialog = page.getByRole('dialog', { name: 'Select Workspace Directory' })
   await dialog.waitFor({ timeout: 10_000 })
   await dialog.getByRole('button', { name: 'Edit path' }).click()
@@ -145,10 +362,12 @@ export async function connectFreshWorkspace(page: Page, root: string, name = 'wo
  * @param page - the browser page under test.
  * @param root - workspace parent directory.
  * @param name - directory created under `root` and connected.
+ * @param modelAvailable - require an editable composer when the selected model is available.
  */
-export async function connectFreshWorkspaceZh(page: Page, root: string, name = 'workspace'): Promise<void> {
+export async function connectFreshWorkspaceZh(page: Page, root: string, name = 'workspace', modelAvailable = true): Promise<void> {
   mkdirSync(join(root, name), { recursive: true })
-  await page.getByRole('textbox', { name: '选择工作区' }).click()
+  await revealNavigationDrawer(page, 'zh')
+  await page.getByRole('button', { name: '添加工作区', exact: true }).click()
   const dialog = page.getByRole('dialog', { name: '选择工作区目录' })
   await dialog.waitFor({ timeout: 10_000 })
   await dialog.getByRole('button', { name: '编辑路径' }).click()
@@ -156,7 +375,8 @@ export async function connectFreshWorkspaceZh(page: Page, root: string, name = '
   await pathInput.fill(join(root, name))
   await pathInput.press('Enter')
   await dialog.getByRole('button', { name: '打开', exact: true }).click()
-  await page.locator('[data-composer-input][contenteditable="true"][data-placeholder="描述你想要构建的内容, / 调用指令, @ 文件或对话"]')
+  const editable = modelAvailable ? '[contenteditable="true"]' : ''
+  await page.locator(`[data-composer-input]${editable}[data-placeholder="描述你想要构建的内容, / 调用指令, @ 文件或对话"]`)
     .waitFor({ timeout: 15_000 })
 }
 
@@ -199,9 +419,33 @@ export async function saveFailureShot(page: Page, name: string): Promise<void> {
   mkdirSync(dir, { recursive: true })
   try {
     await page.screenshot({ path: `${dir}/${name}.png`, fullPage: true })
-  } catch {
-    // Best-effort evidence: a dead page/browser at failure time must not mask the real assertion error.
+  } catch (_screenshotFailed) {
+    // Screenshot evidence is optional: a dead page/browser at failure time must not mask the real assertion error.
   }
+}
+
+/**
+ * Assert a visible tooltip paints above the element a user would read through
+ * it, at the bubble's center and bottom edge. The bubble ignores pointer events
+ * by design, so the measurement enables them for its own duration; each probe
+ * reports the bubble or the covering element, so a failure names its cover.
+ * @param tooltip - locator for the visible `[role="tooltip"]` bubble.
+ */
+export async function expectTooltipOnTop(tooltip: Locator): Promise<void> {
+  const probes = await tooltip.evaluate((bubble) => {
+    const rect = bubble.getBoundingClientRect()
+    const previous = bubble.style.pointerEvents
+    bubble.style.pointerEvents = 'auto'
+    const probe = (y: number): string => {
+      const hit = document.elementFromPoint(rect.left + rect.width / 2, y)
+      if (hit === null) return 'none'
+      return bubble.contains(hit) ? 'tooltip' : `${hit.tagName}.${hit.classList.value}`.slice(0, 120)
+    }
+    const probes = { center: probe(rect.top + rect.height / 2), bottom: probe(rect.bottom - 1) }
+    bubble.style.pointerEvents = previous
+    return probes
+  })
+  expect(probes).toEqual({ center: 'tooltip', bottom: 'tooltip' })
 }
 
 /**
@@ -216,4 +460,122 @@ export async function saveFailureShot(page: Page, name: string): Promise<void> {
  */
 export function conversationContextKey(kind: string, id: string): string {
   return `${kind.length}:${kind}${id}`
+}
+
+/** Open Settings through the sidebar account menu.
+ * @param page - browser page with the mounted sidebar.
+ * @param locale - current UI language.
+ */
+export async function openSettings(page: Page, locale: 'en' | 'zh' | 'ja'): Promise<void> {
+  const labels = { en: ['Account menu', 'Settings'], zh: ['账号菜单', '设置'], ja: ['アカウントメニュー', '設定'] } as const
+  const trigger = page.getByRole('button', {
+    name: labels[locale][0], exact: true, includeHidden: true,
+  })
+  await trigger.waitFor({ state: 'attached' })
+  await revealNavigationDrawer(page, locale)
+  if (!await trigger.isVisible()) {
+    await page.getByRole('button', { name: { en: 'Open sidebar', zh: '打开侧边栏', ja: 'サイドバーを開く' }[locale], exact: true }).click()
+  }
+  await trigger.click()
+  await page.getByRole('menuitem', { name: labels[locale][1], exact: true }).click()
+}
+
+/** The Session panel toggle in the Session header. */
+export function sessionPanelToggle(page: Page): Locator {
+  return page.locator('[data-session-panel-toggle]')
+}
+
+/**
+ * Show the Session panel unless it already shows, and wait for its entrance
+ * animation so geometry reads see the final position. A panel over the
+ * conversation closes on presses outside it and a narrower window can hide
+ * it, so each step that reads the panel shows it first. While the layout
+ * settles after a resize the gutter can briefly read wide enough to dock, so
+ * the toggle is pressed again until the panel stays visible.
+ * @param page - the page under test.
+ * @returns the panel.
+ */
+export async function showSessionPanel(page: Page): Promise<Locator> {
+  const toggle = sessionPanelToggle(page)
+  const panel = page.locator('[data-session-panel]')
+  await toggle.waitFor({ timeout: 20_000 })
+  // A plain loop, not expect.poll, so suite setup can call it too.
+  const deadline = Date.now() + 20_000
+  while (true) {
+    if (await toggle.getAttribute('aria-expanded') !== 'true') await toggle.click()
+    if (await panel.isVisible()) break
+    if (Date.now() >= deadline) throw new Error('the Session panel did not show')
+    await page.waitForTimeout(250)
+  }
+  await panel.evaluate(async (element) => {
+    await Promise.all(element.getAnimations().map(animation => animation.finished))
+  })
+  return panel
+}
+
+/**
+ * Close the Session panel shown over the conversation with Escape.
+ * @param page - the page under test.
+ */
+export async function dismissSessionPanel(page: Page): Promise<void> {
+  await page.keyboard.press('Escape')
+  await page.locator('[data-session-panel]').waitFor({ state: 'detached' })
+}
+
+/**
+ * Measure a Session panel fold control against a data row of its list: both
+ * heights, how far the control's chevron sits from the row's state mark and
+ * its text from the row's name, in px, and the control's type size and state.
+ * @param control - the fold control row (`[data-session-panel-row="fold"]`).
+ * @param row - a data row of the same list.
+ * @param name - selector of the row's name element inside `row`.
+ * @returns the measurements.
+ */
+export async function foldControlLayout(control: Locator, row: Locator, name: string): Promise<{
+  heights: [number, number]
+  chevronOffset: number
+  textOffset: number
+  fontSize: string
+  expanded: string | null
+}> {
+  const rowBox = await row.evaluate((element, selector) => {
+    const mark = element.querySelector('[data-state]')!.getBoundingClientRect()
+    return {
+      height: element.getBoundingClientRect().height,
+      markCenter: mark.left + mark.width / 2,
+      nameLeft: element.querySelector(selector)!.getBoundingClientRect().left,
+    }
+  }, name)
+  return control.evaluate((element, data) => {
+    const chevron = element.querySelector('svg')!.getBoundingClientRect()
+    const text = document.createRange()
+    text.selectNodeContents(element.querySelector('[data-row-part="content"]')!)
+    return {
+      heights: [element.getBoundingClientRect().height, data.height] as [number, number],
+      chevronOffset: chevron.left + chevron.width / 2 - data.markCenter,
+      textOffset: text.getBoundingClientRect().left - data.nameLeft,
+      fontSize: getComputedStyle(element).fontSize,
+      expanded: element.querySelector('button')!.getAttribute('aria-expanded'),
+    }
+  }, rowBox)
+}
+
+/**
+ * Hide the Session panel unless it is already hidden.
+ * @param page - the page under test.
+ */
+export async function hideSessionPanel(page: Page): Promise<void> {
+  const toggle = sessionPanelToggle(page)
+  if (await toggle.getAttribute('aria-expanded') === 'true') await toggle.click()
+  await expect.poll(() => toggle.getAttribute('aria-expanded')).toBe('false')
+}
+
+/**
+ * The right Sidebar's fullscreen panel box: 1px wider than the viewport, so the
+ * first column's divider sits past the window's left edge where the frame clips it.
+ * @param viewport - the page viewport size.
+ * @returns the panel's expected bounding box.
+ */
+export function fullscreenBox(viewport: { width: number; height: number }): { x: number; y: number; width: number; height: number } {
+  return { x: -1, y: 0, width: viewport.width + 1, height: viewport.height }
 }

@@ -1,20 +1,24 @@
 // @vitest-environment jsdom
+import { syncedConfig } from '@deepseek-ai/dsh-client-test-runtime'
+import { apply as applyMenus, inject as injectMenus } from '@deepseek-ai/dsh-client-ui-context-menu/client'
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent } from '@testing-library/react'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type {
-  ChatSnapshot, RunningToolCall, ToolCallBlock, ToolResultNode,
+  ChatSnapshot, StartedToolCall, ToolCallBlock, ToolResultNode,
 } from '@deepseek-ai/dsh-client-ui-chat/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
-import { SlotTestRuntime, stubSettingsScope } from '@deepseek-ai/dsh-client-test-runtime'
+import { SlotTestRuntime, stubConfigForm } from '@deepseek-ai/dsh-client-test-runtime'
 import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
 import type { PropsRenderSlots } from '@deepseek-ai/dsh-client-ui-slots'
 import {
-  ConversationEventRegistry, ConversationViewRegistry, type ConvViewOwnerProps,
+  ConversationEventRegistry, ConversationViewRegistry, EMPTY_CONVERSATION_SNAPSHOT, type ConvViewOwnerProps,
 } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import { ConversationInteractionRegistry } from '@deepseek-ai/dsh-client-ui-conversation/src/client/conversation/interaction-registry.ts'
 import { en as conversationEn, NS as CONVERSATION_NS, zh as conversationZh } from '@deepseek-ai/dsh-client-ui-conversation/src/client/locales.ts'
 import { apply as applyChat, inject as injectChat } from '@deepseek-ai/dsh-client-ui-chat/client'
+import { PartialArguments } from '@deepseek-ai/dsh-util-values'
 import { apply as applyTool, inject as injectTool } from '../src/client/apply.ts'
 import { toolChatSnapshot } from './tool-fixtures.client.ts'
 
@@ -42,16 +46,17 @@ beforeEach(() => {
 const PROGRAM = 'const listing = await tools.bash({ command: "ls notes", description: "List notes" })\nreturn listing'
 const RUN_CODE_ARGS = JSON.stringify({ code: PROGRAM, description: 'List the notes directory' })
 
-const codeResult = (seq: number, callId: string): ToolResultNode => ({
+const codeResult = (seq: number, callId: string, name = 'run_code', argsRaw = RUN_CODE_ARGS): ToolResultNode => ({
   kind: 'tool-result', seq, time: seq * 1_000, callId,
-  call: { name: 'run_code', argsRaw: RUN_CODE_ARGS },
+  name, args: PartialArguments.fromText(argsRaw),
+  call: { name, argsRaw },
   callTime: seq * 1_000 - 500,
   content: [{ type: 'text', text: 'demo.txt' }], isError: false,
   subCalls: [],
 })
 
-const runningCode = (callId: string): RunningToolCall => ({
-  callId, name: 'run_code', argsRaw: RUN_CODE_ARGS, turn: 9, step: 0, time: 9_000,
+const runningCode = (callId: string, name = 'run_code', argsRaw = RUN_CODE_ARGS): StartedToolCall => ({
+  phase: 'start' as const, args: PartialArguments.fromText(argsRaw), callId, name, argsRaw, turn: 9, step: 0, time: 9_000,
   subCalls: [],
 })
 
@@ -60,6 +65,7 @@ const subCall = (
 ): ToolCallBlock => ({
   kind: 'tool-result', seq, time: seq * 1_000,
   callId: `${parent}:code:${n}`,
+  name, args: PartialArguments.fromText(JSON.stringify(args)),
   parentCallId: parent,
   call: { name, argsRaw: JSON.stringify(args) },
   callTime: seq * 1_000,
@@ -70,7 +76,7 @@ const subCall = (
 function snapshotWith(
   nodes: ToolResultNode[],
   subCalls: readonly ToolCallBlock[],
-  runningCalls: RunningToolCall[] = [],
+  runningCalls: StartedToolCall[] = [],
 ): ChatSnapshot {
   const nestedNodes = nodes.map(node => ({ ...node, subCalls }))
   const nestedRunningCalls = runningCalls.map(call => ({ ...call, subCalls }))
@@ -80,6 +86,7 @@ function snapshotWith(
 /** Test-owned AppFrame role: declares and renders the Chat view list. */
 type AppRootProps = PropsRenderSlots<'conversation.view'>
 const VIEW_OWNER: ConvViewOwnerProps = {
+  inspectCall: undefined,
   viewRequest: null,
   openView: () => {},
   completeViewRequest: () => {},
@@ -98,24 +105,33 @@ const ROOT_CHILDREN = {
  */
 async function bench(snapshot: ChatSnapshot) {
   const runtime = await SlotTestRuntime.create()
+  runtime.ctx.provide('fileDrag', { actions: { prepare: async () => ({ start: () => true, release: () => {} }), reportFailure: () => {} }, read: () => undefined } satisfies import('@deepseek-ai/cordis').Context['fileDrag'])
   runtimes.push(runtime)
   const ctx = runtime.ctx
   const chat = createSnapshotStore(snapshot)
+  const conversation = createSnapshotStore(EMPTY_CONVERSATION_SNAPSHOT)
   const events = new ConversationEventRegistry(ctx)
   const views = new ConversationViewRegistry(ctx)
-  ctx.provide('settingsScope', { bind: () => stubSettingsScope().scope } as never)
+  ctx.provide('connection', { state: createSnapshotStore('connected') } as never)
+  ctx.provide('configForms', { developerTools: { enabled: createSnapshotStore(true) }, get: () => stubConfigForm().scope } as never)
   ctx.provide('uiConversation', {
     events,
     views,
-    binding: () => ({ target: () => chat }),
+    interactions: new ConversationInteractionRegistry(ctx),
+    groups: { register: () => () => {} },
+    binding: () => ({ target: () => chat, snapshot: conversation }),
   } as never)
+  ctx.uiSession.provide({
+    hooks: ['conversation'],
+    resolve: () => ({ hooks: { conversation } }),
+  })
 
   await runtime.sessions.add({
     id: SID,
     summary: { title: 'S', displayTitle: 'S', cwd: '/w' },
     snapshot: { running: snapshot.legacy.runningCalls.length > 0 },
   })
-  await runtime.sessions.retainFor(runtime.ctx, SID, { source: 'mainView' }).ready
+  await runtime.sessions.retainFor(runtime.ctx, SID, { source: 'mainView', facets: { conversation: true } }).ready
   const layout = { openDetails: vi.fn(), closeDetails: vi.fn() }
   const openWorkspacePath = vi.fn(async () => ({ ok: true, value: { opened: true } }))
   ctx.provide('layout', layout as never)
@@ -127,6 +143,8 @@ async function bench(snapshot: ChatSnapshot) {
   ctx.provide('locale', locale)
   locale.register(CONVERSATION_NS, { zh: conversationZh, en: conversationEn })
   runtime.slots.installLocale(locale)
+  runtime.ctx.provide('shortcuts', { catalog: createSnapshotStore([]) })
+  await runtime.mount({ inject: [...injectMenus], apply: applyMenus }, syncedConfig({ resolutionTimeoutMs: 1000 }))
 
   await runtime.root.declare(ROOT_CHILDREN, AppRoot)
   await runtime.mount({ inject: [...injectChat], apply: applyChat })
@@ -138,7 +156,24 @@ function mountApp(runtime: SlotTestRuntime) {
   return runtime.renderRoot()
 }
 
-describe('run_code sub-calls through the real chat machinery', () => {
+describe('program sub-calls through the real chat machinery', () => {
+  it.each([false, true])('renders the CUA program and its nested calls while running=%s', async (running) => {
+    const parent = 'cua-program'
+    const program = "var app = await cua.getApp('Calculator')\nconsole.log(app)"
+    const argsRaw = JSON.stringify({ code: program, description: 'Select Calculator' })
+    const child = subCall(11, parent, 1, 'cua', { method: 'getApp', params: { selector: 'Calculator' } }, 'Calculator')
+    const b = await bench(snapshotWith(
+      running ? [] : [codeResult(10, parent, 'cua_run_code', argsRaw)], [child],
+      running ? [runningCode(parent, 'cua_run_code', argsRaw)] : [],
+    ))
+    const view = mountApp(b.runtime)
+    expect(view.getByText('Code')).toBeTruthy()
+    expect(view.getByText('Select Calculator')).toBeTruthy()
+    expect(view.container.querySelector('[data-subcalls] [data-tool="cua"]')).not.toBeNull()
+    fireEvent.click(view.getByText('Select Calculator'))
+    expect(view.container.querySelector('pre.shiki')?.textContent).toBe(program)
+  })
+
   it('renders the code-variant parent row with the description summary and nested sub-rows', async () => {
     const parent = 'call-64'
     const subCalls = [
@@ -182,7 +217,7 @@ describe('run_code sub-calls through the real chat machinery', () => {
 
     // Each run-control verb names its act and shows the package id; without the
     // owned titles all three would read "Tool call · cordis_run · dyn-2".
-    expect(nest.querySelector('[data-tool="cordis_runtime_inspect"]')?.textContent).toContain('Inspect')
+    expect(nest.querySelector('[data-tool="cordis_runtime_inspect"]')?.textContent).toContain('Query Cordis environment')
     expect(nest.querySelector('[data-tool="cordis_run"]')?.textContent).toContain('Run Cordis Plugindyn-2')
     expect(nest.querySelector('[data-tool="cordis_undefine"]')?.textContent).toContain('Remove Cordis Plugindyn-2')
     // None of them is a code row: the program belongs to cordis_define, whose
@@ -206,7 +241,7 @@ describe('run_code sub-calls through the real chat machinery', () => {
     expect(pre!.querySelectorAll('span[style]').length).toBeGreaterThan(3)
   })
 
-  it('an isError sub-call renders the error state dot exactly like a failed native row', async () => {
+  it('an isError sub-call renders the same error row state as a failed native row', async () => {
     const parent = 'call-64'
     const subCalls = [
       subCall(11, parent, 1, 'mystery', { n: 1 }, 'Error: boom', true),
@@ -220,7 +255,7 @@ describe('run_code sub-calls through the real chat machinery', () => {
   it('a file sub-row click opens the file in the Sidebar; bash sub-rows open nothing', async () => {
     const parent = 'call-64'
     const subCalls = [
-      subCall(11, parent, 1, 'read', { path: 'notes/demo.txt' }, 'ok'),
+      { ...subCall(11, parent, 1, 'read', { path: 'notes/demo.txt' }, 'ok'), meta: { path: '/w/notes/demo.txt' } },
       subCall(12, parent, 2, 'bash', { command: 'ls notes', description: 'List notes' }, 'demo.txt'),
     ]
     const b = await bench(snapshotWith([codeResult(10, parent)], subCalls))
@@ -251,13 +286,13 @@ describe('run_code sub-calls through the real chat machinery', () => {
   it('a started-but-unsettled sub-call renders the running state exactly like a native in-flight row', async () => {
     const parent = 'call-live'
     const runningSub: ToolCallBlock = {
-      callId: `${parent}:code:1`, name: 'grep', argsRaw: '{"pattern":"todo"}',
+      phase: 'start' as const, args: PartialArguments.fromText('{"pattern":"todo"}'), callId: `${parent}:code:1`, name: 'grep', argsRaw: '{"pattern":"todo"}',
       parentCallId: parent,
       turn: 0, step: 0, time: 21_000, subCalls: [],
     }
     const b = await bench(snapshotWith([], [runningSub], [runningCode(parent)]))
     const view = mountApp(b.runtime)
-    // The nested row derives 'running' from the RunningToolCall shape — the
+    // The nested row derives 'running' from the StartedToolCall shape — the
     // same data-state chrome (row sweep) a native in-flight row wears.
     const nested = view.container.querySelector('[data-subcalls] [data-variant][data-state="running"]')
     expect(nested).not.toBeNull()
@@ -267,6 +302,7 @@ describe('run_code sub-calls through the real chat machinery', () => {
     const parent = 'call-64'
     const plain: ToolResultNode = {
       kind: 'tool-result', seq: 10, time: 10_000, callId: parent,
+      name: 'mystery', args: PartialArguments.fromText('{"n":1}'),
       call: { name: 'mystery', argsRaw: '{"n":1}' },
       callTime: 9_500,
       content: [], isError: false, subCalls: [],

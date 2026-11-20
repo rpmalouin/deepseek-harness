@@ -97,6 +97,7 @@ interface ErasedRegisterOptions {
   /** Declared dictionary namespace (the renderer synthesizes the `t` seat from it). */
   locale?: string
   registrant?: string
+  module?: string
 }
 
 interface ErasedFactoryOptions {
@@ -115,6 +116,29 @@ interface ErasedFactoryCore { registerFactory(options: object, component: unknow
 
 /** One synchronous effect installed while an injected slot declaration is live. */
 type SlotInjectionEffect = (() => void) | Iterable<() => void, void, void>
+
+/**
+ * Name the Loader entry that owns a calling Context: the nearest fiber, walking
+ * up through nested plugins, that the Loader attached an entry to.
+ * @param ctx - the caller's Context.
+ * @returns the entry's module name, which the client module system sets to the package name.
+ */
+function entryName(ctx: Context): string | undefined {
+  // The Loader augments fibers with `entry`; this package does not depend on the Loader's types.
+  let fiber = ctx.fiber as EntryFiber
+  for (;;) {
+    if (fiber.entry !== undefined) return fiber.entry.options.name
+    const parent = fiber.parent.fiber
+    if (parent === fiber) return undefined
+    fiber = parent
+  }
+}
+
+/** The fiber members {@link entryName} reads: the Loader's entry and the parent chain ending at the root fiber. */
+interface EntryFiber {
+  readonly entry?: { readonly options: { readonly name: string } } | undefined
+  readonly parent: { readonly fiber: EntryFiber }
+}
 
 /** cordis Service layer of the slot system; see the module doc for the split with SlotCore. */
 export class SlotRegistry extends Service {
@@ -352,16 +376,17 @@ export class SlotRegistry extends Service {
   }
 
   /**
-   * Bind scoped Store instances to one owner Context lifetime. Cleanup drops
-   * only materialized in-memory instances; persisted state belongs to the
-   * durable scope key. Rebinding the same key transfers cleanup ownership to
-   * the newest Context generation.
+   * Bind scoped Store instances to one Context generation. Rebinding the key
+   * drops the previous generation's memory instances before the new owner can
+   * resolve them. Cleanup never clears persisted state, which belongs to the
+   * durable scope key, or drops a replacement generation's instances.
    *
    * @param binding - materialized scope identity and its owning Context.
    */
   bindStoreScope(binding: Pick<ScopedStandardSourceBinding, 'key' | 'ctx'>): void {
     const current = this._storeScopeOwners.get(binding.key)
     if (current === binding.ctx) return
+    if (current !== undefined) this.releaseStoreScope(binding.key)
     this._storeScopeOwners.set(binding.key, binding.ctx)
     binding.ctx.effect(() => () => {
       if (this._storeScopeOwners.get(binding.key) !== binding.ctx) return
@@ -478,15 +503,17 @@ export class SlotRegistry extends Service {
     // core's shared-handle scope pinning applies to it harmlessly).
     const store = typeof options.store === 'function' ? options.store() : options.store
     const registrant = options.registrant ?? (this.ctx.fiber as { name?: string } | undefined)?.name
+    const module = entryName(this.ctx)
     const erased: ErasedRegisterOptions = {
       ...options,
       ...(store !== undefined ? { store } : {}),
       ...(registrant !== undefined ? { registrant } : {}),
+      ...(module !== undefined ? { module } : {}),
     }
     // Core write first: all load-time validation (undeclared target,
     // duplicate declaration, kind conflicts, cross-scope handle) throws
     // there before this layer commits anything.
-    const dispose = (this._core as unknown as ErasedCore).register(erased, component)
+    const dispose = (this._core as ErasedCore).register(erased, component)
     if (store !== undefined) {
       const scope = (this._core.specDynamic(options.name) as SlotSpec<SlotEntryDef>).scope
       this._acquire(store, scope)
@@ -506,7 +533,7 @@ export class SlotRegistry extends Service {
       ...options,
       ...(registrant === undefined ? {} : { registrant }),
     }
-    const dispose = (this._core as unknown as ErasedFactoryCore).registerFactory(erased, component)
+    const dispose = (this._core as ErasedFactoryCore).registerFactory(erased, component)
     const definition = this._core.factory(options.name)
     if (definition === undefined) throw new Error(`slot factory "${options.name}" disappeared during registration`)
     if (definition.store !== undefined && typeof definition.store !== 'function') {
@@ -550,7 +577,7 @@ export class SlotRegistry extends Service {
       storeOf: (entry, scopeBinding) =>
         entry.store === undefined
           ? undefined
-          : this.resolveStore(entry.store as unknown as EngineStoreHandle, scopeBinding),
+          : this.resolveStore(entry.store as EngineStoreHandle, scopeBinding),
       factoryStoreOf: (definition, scopeBinding, occurrence) =>
         this.resolveFactoryStore(definition, scopeBinding, occurrence),
       retainFactoryOccurrence: (definition, occurrence) =>

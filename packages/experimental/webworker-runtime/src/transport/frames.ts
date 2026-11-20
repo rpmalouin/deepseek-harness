@@ -25,6 +25,19 @@ export interface TunnelStreamOpenFrame {
   readonly payload: unknown
 }
 
+/** One uplink item for an open Remote stream; `value` absent and `undefined` are equivalent. */
+export interface TunnelStreamUplinkItemFrame {
+  readonly t: 'stream-uplink-item'
+  readonly id: TunnelRequestId
+  readonly value?: unknown
+}
+
+/** Page-side half-close of a Remote stream's uplink. */
+export interface TunnelStreamUplinkEndFrame {
+  readonly t: 'stream-uplink-end'
+  readonly id: TunnelRequestId
+}
+
 /** Page-side cancellation of an in-flight request or stream. */
 export interface TunnelAbortFrame {
   readonly t: 'abort'
@@ -47,6 +60,8 @@ export type TunnelInboundFrame =
   | TunnelInitFrame
   | TunnelRequestFrame
   | TunnelStreamOpenFrame
+  | TunnelStreamUplinkItemFrame
+  | TunnelStreamUplinkEndFrame
   | TunnelAbortFrame
 
 /** Complete response for unary requests and static files. */
@@ -118,8 +133,17 @@ export interface TunnelStreamErrorFrame {
     }
 }
 
+/** Worker request to show one VFS text file in the page's read-only viewer; no reply follows. */
+export interface TunnelViewTextFrame {
+  readonly t: 'view-text'
+  /** Absolute VFS path, shown as the viewer title. */
+  readonly path: string
+  readonly text: string
+}
+
 /** Frames the worker emits. */
 export type TunnelOutboundFrame =
+  | TunnelViewTextFrame
   | TunnelResponseFrame
   | TunnelResponseHeadFrame
   | TunnelResponseChunkFrame
@@ -153,6 +177,8 @@ export function parseInboundFrame(data: unknown): TunnelInboundFrame {
     throw new Error(`webworker tunnel: frame has no usable id: ${JSON.stringify(frame.id)}`)
   }
   if (frame.t === 'abort') return { t: 'abort', id }
+  if (frame.t === 'stream-uplink-end') return { t: 'stream-uplink-end', id }
+  if (frame.t === 'stream-uplink-item') return { t: 'stream-uplink-item', id, value: frame.value }
   if (frame.t === 'stream-open') {
     if (typeof frame.endpoint !== 'string' || frame.endpoint.length === 0) {
       throw new Error(`webworker tunnel: stream ${String(id)} needs a non-empty endpoint`)

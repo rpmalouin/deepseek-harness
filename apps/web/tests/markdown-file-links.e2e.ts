@@ -1,17 +1,102 @@
 /** Cold-replayed Markdown references open Session files through the shipped Web composition. */
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { chromium, type Browser, type Page } from 'playwright'
+import { chromium, type Browser, type Locator, type Page } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import { type ToolCallId, createAssistantMessage, createToolResultMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
+import { SESSION_FORMAT_VERSION, Session, type SessionId } from '@deepseek-ai/dsh-session'
+import { sessionFileAddress } from '@deepseek-ai/dsh-util-workspace-path'
+import type {} from '@deepseek-ai/dsh-session-title'
 import {
   assertFixtureInventory, captureStableAria, compareOrRefreshGolden,
-  launchWebScaffold, seedSession, watchConsole, webSnapshotMode, type WebScaffold,
+  launchWebScaffold, readPersistedEvents, seedSession, watchConsole, webSnapshotMode, type WebScaffold,
 } from './scaffold.ts'
-import { newEnglishPage, saveFailureShot } from './support.ts'
+import { expandOwningTurnProcess, newEnglishPage, saveFailureShot, writeComposerDraft } from './support.ts'
 
 const SNAPSHOT_DIR = fileURLToPath(new URL('../../../snapshots/web/markdown-file-links', import.meta.url))
 const MODE = webSnapshotMode()
+
+/** A restored preview resolves its Host path after the document's load event. */
+async function reloadPreview(page: Page, column: Locator, absolutePath: string): Promise<void> {
+  await page.reload({ waitUntil: 'load' })
+  await column.getByText(absolutePath, { exact: true }).waitFor()
+  expect(await column.locator('[data-textpreview-path]').textContent()).toBe(absolutePath)
+}
+
+/** Build live test input with a parent-path link and a read result naming the same Host file. */
+function parentPathFixture(path: string): string {
+  const session = Session.create(brandString<SessionId>('parent-file-links-source'))
+  session.append('turn/start', { turn: 1 })
+  const user = session.append('user/message', createUserMessage({
+    content: [{ type: 'text', text: 'Read the parent-path file and link lines 24 and 30.' }], source: { kind: 'user' },
+  }), { surfaceOp: 'append' })
+  session.append('session/title', { title: 'Parent file links', messageSeqs: [user.seq], source: { kind: 'fallback' } })
+  session.append('step/start', { turn: 1, step: 1 })
+  const callId = brandString<ToolCallId>('parent-file-read')
+  const args = JSON.stringify({ file_path: path, offset: 24, limit: 7 })
+  session.append('assistant/message', {
+    turn: 1, step: 1, stream: [],
+    message: createAssistantMessage({
+      content: [{ type: 'tool-call', id: callId, name: 'read', arguments: args }],
+      source: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
+    }),
+  }, { surfaceOp: 'append' })
+  const call = session.append('tool/call', { turn: 1, step: 1, callId, name: 'read', arguments: args })
+  session.append('tool/result', {
+    turn: 1, step: 1, meta: { path: '{{cwd}}/parent.txt' },
+    message: createToolResultMessage({ callId, content: [{ type: 'text', text: 'parent line 24\n' }], isError: false }),
+  }, { surfaceOp: 'append', sourceEventSeqs: [call.seq] })
+  session.append('step/end', { turn: 1, step: 1 })
+  session.append('step/start', { turn: 1, step: 2 })
+  session.append('assistant/message', {
+    turn: 1, step: 2, stream: [],
+    message: createAssistantMessage({
+      content: [{ type: 'text', text: `[Parent file:24–30](<${path}#L24-L30>) · [Parent file:30](<${path}#L30>)` }],
+      source: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
+    }),
+  }, { surfaceOp: 'append' })
+  session.append('step/end', { turn: 1, step: 2 })
+  session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+  return [
+    JSON.stringify({
+      type: 'session', version: SESSION_FORMAT_VERSION, id: '{{sessionId}}', createdAt: 0,
+      cwd: '{{cwd}}', isSeeded: false, delegationDepth: 0,
+    }),
+    ...session.snapshotEvents().map(event => JSON.stringify(event)),
+    '',
+  ].join('\n')
+}
+
+/** Build a settled turn whose relative link follows a directory change into a nested checkout. */
+function changedDirectoryFixture(path: string): string {
+  const session = Session.create(brandString<SessionId>('changed-directory-links-source'))
+  session.append('turn/start', { turn: 1 })
+  const user = session.append('user/message', createUserMessage({
+    content: [{ type: 'text', text: 'Enter the worktree and link its notes.' }], source: { kind: 'user' },
+  }), { surfaceOp: 'append' })
+  session.append('session/title', { title: 'Changed directory links', messageSeqs: [user.seq], source: { kind: 'fallback' } })
+  session.append('workspace-root/change', { cwd: '{{cwd}}/.agents/worktrees/w' })
+  session.append('step/start', { turn: 1, step: 1 })
+  session.append('assistant/message', {
+    turn: 1, step: 1, stream: [],
+    message: createAssistantMessage({
+      content: [{ type: 'text', text: `[Worktree notes](${path})` }],
+      source: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
+    }),
+  }, { surfaceOp: 'append' })
+  session.append('step/end', { turn: 1, step: 1 })
+  session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+  return [
+    JSON.stringify({
+      type: 'session', version: SESSION_FORMAT_VERSION, id: '{{sessionId}}', createdAt: 0,
+      cwd: '{{cwd}}', isSeeded: false, delegationDepth: 0,
+    }),
+    ...session.snapshotEvents().map(event => JSON.stringify(event)),
+    '',
+  ].join('\n')
+}
 
 describe('web e2e: Markdown file links', () => {
   let scaffold: WebScaffold
@@ -76,6 +161,172 @@ describe('web e2e: Markdown file links', () => {
     expect(page.url()).toBe(beforeUrl)
     expect(tripwire.pageErrors).toEqual([])
     expect(tripwire.warnings).toEqual([])
-    await assertFixtureInventory(SNAPSHOT_DIR, ['session.v3.jsonl', 'links.expected.md', 'preview.expected.md'])
+  })
+
+  it('adds a recorded line-labeled file to the draft without its line suffix or a new turn', async () => {
+    onTestFailed(() => saveFailureShot(page, 'web-e2e-markdown-file-add-to-chat'))
+    const sessionId = brandString<SessionId>('markdown-file-links')
+    const beforeEvents = await readPersistedEvents(scaffold, sessionId)
+    const beforeMessages = await page.locator('[data-chat-flow-kind="user"]').count()
+    const input = page.locator('[data-composer-input]').first()
+    const draft = 'Review this file next: '
+    await writeComposerDraft(page, input, draft)
+    await page.getByRole('button', { name: 'src/example.txt:24–30', exact: true }).click({ button: 'right' })
+    const menu = page.getByRole('menu')
+    const action = menu.getByRole('menuitem', { name: 'Add to chat', exact: true })
+    await action.waitFor()
+    expect(await menu.getByRole('menuitem').last().textContent()).toBe('Add to chat')
+    const menuAria = await captureStableAria(page, '[role="menu"]', scaffold.workspaceCwd)
+    await action.click()
+    await menu.waitFor({ state: 'hidden' })
+    await expect.poll(() => input.evaluate(node => node === document.activeElement)).toBe(true)
+    await expect.poll(() => input.textContent()).toBe(`${draft}example.txt `)
+    const chip = input.locator('[data-composer-chip]')
+    expect(await chip.count()).toBe(1)
+    expect(await chip.textContent()).toBe('example.txt')
+    expect(await chip.locator('svg').count()).toBe(1)
+    const composerAria = await captureStableAria(page, '[data-composer-input]', scaffold.workspaceCwd)
+    await compareOrRefreshGolden(join(SNAPSHOT_DIR, 'add-to-chat.expected.md'),
+      `## File menu\n\n${menuAria}\n\n## Composer\n\n${composerAria}`, MODE)
+
+    await page.keyboard.press('ControlOrMeta+A')
+    const copied = await input.evaluate((node) => {
+      const clipboardData = new DataTransfer()
+      node.dispatchEvent(new ClipboardEvent('copy', { clipboardData, bubbles: true, cancelable: true }))
+      return clipboardData.getData('text/plain')
+    })
+    const path = join(scaffold.workspaceCwd, 'src/example.txt')
+    expect(copied).toBe(`${draft}@${path} `)
+    expect(copied).not.toContain(':24')
+    expect(copied).not.toContain('#L24')
+    expect(await page.locator('[data-chat-flow-kind="user"]').count()).toBe(beforeMessages)
+    expect(await readPersistedEvents(scaffold, sessionId)).toEqual(beforeEvents)
+    await writeComposerDraft(page, input, '')
+    expect(tripwire.pageErrors).toEqual([])
+    expect(tripwire.warnings).toEqual([])
+    await assertFixtureInventory(SNAPSHOT_DIR, [
+      'session.v3.jsonl', 'links.expected.md', 'preview.expected.md', 'add-to-chat.expected.md',
+    ])
+  })
+
+  it('replays colon line suffixes as locations and shares tabs with fragment links', async () => {
+    onTestFailed(() => saveFailureShot(page, 'web-e2e-colon-file-links'))
+    const fixture = new URL('./fixtures/markdown-colon-file-links/session.v3.jsonl', import.meta.url)
+    const id = await seedSession(scaffold, await readFile(fixture, 'utf8'), 'colon-file-links')
+    await page.reload({ waitUntil: 'load' })
+    const workspace = page.getByRole('treeitem').first()
+    await workspace.waitFor()
+    if (await workspace.getAttribute('aria-expanded') !== 'true') await workspace.click()
+    await page.locator(`[data-row-key="session:${id}"]`).click()
+
+    const relative = page.getByRole('button', { name: 'Relative colon:24–30', exact: true })
+    await relative.waitFor()
+    expect(await page.getByRole('button', { name: 'Development server', exact: true }).count()).toBe(0)
+    expect(await page.getByRole('link', { name: 'Development server', exact: true }).getAttribute('href')).toBe('localhost:3000')
+    expect(await page.getByRole('link', { name: 'Bare URL', exact: true }).getAttribute('href')).toBe('index.ts:24')
+    expect(await page.getByRole('link', { name: 'Blocked script', exact: true }).count()).toBe(0)
+    expect(await page.getByRole('button', { name: 'Blocked script', exact: true }).count()).toBe(0)
+    expect(await page.getByRole('link', { name: 'Mail', exact: true }).getAttribute('href')).toBe('mailto:10086')
+    await compareOrRefreshGolden(
+      fileURLToPath(new URL('./expected/markdown-colon-file-links.md', import.meta.url)),
+      await relative.locator('..').ariaSnapshot(), MODE,
+    )
+    const column = page.locator('[data-rightbar-col]')
+    for (const label of ['Zero line', 'Reversed range']) {
+      await page.getByRole('button', { name: label, exact: true }).click()
+      await expect.poll(() => column.locator('[data-textpreview-path]').textContent())
+        .toBe(join(scaffold.workspaceCwd, 'src/example.txt'))
+      await expect.poll(() => column.locator('[data-textpreview-line="1"]').textContent()).toBe('source line 1\n')
+      expect(await column.locator('[data-dockkit-tab-title]').allTextContents()).toEqual(['example.txt'])
+    }
+    for (const [label, line] of [['Relative colon:24–30', 24], ['Absolute colon:30', 30], ['Column:24:5', 24], ['Fragment:12', 12]] as const) {
+      const link = page.getByRole('button', { name: label, exact: true })
+      await link.focus()
+      await link.press('Enter')
+      await expect.poll(() => column.locator(`[data-textpreview-target="${line}"]`).textContent())
+        .toBe(`source line ${line}\n`)
+      await expect.poll(() => column.locator('[data-textpreview-path]').textContent())
+        .toBe(join(scaffold.workspaceCwd, 'src/example.txt'))
+      expect(await column.locator('[data-dockkit-tab-title]').allTextContents()).toEqual(['example.txt'])
+    }
+    await reloadPreview(page, column, join(scaffold.workspaceCwd, 'src/example.txt'))
+    await relative.click()
+    await expect.poll(() => column.locator('[data-textpreview-target="24"]').textContent()).toBe('source line 24\n')
+    expect(await column.locator('[data-dockkit-tab-title]').allTextContents()).toEqual(['example.txt'])
+    expect(tripwire.pageErrors).toEqual([])
+    expect(tripwire.warnings).toEqual([])
+  })
+
+  it('opens parent-path prose and read-card links while retaining each address across reload', async () => {
+    onTestFailed(() => saveFailureShot(page, 'web-e2e-parent-file-links'))
+    // Return through the parent into this owned temp root; no shared parent file is created.
+    const path = `../${basename(scaffold.workspaceCwd)}/parent.txt`
+    await writeFile(join(scaffold.workspaceCwd, 'parent.txt'),
+      Array.from({ length: 60 }, (_, i) => `parent line ${i + 1}\n`).join(''))
+    const id = await seedSession(scaffold, parentPathFixture(path), 'parent-file-links')
+    await page.reload({ waitUntil: 'load' })
+    const workspace = page.getByRole('treeitem').first()
+    await workspace.waitFor()
+    if (await workspace.getAttribute('aria-expanded') !== 'true') await workspace.click()
+    await page.locator(`[data-row-key="session:${id}"]`).click()
+
+    const source = page.getByRole('button', { name: 'Parent file:24–30', exact: true })
+    await source.click()
+    const column = page.locator('[data-rightbar-col]')
+    const stored = () => page.evaluate(key => localStorage.getItem(key), `dsh.sidebar-right.v1.${id}`)
+    const address = sessionFileAddress(id, path)
+    await expect.poll(() => column.locator('[data-textpreview-target="24"]').textContent()).toBe('parent line 24\n')
+    await expect.poll(() => column.locator('[data-textpreview-path]').textContent()).toBe(join(scaffold.workspaceCwd, 'parent.txt'))
+    await expect.poll(stored).toContain(address)
+    const tabs = column.locator('[data-dockkit-tab-title]')
+    expect(await tabs.allTextContents()).toEqual(['parent.txt'])
+
+    const later = page.getByRole('button', { name: 'Parent file:30', exact: true })
+    await later.focus()
+    await later.press('Enter')
+    await expect.poll(() => column.locator('[data-textpreview-target="30"]').textContent()).toBe('parent line 30\n')
+    expect(await tabs.allTextContents()).toEqual(['parent.txt'])
+
+    await reloadPreview(page, column, join(scaffold.workspaceCwd, 'parent.txt'))
+    await expect.poll(stored).toContain(address)
+    await source.click()
+    await expect.poll(() => column.locator('[data-textpreview-target="24"]').textContent()).toBe('parent line 24\n')
+    expect(await tabs.allTextContents()).toEqual(['parent.txt'])
+
+    const readCardLink = page.locator('[data-tool="read"] button').filter({ hasText: 'parent.txt' })
+    await expandOwningTurnProcess(page, readCardLink)
+    await readCardLink.click()
+    await expect.poll(() => column.locator('[data-textpreview-path]').textContent()).toBe(join(scaffold.workspaceCwd, 'parent.txt'))
+    await expect.poll(() => column.locator('[data-textpreview-target="24"]').textContent()).toBe('parent line 24\n')
+    // The Host-reported path and the unresolved prose path are distinct resource identities.
+    expect(await tabs.allTextContents()).toEqual(['parent.txt', 'parent.txt'])
+    await expect.poll(stored).toContain(sessionFileAddress(id, 'parent.txt'))
+    await source.click()
+    expect(await tabs.allTextContents()).toEqual(['parent.txt', 'parent.txt'])
+    expect(tripwire.pageErrors).toEqual([])
+    expect(tripwire.warnings).toEqual([])
+  })
+  it('resolves relative links from the Session\'s current working directory', async () => {
+    onTestFailed(() => saveFailureShot(page, 'web-e2e-changed-directory-file-links'))
+    const worktree = join(scaffold.workspaceCwd, '.agents/worktrees/w')
+    await mkdir(worktree, { recursive: true })
+    await writeFile(join(scaffold.workspaceCwd, 'notes.txt'), 'original checkout\n')
+    await writeFile(join(worktree, 'notes.txt'), 'worktree checkout\n')
+    const id = await seedSession(scaffold, changedDirectoryFixture('notes.txt'), 'changed-directory-file-links')
+    await page.reload({ waitUntil: 'load' })
+    const workspace = page.getByRole('treeitem').first()
+    await workspace.waitFor()
+    if (await workspace.getAttribute('aria-expanded') !== 'true') await workspace.click()
+    await page.locator(`[data-row-key="session:${id}"]`).click()
+
+    await page.getByRole('button', { name: 'Worktree notes', exact: true }).click()
+    const column = page.locator('[data-rightbar-col]')
+    await expect.poll(() => column.locator('[data-textpreview-path]').textContent()).toBe(join(worktree, 'notes.txt'))
+    await expect.poll(() => column.locator('[data-textpreview-line="1"]').textContent()).toBe('worktree checkout\n')
+    const artifacts = fileURLToPath(new URL('../../../.artifacts', import.meta.url))
+    await mkdir(artifacts, { recursive: true })
+    await page.screenshot({ path: join(artifacts, 'changed-directory-file-links.png'), animations: 'disabled' })
+    expect(tripwire.pageErrors).toEqual([])
+    expect(tripwire.warnings).toEqual([])
   })
 })

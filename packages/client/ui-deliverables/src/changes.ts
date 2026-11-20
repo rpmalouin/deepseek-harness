@@ -11,11 +11,26 @@ export const CHANGES_DIFF_PATH = '/api/changes.diff'
 /** Authenticated POST route for opening a changed file on the Host desktop. */
 export const CHANGES_OPEN_PATH = '/api/changes.open'
 
+/**
+ * Browser-relative form of {@link CHANGED_FILES_PATH}; see
+ * .agents/notes/implemented/architecture/2026-09-14-web-document-relative-app-routes.md.
+ */
+export const CHANGED_FILES_ROUTE = CHANGED_FILES_PATH.slice(1)
+
+/** Browser-relative form of {@link CHANGES_DIFF_PATH}. */
+export const CHANGES_DIFF_ROUTE = CHANGES_DIFF_PATH.slice(1)
+
+/** Browser-relative form of {@link CHANGES_OPEN_PATH}. */
+export const CHANGES_OPEN_ROUTE = CHANGES_OPEN_PATH.slice(1)
+
 /** Resource-address prefix of a turn's review tab in the right Sidebar. */
 export const CHANGES_REVIEW_ADDRESS = 'dsh-resource://changes-review/session/'
 
-/** The summary fields the route serves; the Host keeps the working directory and snapshot ids to itself. */
-export type ChangesSummary = Pick<WorkspaceChangesSummary, 'turn' | 'files' | 'total' | 'added' | 'deleted'>
+/**
+ * The summary fields the route serves; the Host keeps the snapshot ids to itself. `cwd` is the directory the
+ * turn started in, which the listed paths are relative to; the Session may work elsewhere by the time it is read.
+ */
+export type ChangesSummary = Pick<WorkspaceChangesSummary, 'turn' | 'cwd' | 'files' | 'total' | 'added' | 'deleted'>
 
 /** The comparison the route serves, as the Host computed it. */
 export type ChangesDiff = WorkspaceFileDiff
@@ -48,12 +63,12 @@ export function isChangedFile(value: unknown): value is WorkspaceChangedFile {
 /**
  * Validate a summary read from the summary route.
  * @param value - decoded JSON.
- * @returns whether the value identifies a turn, a complete file list, the total count, and the line totals.
+ * @returns whether the value identifies a turn, its directory, a complete file list, the total count, and the line totals.
  */
 export function isChangesSummary(value: unknown): value is ChangesSummary {
   if (!isRecord(value)) return false
-  const { turn, files, total, added, deleted } = value
-  return Number.isSafeInteger(turn) && (turn as number) >= 1 && Number.isSafeInteger(total)
+  const { turn, cwd, files, total, added, deleted } = value
+  return Number.isSafeInteger(turn) && (turn as number) >= 1 && typeof cwd === 'string' && Number.isSafeInteger(total)
     && Number.isSafeInteger(added) && Number.isSafeInteger(deleted)
     && Array.isArray(files) && files.every(isChangedFile)
 }
@@ -94,10 +109,10 @@ export function isChangesEvent(value: unknown): value is { turn: number } {
  * Build authenticated coordinates for the summary one `workspace/changes` event announced.
  * @param sessionId - owning Session.
  * @param seq - event sequence.
- * @returns same-origin summary URL.
+ * @returns document-relative summary route.
  */
 export function changesSummaryUrl(sessionId: SessionId, seq: number): string {
-  return `${CHANGED_FILES_PATH}?${new URLSearchParams({ sessionId, seq: String(seq) })}`
+  return `${CHANGED_FILES_ROUTE}?${new URLSearchParams({ sessionId, seq: String(seq) })}`
 }
 
 /**
@@ -105,10 +120,10 @@ export function changesSummaryUrl(sessionId: SessionId, seq: number): string {
  * @param sessionId - owning Session.
  * @param seq - workspace/changes event sequence.
  * @param index - original index in the summary's files array.
- * @returns same-origin comparison URL.
+ * @returns document-relative comparison route.
  */
 export function changesDiffUrl(sessionId: SessionId, seq: number, index: number): string {
-  return `${CHANGES_DIFF_PATH}?${new URLSearchParams({ sessionId, seq: String(seq), index: String(index) })}`
+  return `${CHANGES_DIFF_ROUTE}?${new URLSearchParams({ sessionId, seq: String(seq), index: String(index) })}`
 }
 
 /**
@@ -116,10 +131,10 @@ export function changesDiffUrl(sessionId: SessionId, seq: number, index: number)
  * @param sessionId - owning Session.
  * @param seq - workspace/changes event sequence.
  * @param index - original index in the summary's files array.
- * @returns same-origin action URL.
+ * @returns document-relative action route.
  */
 export function changedFileUrl(sessionId: SessionId, seq: number, index: number): string {
-  return `${CHANGES_OPEN_PATH}?${new URLSearchParams({ sessionId, seq: String(seq), index: String(index) })}`
+  return `${CHANGES_OPEN_ROUTE}?${new URLSearchParams({ sessionId, seq: String(seq), index: String(index) })}`
 }
 
 /**

@@ -4,17 +4,19 @@
  * the actual values and their storage. Consumers resolve a reference once per
  * operation, so a changed credential reaches the next operation without any
  * plugin restart, and configuration surfaces describe a reference without
- * ever seeing its value.
+ * ever seeing its full value.
  * @module @deepseek-ai/dsh-credentials
  */
 
 import { Context, Service } from '@deepseek-ai/cordis'
 import { brandString } from '@deepseek-ai/dsh-brand'
+import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
 import type { CredentialInfo, CredentialKey, CredentialRecord, CredentialRef } from './types.ts'
 
 export type {
   ApiKeyRecord, CredentialInfo, CredentialKey, CredentialRecord, CredentialRef, GrantRecord,
 } from './types.ts'
+export * from './api-key.ts'
 
 const REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 
@@ -152,13 +154,46 @@ declare module '@deepseek-ai/cordis' {
 }
 
 /**
+ * Read one reference's current value through the mounted credentials service,
+ * or through the launch environment when the composition mounts no service. A
+ * mounted service is authoritative, including when it holds no value: the
+ * environment is read only when there is no service to ask, which is how
+ * one-shot compositions without the store authenticate from their launching
+ * shell. Empty values are absent. Store failures propagate; callers validate
+ * the value's format.
+ * @param ctx - context providing the optional credentials service and the launch environment.
+ * @param ref - the reference to read.
+ * @returns the value, or `undefined` while unconfigured.
+ */
+export async function resolveCredentialRef(ctx: Context, ref: CredentialRef): Promise<string | undefined> {
+  const credentials = ctx.get('credentials')
+  if (credentials !== undefined) return (await credentials.resolve(ref))?.value
+  const ambient = launchEnvironmentOf(ctx).get(ref)?.value
+  return ambient === undefined || ambient.length === 0 ? undefined : ambient
+}
+
+/**
+ * Report whether a reference is configured without reading its value, through
+ * the same source {@link resolveCredentialRef} reads. Store failures propagate.
+ * @param ctx - context providing the optional credentials service and the launch environment.
+ * @param ref - the reference to inspect.
+ * @returns whether the authoritative source holds a value for the reference.
+ */
+export async function credentialRefConfigured(ctx: Context, ref: CredentialRef): Promise<boolean> {
+  const credentials = ctx.get('credentials')
+  if (credentials !== undefined) return (await credentials.describe(ref)).configured
+  return (launchEnvironmentOf(ctx).get(ref)?.value.length ?? 0) > 0
+}
+
+/**
  * Abstract credential service over two key spaces that answer two questions.
  *
  * A {@link CredentialRef} answers "what is behind this environment-variable
- * name", layered over the process environment, the provider-managed store, and
- * `.env` files. One seam-wide rule binds that half: an empty stored value is
- * absent everywhere — `resolve` skips it, `describe` reports it unconfigured —
- * so a blank never masquerades as a configured secret.
+ * name": the provider-managed store first, then ambient fallbacks such as the
+ * process environment and `.env` files. One seam-wide rule binds that half: an
+ * empty stored value is absent everywhere — `resolve` skips it, `describe`
+ * reports it unconfigured — so a blank never masquerades as a configured
+ * secret.
  *
  * A {@link CredentialKey} answers "what credential does this plugin hold for
  * this id". Nothing can layer here — an authorization grant has no
@@ -184,17 +219,16 @@ export abstract class CredentialProvider extends Service {
 
   /**
    * Describe one reference for configuration surfaces without exposing the
-   * value.
+   * full value.
    * @param ref - the reference to describe.
-   * @returns configured state, supplying source, and writability.
+   * @returns configured state, supplying source, writability, and optional masked preview.
    */
   abstract describe(ref: CredentialRef): Promise<CredentialInfo>
 
   /**
-   * Durably store one value in the provider-managed writable source. Rejects
-   * while a read-only source shadows the reference — the write would appear
-   * to succeed while resolution keeps returning the shadowing value — and
-   * rejects an empty value (use {@link unset}).
+   * Durably store one value in the provider-managed writable source. The stored
+   * value takes precedence over ambient fallbacks, and empty values are
+   * rejected (use {@link unset}).
    * @param ref - the reference to store.
    * @param value - the non-empty secret value.
    */
@@ -202,8 +236,8 @@ export abstract class CredentialProvider extends Service {
 
   /**
    * Remove one reference from the provider-managed writable source; removing
-   * an absent reference is a no-op. Rejects while a read-only source shadows
-   * the reference, like {@link set}.
+   * an absent reference is a no-op. Ambient fallback layers may become
+   * effective again after removal.
    * @param ref - the reference to remove.
    */
   abstract unset(ref: CredentialRef): Promise<void>
@@ -258,10 +292,7 @@ export abstract class CredentialProvider extends Service {
   /**
    * Fan `credentials/reference-updated` out with contained listener failures: every
    * listener runs, and a sync throw or async rejection is logged without
-   * changing the committed operation's outcome — except `INVARIANT`-coded
-   * failures, which rethrow after every listener ran (the rethrow reaches the
-   * caller only from synchronous listeners, so invariant checks on this event
-   * must not be async functions). Providers call this only after the write or
+   * changing the committed operation's outcome. Providers call this only after the write or
    * reload actually committed, so a broken observer can never make a durable
    * change look failed.
    * @param ref - the reference whose stored value changed.
@@ -284,7 +315,6 @@ export abstract class CredentialProvider extends Service {
      contract, and extracting it would couple the two seams' event semantics. */
   /** The contained dispatch both notifications run through; see {@link notifyUpdated}. */
   private fanOut(event: 'credentials/reference-updated' | 'credentials/record-updated', subject: string): void {
-    let invariantFailure: unknown
     const args = [event, subject]
     for (const listener of this.ctx.events.dispatch('emit', args) as Array<(...listenerArgs: unknown[]) => unknown>) {
       try {
@@ -295,14 +325,9 @@ export abstract class CredentialProvider extends Service {
           })
         }
       } catch (error) {
-        if ((error as { code?: unknown } | null)?.code === 'INVARIANT') {
-          invariantFailure ??= error
-          continue
-        }
         this.warnListenerFailure(event, subject, error)
       }
     }
-    if (invariantFailure !== undefined) throw invariantFailure as Error
   }
   /* jscpd:ignore-end */
 

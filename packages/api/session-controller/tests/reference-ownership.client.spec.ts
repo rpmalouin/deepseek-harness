@@ -4,24 +4,30 @@ import { describe, expect, onTestFinished, vi } from 'vitest'
 import type {
   SessionReference, SessionReferenceSource, SessionRetainInfo,
 } from '@deepseek-ai/dsh-api-session-controller/client'
-import { SessionId } from '@deepseek-ai/dsh-session/types'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
 import { ok, type RemoteMock } from '@deepseek-ai/dsh-remote-mock'
 import { createClientTest, webApp, type TestClient } from '@deepseek-ai/dsh-client-test-runtime/src/assembly/index.ts'
 import { ClientSessions } from '../src/client/sessions/service.ts'
+import { Session } from '../src/client/sessions/session.ts'
 import { FOLLOW, followScript, type HistoryAnswer } from './remote/session.client.ts'
+import { brandString } from '@deepseek-ai/dsh-brand'
 
 declare module '@deepseek-ai/dsh-api-session-controller/client' {
   interface SessionReferenceSourceMap {
     referenceTestView: unknown
     referenceTestWork: unknown
   }
+  interface SessionRetainFacetMap {
+    referenceTestFacet: unknown
+    referenceTestOtherFacet: unknown
+  }
 }
 
 const viewSource: SessionReferenceSource = 'referenceTestView'
 const workSource: SessionReferenceSource = 'referenceTestWork'
-const ID = SessionId('reference-session')
-const EMPTY_HISTORY = ok({ records: [], hasMore: false })
+const ID = brandString<SessionId>('reference-session')
+const EMPTY_HISTORY = ok({ cursor: -1, records: [], hasMore: false })
 const it = createClientTest({ roster: webApp.closure(['@deepseek-ai/dsh-api-gateway']) })
 
 async function bench(mock: RemoteMock, start: () => Promise<TestClient>, listed = true) {
@@ -36,7 +42,7 @@ async function bench(mock: RemoteMock, start: () => Promise<TestClient>, listed 
   mock.stream(FOLLOW, followScript(EMPTY_HISTORY))
   const feed = async (include: boolean): Promise<void> => {
     mock.remote.session.list.mockResolvedValue(ok({ items: include
-      ? [{ sessionId: ID, updatedAt: 1, running: false, blank: true }]
+      ? [{ sessionId: ID, updatedAt: 1, running: false, blank: true, agentAvailable: true }]
       : [] }))
     await svc.refresh()
   }
@@ -74,7 +80,9 @@ describe('Client reference sources', () => {
     const second = b.svc.retain(ID, { source: workSource })
     const acquisitions = Promise.allSettled([first.ready, second.ready])
     expect(binding).toBeDefined()
-    expect(source.getSnapshot()).toEqual({ referenceCount: 2, retainedBy: { referenceTestView: 1, referenceTestWork: 1 } })
+    expect(source.getSnapshot()).toEqual({
+      referenceCount: 2, retainedBy: { referenceTestView: 1, referenceTestWork: 1 }, connectionCount: 2,
+    })
     expect(b.svc.list.getSnapshot().byId[ID]?.retainedBy).toBe(source.getSnapshot().retainedBy)
     await entered.promise
     expect(mock.log.requests(FOLLOW)).toHaveLength(1)
@@ -87,7 +95,7 @@ describe('Client reference sources', () => {
     expect(a.binding.session.getSnapshot().openState).toBe('open')
     a.release()
     a[Symbol.dispose]()
-    expect(source.getSnapshot()).toEqual({ referenceCount: 1, retainedBy: { referenceTestWork: 1 } })
+    expect(source.getSnapshot()).toEqual({ referenceCount: 1, retainedBy: { referenceTestWork: 1 }, connectionCount: 1 })
     expect(() => a.binding).toThrow('is released')
     c.release()
     expect(source.getSnapshot()).toEqual({ referenceCount: 0, retainedBy: {} })
@@ -100,7 +108,7 @@ describe('Client reference sources', () => {
     using second = b.svc.retain(ID, { source: workSource })
     await Promise.all([first.ready, second.ready])
     const source = b.svc.retainInfo(ID)
-    expect(source.getSnapshot()).toEqual({ referenceCount: 2, retainedBy: { referenceTestWork: 2 } })
+    expect(source.getSnapshot()).toEqual({ referenceCount: 2, retainedBy: { referenceTestWork: 2 }, connectionCount: 2 })
     first.release()
     expect(source.getSnapshot().retainedBy.referenceTestWork).toBe(1)
     second.release()
@@ -119,7 +127,7 @@ describe('Client reference sources', () => {
     expect(b.svc.list.getSnapshot().byId[ID]?.retainedBy).toBe(snapshot.retainedBy)
     b.svc.handleSessionRemoved(ID)
     await vi.waitFor(() => {
-      expect(b.svc.list.getSnapshot().byId[ID]?.retainedBy).toBe(snapshot.retainedBy)
+      expect(b.svc.list.getSnapshot().byId[ID]).toBeUndefined()
     })
     expect(b.svc.list.getSnapshot().ids).not.toContain(ID)
     expect(source.getSnapshot()).toBe(snapshot)
@@ -138,9 +146,9 @@ describe('Client reference sources', () => {
     expect(reference.binding.session.getSnapshot().openState).toBe('cold')
     expect(source.getSnapshot()).toEqual({ referenceCount: 1, retainedBy: { gateway: 1 } })
     expect(b.svc.list.getSnapshot().ids).not.toContain(ID)
-    expect(b.svc.list.getSnapshot().byId[ID]?.retainedBy).toEqual({ gateway: 1 })
+    expect(b.svc.list.getSnapshot().byId[ID]).toBeUndefined()
     expect(mock.log.requests(FOLLOW)).toHaveLength(0)
-    expect(mock.remote.subagents.list).not.toHaveBeenCalled()
+    expect(mock.remote.session.projections).not.toHaveBeenCalled()
     await b.feed(true)
     expect(b.svc.list.getSnapshot().byId[ID]?.retainedBy).toEqual({ gateway: 1 })
   })
@@ -155,7 +163,9 @@ describe('Client reference sources', () => {
     mock.stream(FOLLOW, followScript(() => Promise.reject(failure)))
     const failed = b.svc.retain(ID, { source: viewSource })
     await expect(failed.ready).resolves.toBe(binding)
-    expect(b.svc.retainInfo(ID).getSnapshot()).toEqual({ referenceCount: 2, retainedBy: { gateway: 1, referenceTestView: 1 } })
+    expect(b.svc.retainInfo(ID).getSnapshot()).toEqual({
+      referenceCount: 2, retainedBy: { gateway: 1, referenceTestView: 1 }, connectionCount: 1,
+    })
     expect(binding.session.getSnapshot().openState).toBe('error')
     failed.release()
     mock.stream(FOLLOW, followScript(EMPTY_HISTORY))
@@ -177,9 +187,11 @@ describe('Client reference sources', () => {
     const rejected = expect(cancelled.ready).rejects.toBe(reason)
     controller.abort(reason)
     await rejected
-    expect(b.svc.retainInfo(ID).getSnapshot()).toEqual({ referenceCount: 2, retainedBy: { referenceTestView: 1, referenceTestWork: 1 } })
+    expect(b.svc.retainInfo(ID).getSnapshot()).toEqual({
+      referenceCount: 2, retainedBy: { referenceTestView: 1, referenceTestWork: 1 }, connectionCount: 2,
+    })
     cancelled.release()
-    expect(b.svc.retainInfo(ID).getSnapshot()).toEqual({ referenceCount: 1, retainedBy: { referenceTestWork: 1 } })
+    expect(b.svc.retainInfo(ID).getSnapshot()).toEqual({ referenceCount: 1, retainedBy: { referenceTestWork: 1 }, connectionCount: 1 })
     opening.resolve(EMPTY_HISTORY)
     using reference = survivor
     await reference.ready
@@ -280,6 +292,79 @@ describe('Client reference sources', () => {
     reference.release()
     expect(() => b.svc.retain(ID, { source: workSource })).toThrow('Controller is disposed')
     expect(() => b.svc.retainAgentScope(ID)).toThrow('Controller is disposed')
+  })
+})
+
+describe('Client retained facets', () => {
+  it('counts each facet across references in the retain info and omits facets nobody retains', async ({ mock, start }) => {
+    const b = await bench(mock, start)
+    const info = b.svc.retainInfo(ID)
+    using plain = b.svc.retain(ID, { source: workSource })
+    expect(info.getSnapshot()).toEqual({ referenceCount: 1, retainedBy: { referenceTestWork: 1 }, connectionCount: 1 })
+    expect('retainedFacets' in info.getSnapshot()).toBe(false)
+    const first = b.svc.retain(ID, { source: viewSource, facets: { referenceTestFacet: true } })
+    const second = b.svc.retain(ID, { source: viewSource, facets: { referenceTestFacet: true } })
+    expect(info.getSnapshot().retainedFacets).toEqual({ referenceTestFacet: 2 })
+    expect(b.svc.list.getSnapshot().byId[ID]?.retainedBy).toEqual({ referenceTestWork: 1, referenceTestView: 2 })
+    first.release()
+    first.release()
+    expect(info.getSnapshot().retainedFacets).toEqual({ referenceTestFacet: 1 })
+    second.release()
+    expect('retainedFacets' in info.getSnapshot()).toBe(false)
+    expect(plain.sessionId).toBe(ID)
+  })
+
+  it('clears retained facets with the generation and on root disposal', async ({ mock, start }) => {
+    const b = await bench(mock, start)
+    const info = b.svc.retainInfo(ID)
+    const reference = b.svc.retain(ID, { source: viewSource, facets: { referenceTestFacet: true } })
+    reference.release()
+    expect(info.getSnapshot()).toEqual({ referenceCount: 0, retainedBy: {} })
+    b.svc.retain(ID, { source: viewSource, facets: { referenceTestFacet: true } })
+    expect(info.getSnapshot().retainedFacets).toEqual({ referenceTestFacet: 1 })
+    await b.ctx.fiber.dispose()
+    expect(info.getSnapshot()).toEqual({ referenceCount: 0, retainedBy: {} })
+  })
+})
+
+describe('Client connection retention', () => {
+  it('holds a Session without connecting it and connects once a reference keeps the connection', async ({ mock, start }) => {
+    const b = await bench(mock, start)
+    const held = b.svc.retain(ID, { source: workSource, connection: false })
+    await held.ready
+    expect(held.binding.session.getSnapshot().openState).toBe('cold')
+    expect(mock.log.requests(FOLLOW)).toHaveLength(0)
+    expect(b.svc.retainInfo(ID).getSnapshot()).toEqual({ referenceCount: 1, retainedBy: { referenceTestWork: 1 } })
+    const viewed = b.svc.retain(ID, { source: viewSource })
+    await viewed.ready
+    expect(viewed.binding).toBe(held.binding)
+    expect(viewed.binding.session.getSnapshot().openState).toBe('open')
+    expect(b.svc.retainInfo(ID).getSnapshot().connectionCount).toBe(1)
+    viewed.release()
+    await vi.waitFor(() => { expect(held.binding.session.getSnapshot().openState).toBe('cold') })
+    expect(b.svc.binding(ID)).toBe(held.binding)
+    held.release()
+    expect(b.svc.binding(ID)).toBeUndefined()
+  })
+
+  it('keeps the connection while another reference keeps it', async ({ mock, start }) => {
+    const b = await bench(mock, start)
+    using first = b.svc.retain(ID, { source: viewSource })
+    const second = b.svc.retain(ID, { source: workSource })
+    await Promise.all([first.ready, second.ready])
+    second.release()
+    expect(first.binding.session.getSnapshot().openState).toBe('open')
+    expect(b.svc.retainInfo(ID).getSnapshot().connectionCount).toBe(1)
+  })
+
+  it('buffers the older window pages when the last facet is released', async ({ mock, start }) => {
+    const b = await bench(mock, start)
+    const buffered = vi.spyOn(Session.prototype, 'bufferOlder')
+    using view = b.svc.retain(ID, { source: workSource })
+    const rendered = b.svc.retain(ID, { source: viewSource, facets: { referenceTestFacet: true } })
+    await Promise.all([view.ready, rendered.ready])
+    rendered.release()
+    expect(buffered).toHaveBeenCalledOnce()
   })
 })
 

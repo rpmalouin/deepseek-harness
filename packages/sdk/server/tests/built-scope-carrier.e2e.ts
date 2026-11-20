@@ -3,7 +3,7 @@
  * `dsh-sdk-jsonrpc-server`. The carrier registry is module-local, so both bundles must
  * externalize `dsh-scope`; source-mode tests cannot expose an accidentally
  * inlined second registry. This test runs the real `lib/index.js` bundles in a
- * plain Node subprocess, disposes the child before settlement, and requires the
+ * plain Node subprocess, settles a child with an unavailable model, and requires the
  * SDK completion notification to retain the delegating parent.
  */
 
@@ -29,9 +29,9 @@ const [
   { default: AgentLoop },
   { mountAgentLoopTestDependencies },
   { default: SubagentRuntime },
-  { default: JsonlSessionPersistence },
+  JsonlSessionPersistence,
   { HarnessSdkJsonRpcServer },
-  { SessionId },
+  { brandString },
 ] = await Promise.all([
   load("vendor/cordis/lib/index.js"),
   load("packages/core/agent-loop/lib/index.js"),
@@ -39,13 +39,13 @@ const [
   load("packages/subagent/subagent/lib/index.js"),
   load("packages/session/session-persistence-jsonl/lib/index.js"),
   load("packages/sdk/server/lib/index.js"),
-  load("packages/core/session/lib/index.js"),
+  load("packages/util/brand/lib/index.js"),
 ]);
 
 const storageRoot = await mkdtemp(join(tmpdir(), "jsonrpc-built-scope-"));
 const ctx = new Context();
 try {
-  await mountAgentLoopTestDependencies(ctx);
+  await mountAgentLoopTestDependencies(ctx, { workingDirectory: true });
   await ctx.plugin(AgentLoop, { agents: [] });
   await ctx.plugin(SubagentRuntime);
   await ctx.plugin(JsonlSessionPersistence, { root: storageRoot });
@@ -57,39 +57,26 @@ try {
     notify(method, params) { notifications.push({ method, params }); },
   });
   const parent = await ctx.agents.create({
-    sessionId: SessionId("built-parent"),
+    sessionId: brandString("built-parent"),
     meta: { cwd: storageRoot },
     agentOptions: { model: "test" },
   });
-  const child = await parent.agent.ctx.agents.create({
-    sessionId: SessionId("built-child"),
-    meta: { cwd: storageRoot, parentSession: SessionId("built-parent") },
-    agentOptions: { model: "test" },
-    parentAgent: parent.agent,
-  });
-  const result = Promise.withResolvers();
   const unregister = ctx.subagents.registerProvider({
     name: "built-local",
-    capabilities: { agentOptions: false, outputSchema: false, depthLimit: false, toolFilter: false, persona: false },
+    capabilities: { agentOptions: false, agentPreset: false, outputSchema: false, depthLimit: false },
     inheritsParentContext: false,
-    start() {
-      return Promise.resolve({
-        id: child.agent.id,
-        localAgent: child.agent,
-        result: result.promise,
-        dispose() { return Promise.resolve(); },
-      });
-    },
+    prepareContinuable() { return Promise.resolve({}); },
   });
-  const run = await ctx.subagents.start("built-local", {
-    parent: parent.agent,
-    prompt: [],
+  const run = await ctx.subagents.startActivation({
+    provider: "built-local",
+    childId: brandString("built-child"),
+    label: "built scope carrier",
+    delivery: "caller",
+    parent: parent.agent, prompt: [{ type: "text", text: "Use the unavailable test model." }],
     signal: new AbortController().signal,
   });
-  await child.dispose();
-  result.resolve({ output: [], stopReason: "completed" });
   await run.result;
-  await Promise.resolve();
+  await run.dispose();
 
   console.log(JSON.stringify(notifications.filter(({ method }) => method === "subagent.finished")));
   await run.dispose();
@@ -119,8 +106,8 @@ describe.skipIf(!existsSync(jsonrpcBundle))('dsh-sdk-jsonrpc-server BUILT scope 
         agentId: 'built-child',
         parentSessionId: 'built-parent',
         childSessionId: 'built-child',
-        status: 'ok',
-        stopReason: 'completed',
+        status: 'error',
+        stopReason: 'error',
       },
     }])
   })

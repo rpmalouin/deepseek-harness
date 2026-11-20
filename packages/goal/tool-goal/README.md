@@ -37,7 +37,7 @@ All three tools return the same compact JSON — `{ goal: null }` when no goal i
 | `create_goal(objective, max_goal_rounds?)` | Creates one goal from a direct top-level human turn |
 | `update_goal(goal_id, revision, action, objective?, max_goal_rounds?, blocked_reason?)` | `edit`, `pause`, `resume`, `complete`, or `blocked` on the exact goal revision |
 
-Call `get_goal` before `update_goal` and copy the exact `goal_id` and `revision`; all calls are exclusive, so a model-ordered batch observes earlier mutations and their new revisions. Replacements belong only to `edit`; `blocked_reason` is required only for `blocked` and is persisted with the stable code `model-reported`. Strict-schema empty-string and zero fillers count as omitted, while meaningful values remain limited to their action.
+Call `get_goal` before `update_goal` and copy the exact `goal_id` and `revision`; all calls are exclusive, so a model-ordered batch observes earlier mutations and their new revisions. `objective` and `max_goal_rounds` affect only `edit` and are ignored for all other actions. `blocked_reason` is required and non-empty for `blocked`, persisted with the stable code `model-reported`, and ignored for all other actions. Ignored fields cannot change the objective, round cap, or blocker reason. Declared types, authority, and exact-revision checks still apply. For `edit`, exact empty-string objectives and zero round caps count as omitted, and at least one meaningful replacement is required.
 
 ### Configure it
 
@@ -68,7 +68,7 @@ This section explains how the tools enforce authority and render output; the obs
 
 ### Design
 
-- **Authority at execution.** Every call resolves the exact live agent, its inherited `AgentRegistry` initiator, running status, and an open turn; `create`, `edit`, `pause`, and `resume` additionally require an accepted `{ kind: 'user' }` message or steering event in a runtime-root agent's current turn. A durable paused goal fails the `resume` action with `GOAL_TOOL_RESUME_PAUSED`; the user-facing command or Web control owns that transition. Durable fork lineage does not demote a resumed root; live subagent ownership does.
+- **Authority at execution.** The plugin requires `agents` and reads turn state through `turnBoundaryOf(session)`. Every call resolves the exact live agent, its inherited `AgentRegistry` initiator, running status, and an open turn; `create`, `edit`, `pause`, and `resume` additionally require an accepted `{ kind: 'user' }` message or steering event in a runtime-root agent's current turn. A durable paused goal fails the `resume` action with `GOAL_TOOL_RESUME_PAUSED`; the user-facing command or Web control owns that transition. A Session with `origin: 'subagent'` cannot supply direct-human authority; historical ordinary forks with `parentSession` remain eligible.
 - **Host attestation of human input.** `{ kind: 'user' }` is assigned by `Agent.followup()` and `steer()` when their caller omits a source, so plugins, schedulers, and other non-human producers must pass their own source rather than inheriting human authority.
 - **System-prompt guidance with the configured threshold.** The package registers one `tool:goal` system-prompt section whose fixed text interpolates `blockedAfterConsecutiveRounds`; the same value is the hard lower bound enforced at execution.
 - **Wrap-up context for terminal rounds.** A successful autonomous `complete` or `blocked` defers a closing `<goal_complete>` or `<goal_blocked>` instruction so the model addresses the user once before the turn ends; direct-human mutations never defer this context.
@@ -80,7 +80,6 @@ This section explains how the tools enforce authority and render output; the obs
 | [`src/index.ts`](src/index.ts) | Plugin entry: tool registration, config, system-prompt section, result rendering |
 | [`src/authority.ts`](src/authority.ts) | Execution-time authority checks and goal-round acceptance |
 | [`src/wrapup.ts`](src/wrapup.ts) | Closing-message instruction for terminal autonomous updates |
-| — | No runtime invariant companion is published; this model-facing adapter owns no independent state or event protocol; accepted mutations are checked by the goal domain and authority behavior is package-tested. |
 
 ### Tool output
 
@@ -109,12 +108,12 @@ The tools are the model-facing half of the goal surface; read these pages for th
 
 #### What the model sees
 
-A fixed goal policy says when semantic human intent warrants creation, requires exact read-before-update refs, explains rearming after resume/fork, and limits completion/blocking claims. Durable paused resume is rejected at execution with `GOAL_TOOL_RESUME_PAUSED`; the user-facing goal control owns that transition. The configured threshold is interpolated into that guidance.
+A fixed goal policy allows inferring goal intent in any language, explains rearming after resume/fork, and limits completion/blocking claims; creation scope and read-before-update refs live in the tool definitions. Durable paused resume is rejected at execution with `GOAL_TOOL_RESUME_PAUSED`; the user-facing goal control owns that transition. The configured threshold is interpolated into that guidance.
 
 ##### Goal policy
 
 ```markdown
-Use goal tools for one long-running completion objective in the current session. create_goal may infer goal intent from a direct human request in any language; do not create a goal for routine single-turn work. Call get_goal before update_goal and copy its exact goal_id and revision. After session resume or fork, an active goal is disarmed: when a human asks to continue or resume in any wording or language, use update_goal action resume to rearm it. Mark complete only when the objective is actually achieved. Mark blocked only after the same blocking condition persists for at least 3 consecutive goal rounds, and report that concrete condition in blocked_reason; difficulty, uncertainty, or useful remaining work is not blocked.
+create_goal may infer goal intent from a direct human request in any language. After session resume or fork, an active goal is disarmed: when a human asks to continue or resume in any wording or language, use update_goal action resume to rearm it. Mark complete only when the objective is actually achieved. Mark blocked only after the same blocking condition persists for at least 3 consecutive goal rounds, and report that concrete condition in blocked_reason; difficulty, uncertainty, or useful remaining work is not blocked.
 ```
 
 #### Token effect

@@ -1,17 +1,18 @@
-import { createAssistantMessage, createToolResultMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 /**
  * Coordinator semantics against a bare fake backend — the RFC's named unit
  * tier for the seam: adoption (fresh, seeded, re-adoption via the handoff
  * cursor), lifecycle-suffix replay, deep-copy isolation, turn-latency and
  * dispose-ordering pins, failure containment, and the `agent/error` relay.
  */
+import { createAssistantMessage, createToolResultMessage, createUserMessage, type ToolCallId } from '@deepseek-ai/dsh-llm'
+import { brandString } from '@deepseek-ai/dsh-brand'
 
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, onTestFinished, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import SessionStore, {
   SESSION_FORMAT_VERSION,
   Session,
-  SessionId,
+  type SessionId,
   SessionLogOffset,
   type SessionEvent,
 } from '@deepseek-ai/dsh-session'
@@ -83,7 +84,7 @@ async function setup(
 }
 
 function liveSession(ctx: Context, id = `s-${Math.random().toString(36).slice(2)}`): Session {
-  return ctx.sessions.create(SessionId(id), { meta: {} })
+  return ctx.sessions.create(brandString<SessionId>(id), { meta: {} })
 }
 
 function appendTurn(session: Session): void {
@@ -135,6 +136,12 @@ describe('SessionTelemetryCoordinator capture', () => {
     ;(message.body as { content: { text: string }[] }).content[0]!.text = 'tampered'
     const logged = session.snapshotEvents()[1] as SessionEvent<'user/message'>
     expect(logged.data.content[0]).toMatchObject({ text: 'hello' })
+    expect(message.sourceEvent?.sessionId).toBe(session.id)
+    expect(message.sourceEvent?.envelope).not.toHaveProperty('data')
+    expect(message.sourceEvent?.envelope).toMatchObject({ seq: logged.seq, time: logged.time, type: logged.type, surfaceOp: 'append' })
+    expect(message.sourceEvent?.envelope).not.toBe(logged)
+    message.sourceEvent!.envelope.time = 0
+    expect(logged.time).not.toBe(0)
   })
 
   it('captures a live request header without replaying previously withheld events', async () => {
@@ -157,8 +164,8 @@ describe('SessionTelemetryCoordinator capture', () => {
 
   it('stamps header facts on every record when present', async () => {
     const { ctx, backend } = await setup()
-    const parent = SessionId('parent')
-    const session = ctx.sessions.create(SessionId('child'), { meta: { cwd: '/tmp/proj', parentSession: parent } })
+    const parent = brandString<SessionId>('parent')
+    const session = ctx.sessions.create(brandString<SessionId>('child'), { meta: { cwd: '/tmp/proj', parentSession: parent } })
     appendTurn(session)
     for (const record of backend.ledger()) {
       expect(record.attributes['session.format_version']).toBe(SESSION_FORMAT_VERSION)
@@ -299,8 +306,8 @@ describe('SessionTelemetryCoordinator on-demand capture', () => {
       })
       const parent = liveSession(ctx, 'history-parent')
       appendTurn(parent)
-      const child = ctx.sessions.create(SessionId('history-child'), { seed: [...parent.snapshotEvents()] })
-      const boundary = child.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+      const child = ctx.sessions.fork(parent, undefined, brandString<SessionId>('history-child'))
+      const boundary = child.snapshotEvents().at(-1)!
       child.append('turn/start', { turn: 2 })
       expect(backend.records).toEqual([])
       coordinator.captureSession(child, boundary.seq)
@@ -387,6 +394,96 @@ describe('SessionTelemetryCoordinator on-demand capture', () => {
 })
 
 describe('SessionTelemetryCoordinator adoption', () => {
+  it.each([
+    { capture: 'live', includeHistory: false },
+    { capture: 'on-demand', includeHistory: false },
+    { capture: 'live', includeHistory: true },
+    { capture: 'on-demand', includeHistory: true },
+  ] as const)('restores a seeded Session with $capture capture and includeHistory=$includeHistory', async (options) => {
+    const ctx = new Context()
+    try {
+      await ctx.plugin(SessionStore)
+      const parent = liveSession(ctx, 'cold-parent')
+      appendTurn(parent)
+      parent.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+      const child = ctx.sessions.fork(parent, undefined, brandString<SessionId>('cold-child'))
+      child.append('turn/start', { turn: 2 })
+      child.append('turn/end', { turn: 2, reason: { kind: 'completed' } })
+      const resumedId = brandString<SessionId>('restored-child')
+      const resumed = Session.fromRestore(resumedId, child.snapshotEvents(), { ...child.header, id: resumedId },
+        child.inheritedEventCount, 'shared-frozen')
+      const backend = new FakeBackend()
+      let coordinator!: SessionTelemetryCoordinator
+      await ctx.plugin({
+        name: 'seeded-resume-telemetry', inject: ['sessions'],
+        apply: (inner: Context) => { coordinator = new SessionTelemetryCoordinator(inner, backend, options) },
+      })
+      ctx.sessions.enter(resumed)
+      ctx.sessions.announce(resumed)
+      const expected = resumed.snapshotEvents().slice(options.includeHistory ? 0 : resumed.firstLiveSeq)
+      const captured = () => backend.ledger().filter(record => record.attributes['session.id'] === resumedId)
+      expect(captured().map(record => record.attributes['event.seq']))
+        .toEqual(options.capture === 'live' ? expected.map(event => event.seq) : [])
+      coordinator.captureSession(resumed)
+      coordinator.captureSession(resumed)
+      expect(captured().map(record => record.attributes['event.seq'])).toEqual(expected.map(event => event.seq))
+      expect(expected.at(-1)?.type).toBe('session/end-seed')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it.each(['live', 'on-demand'] as const)('captures the child-owned fork marker and closers in %s mode', async (capture) => {
+    const { ctx, backend, coordinator, fiber } = await setup(new FakeBackend(), capture)
+    try {
+      const parent = liveSession(ctx, 'fork-parent')
+      appendTurn(parent)
+      parent.append('step/start', { turn: 1, step: 1 })
+      parent.append('assistant/message', {
+        turn: 1, step: 1, stream: [],
+        message: createAssistantMessage({
+          content: [{ type: 'tool-call', id: brandString<ToolCallId>('fork-call'), name: 'bash', arguments: '{}' }],
+          source: { provider: 'mock', model: 'mock' },
+        }),
+      }, { surfaceOp: 'append' })
+      parent.append('tool/call', {
+        turn: 1, step: 1, callId: brandString<ToolCallId>('fork-call'), name: 'bash', arguments: '{}',
+      })
+      const child = ctx.sessions.fork(parent, undefined, brandString<SessionId>('fork-child'))
+      const ownEvents = child.snapshotEvents().slice(child.inheritedEventCount)
+      expect(ownEvents.map(event => event.type)).toEqual([
+        'session/end-seed', 'tool/result', 'step/end', 'turn/end',
+      ])
+      expect(child.firstLiveSeq).toBe(child.inheritedEventCount + ownEvents.length)
+      const captured = () => backend.ledger().filter(record => record.attributes['session.id'] === child.id)
+      expect(captured().map(record => record.attributes['event.seq']))
+        .toEqual(capture === 'live' ? ownEvents.map(event => event.seq) : [])
+
+      coordinator.captureSession(child)
+      coordinator.captureSession(child)
+      expect(captured().map(record => record.attributes['event.seq'])).toEqual(ownEvents.map(event => event.seq))
+      expect(captured().map(record => record.body)).toEqual(ownEvents.map(event => event.data))
+
+      await fiber.dispose()
+      const second = new FakeBackend()
+      let reloaded!: SessionTelemetryCoordinator
+      await ctx.plugin({
+        name: 'fork-telemetry-reloaded',
+        inject: ['sessions'],
+        apply: (inner: Context) => {
+          reloaded = new SessionTelemetryCoordinator(inner, second, { capture })
+        },
+      })
+      reloaded.captureSession(child)
+      expect(second.ledger()).toEqual([])
+      const next = child.append('turn/start', { turn: 2 })
+      reloaded.captureSession(child)
+      expect(second.ledger().map(record => record.attributes['event.seq'])).toEqual([next.seq])
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('replays a new fork object from its constructor boundary without its inherited prefix', async () => {
     const backend = new FakeBackend()
     const ctx = new Context()
@@ -398,10 +495,10 @@ describe('SessionTelemetryCoordinator adoption', () => {
       inject: ['sessions'],
       apply: (inner: Context) => void new SessionTelemetryCoordinator(inner, backend),
     })
-    const child = ctx.sessions.prepare(SessionId('seeded'), { seed: [...parent.snapshotEvents()], meta: {} })
-    child.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
-    ctx.sessions.enter(child)
+    const child = ctx.sessions.prepare(brandString<SessionId>('seeded'), { seed: [...parent.snapshotEvents()], meta: {} })
+    ctx.effect(() => ctx.sessions.enter(child))
     ctx.sessions.announce(child)
+    child.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
 
     const seqs = backend.ledger().map(r => [r.attributes['session.id'], r.attributes['event.seq']])
     expect(seqs).toEqual(expect.arrayContaining([['seed-parent', 0], ['seed-parent', 1]]))
@@ -415,7 +512,7 @@ describe('SessionTelemetryCoordinator adoption', () => {
     const backend = new FakeBackend()
     const ctx = new Context()
     await ctx.plugin(SessionStore)
-    const donor = Session.create(SessionId('donor'))
+    const donor = Session.create(brandString<SessionId>('donor'))
     donor.append('turn/start', { turn: 1 })
     appendAssistantMessage(donor, 1, 1, ['first'], 100)
     await ctx.plugin({
@@ -426,11 +523,11 @@ describe('SessionTelemetryCoordinator adoption', () => {
     // Session persistence migrates before it constructs the restored Session;
     // telemetry therefore receives a current-format object with the complete
     // migrated canonical seed.
-    const resumed = ctx.sessions.prepare(SessionId('resumed'), {
+    const resumed = ctx.sessions.prepare(brandString<SessionId>('resumed'), {
       seed: structuredClone(donor.snapshotEvents()) as SessionEvent[],
       meta: {
         version: SESSION_FORMAT_VERSION,
-        id: SessionId('resumed'),
+        id: brandString<SessionId>('resumed'),
         createdAt: 1,
         isSeeded: false,
       },
@@ -459,10 +556,10 @@ describe('SessionTelemetryCoordinator adoption', () => {
     await ctx.plugin(SessionStore)
     const parent = liveSession(ctx, 'stitch-parent')
     appendTurn(parent)
-    const child = ctx.sessions.create(SessionId('stitch-child'), {
+    const child = ctx.sessions.create(brandString<SessionId>('stitch-child'), {
       seed: [...parent.snapshotEvents()],
       inheritedEventCount: SessionLogOffset(parent.snapshotEvents().length),
-      meta: { parentSession: SessionId('stitch-parent'), isSeeded: true },
+      meta: { parentSession: brandString<SessionId>('stitch-parent'), isSeeded: true },
     })
     await ctx.plugin({
       name: 'fake-telemetry',
@@ -475,25 +572,28 @@ describe('SessionTelemetryCoordinator adoption', () => {
     expect(record.attributes['session.seed_length']).toBe(2)
   })
 
-  it('adopts exactly once when created fires after the sweep', async () => {
+  it.each([false, true])('adopts exactly once when created fires after the sweep with includeHistory=%s', async (includeHistory) => {
     const backend = new FakeBackend()
     const ctx = new Context()
+    onTestFinished(() => ctx.fiber.dispose())
     await ctx.plugin(SessionStore)
     // The enter/announce window: prepare+enter puts the session in the store
     // (visible to the constructor sweep) before `session/created` fires, so a
     // coordinator loaded inside that window sees the session twice — sweep
     // first, created second. The second adoption must be a no-op.
-    const session = ctx.sessions.prepare(SessionId('overlap'))
-    appendTurn(session)
-    ctx.sessions.enter(session)
+    const seed = Session.create(brandString<SessionId>('overlap-seed'))
+    appendTurn(seed)
+    const session = ctx.sessions.prepare(brandString<SessionId>('overlap'), { seed: seed.snapshotEvents() })
+    ctx.effect(() => ctx.sessions.enter(session))
     await ctx.plugin({
       name: 'fake-telemetry',
       inject: ['sessions'],
-      apply: (inner: Context) => void new SessionTelemetryCoordinator(inner, backend),
+      apply: (inner: Context) => void new SessionTelemetryCoordinator(inner, backend, { includeHistory }),
     })
-    expect(backend.ledger()).toHaveLength(2)
+    const expected = includeHistory ? ['turn/start', 'user/message', 'session/end-seed'] : ['session/end-seed']
+    expect(backend.ledger().map(record => record.attributes['event.type'])).toEqual(expected)
     ctx.sessions.announce(session)
-    expect(backend.ledger()).toHaveLength(2)
+    expect(backend.ledger().map(record => record.attributes['event.type'])).toEqual(expected)
   })
 
   it('resumes from the handoff cursor across same-object re-adoption without duplicates', async () => {
@@ -575,7 +675,7 @@ describe('SessionTelemetryCoordinator lifecycle and containment', () => {
 
   it('ignores flush hints for sessions it never adopted', async () => {
     const { ctx, backend } = await setup()
-    const stranger = ctx.sessions.prepare(SessionId('stranger'), { meta: {} })
+    const stranger = ctx.sessions.prepare(brandString<SessionId>('stranger'), { meta: {} })
     await ctx.parallel('session/flush', stranger)
     expect(backend.flush).not.toHaveBeenCalled()
   })
@@ -596,7 +696,7 @@ describe('SessionTelemetryCoordinator lifecycle and containment', () => {
       inject: ['sessions'],
       apply: (inner: Context) => void new SessionTelemetryCoordinator(inner, backend),
     })
-    expect(() => ctx.sessions.create(SessionId('vetoed'), { meta: {} })).toThrow('vetoed')
+    expect(() => ctx.sessions.create(brandString<SessionId>('vetoed'), { meta: {} })).toThrow('vetoed')
     expect(backend.records.filter(r => r.channel === 'ops')).toHaveLength(0)
   })
 
@@ -623,7 +723,7 @@ describe('SessionTelemetryCoordinator lifecycle and containment', () => {
     // long-running host must not look like a crash), and the session retires
     // from the adopted set so unload neither retains it nor re-marks it.
     const owner = await ctx.plugin(Object.assign((inner: Context) => {
-      inner.sessions.create(SessionId('ephemeral'), { meta: {} })
+      inner.sessions.create(brandString<SessionId>('ephemeral'), { meta: {} })
     }, { inject: ['sessions'] }))
     await owner.dispose()
     const atEdge = backend.records.filter(r => r.channel === 'ops')

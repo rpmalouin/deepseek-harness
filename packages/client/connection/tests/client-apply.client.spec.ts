@@ -13,6 +13,8 @@ import {
   type ConnectionHandle,
   type ConnectionState,
 } from '../src/client/index.ts'
+import type { ConnectionRecoveryConfig } from '../src/recovery-config.ts'
+import { syncedConnectionConfig as synced } from './synced-config.client.ts'
 
 type Win = {
   location?: { hostname: string; origin?: string }
@@ -64,22 +66,19 @@ function installGeneration(handle: ConnectionHandle): GenerationProbe {
   return probe
 }
 
-async function mount(): Promise<ConnectionHandle> {
+async function mount(recovery?: ConnectionRecoveryConfig): Promise<ConnectionHandle> {
   const ctx = new Context()
-  await ctx.plugin({ apply, inject: [] })
+  await ctx.plugin({ apply, inject: [] }, synced(recovery))
   const handle = ctx.get('connection') as ConnectionHandle | undefined
   if (handle === undefined) throw new Error('ctx.connection not provided')
   return handle
 }
 
 describe('connection client apply', () => {
-  it('uses Host bootstrap timing when Gateway starts without overrides', async () => {
+  it('uses Host-synced timing when Gateway starts without overrides', async () => {
     vi.useFakeTimers()
-    vi.stubGlobal('__DSH_CONNECTION_RECOVERY__', {
-      backoffBaseMs: 10, backoffMaxMs: 10, generationReadyTimeoutMs: 20,
-    })
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
-    const handle = await mount()
+    const handle = await mount({ backoffBaseMs: 10, backoffMaxMs: 10, generationReadyTimeoutMs: 20 })
     const signals: AbortSignal[] = []
     handle.registerGenerationSource(signal => new Promise<void>((resolve) => {
       signals.push(signal)
@@ -99,10 +98,9 @@ describe('connection client apply', () => {
     }
   })
 
-  it.each([{ generationReadyTimeoutMs: 0 }, { backoffFactor: NaN }])('rejects malformed bootstrap recovery before publishing the service: %j', (recovery) => {
-    vi.stubGlobal('__DSH_CONNECTION_RECOVERY__', recovery)
+  it.each([{ generationReadyTimeoutMs: 0 }, { backoffFactor: NaN }])('rejects malformed synced recovery before publishing the service: %j', (recovery) => {
     const ctx = new Context()
-    expect(() => { apply(ctx) }).toThrow()
+    expect(() => { apply(ctx, synced(recovery)) }).toThrow()
     expect(ctx.get('connection')).toBeUndefined()
   })
 
@@ -469,7 +467,7 @@ describe('connection client apply', () => {
       vi.unstubAllGlobals()
     }
     expect(seen).toHaveLength(1)
-    expect(seen[0]?.url).toBe('http://dsh.internal/api/goals/create')
+    expect(seen[0]?.url).toBe('api/goals/create')
     expect(seen[0]?.body).toMatchObject({
       type: 'client-request',
       rpcId: '00000000-0000-4000-8000-000000000000',
@@ -495,9 +493,10 @@ describe('connection client apply', () => {
   it('exposes a worker-local Gateway stream through connection.rpc.open', async () => {
     ;(globalThis as Win).location = { hostname: 'preview.example' }
     const openStream = vi.fn<NonNullable<ClientTransportHooks['openStream']>>(
-      (endpoint, payload, signal) => (async function *(): AsyncGenerator {
+      (endpoint, payload, signal, uplink) => (async function *(): AsyncGenerator {
         signal.throwIfAborted()
         yield { endpoint, payload }
+        if (uplink !== undefined) yield* uplink
       })(),
     )
     ;(globalThis as Win).__DSH_TRANSPORT__ = {
@@ -521,7 +520,14 @@ describe('connection client apply', () => {
       'session/follow',
       { args: { sessionId: 'session-1' } },
       abort.signal,
+      undefined,
     )
+
+    const uplink = (async function *(): AsyncGenerator<string> { yield 'typed' })()
+    const echoed = []
+    for await (const value of open('/api', 'job/attach', { args: {} }, abort.signal, uplink)) echoed.push(value)
+    expect(echoed).toEqual([{ endpoint: 'job/attach', payload: { args: {} } }, 'typed'])
+    expect(openStream).toHaveBeenLastCalledWith('job/attach', { args: {} }, abort.signal, uplink)
     expect(handle.isLoopback).toBe(true)
     expect(() => open('/rpc', 'session/follow', {}, abort.signal))
       .toThrow('worker-local streams require the /api channel')
@@ -541,7 +547,7 @@ describe('connection client apply', () => {
       await expect(handle.rpc.call('/api', 'goals/create', {}, abort.signal))
         .rejects.toThrow('HTTP 503')
       expect(globalThis.fetch).toHaveBeenCalledWith(
-        new URL('https://harness.example/api/goals/create'),
+        'api/goals/create',
         expect.objectContaining({ signal: abort.signal }),
       )
 
@@ -553,7 +559,7 @@ describe('connection client apply', () => {
       }))
       await expect(handle.rpc.call('/api', 'goals/create', {})).rejects.toThrow('rpcId mismatch')
       const fetch = vi.mocked(globalThis.fetch)
-      expect(fetch.mock.calls[0]?.[0]).toEqual(new URL('http://dsh.internal/api/goals/create'))
+      expect(fetch.mock.calls[0]?.[0]).toEqual('api/goals/create')
       expect(fetch.mock.calls[0]?.[1]).not.toHaveProperty('signal')
 
       const respond = (result: unknown): void => {

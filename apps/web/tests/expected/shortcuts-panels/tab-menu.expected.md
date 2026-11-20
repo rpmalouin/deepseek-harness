@@ -1,0 +1,3 @@
+- menu:
+  - menuitem "Close"
+  - menuitem "Close Other Tabs" [disabled]

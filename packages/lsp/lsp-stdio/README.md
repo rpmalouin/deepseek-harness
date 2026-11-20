@@ -68,7 +68,7 @@ On the first query for a workspace, the provider launches one server process for
 
 ### Observable success and failures
 
-A successful navigation returns normalized locations, and hover returns normalized text or a no-hover notice; empty results are successful no-result responses. The query fails when the server does not support the operation or the transient open/close synchronization (`LSP_UNSUPPORTED_OPERATION`), when the source is missing, non-regular, non-UTF-8, oversized, or outside the canonical workspace (rejected before the server starts), or when the server returns a malformed payload (`LSP_MALFORMED_RESPONSE`). A hard-killed harness leaves servers running until they exit on their own — graceful shutdown happens only through service disposal.
+A successful navigation returns normalized locations, and hover returns normalized text or a no-hover notice; empty results are successful no-result responses. Before the server starts, a missing, non-directory, non-regular, non-UTF-8, or oversized workspace or source fails with its `FsError` code, and a source outside the canonical workspace fails with `LSP_FILE_OUTSIDE_WORKSPACE`. The server then fails the query with `LSP_UNSUPPORTED_OPERATION` when it lacks the operation or the transient open/close synchronization, `LSP_UNSUPPORTED_ENCODING` for a non-UTF-16 position encoding, `LSP_MALFORMED_RESPONSE` for a malformed payload, and `LSP_SERVER_ERROR` for a JSON-RPC error response; a failed process or stream reports `LSP_SPAWN_FAILED`, `LSP_SERVER_EXITED`, `LSP_PROTOCOL_ERROR`, or `LSP_MESSAGE_TOO_LARGE`. The [LSP navigation subsystem](../../../docs/subsystems/lsp.md#failures) gives each code's meaning and consumer action. A hard-killed harness leaves servers running until they exit on their own — graceful shutdown happens only through service disposal.
 
 ### Security boundary
 
@@ -106,7 +106,6 @@ This section explains the design decisions behind the provider and where the cod
 | [`src/protocol.ts`](src/protocol.ts) | Wire-type subset: capabilities, locations, hover, text-document synchronization |
 | [`src/translate.ts`](src/translate.ts) | Capability checks, UTF-16 negotiation, `Location`/`LocationLink`/hover normalization |
 | [`src/abort.ts`](src/abort.ts) | Cancellation helpers fusing caller and disposal signals |
-| — | No runtime invariant companion is published; process pools and per-workspace queues are private implementation state, and this provider publishes no independent lifecycle event stream or enumerable snapshot. |
 
 ### Protocol behavior
 

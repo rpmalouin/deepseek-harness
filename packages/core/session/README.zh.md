@@ -29,7 +29,11 @@ kind: "package-reference"
 
 ### 创建与检查会话
 
-`ctx.sessions.create()` 构建绑定到调用方 fiber 的实时会话；`get(id)` 与 `list()` 查找会话，`fork()` 从实时会话的稳定前缀创建子会话。
+`SessionId` 是包根入口与 `/types` 导出的类型。使用 `dsh-brand` 的 `brandString<SessionId>(value)` 为已准入的字符串添加品牌；品牌转换不校验或生成 id。
+
+`ctx.sessions.create()` 构建绑定到调用方 fiber 的实时会话；`get(id)` 与 `list()` 查找会话，`fork()` 从实时会话的精确前缀创建独立会话。它复制历史、`cwd`、`isSeeded` 和继承事件数，不记录来源关系。`parentSession` 记录子代理的直接创建者；历史普通 fork 可能仍在此字段保留来源，因此分类使用 `origin`。
+
+独立的 `Session.create()` 和 `Session.fromRestore()` 实例接受事件和插件记录，但不发送 `session/event`。`SessionStore` 通过 `prepare()` 或 `enter()` 接管实例；此后只有实例仍在 Store 中且同步 `session/created` 宣告已完成时才能写入。创建监听器只能读取，并能看到全部已有历史；独立实例进入 Store 时不会把已有历史重放为 `session/event`。宣告失败或移除后仍禁止写入。只有开始过 `session/created` 宣告的实例在移除时发出 `session/disposed`，宣告失败也不例外；进入 Store 但从未宣告的实例不发出这两个通知。
 
 ```text
 const session = ctx.sessions.create(sessionId, { meta: { cwd: '/workspace' } })
@@ -39,7 +43,7 @@ ctx.sessions.list()              // every live session, in creation order
 
 ### 追加与派生
 
-`session.append(type, data, opts?)` 提交一个类型化事件——它先快照并冻结载荷、校验其为无损 JSON，再通知观察者。`session.deriveMessages()` 把日志投影为模型看到的 `Message[]`，采用增量且有缓存的方式：
+`session.append(type, data, opts?)` 提交一个类型化事件。它在读取载荷字段前拒绝只读实例，为有效 JSON 创建快照并冻结，再次检查写入权限后提交并通知观察者。`session.deriveMessages()` 把日志投影为模型看到的 `Message[]`，采用增量且有缓存的方式：
 
 ```text
 session.append('user/message', { role: 'user', content: [{ type: 'text', text: 'hello' }], source: { kind: 'user' } },
@@ -47,11 +51,13 @@ session.append('user/message', { role: 'user', content: [{ type: 'text', text: '
 session.deriveMessages()         // the derived model history
 ```
 
-表层事件（`system/message`、`user/message`、`assistant/message`、`tool/result`）在类型化事件与追加输入中都必须带有 `surfaceOp`。替换操作仅接受 `{ op: 'replace', startSeq, endSeq }`，端点为包含边界的 `SessionSeq`，按当前 surface 顺序解释。assistant 消息会嵌入精确、紧凑的提供方流，并禁止 `sourceEventSeqs`。已知仅日志事件禁止这两个元数据字段，且从不产生消息。
+表层事件（`system/message`、`developer/message`、`user/message`、`assistant/message`、`tool/result`）在类型化事件与追加输入中都必须带有 `surfaceOp`。替换操作仅接受 `{ op: 'replace', startSeq, endSeq }`，端点为包含边界的 `SessionSeq`，按当前 surface 顺序解释。assistant 消息会嵌入精确、紧凑的提供方流，并禁止 `sourceEventSeqs`。已知仅日志事件禁止这两个元数据字段，且从不产生消息。
+
+`developer/message` 存储工具添加名称，以及指向更早 `request/header` 的 `headerSeq` 引用。仅在存在添加块时必须携带该引用，每个名称必须在所引用的请求头中恰好对应一个完整模式。移除块仅记录工具名称，不携带请求头引用。重启、fork 和 surface 替换保留历史请求头；较早添加的定义不由当前注册表或最新请求头决定。`sourceEventSeqs` 继续描述派生来源及被替换节点。
 
 插件用 `@messageProjection` 声明修改内容的事件，并通过 `ctx.sessions.registerMessageProjection()` 注册纯处理器。Session 在接受事件前调用处理器，并缓存其不可变消息更新。缺少处理器时拒绝追加和恢复，卸载已经使用的处理器后也会拒绝读取缓存。独立构造函数和 `foldSurface(events, projections)` 必须显式接收处理器。重建函数将折叠结果的 `projectedMessages` 传给 `deriveEventMessage()`，实时实例方法自动应用相同的投影。[插件拥有消息投影](../../../.agents/notes/implemented/architecture/2026-09-11-plugin-owned-message-projections.zh.md)说明职责划分和离线装配。
 
-追加、seed/restore 与事件 adoption/snapshot 会拒绝任何 `header.system` 及恰好为空的可选请求头字段（`tools: []`、`adapterDefaults: {}`），而不规范化输入。工具结果的 `data.error` 仅在 `message.content[0].isError === true` 时允许存在；失败标识仍是可选的。被拒绝的追加不会改变日志、派生状态或事件流。Adoption 校验事件局部元数据，但不校验所引用的历史或替换端点是否属于 surface。
+追加、seed/restore 与事件 adoption/snapshot 会拒绝任何 `header.system` 及恰好为空的可选请求头字段（`tools: []`、`adapterDefaults: {}`），而不规范化输入。工具结果的 `data.error` 仅在一等消息的 `isError === true` 时允许存在；失败标识仍是可选的。被拒绝的追加不会改变日志、派生状态或事件流。Adoption 校验事件局部元数据，但不校验所引用的历史或替换端点是否属于 surface。
 
 `system/message` 承载渲染后的系统提示词：第一条是 surface 第 0 号节点，准入依据已准备调用的能力，不具备能力的路由将非空渲染文本归并到首个系统节点，延续中的 `in-history` 序列则在缓存历史之后追加；空系统节点不投影为消息，因此清除提示词必须为所有生效的系统节点记录空内容替换，而非仅替换最新节点；当第 0 号节点是 `system/message` 时，surface 折叠拒绝覆盖它的替换，除非替换事件本身是恰好覆盖该节点的 `system/message`，而后续系统节点不受保护，压缩范围可以遮蔽它们（[决策](../../../.agents/notes/implemented/architecture/2026-09-02-system-prompt-as-surface-node.zh.md)）。
 
@@ -61,11 +67,25 @@ session.deriveMessages()         // the derived model history
 
 会话日志位置使用两种数字类型。`SessionSeq` 标识已有事件或包含端点的事件水位；`SessionLogOffset` 标识间隙、前缀长度或读取边界，并且可以等于事件数量。`SessionSeqCursor` 添加 `-1` 这个“尚无事件”值，`OptionalSessionSeq` 则在缺失本身属于数据时使用 `null`。构造函数会校验非负安全整数，brand 在运行时会被擦除，因此持久 JSON 与 wire 值仍是普通数字。
 
+<a id="write-experimental-plugin-records"></a>
+
+### 写入实验性插件记录
+
+`appendPluginRecord(session, type, data)` 为 `packages/experimental/` 下的包追加一条插件记录；`verify-plugin-record-callers` 检查拒绝本仓库中任何其他生产调用方。本仓库之外的插件同样不得调用它，尽管仓库检查无法检查它们。
+
+在所属实验性包的 `src/` 中，通过 `@deepseek-ai/dsh-session/types` 的 `PluginRecordMap` 为每条记录声明描述与显式 payload 类型注解。名称使用 `plugin:<owner>/<record>`，其中 `owner` 是包名去掉前缀后的部分：带旧前缀时去掉 `@deepseek-ai/dsh-experimental-`，否则去掉 `@deepseek-ai/dsh-`；例如 `plugin:pi-extensions/entry`。TypeScript 按声明检查每个名称与 payload；写入方运行时的 JSON 快照拒绝无法无损保留的值。扩展自定义名称或其他动态名称放在已声明记录的 payload 中。
+
+[实验性持久化目录](../../../docs/experimental-persistence-catalog.zh.md)列出当前插件记录声明及其所属包、描述、payload 类型注解与源文件。这些声明与 `SessionEventMap`、展开的持久化 schema、已发布类型历史及 `KNOWN_SESSION_EVENT_TYPES` 分开。记录带有 `ignorable: true`：不认识某条记录的构建在读取时保留并跳过它。记录从不进入模型可见的 surface。resume 与 fork 随日志其余部分一起携带它们；Session 格式迁移以尽力而为的方式保留它们。
+
+`pluginRecordOf(event)` 把事件作为记录返回，对其他任何事件返回 `undefined`；把每个事件都交给它的 `ctx.sessionProjections` 单元在 resume 时重建插件状态。即使当前映射声明了该名称，其 `data` 仍为 `unknown`。所属包在使用前校验数据，因为早先构建可能写入不同的 payload，V3-to-V4 格式迁移边也可能把未知的 ignorable V3 事件改名放入同一个 `plugin:` 命名空间。删除或重命名声明不会丢弃已存记录。[ignorable 事件决策](../../../.agents/notes/implemented/architecture/2026-08-30-retain-ignorable-external-session-events.zh.md)定义兼容性策略。
+
 ### 派生会话的 fork
 
-`ctx.sessions.fork(source, boundary?, childSessionId?)` 选取截至 `boundary` 事件序号（含该事件）的源事件（默认：当前最后一个事件），要求所选前缀结束时没有开放轮次，再创建带谱系元数据的实时子会话。必须在轮次中途分支的工具时委派会裁剪到已完成前缀。
+`ctx.sessions.fork(source, boundary?, childSessionId?)` 从实时源会话复制包含切点的精确事件前缀（默认：最后一个事件）。`dsh-session/fork` 的 `buildForkSeed` 在复制事件之后放置继承标记，仅为开放步骤补缺失的错误工具结果，并以 `forked` 原因关闭步骤和轮次。已关闭的步骤与轮次保持原样，包括历史缺失结果。标记和结束事件属于子会话；`inheritedEventCount` 只统计复制的前缀。
 
 逻辑 `SessionHeader.isSeeded` 字段报告是否存在 fork 历史，而不公开位置整数。`Session.inheritedEventCount` 保留经过校验的精确 `SessionLogOffset`；`ownEvents()` 返回从该切点开始的事件，`isOwnSeq(seq)` 只接受已存在且由子会话拥有的位置。底层带 seed 构造必须显式提供 `seed` 与 `inheritedEventCount`，因为构造 seed 可以在继承前缀之后包含子会话自有的设置事件。
+
+`session.append(type, data, ...opts)` 追加一个事件并返回该事件。`session.append(inputs)` 接受位置参数元组 `[type, data, ...opts]`（`SessionEventInput`）的只读数组，并按输入顺序返回已提交事件；空数组不追加任何内容。数组准入会在改变日志或surface前验证所有候选和同步分发，因此观察者读取完整的已提交组。持久化监听器保留各自的持久性规则；仅数组准入不保证进程崩溃时整组存储的原子性。
 
 ### 刷新持久状态
 
@@ -98,16 +118,19 @@ session.deriveMessages()         // the derived model history
 | [`src/surface.ts`](src/surface.ts) | 有序 surface 投影、替换校验、`deriveEventMessage` |
 | [`src/request-header.ts`](src/request-header.ts) | `request/header` 折叠与重建 |
 | [`dsh-util-values`](../../util/values/README.zh.md) | 共享无损 JSON 校验与分离式快照 |
-| [`src/repair.ts`](src/repair.ts) | 崩溃遗留日志的冷修复 |
-| [`src/invariant.ts`](src/invariant.ts) | 不变式配套：序号、轮次／步骤闭合、工具调用／结果配对 |
+| [`src/repair.ts`](src/repair.ts) | 失败步骤、中断日志与 fork 种子共享的工具结果恢复 |
 
 ### 追加校验
 
 每次追加都会使用共享的迭代式 `snapshotJsonValue()` 流程，对每个嵌套值只读取、校验并复制一次，因此有状态的 getter 无法给校验提供一个值、给存储提供另一个值。非无损 JSON 载荷（BigInt、循环、稀疏数组、`-0`、特殊原型）会在追加位置被拒绝，先于任何后端刷新。追加路径会构造每个 `SessionSeq`；surface 事件还会校验标记形态、被引用的源事件序号，以及替换的完整遮蔽节点覆盖。
 
+### 共享恢复逻辑
+
+`ToolCallRecovery` 从已提交事件中跟踪尚无结果的请求，不保留事件历史。AgentLoop 观察实时步骤；崩溃恢复与 fork 种子构造通过 `openTurnClosers` 回放各自的前缀。实时失败与崩溃恢复默认使用中断结果文案；fork 构造传入 fork 原因，以选择其专用的重试指引。调用方在关闭步骤之前追加恢复结果（[参考](../agent-loop/README.zh.md)）。
+
 ### 派生历史
 
-`deriveMessages()` 缓存深度冻结的派生消息，每次调用返回新数组。四种 surface 事件类型（`system/message`、`user/message`、`assistant/message`、`tool/result`）提供记录的消息身份和内容，空内容的系统节点不派生消息。插件拥有的投影修改派生内容，不修改记录的消息。替换和投影决策使缓存失效。嵌入式 Assistant stream 与 `assistant/attempt` 事件只保留回放和诊断数据。
+`deriveMessages()` 缓存深度冻结的派生消息，每次调用返回新数组。surface 事件类型（`system/message`、`developer/message`、`user/message`、`assistant/message`、`tool/result`）提供记录的消息身份和内容，空内容的 system 和 developer 节点不派生消息。插件拥有的投影修改派生内容，不修改记录的消息。替换和投影决策使缓存失效。嵌入式 Assistant stream 与 `assistant/attempt` 事件只保留回放和诊断数据。普通提示与注入上下文在派生时不会按类型或来源自动添加包装。生产方负责记录内容中的所有框定格式。
 
 ### 请求头
 
@@ -137,7 +160,7 @@ session.deriveMessages()         // the derived model history
 
 #### 模型看到什么
 
-模型会接收 `system/message`、`user/message`、`assistant/message` 与 `tool/result` surface 条目中的消息，并应用日志中的投影，系统提示词在先。消息标识、角色、来源及未修改的内容块保持不变，投影不生成标识。直接提示词与注入上下文仍是独立的 `user/message` 事件，各事件的来源保留其出处。嵌入式 stream、`assistant/attempt`、边界与其他仅日志事实不添加消息。
+模型会接收 `system/message`、`developer/message`、`user/message`、`assistant/message` 与 `tool/result` surface 条目中的消息，并应用日志中的投影，系统提示词在先。消息标识、角色、来源及未修改的内容块保持不变，投影不生成标识。直接提示词与注入上下文仍是独立的 `user/message` 事件，各事件的来源保留其出处。嵌入式 stream、`assistant/attempt`、边界与其他仅日志事实不添加消息。
 
 #### Token 影响
 
@@ -147,15 +170,15 @@ session.deriveMessages()         // the derived model history
 
 追加的 surface 条目会保留可复用前缀。即使底层事件日志保持仅追加，`replace` 操作也会从首条被遮蔽消息起使缓存复用失效。
 
-### 崩溃修复结果
+### 工具结果恢复与 fork 结果
 
 #### 模型看到什么
 
-如果恢复发现 assistant 工具请求没有持久 `tool/call`，其合成 `TOOL_NOT_STARTED` 结果内容为 `The tool call was interrupted before the Harness recorded it as started. Retry it if it is still needed.`。如果持久 `tool/call` 没有结果，其 `TOOL_OUTCOME_UNKNOWN` 结果内容为 `The tool call was interrupted after it was recorded, but no result was durably recorded. Its outcome is unknown. Decide whether to retry from the tool semantics: retry only if the operation is read-only or idempotent; if it may have side effects, first verify external state or ask the user. Do not retry blindly.`。
+如果恢复发现 assistant 工具请求没有持久 `tool/call`，其合成 `TOOL_NOT_STARTED` 结果内容为 `The tool call was interrupted before the Harness recorded it as started. Retry it if it is still needed.`。如果持久 `tool/call` 没有结果，其 `TOOL_OUTCOME_UNKNOWN` 结果内容为 `The tool call was interrupted after it was recorded, but no result was durably recorded. Its outcome is unknown. Decide whether to retry from the tool semantics: retry only if the operation is read-only or idempotent; if it may have side effects, first verify external state or ask the user. Do not retry blindly.`。 Fork 生成的结果只描述继承记录：父会话可能已经在所选事件之后启动或完成调用。`TOOL_NOT_STARTED` 表示前缀中没有启动记录；`TOOL_OUTCOME_UNKNOWN` 表示有启动记录但没有结果。两者都要求模型仅对只读或幂等操作直接重试；有副作用的操作需要先验证外部状态或询问用户。参见 [fork 参考](src/fork.ts)。
 
 #### Token 影响
 
-未受损会话的 token 增量为零。恢复时，每个修复后的调用都会添加保留的、针对具体风险的错误文本。
+未受损会话的 token 增量为零。每个修复后的调用都会向后续请求添加保留的、针对具体风险的错误文本。
 
 #### KV Cache 影响
 
@@ -165,7 +188,7 @@ session.deriveMessages()         // the derived model history
 
 #### 模型看到什么
 
-会话会重建循环实际发送的工具 schema 与调用配置；系统提示词作为 surface 第 0 号节点、并在历史内更新之后作为最新的系统节点，属于 `deriveMessages()` 的一部分。请求头事件不向历史加入任何消息，也不持有提示词的副本。
+会话从请求头重建有效工具模式和调用配置；提供方专用的延迟声明与保留声明在分发时派生。`toolHistory()` 缓存对已提交请求头和 developer 消息的有状态归约，后续读取仅处理新增事件。它通过历史 `headerSeq` 解析添加定义，返回不可变快照，并在显式新请求序列或保留定义发生变化时重新建立声明。以未变化的定义恢复保留名称时序列继续，由记录的添加重新提供该工具。循环请求和压缩调用均使用此状态。 请求头缺少对应更新记录时，使用完整有效声明。 允许同名工具的 schema 变化，即使在 `in-history` 路由上也会使前缀复用失效；注册时对照历史工具进行拒绝检查留待后续实现（[原因](../../../.agents/notes/implemented/architecture/2026-09-20-dynamic-tool-updates.zh.md)）。系统提示词仍属于 `deriveMessages()`；请求头事件不添加消息或提示词副本。
 
 #### Token 影响
 
@@ -182,8 +205,8 @@ session.deriveMessages()         // the derived model history
 
 这些限制说明会话存储何时需要特别留意。它们是当前包约束，不是任务积压。
 
-- **`fork()` 仅在实时会话的稳定边界处切分**：所选前缀结束时不得有开放轮次，且源会话必须位于存储中；fork API 不支持对已持久化但未加载的会话进行 fork。
-- **`SESSION_FORMAT_VERSION` 命名[当前逻辑表示](../../../docs/session-format-status.zh.md)**——当前读取器拒绝已退役的 `header.system`，并校验 `system/message` 载荷与受保护头节点的重写。历史 header 与事件归相邻格式包所有；相邻迁移链在构造 `Session` 前转换受支持的历史，写打开只发布当前格式的后继代际。同版本未知事件要求信封显式带有 `ignorable` 标记，但这不保证结构迁移的安全性（[机制](../../../.agents/notes/implemented/architecture/2026-08-31-released-session-format-migrations.zh.md)）。
+- **Store API 仅接受活跃源会话** — 已持久化但未加载的源会话通过 Host 观察路径处理。Fork 仅闭合开放尾部，不修复先前已闭合步骤中缺失的结果。
+- **`SESSION_FORMAT_VERSION` 命名[当前逻辑表示](../../../docs/session-format-status.zh.md)**——当前读取器拒绝已退役的 `header.system`，并校验 `system/message` 载荷与受保护头节点的重写。历史 header 与事件归相邻格式包所有；[相邻迁移链](../../session/session-format-catalog/README.zh.md)在构造 `Session` 前转换受支持的历史，写打开只发布当前格式的后继代际。同版本未知事件要求信封显式带有 `ignorable` 标记，但这不保证结构迁移的安全性（[机制](../../../.agents/notes/implemented/architecture/2026-08-31-released-session-format-migrations.zh.md)）。[读取器兼容性](../../../.agents/notes/implemented/process/2026-10-08-session-reader-compatibility-review.zh.md)决定变更是否需要升版本。
 - **`TurnEndReasonMap` 不含 ACP（Agent Client Protocol）命名的 `refusal`／`max_turn_requests` 变体**：受生产方约束；只有当适配器或循环首次产生这些变体时才加入。
 - **fork 之外没有会话树**：基于分支会话的 pi 风格条目树被推迟，除非消费方需要超越基于边界的 forking 的能力。
 

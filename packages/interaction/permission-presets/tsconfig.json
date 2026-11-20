@@ -9,6 +9,9 @@
   ],
   "references": [
     {
+      "path": "../../util/brand"
+    },
+    {
       "path": "../../../vendor/cosmokit"
     },
     {
@@ -33,19 +36,16 @@
       "path": "../user-approval"
     },
     {
-      "path": "../../runtime-diagnostics/invariants"
-    },
-    {
       "path": "../../session/session-projection"
-    },
-    {
-      "path": "../../settings/settings"
     },
     {
       "path": "../commands"
     },
     {
       "path": "../../typert/protocol"
+    },
+    {
+      "path": "../../settings/settings"
     }
   ]
 }

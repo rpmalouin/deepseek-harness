@@ -3,10 +3,14 @@ import { Context } from '@deepseek-ai/cordis'
 import { createScope, scopeOf } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { ApprovalCard } from '../src/client/ApprovalCard.tsx'
+import { ApprovalWarning } from '../src/client/ApprovalWarning.tsx'
+import { Modal } from '@deepseek-ai/dsh-client-ui-primitives'
+import type { FactoryComponentPropsOf } from '@deepseek-ai/dsh-client-ui-slots'
 import { ApprovalPanel } from '../src/client/ApprovalPanel.tsx'
-import type { ApprovalComposerProps } from '../src/client/contract/slots.ts'
+import type { ApprovalCardInput, ApprovalComposerProps, ApprovalInjected } from '../src/client/contract/slots.ts'
 import { PendingApproval } from '../src/client/contract/slots.ts'
 import { apply, inject } from '../src/client/index.ts'
 import { apply as nodeApply } from '../src/index.ts'
@@ -17,6 +21,7 @@ type ApprovalListener = (
     toolName: string
     callId?: string
     reason?: string
+    displayReason?: PendingApproval['displayReason']
     signal?: AbortSignal
   },
   next: () => Promise<'unavailable'>,
@@ -31,21 +36,24 @@ interface PluginBench {
   readonly disposeLocale: ReturnType<typeof vi.fn>
   readonly register: ReturnType<typeof vi.fn>
   readonly injectSlot: ReturnType<typeof vi.fn>
+  readonly shortcuts: ReturnType<typeof vi.fn<(entry: { label: () => string }) => () => void>>
   releasePending(): Promise<void>
   registration(): {
     options: {
       select(props: { pendingInteraction: PendingApproval | undefined }): PendingApproval | null
+      inject(): ApprovalInjected
     }
     component: unknown
   }
 }
 
-function setupPlugin(): PluginBench {
+async function setupPlugin(): Promise<PluginBench> {
   const ctx = new Context()
   let listener: ApprovalListener | undefined
   let registration: {
     options: {
       select(props: { pendingInteraction: PendingApproval | undefined }): PendingApproval | null
+      inject(): ApprovalInjected
     }
     component: unknown
   } | undefined
@@ -79,12 +87,17 @@ function setupPlugin(): PluginBench {
   } as never)
   ctx.provide('sessions', { scopeOf } as never)
   ctx.provide('uiSession', { registerPendingInteraction } as never)
-  ctx.provide('slots', { inject: injectSlot, register } as never)
+  ctx.provide('slots', { inject: injectSlot, register, registerFactory: vi.fn() } as never)
+  const shortcuts = vi.fn((entry: { label: () => string }) => { entry.label(); return () => {} })
+  ctx.provide('shortcuts', { registerFixed: shortcuts } as never)
   ctx.provide('locale', {
+    bind: () => (key: string) => key,
     register: vi.fn(() => disposeLocale),
+    resolveText: (reason: NonNullable<PendingApproval['displayReason']>) => reason.en,
   } as never)
 
-  apply(ctx)
+  const fiber = ctx.plugin({ apply })
+  await fiber.await()
   if (listener === undefined) throw new Error('approval listener was not registered')
   return {
     ctx,
@@ -95,6 +108,7 @@ function setupPlugin(): PluginBench {
     disposeLocale,
     register,
     injectSlot,
+    shortcuts,
     async releasePending() {
       const delegates = [...pending.values()]
       pending.clear()
@@ -111,7 +125,9 @@ const id = (value: string): SessionId => value as SessionId
 
 afterEach(() => {
   cleanup()
+  vi.useRealTimers()
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
 })
 
 describe('PendingApproval', () => {
@@ -198,7 +214,7 @@ describe('PendingApproval', () => {
 
 describe('approval Remote Event consumer', () => {
   it('delegates an event that has no Agent scope', async () => {
-    const bench = setupPlugin()
+    const bench = await setupPlugin()
     const next = vi.fn(() => Promise.resolve<'unavailable'>('unavailable'))
 
     await expect(bench.listener.call(bench.ctx, { toolName: 'bash' }, next))
@@ -206,10 +222,11 @@ describe('approval Remote Event consumer', () => {
     expect(next).toHaveBeenCalledOnce()
     expect(bench.pending.getSnapshot()).toEqual([])
     expect(bench.register).toHaveBeenCalledOnce()
+    expect(bench.shortcuts.mock.calls.map(([entry]) => entry.label())).toEqual(['allow', 'reject'])
   })
 
   it('publishes one scoped takeover, returns the answer, and keeps stable registrations', async () => {
-    const bench = setupPlugin()
+    const bench = await setupPlugin()
     const scope = createScope(bench.ctx, id('s1'))
     await scope.fiber.await()
     const controller = new AbortController()
@@ -218,12 +235,15 @@ describe('approval Remote Event consumer', () => {
       toolName: 'bash',
       callId: 'call-1',
       reason: 'needs access',
+      displayReason: { en: 'Display reason', zh: '展示原因' },
       signal: controller.signal,
     }, next)
     const pending = bench.pending.getSnapshot()[0]!
     const { options, component } = bench.registration()
 
     expect(component).toBe(ApprovalPanel)
+    expect(pending.displayReason).toEqual({ en: 'Display reason', zh: '展示原因' })
+    expect(options.inject().resolveReason(pending.displayReason!)).toBe('Display reason')
     expect(options.select({ pendingInteraction: undefined })).toBeNull()
     expect(options.select({ pendingInteraction: pending })).toBe(pending)
     expect(pending).toMatchObject({
@@ -245,7 +265,7 @@ describe('approval Remote Event consumer', () => {
   })
 
   it('propagates request cancellation after removing the pending object', async () => {
-    const bench = setupPlugin()
+    const bench = await setupPlugin()
     const scope = createScope(bench.ctx, id('s1'))
     await scope.fiber.await()
     const controller = new AbortController()
@@ -265,7 +285,7 @@ describe('approval Remote Event consumer', () => {
   })
 
   it('delegates an active request when its interaction domain unloads', async () => {
-    const bench = setupPlugin()
+    const bench = await setupPlugin()
     const scope = createScope(bench.ctx, id('s1'))
     await scope.fiber.await()
     const next = vi.fn(() => Promise.resolve<'unavailable'>('unavailable'))
@@ -281,7 +301,7 @@ describe('approval Remote Event consumer', () => {
   })
 
   it('publishes a scoped request without optional request metadata', async () => {
-    const bench = setupPlugin()
+    const bench = await setupPlugin()
     const scope = createScope(bench.ctx, id('s1'))
     await scope.fiber.await()
     const result = bench.listener.call(scope.ctx, { toolName: 'read' }, () => Promise.resolve('unavailable'))
@@ -297,7 +317,7 @@ describe('approval Remote Event consumer', () => {
   })
 
   it('removes stable registrations with the plugin lifetime', async () => {
-    const bench = setupPlugin()
+    const bench = await setupPlugin()
     await bench.ctx.fiber.dispose()
     expect(bench.disposeSlot).toHaveBeenCalledOnce()
     expect(bench.disposeLocale).toHaveBeenCalledOnce()
@@ -306,7 +326,7 @@ describe('approval Remote Event consumer', () => {
 
 function panelProps(
   pending: PendingApproval,
-  renderSlot: ApprovalComposerProps['renderSlot'] = vi.fn(() => null),
+  renderSlot: FactoryComponentPropsOf<'conversation.approval.card'>['renderSlot'] = vi.fn(() => null),
 ): ApprovalComposerProps {
   const messages: Record<string, string> = {
     waiting: 'Waiting',
@@ -314,12 +334,15 @@ function panelProps(
     escalation: `Tool ${pending.toolName} asks`,
     reject: 'Reject',
     allowOnce: 'Allow once',
+    allowAlways: 'Always allow',
   }
   return {
     matched: pending,
-    renderSlot,
+    renderFactorySlot: (_name: string, input: ApprovalCardInput) => <ApprovalCard {...{ ...input, renderSlot,
+      t: (key: string) => messages[key] ?? key } as FactoryComponentPropsOf<'conversation.approval.card'>} />,
+    resolveReason: (reason: NonNullable<PendingApproval['displayReason']>) => reason.en,
     t: (key: string) => messages[key] ?? key,
-  } as unknown as ApprovalComposerProps
+  } as ApprovalComposerProps
 }
 
 describe('ApprovalPanel', () => {
@@ -329,10 +352,12 @@ describe('ApprovalPanel', () => {
     render(<ApprovalPanel {...props} />)
 
     expect(screen.getByText('Tool bash asks')).toBeTruthy()
+    expect(document.querySelector('[data-approval-key] [data-state="warning"]')).not.toBeNull()
     expect(screen.getByRole('group', { name: 'Approval details' })).toBeTruthy()
-    expect(props.renderSlot).not.toHaveBeenCalled()
+    expect(screen.queryByText('pnpm test')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Reject' }))
 
+    expect(document.querySelector('[data-approval-key]')?.getAttribute('aria-busy')).toBe('true')
     await expect(pending.result).resolves.toBe('rejected')
     expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Reject' }).disabled).toBe(true)
     expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Allow once' }).disabled).toBe(true)
@@ -353,8 +378,121 @@ describe('ApprovalPanel', () => {
       callId: 'call-1',
     })
     fireEvent.click(screen.getByRole('button', { name: 'Allow once' }))
+    expect(document.querySelector('[data-approval-key] [data-state="ongoing"]')).not.toBeNull()
+    expect(document.querySelector('[data-approval-key]')?.getAttribute('aria-busy')).toBe('true')
 
     await expect(pending.result).resolves.toBe('allowed-once')
+  })
+
+  it('keeps the audit reason intact and follows the UI language for presentation copy', () => {
+    const pending = new PendingApproval(id('s1'), {
+      toolName: 'bash',
+      reason: 'audit reason',
+      displayReason: { en: 'English explanation', zh: '中文说明' },
+    })
+    const props = panelProps(pending)
+    const view = render(<ApprovalPanel {...props} />)
+    expect(screen.getByText('English explanation')).toBeTruthy()
+    expect(screen.queryByText('audit reason')).toBeNull()
+    view.rerender(<ApprovalPanel {...props} resolveReason={reason => reason['zh']!} />)
+    expect(screen.getByText('中文说明')).toBeTruthy()
+    expect(pending.reason).toBe('audit reason')
+  })
+
+  it.each([['Enter', 'allowed-once'], ['Escape', 'rejected']] as const)(
+    'answers the focused container with %s through the pending request', async (key, outcome) => {
+      const pending = new PendingApproval(id('s1'), { toolName: 'bash' })
+      render(<ApprovalPanel {...panelProps(pending)} />)
+      const group = screen.getByRole('group', { name: 'Approval details' })
+      group.focus()
+      const bubbled = vi.fn()
+      window.addEventListener('keydown', bubbled)
+      try {
+        fireEvent.keyDown(group, { key, code: key })
+        await expect(pending.result).resolves.toBe(outcome)
+        expect(bubbled).not.toHaveBeenCalled()
+        expect(pending.answerable).toBe(false)
+      } finally { window.removeEventListener('keydown', bubbled) }
+    },
+  )
+
+  it('leaves button Enter to its native click and rejects from the reject button', async () => {
+    const pending = new PendingApproval(id('s1'), { toolName: 'bash' })
+    render(<ApprovalPanel {...panelProps(pending)} />)
+    const reject = screen.getByRole('button', { name: 'Reject' })
+    reject.focus()
+    expect(fireEvent.keyDown(reject, { key: 'Enter', code: 'Enter' })).toBe(true)
+    expect(pending.answerable).toBe(true)
+    // jsdom does not synthesize the browser's native button activation.
+    fireEvent.click(reject)
+    await expect(pending.result).resolves.toBe('rejected')
+  })
+
+  it('ignores unowned input, modified keys, repeats and IME candidate keys', async () => {
+    const pending = new PendingApproval(id('s1'), { toolName: 'bash', callId: 'call-1' as ToolCallId })
+    const renderSlot = () => <input aria-label="Approval input" />
+    render(<ApprovalPanel {...panelProps(pending, renderSlot)} />)
+    const group = screen.getByRole('group', { name: 'Approval details' })
+    fireEvent.keyDown(group, { key: 'Enter', code: 'Enter' })
+    expect(pending.answerable).toBe(true)
+    const input = screen.getByRole('textbox', { name: 'Approval input' })
+    input.focus()
+    fireEvent.keyDown(input, { key: 'Enter', code: 'Enter' })
+    fireEvent.keyDown(input, { key: 'Escape', code: 'Escape' })
+    group.focus()
+    expect(fireEvent.keyDown(group, { key: 'Tab', code: 'Tab' })).toBe(true)
+    fireEvent.keyDown(group, { key: 'Enter', code: 'Enter', ctrlKey: true })
+    fireEvent.keyDown(group, { key: 'Escape', code: 'Escape', repeat: true })
+    fireEvent.keyDown(group, { key: 'Enter', code: 'Enter', isComposing: true })
+    fireEvent.keyDown(group, { key: 'Enter', code: 'Enter', keyCode: 229 })
+    fireEvent.compositionStart(group)
+    fireEvent.keyDown(group, { key: 'Enter', code: 'Enter' })
+    fireEvent.compositionEnd(group)
+    fireEvent.keyDown(group, { key: 'Escape', code: 'Escape' })
+    expect(pending.answerable).toBe(true)
+    fireEvent.keyUp(group, { key: 'Escape', code: 'Escape' })
+    fireEvent.keyDown(group, { key: 'Enter', code: 'Enter' })
+    await expect(pending.result).resolves.toBe('allowed-once')
+  })
+
+  it('locks keyboard and click submissions synchronously while the answer is pending', async () => {
+    const pending = new PendingApproval(id('s1'), { toolName: 'bash' })
+    const gate = Promise.withResolvers<undefined>()
+    const answer = vi.spyOn(pending, 'answer').mockImplementation(() => gate.promise)
+    render(<ApprovalPanel {...panelProps(pending)} />)
+    const group = screen.getByRole('group', { name: 'Approval details' })
+    group.focus()
+    fireEvent.keyDown(group, { key: 'Enter', code: 'Enter' })
+    fireEvent.keyDown(group, { key: 'Escape', code: 'Escape' })
+    fireEvent.click(screen.getByRole('button', { name: 'Reject' }))
+    expect(answer).toHaveBeenCalledExactlyOnceWith('allowed-once')
+    await act(async () => { gate.resolve(undefined); await gate.promise })
+    pending.abort(new Error('test cleanup'))
+    await pending.result.catch(() => {})
+  })
+
+  it('does not settle an aborted request or let its late rejection unlock its replacement', async () => {
+    const first = new PendingApproval(id('s1'), { toolName: 'bash' })
+    const gate = Promise.withResolvers<undefined>()
+    vi.spyOn(first, 'answer').mockImplementation(() => gate.promise)
+    const view = render(<ApprovalPanel {...panelProps(first)} />)
+    let group = screen.getByRole('group', { name: 'Approval details' })
+    group.focus()
+    fireEvent.keyDown(group, { key: 'Enter', code: 'Enter' })
+    first.abort(new Error('request withdrawn'))
+    await first.result.catch(() => {})
+    const second = new PendingApproval(id('s1'), { toolName: 'read' })
+    view.rerender(<ApprovalPanel {...panelProps(second)} />)
+    await act(async () => { gate.reject(new Error('late transport failure')); await gate.promise.catch(() => {}) })
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Reject' }).disabled).toBe(false)
+    second.abort(new Error('request withdrawn'))
+    await second.result.catch(() => {})
+    const answer = vi.spyOn(second, 'answer')
+    group = screen.getByRole('group', { name: 'Approval details' })
+    group.focus()
+    fireEvent.keyDown(group, { key: 'Enter', code: 'Enter' })
+    fireEvent.click(screen.getByRole('button', { name: 'Reject' }))
+    expect(answer).not.toHaveBeenCalled()
   })
 
   it('re-enables actions when answering fails', async () => {
@@ -367,6 +505,7 @@ describe('ApprovalPanel', () => {
     await waitFor(() => {
       expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Allow once' }).disabled).toBe(false)
     })
+    expect(document.querySelector('[data-approval-key]')?.getAttribute('aria-busy')).toBe('false')
     pending.abort(new Error('test cleanup'))
     await pending.result.catch(() => {})
   })
@@ -377,4 +516,210 @@ describe('package entries', () => {
     expect(inject).toEqual(['sessions', 'remote', 'uiSession', 'slots', 'locale'])
     expect(() => { nodeApply() }).not.toThrow()
   })
+})
+
+it.each(['allow', 'reject', 'always', 'keyboard'] as const)('settles a fixed application decision through %s without free text', async (choice) => {
+  const onAllow = vi.fn(async () => {}), onReject = vi.fn(async () => {}), onAlways = vi.fn(async () => {})
+  const actions = { allow: onAllow, reject: onReject, always: onAlways }
+  render(<ApprovalCard {...{
+    requestKey: 'app-approval', title: 'Control this app?', description: 'Only for this task.',
+    subject: { name: 'Calculator', ...choice === 'keyboard' ? {} : { icon: 'data:image/png;base64,aWNvbg==' } }, allowLabel: 'Allow for this task',
+    canAnswer: () => true, onAllow, onReject, onAlways, renderSlot: vi.fn(() => null),
+    t: (key: string) => ({ reject: 'Reject', allowAlways: 'Always allow' })[key] ?? key,
+  } as FactoryComponentPropsOf<'conversation.approval.card'>} />)
+  expect(screen.getByText('Calculator')).toBeTruthy()
+  if (choice === 'keyboard') expect(document.querySelector('img')).toBeNull()
+  else expect(document.querySelector('img')?.getAttribute('src')).toBe('data:image/png;base64,aWNvbg==')
+  expect(screen.queryByRole('textbox')).toBeNull()
+  const action = choice === 'keyboard' ? 'allow' : choice
+  if (choice === 'keyboard') {
+    const detail = screen.getByRole('group')
+    detail.focus()
+    fireEvent.keyDown(detail, { key: 'Enter', code: 'Enter' })
+    fireEvent.keyDown(detail, { key: 'Enter', code: 'Enter' })
+  } else {
+    const label = { allow: 'Allow for this task', reject: 'Reject', always: 'Always allow' }[choice]
+    fireEvent.click(screen.getByRole('button', { name: label }))
+    fireEvent.click(screen.getByRole('button', { name: label }))
+  }
+  await waitFor(() => { expect(actions[action]).toHaveBeenCalledOnce() })
+  expect(Object.values(actions).filter(callback => callback.mock.calls.length > 0)).toEqual([actions[action]])
+})
+
+it('opens and dismisses risk details without answering the approval', () => {
+  const onAllow = vi.fn(async () => {}), onReject = vi.fn(async () => {})
+  const props = {
+    requestKey: 'risk-approval', title: 'Control this app?',
+    warning: { label: 'Risks', title: 'Computer use risks', detail: 'Background control.\n\nAccount restrictions.\n\nStop in DSH.' },
+    canAnswer: () => true, onAllow, onReject, renderSlot: () => null, t: (key: string) => key,
+  } as FactoryComponentPropsOf<'conversation.approval.card'>
+  const view = render(<ApprovalCard {...props} />)
+  const trigger = screen.getByRole('button', { name: 'Risks' })
+  vi.spyOn(trigger, 'matches').mockImplementation(selector => selector === ':focus-visible')
+  act(() => { trigger.focus() })
+  const dialog = screen.getByRole('dialog', { name: 'Computer use risks' })
+  expect([...dialog.querySelectorAll('p')].map(p => p.textContent).join('\n\n')).toBe(props.warning!.detail)
+  expect(document.activeElement).toBe(trigger)
+  expect(trigger.getAttribute('aria-expanded')).toBe('true')
+  act(() => { trigger.focus() })
+  fireEvent.keyDown(trigger, { key: 'Enter' })
+  expect(onAllow).not.toHaveBeenCalled()
+  fireEvent.keyDown(trigger, { key: 'Escape' })
+  expect(screen.queryByRole('dialog', { name: 'Computer use risks' })).toBeNull()
+  expect(onReject).not.toHaveBeenCalled()
+  expect(document.activeElement).toBe(trigger)
+  fireEvent.click(trigger)
+  fireEvent.pointerDown(document.body)
+  expect(screen.queryByRole('dialog', { name: 'Computer use risks' })).toBeNull()
+  fireEvent.click(trigger)
+  view.rerender(<ApprovalCard {...props} requestKey="replacement" />)
+  expect(screen.queryByRole('dialog', { name: 'Computer use risks' })).toBeNull()
+  expect(onAllow).not.toHaveBeenCalled()
+  expect(onReject).not.toHaveBeenCalled()
+})
+
+it('keeps risk details readable across the pointer gap and after a touch tap', () => {
+  vi.useFakeTimers()
+  vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: true, addEventListener() {}, removeEventListener() {} })))
+  render(<ApprovalWarning warning={{ label: 'Risks', title: 'Computer use risks', detail: 'Background control.' }} />)
+  const trigger = screen.getByRole('button', { name: 'Risks' })
+  const pointer = (target: Element, type: string, pointerType = 'mouse') => {
+    const event = new Event(type, { bubbles: true })
+    Object.defineProperty(event, 'pointerType', { value: pointerType })
+    fireEvent(target, event)
+  }
+  pointer(trigger, 'pointerover')
+  const dialog = screen.getByRole('dialog', { name: 'Computer use risks' })
+  expect(document.activeElement).toBe(document.body)
+  pointer(trigger, 'pointerout')
+  act(() => { vi.advanceTimersByTime(100) })
+  pointer(dialog, 'pointerover')
+  act(() => { vi.advanceTimersByTime(200) })
+  expect(screen.getByRole('dialog', { name: 'Computer use risks' })).toBe(dialog)
+  pointer(dialog, 'pointerout')
+  act(() => { vi.advanceTimersByTime(200) })
+  expect(screen.queryByRole('dialog')).toBeNull()
+  pointer(trigger, 'pointerover', 'touch')
+  expect(screen.queryByRole('dialog')).toBeNull()
+  fireEvent.click(trigger)
+  pointer(trigger, 'pointerout', 'touch')
+  act(() => { vi.advanceTimersByTime(200) })
+  expect(screen.getByRole('dialog', { name: 'Computer use risks' })).toBeTruthy()
+})
+
+it('leaves Escape to composition and dismisses risk details when a modal takes focus', () => {
+  const onClose = vi.fn()
+  const warning = <ApprovalWarning warning={{ label: 'Risks', title: 'Computer use risks', detail: 'Background control.' }} />
+  const view = render(warning)
+  fireEvent.click(screen.getByRole('button', { name: 'Risks' }))
+  fireEvent.compositionStart(document)
+  fireEvent.keyDown(document, { key: 'Escape' })
+  expect(screen.getByRole('dialog', { name: 'Computer use risks' })).toBeTruthy()
+  fireEvent.compositionEnd(document)
+  fireEvent.keyUp(document, { key: 'Escape' })
+  fireEvent.keyDown(document, { key: 'Escape', shiftKey: true })
+  expect(screen.getByRole('dialog', { name: 'Computer use risks' })).toBeTruthy()
+  view.rerender(<>{warning}<Modal open title="Foreground" closeLabel="Close modal" onClose={onClose} /></>)
+  const modal = screen.getByRole('dialog', { name: 'Foreground' })
+  expect(screen.queryByRole('dialog', { name: 'Computer use risks' })).toBeNull()
+  act(() => { modal.focus() })
+  fireEvent.keyDown(modal, { key: 'Escape' })
+  expect(onClose).toHaveBeenCalledOnce()
+  expect(document.activeElement).toBe(modal)
+  expect(screen.queryByRole('dialog', { name: 'Computer use risks' })).toBeNull()
+  fireEvent.click(screen.getByRole('button', { name: 'Risks' }))
+  expect(screen.queryByRole('dialog', { name: 'Computer use risks' })).toBeNull()
+  expect(document.activeElement).toBe(modal)
+})
+
+it('keeps risk details open for keyboard focus and closes when focus leaves', () => {
+  vi.useFakeTimers()
+  render(<>
+    <ApprovalWarning warning={{ label: 'Risks', title: 'Computer use risks', detail: 'Background control.' }} />
+    <button>Outside</button>
+  </>)
+  const trigger = screen.getByRole('button', { name: 'Risks' })
+  const focusVisible = vi.spyOn(trigger, 'matches').mockReturnValue(false)
+  act(() => { trigger.focus() })
+  expect(screen.queryByRole('dialog')).toBeNull()
+  fireEvent.click(trigger)
+  const dialog = screen.getByRole('dialog', { name: 'Computer use risks' })
+  vi.spyOn(dialog, 'matches').mockImplementation(selector => selector === ':focus-visible')
+  act(() => { dialog.focus() })
+  fireEvent.pointerLeave(dialog)
+  act(() => { vi.advanceTimersByTime(200) })
+  expect(screen.getByRole('dialog')).toBe(dialog)
+
+  focusVisible.mockImplementation(selector => selector === ':focus-visible')
+  act(() => { trigger.focus() })
+  fireEvent.pointerLeave(trigger)
+  act(() => { vi.advanceTimersByTime(200) })
+  expect(screen.getByRole('dialog')).toBe(dialog)
+  act(() => { screen.getByRole('button', { name: 'Outside' }).focus() })
+  expect(screen.queryByRole('dialog')).toBeNull()
+
+  fireEvent.click(trigger)
+  act(() => { screen.getByRole('dialog').focus() })
+  act(() => { screen.getByRole('dialog').blur() })
+  expect(screen.queryByRole('dialog')).toBeNull()
+})
+
+it('dismisses pointer-focused risk details when the pointer leaves', () => {
+  vi.useFakeTimers()
+  render(<ApprovalWarning warning={{ label: 'Risks', title: 'Computer use risks', detail: 'Background control.' }} />)
+  fireEvent.click(screen.getByRole('button', { name: 'Risks' }))
+  const dialog = screen.getByRole('dialog', { name: 'Computer use risks' })
+  vi.spyOn(dialog, 'matches').mockReturnValue(false)
+  act(() => { dialog.focus() })
+  fireEvent.pointerLeave(dialog)
+  act(() => { vi.advanceTimersByTime(200) })
+  expect(screen.queryByRole('dialog')).toBeNull()
+})
+
+it('ignores repeated Escape and restores focus when dismissing focused risk details', () => {
+  render(<ApprovalWarning warning={{ label: 'Risks', title: 'Computer use risks', detail: 'Background control.' }} />)
+  const trigger = screen.getByRole('button', { name: 'Risks' })
+  fireEvent.click(trigger)
+  const dialog = screen.getByRole('dialog', { name: 'Computer use risks' })
+  act(() => { dialog.focus() })
+  fireEvent.keyDown(dialog, { key: 'Escape', repeat: true })
+  expect(screen.getByRole('dialog')).toBe(dialog)
+  expect(document.activeElement).toBe(dialog)
+  fireEvent.keyDown(dialog, { key: 'Escape' })
+  expect(screen.queryByRole('dialog')).toBeNull()
+  expect(document.activeElement).toBe(trigger)
+})
+
+it('dismisses hover-open risks when focus moves elsewhere without taking focus on open', () => {
+  render(<>
+    <button>Before</button>
+    <ApprovalWarning warning={{ label: 'Risks', title: 'Computer use risks', detail: 'Background control.' }} />
+    <button>After</button>
+  </>)
+  const before = screen.getByRole('button', { name: 'Before' })
+  const after = screen.getByRole('button', { name: 'After' })
+  act(() => { before.focus() })
+  fireEvent.click(screen.getByRole('button', { name: 'Risks' }))
+  expect(document.activeElement).toBe(before)
+  expect(screen.getByRole('dialog', { name: 'Computer use risks' })).toBeTruthy()
+  act(() => { after.focus() })
+  expect(screen.queryByRole('dialog')).toBeNull()
+  expect(document.activeElement).toBe(after)
+})
+
+it.each(['window blur', 'hidden tab'] as const)('dismisses risk details on %s without restoring focus', (reason) => {
+  render(<ApprovalWarning warning={{ label: 'Risks', title: 'Computer use risks', detail: 'Background control.' }} />)
+  const trigger = screen.getByRole('button', { name: 'Risks' })
+  fireEvent.click(trigger)
+  fireEvent(document, new Event('visibilitychange'))
+  expect(screen.getByRole('dialog')).toBeTruthy()
+  if (reason === 'window blur') fireEvent(window, new Event('blur'))
+  else {
+    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden')
+    fireEvent(document, new Event('visibilitychange'))
+  }
+  expect(screen.queryByRole('dialog')).toBeNull()
+  expect(document.activeElement).toBe(document.body)
+  fireEvent(window, new Event('focus'))
+  expect(trigger.getAttribute('aria-expanded')).toBe('false')
 })

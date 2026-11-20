@@ -28,9 +28,9 @@ afterEach(async () => {
 describe('macOS packaged updater configuration', () => {
   it('uses the final generic Nightly provider configured for the build', () => {
     expect(resolveMacOSAppUpdateFeed([{ provider: 'generic', url: update.publicUrl, channel: 'nightly' }]))
-      .toEqual(update)
+      .toEqual({ ...update, channel: 'nightly' })
     for (const publish of [undefined, [], [{ provider: 'github', channel: 'nightly', url: update.publicUrl }],
-      [{ provider: 'generic', channel: 'latest', url: update.publicUrl }]]) {
+      [{ provider: 'generic', channel: 'invalid', url: update.publicUrl }]]) {
       expect(() => resolveMacOSAppUpdateFeed(publish)).toThrow(/macOS update config/u)
     }
   })
@@ -63,4 +63,13 @@ describe('macOS packaged updater configuration', () => {
     await expect(verifyMacOSAppUpdateConfig(paths.appPath, update, 'deepseek-harness-updater'))
       .rejects.toThrow(/expected deepseek-harness-updater/u)
   })
+})
+
+
+it('seals stable into the macOS updater file and rejects a different expected channel', async () => {
+  const paths = await fixture()
+  const stable = resolveMacOSAppUpdateFeed([{ provider: 'generic', url: update.publicUrl, channel: 'stable' }])
+  await writeMacOSAppUpdateConfig(paths.resourcesDir, stable, 'fixture-updater')
+  await expect(verifyMacOSAppUpdateConfig(paths.appPath, stable)).resolves.toBeUndefined()
+  await expect(verifyMacOSAppUpdateConfig(paths.appPath, update)).rejects.toThrow(/does not match/u)
 })

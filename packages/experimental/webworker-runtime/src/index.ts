@@ -11,8 +11,8 @@ export {
   type TunnelAbortFrame, type TunnelInboundFrame, type TunnelOutboundFrame, type TunnelRequestFrame,
   type TunnelRequestId, type TunnelResponseChunkFrame, type TunnelResponseEndFrame,
   type TunnelResponseErrorFrame, type TunnelResponseFrame, type TunnelResponseHeadFrame,
-  type TunnelStreamEndFrame, type TunnelStreamErrorFrame, type TunnelStreamItemFrame,
-  type TunnelStreamOpenFrame,
+  type TunnelStreamEndFrame, type TunnelStreamErrorFrame, type TunnelStreamUplinkEndFrame,
+  type TunnelStreamUplinkItemFrame, type TunnelStreamItemFrame, type TunnelStreamOpenFrame,
 } from './transport/frames.ts'
 export {
   DEFAULT_CONDITIONS, requireActiveModuleLoader, setActiveModuleLoader, WorkerModuleLoader,
@@ -35,18 +35,21 @@ export {
   createWorkerHost, type WorkerHost, type WorkerHostOptions,
 } from './worker-host.ts'
 export {
-  DEFAULT_ROOT, IMAGE_CONFIG_PATH, IMAGE_EMPTY_DIRECTORIES, IMAGE_FILE_NAME, IMAGE_HOME_DIRECTORY,
-  IMAGE_MANIFEST_PATH, IMAGE_OVERLAY_DIRECTORIES, LOWERING_VERSION, WRAPPER_PARAMS,
+  DEFAULT_ROOT, IMAGE_EMPTY_DIRECTORIES, IMAGE_FILE_NAME, IMAGE_HOME_DIRECTORY, IMAGE_LAZY_DIRECTORY,
+  IMAGE_MANIFEST_PATH, IMAGE_OVERLAY_DIRECTORIES, LOWERING_VERSION, PLATFORM_ENTRY_CONFIG, WRAPPER_PARAMS,
 } from './image-layout.ts'
 export {
+  parseImageManifest, type ImageLazyArchive, type ImageLazyFile, type ImageManifest,
+} from './image-manifest.ts'
+export {
   parsePreviewFixtureManifest, PREVIEW_FIXTURE_MANIFEST_FILE, PREVIEW_FIXTURE_MANIFEST_VERSION,
-  type PreviewFixtureManifest, type PreviewFixtureManifestEntry,
+  type PreviewFixtureManifest, type PreviewFixtureManifestEntry, type PreviewLink,
 } from './fixture-manifest.ts'
 export { loadVfsImage, loadVfsOverlay, MemoryVfs } from './storage/memory.ts'
 export { inflateImage, inflateImageStream } from './storage/image-gzip.ts'
 export { packTar, parseTar, type TarEntry } from './storage/tar.ts'
 export { requireActiveVfs, setActiveVfs } from './storage/active.ts'
 export {
-  type VfsDir, type VfsDirent, type VfsEncoding, type VfsError, type VfsFileHandle,
-  type VfsReadOptions, type VfsStats, type VfsWriteOptions,
+  type VfsDeferredArchive, type VfsDeferredFile, type VfsDir, type VfsDirent, type VfsEncoding, type VfsError,
+  type VfsFileHandle, type VfsReadOptions, type VfsStats, type VfsWriteOptions,
 } from './storage/types.ts'

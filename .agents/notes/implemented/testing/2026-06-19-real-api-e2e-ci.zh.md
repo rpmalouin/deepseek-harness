@@ -49,12 +49,12 @@ repo secret 命名为 `DEEPSEEK_API_KEY_EXTERNAL`；映射到适配器和测试�
 
 - **步骤级 secret。** `DEEPSEEK_API_KEY` 仅在 preflight 和 e2e 步骤的 `env:` 中设置，从不在 job 级设置——因此 checkout/setup-node/install 永远看不到它。依赖中被入侵的安装时生命周期脚本无法读取不在其环境中的 secret。
 - **`permissions: contents: read`。** job 仅读取仓库以运行测试；不需要写权限（无 PR 评论、无 status 写入），因此 `GITHUB_TOKEN` 降至最小权限。
-- **`DEEPSEEK_BASE_URL` 固定**为 e2e 步骤上的 `https://api.deepseek.com`。适配器在未设置时会默认使用此值（[packages/llm/llm-deepseek/src/index.ts](../../../../packages/llm/llm-deepseek/src/index.ts) `PUBLIC_BASE_URL`），但显式固定具有自文档性和密封性——仓库根目录的 `.env`（如果存在，`vitest.e2e.config.ts` 会加载它）无法静默地将运行重定向到其他端点。
+- **`DEEPSEEK_BASE_URL` 固定**为 e2e 步骤上的 `https://api.deepseek.com/anthropic`。适配器在未设置时会默认使用此值（[packages/llm/llm-deepseek/src/index.ts](../../../../packages/llm/llm-deepseek/src/index.ts) `PUBLIC_BASE_URL`），但显式固定具有自文档性和密封性——仓库根目录的 `.env`（如果存在，`vitest.e2e.config.ts` 会加载它）无法静默地将运行重定向到其他端点。
 - **不回显 secret。** preflight 仅打印 `DEEPSEEK_API_KEY present.`——不打印值或长度。
 
 ### 范围与运行时形态
 
-job 仅在 Node 24 上运行 `test:e2e`；无密钥门禁和版本兼容性属于主 CI 工作流。测试通过 workspace paths 映射以未构建形式运行，使用有界的可配置 worker 池、逐测试重试和 job 超时。[被取代 CI 的取消策略](../process/2026-09-09-cancel-superseded-ci.zh.md)会在 PR、push、schedule 和手动触发之间取消同一工作流/引用组内的旧运行；合并后或每夜触发并不保证完成。
+job 仅在 Node 24 上运行 `test:e2e`；无密钥门禁和版本兼容性属于主 CI 工作流。测试通过 workspace paths 映射以未构建形式运行，使用有界的可配置 worker 池、逐测试重试和 job 超时。[被取代 CI 的取消策略](../../../../.github/workflows/e2e.yml)会在 PR、push、schedule 和手动触发之间取消同一工作流/引用组内的旧运行；合并后或每夜触发并不保证完成。
 
 DeepSeek 原生 `web_search` 探测已注册但会跳过。线上 Anthropic 兼容端点可能返回成功响应却没有结构化来源块，因此对来源存在性的正向断言不是可靠的合并信号；单元测试仍会锁定响应解析行为，但 CI 不会验证线上端点返回的来源块协议格式（wire format）。
 

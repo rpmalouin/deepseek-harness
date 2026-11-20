@@ -1,59 +1,55 @@
 /** Browser-safe request, result, and lifecycle vocabulary for the Session Remote service. */
 
+import type {} from '@deepseek-ai/dsh-agent/types'
+import type { NativeFileApplication } from '@deepseek-ai/dsh-native-command/types'
 import type {
-  AttachmentIdType, ImageAttachmentLimits, ImageAttachmentRef, ImageMediaType,
+  ImageAttachmentLimits, ImageAttachmentRef, ImageMediaType,
 } from '@deepseek-ai/dsh-attachment'
 import type { Branded } from '@deepseek-ai/dsh-brand'
-import type { LlmAttemptId, MessageId } from '@deepseek-ai/dsh-llm/brand'
-import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import type { SessionId, SessionSeqCursor } from '@deepseek-ai/dsh-session/types'
-import type { SessionProjectionMap } from '@deepseek-ai/dsh-session-projection/types'
-import type { JobId } from '@deepseek-ai/dsh-jobs/brand'
+import type { LlmAttemptId, MessageId } from '@deepseek-ai/dsh-llm/types'
+import type { LlmModelBadge, TextBlock } from '@deepseek-ai/dsh-llm'
+import type { SessionId, SessionSeq, SessionSeqCursor } from '@deepseek-ai/dsh-session/types'
+import type { SessionProjectionMap, SessionProjectionSummaryExcluded, SessionProjectionSummaryValues } from '@deepseek-ai/dsh-session-projection/types'
+import type { Principal } from '@deepseek-ai/dsh-typert-protocol'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import type { WorkspaceId } from '@deepseek-ai/dsh-workspace/types'
 
+export type { SessionListMetadata } from '@deepseek-ai/dsh-session-query/types'
+
 declare module '@deepseek-ai/dsh-session-projection/types' {
-  interface SessionProjectionStateMap {
-    /** Host state persisted for cold Session list summaries. */
-    sessionListMetadata: SessionListMetadata
-    /** Host state for the boot-constant image-limit view. */
-    imageLimits: null
-    /** Durable model selection already used by a request and still pending for a later request. */
-    modelSelection: ModelSelectionProjectionState
-  }
   interface SessionProjectionMap {
-    /** Persisted facts used to summarize a Session without activating it. */
-    sessionListMetadata: SessionListMetadata
-    /** Image-intake limits enforced by the Session prompt endpoint. */
-    imageLimits: ImageAttachmentLimits
-    /** Durable model selection already used and selected for the next request. */
-    modelSelection: ModelSelectionProjection
-  }
-}
-
-declare module '@deepseek-ai/dsh-session/types' {
-  interface SessionEventMap {
+    /** Eligible latest failed turn/end for an empty prompt, or null. */
+    conversationContinuation: SessionSeq | null
     /**
-     * Complete validated model selection requested for subsequent prompt
-     * assembly. Log-only: it never enters derived model history.
+     * Image-intake limits enforced by the Session prompt endpoint. Boot
+     * constant, excluded from Session summary payloads: every Session shares
+     * it, so a list row would repeat one host-wide fact.
      */
-    'model/selection': ModelSelection
+    imageLimits: SessionProjectionSummaryExcluded<ImageAttachmentLimits>
   }
 }
 
-/** Persisted hints used to summarize a cold Session. */
-export interface SessionListMetadata {
-  /** Whether the folded prefix contains no turn. */
-  readonly blank: boolean
-  /** Latest human-authored prompt time in the folded prefix. */
-  readonly lastPromptAt: number | null
-}
-
-/** Every available cached wire value used as partial, possibly stale Session-list hints. */
+/**
+ * Summary wire values a Session-list row carries. A `sequenced` block carries
+ * every summary key computed at its `asOfSeq`; a `cached` block carries the
+ * values the persisted cache holds and may omit keys or trail the Session.
+ * The block omits the keys whose unit declares `summary: false`. `kind` and `asOfSeq` are independent facts: `kind` says
+ * which sequence space `asOfSeq` belongs to, and therefore how a client may
+ * merge the block; `asOfSeq` is the producer's watermark in that space.
+ */
 export interface SessionProjectionHints {
+  /**
+   * `sequenced`: the Host's live registry produced the block for an attached
+   * Session, so `asOfSeq` is comparable with baselines and frames of the same
+   * connection. `cached`: a header-only listing viewed the block from the
+   * persisted projection cache, so `asOfSeq` is the stored record's own
+   * watermark and must not be compared with the connected Session's values.
+   */
+  readonly kind: 'cached' | 'sequenced'
+  /** Watermark of the block in the sequence space named by `kind`. */
   readonly asOfSeq: number
-  /** Provider-validated values present in the cache; omitted keys remain unknown. */
-  readonly values: SessionProjectionValues
+  /** Provider-validated summary values present in the block; omitted keys remain unknown. */
+  readonly values: Partial<SessionProjectionSummaryValues>
 }
 
 /** Complete projection values at an exact Session event cursor. */
@@ -70,7 +66,8 @@ export type SessionProjectionValues = Partial<SessionProjectionMap>
 /**
  * Browser-submitted prompt content; the Host promotes image bytes to durable
  * references. File parts carry the opaque receipt returned by a preceding
- * `uploadFile` call on the same Session.
+ * upload on the same Session; the receipt of an image upload enters the
+ * message as that image.
  */
 export type PromptContentPart =
   | { readonly type: 'text'; readonly text: string }
@@ -87,22 +84,6 @@ export interface ModelSelection {
   readonly provider: string
   readonly model: string
   readonly reasoningEffort?: string
-}
-
-/** Host fold state for durable model selection. */
-export interface ModelSelectionProjectionState {
-  /** Selection consumed by the latest recorded model request. */
-  readonly lastUsed: ModelSelection | null
-  /** Later user selection not yet consumed by a matching model request. */
-  readonly pending: ModelSelection | null
-}
-
-/** Client view of the durable model-selection fold. */
-export interface ModelSelectionProjection {
-  /** Selection consumed by the latest recorded model request. */
-  readonly lastUsed: ModelSelection | null
-  /** Selection the next request should use, falling back to {@link lastUsed}. */
-  readonly next: ModelSelection | null
 }
 
 /** One adapter-owned reasoning effort for an exact model route. */
@@ -124,6 +105,8 @@ export interface ModelCatalogModel {
   readonly name: string
   readonly description?: string
   readonly reasoning?: ModelReasoning
+  /** Provider-authored label shown beside the name; display data only. */
+  readonly badge?: LlmModelBadge
 }
 
 /** One provider and its successfully loaded model catalog. */
@@ -143,7 +126,7 @@ export interface ModelCatalogFailure {
 /** Host-generation model catalog and the default used by unconfigured Sessions. */
 export interface ModelCatalog {
   readonly default: ModelSelection
-  /** Provider routes currently able to serve a request, including empty catalogs. */
+  /** Provider routes with at least one currently available catalog model. */
   readonly routableProviders: readonly string[]
   readonly groups: readonly ModelProviderGroup[]
   readonly failures: readonly ModelCatalogFailure[]
@@ -154,13 +137,17 @@ export type QueueAction =
   | {
     readonly kind: 'edit'
     /** Non-empty text-only replacement content. */
-    readonly content: readonly ContentBlock[]
+    readonly content: readonly TextBlock[]
   }
   | { readonly kind: 'remove' }
   | { readonly kind: 'steer' }
 
 /** One Session list entry. */
 export interface SessionSummary {
+  /** Whether this Session currently owns a live Agent. */
+  readonly agentAvailable: boolean
+  /** Current for attached Sessions; otherwise the persistence format status when reported. */
+  readonly formatStatus?: 'current' | 'migration-required'
   readonly sessionId: SessionId
   readonly updatedAt: number
   readonly running: boolean
@@ -185,12 +172,19 @@ export const SESSION_SEARCH_SNIPPET_MAX_CODE_POINTS = 240
 
 declare module '@deepseek-ai/dsh-typert-protocol' {
   interface RemoteErrorDetailsMap {
+    /** A wait observation ended before a stopping state; the caller should reread. */
+    'session/observation-ended': Record<string, never>
+    /** No state arrived before the deadline; a timeout after a state returns its value instead. */
+    'session/wait-timeout': Record<string, never>
+    'session/provider-credentials-unavailable': Record<string, never>
+    'session/provider-models-unavailable': { readonly provider: string }
     'session/model-unavailable': { readonly provider: string; readonly model: string }
     'session/conflict': {
       readonly sessionId: SessionId
       readonly requestedCwd: string
       readonly existingCwd?: string
     }
+    'session/projections-unavailable': Record<string, never>
     'session/writer-held': { readonly sessionId: SessionId }
     'session/agent-busy': { readonly reason: string }
     'session/invalid-time-zone': { readonly value: string }
@@ -198,13 +192,13 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
     'agent-preset/conflict': {
       readonly sessionId: SessionId
       readonly requestedPreset: string
-      readonly existingPreset?: string
     }
     'session/attachment-invalid': { readonly reason: string }
     'session/queue-item-not-found': { readonly itemId: MessageId }
     'session/steer-unavailable': { readonly itemId: MessageId }
     'session/title-invalid': { readonly sessionId: SessionId }
     'session/fork-unavailable': { readonly sessionId: SessionId }
+    'session/migration-required': { readonly sessionId: SessionId }
     'subagent/not-found': {
       readonly parentSessionId: SessionId
       readonly childSessionId: SessionId
@@ -262,17 +256,23 @@ export interface SessionSearchValue {
   readonly hasMore: boolean
 }
 
-/** Session creation or explicit-id adoption request. */
+/** Request for a Session for a new conversation. */
 export interface SessionCreateRequest {
+  /** Workspace the Session joins; exclusive with `cwd`. */
   readonly workspaceId?: WorkspaceId
+  /** Directory the Session owns when no Workspace is named. */
   readonly cwd?: string
+  /** Blank Session to reuse while it is reusable, or the identity of a new Session when none is stored under it. */
   readonly sessionId?: SessionId
+  /** Preset the Session runs, replacing a reused Session's recorded preset; the configured default when omitted. */
   readonly agentPreset?: string
 }
 
 /** Session creation response value. */
 export interface SessionCreateValue {
+  /** The created or reused Session, which may differ from the requested `sessionId`. */
   readonly sessionId: SessionId
+  /** Preset the Session runs, when the deployment composes a preset roster. */
   readonly agentPreset?: string
 }
 
@@ -301,7 +301,10 @@ export interface SessionRenameValue {
 /** Session fork request. */
 export interface SessionForkRequest {
   readonly sessionId: SessionId
+  /** Exact inclusive source event seq; omission selects the latest completed-turn prefix. */
   readonly atSeq?: number
+  /** False asks the Host to check for required migration before forking. Defaults to true. */
+  readonly allowMigration?: boolean
 }
 
 /** Identity of a newly forked Session. */
@@ -311,11 +314,11 @@ export interface SessionForkValue {
 
 /** Session prompt request. */
 export interface SessionPromptRequest {
-  /** Client-minted identity persisted on the exact accepted user message. */
+  /** Client-minted identity persisted on the accepted inbox input, including empty continuation. */
   readonly requestId: SessionRequestId
   readonly sessionId: SessionId
   readonly mode: 'queue' | 'steer'
-  /** At least one non-whitespace text part or attachment. */
+  /** Non-whitespace text or attachments; an empty array continues an eligible failed idle Session. */
   readonly content: readonly PromptContentPart[]
   readonly clientTimeZone?: string
 }
@@ -327,12 +330,14 @@ export interface SessionPromptValue {
 
 /** Durable image read request. */
 export interface SessionAttachmentRequest {
+  /** Gateway permission scope only; neither Session existence nor its image references are checked. */
   readonly sessionId: SessionId
-  readonly attachmentId: AttachmentIdType
+  readonly attachment: ImageAttachmentRef
 }
 
 /** Durable image read response value. */
 export interface SessionAttachmentValue {
+  /** Supplied reference after ID, format, byte length, and dimensions verification; display fields are preserved. */
   readonly attachment: ImageAttachmentRef
   readonly data: string
 }
@@ -363,6 +368,8 @@ export interface SessionCancelValue {
 export interface SessionOpenWorkspacePathRequest {
   /** File-manager navigation when requested; omission uses the default application. */
   readonly action?: 'reveal'
+  /** Registered application identifier; ignored for reveal. Omission preserves the operating system default. */
+  readonly application?: string
   /** Path after best-effort Session workspace resolution, in Host filesystem syntax. */
   readonly path: string
 }
@@ -377,8 +384,14 @@ export type SessionRequestId = Branded<'session-request-id'>
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
-    /** Browser prompt correlation and optional Host-validated time zone. */
-    'user-rpc': { kind: 'user'; rpcId: SessionRequestId; clientTimeZone?: string }
+    /**
+     * Browser prompt correlation, optional Host-validated time zone, and the
+     * caller that submitted the prompt. `principal` is written only for a
+     * caller other than the owner, so an absent `principal` means the owner.
+     */
+    'user-rpc': { kind: 'user'; rpcId: SessionRequestId; clientTimeZone?: string; principal?: Principal }
+    /** Empty retry user message with browser prompt correlation and caller metadata. */
+    'retry-rpc': { kind: 'retry'; rpcId: SessionRequestId; clientTimeZone?: string; principal?: Principal }
   }
 }
 
@@ -389,8 +402,19 @@ export type SessionAddress =
     readonly kind: 'subagent'
     readonly parentSessionId: SessionId
     readonly childSessionId: SessionId
-    readonly mode: 'one-shot' | 'continuable'
+    readonly mode: 'one-shot' | 'continuable' | 'unknown'
   }
+
+/** One non-activating Session projection read. */
+export interface SessionProjectionsRequest {
+  readonly sessionId: SessionId
+}
+
+/** Exact projections carry their event cut; required migration returns sequence-free cache hints. Null means absent. */
+export type SessionProjectionsValue =
+  | (SessionProjectionBaseline & { readonly kind: 'sequenced' })
+  | { readonly kind: 'migration-required'; readonly values: SessionProjectionValues }
+  | null
 
 /** One raw Session event in the Remote journal. */
 export interface SessionEventEntry {
@@ -440,16 +464,27 @@ export interface SessionWireEvent {
 /** One message-aligned backwards-history request. */
 export interface SessionPageRequest {
   readonly address: SessionAddress
-  /** Inclusive log cut obtained from the corresponding follow opening frame. */
-  readonly throughSeq: number
+  /**
+   * Inclusive log cut; omission selects the observed log end. A follow opening
+   * reports the cut it covered so a caller can pin the same point.
+   */
+  readonly throughSeq?: number
   readonly beforeSeq?: number
   readonly maxMessages?: number
+  /** Stop at a Turn start after both minima, unless maxMessages or history exhaustion wins. */
+  readonly turnWindow?: {
+    /** Minimum append-origin user/assistant messages; must not exceed maxMessages. */
+    readonly minMessages: number
+    /** Minimum Turn starts crossed, including the partial Turn at beforeSeq. */
+    readonly minTurns: number
+  }
 }
 
 /** One live event request for a durable Session address. */
-export interface SessionFollowRequest {
+export interface SessionFollowRequest extends Pick<SessionPageRequest, 'maxMessages' | 'turnWindow'> {
   readonly address: SessionAddress
-  readonly maxMessages?: number
+  /** Request background activation; omission leaves the read passive. */
+  readonly activate?: boolean
   /** Include process-local assistant presentation frames for the Web client. */
   readonly assistantStream?: true
 }
@@ -526,43 +561,118 @@ export type SessionFollowFrame =
   | SessionEventEntry
   | { readonly type: 'assistant-stream'; readonly frame: SessionAssistantStreamFrame }
 
-/** Browser-safe background-job row. */
-export interface SessionJob {
-  readonly id: JobId
-  readonly kind: string
-  readonly label: string
-  readonly status: 'running' | 'stopping' | 'completed' | 'killed' | 'failed'
-  readonly detail?: string
-  readonly startedAt: number
-  readonly finishedAt?: number
-}
-
 /** Complete live control baseline emitted once per control stream generation. */
 export interface SessionControlBaseline {
-  readonly jobs: Readonly<Record<SessionId, readonly SessionJob[]>>
   readonly projections: Readonly<Record<SessionId, SessionProjectionBaseline>>
 }
 
-/** One finished projection value and its durable watermark. */
+/**
+ * Projection changes caused by one committed Session event; the Host emits one
+ * update per event that changed at least one client-visible projection view.
+ */
 export interface SessionProjectionUpdate {
   readonly sessionId: SessionId
-  readonly key: string
-  readonly value: JsonValue
+  /** Seq of the committed event that caused every listed change. */
   readonly seq: number
+  /**
+   * One entry per client-visible key whose view the event changed, in
+   * registration order without duplicate keys, with the key's new value as
+   * `val`. A key absent from `changes` is unchanged; unlike a baseline, absence
+   * does not mean an absent capability.
+   */
+  readonly changes: readonly { readonly key: string; readonly val: SessionProjectionValue }[]
 }
 
 /** Host-wide live state stream. Each generation starts with exactly one baseline. */
 export type SessionControlFrame =
   | { readonly type: 'baseline'; readonly value: SessionControlBaseline }
-  | { readonly type: 'jobs'; readonly sessionId: SessionId; readonly jobs: readonly SessionJob[] }
   | ({ readonly type: 'projection' } & SessionProjectionUpdate)
+
+/** One pending live-Agent inbox item, preserving placement and content order. */
+export interface SessionQueuedItem {
+  readonly id: MessageId
+  readonly placement: 'queued' | 'steering' | 'context'
+  readonly rpcId?: SessionRequestId
+  readonly content: readonly JsonValue[]
+}
+
+/** State-owned classification of pending forwarded Remote events. */
+export type SessionPendingInput = 'approval' | 'question' | 'other'
+
+/** Passive Session state; a missing live Agent has no readable queue. */
+export interface SessionState {
+  readonly cursor: number
+  readonly active: boolean
+  readonly running: boolean
+  readonly queue: readonly SessionQueuedItem[] | null
+  /**
+   * Pending Remote requests sampled when this state was read. A pending change alone does not
+   * trigger `observeState`; `wait` refreshes on its own interval.
+   */
+  readonly pendingInput: readonly SessionPendingInput[]
+}
+
+/** Session identity for a passive state read or subscription. */
+export interface SessionStateRequest {
+  readonly sessionId: SessionId
+}
+
+/** Wait bounds and assistant output window; timeout omission uses the fixed 30-second default. */
+export interface SessionWaitRequest extends SessionStateRequest {
+  readonly timeoutMs?: number
+  /** Exclusive output cursor; omission includes all available assistant records. */
+  readonly afterSeq?: number
+  /** Positive assistant-record limit; omission uses the history message budget. */
+  readonly maxMessages?: number
+}
+
+/** Assistant messages after afterSeq through the stopping state's cursor, newest first. */
+export interface SessionWaitOutput {
+  readonly records: readonly SessionHistoryRecord[]
+  /** More eligible assistant messages exist in the selected interval. */
+  readonly truncated: boolean
+}
+
+/** A stopping condition, the last complete passive state and its bounded assistant output. */
+export interface SessionWaitValue {
+  readonly reason: 'idle' | 'input-required' | 'timeout'
+  readonly state: SessionState
+  readonly output: SessionWaitOutput
+}
+
+/**
+ * One `session.events` page (or its deprecated `page` alias) with its inclusive cut:
+ * the supplied `throughSeq`, otherwise the log end it was read at.
+ */
+export interface SessionEventsPage extends SessionPage {
+  readonly cursor: number
+}
+
+/** Address for a passive event subscription. */
+export interface SessionObserveEventRequest {
+  readonly address: SessionAddress
+}
+
+/** Readiness confirms subscription only; event continuity starts with the first delivered event. */
+export type SessionEventFrame =
+  | { readonly type: 'ready' }
+  | SessionEventEntry
+
+/** Projection changes caused by one committed event of the observed Session. */
+export type SessionProjectionChange = { readonly type: 'projection' } & Omit<SessionProjectionUpdate, 'sessionId'>
+
+/** Subscription readiness without a baseline, followed by one change frame per committed event. */
+export type SessionProjectionFrame =
+  | { readonly type: 'ready' }
+  | SessionProjectionChange
 
 declare module '@deepseek-ai/cordis' {
   interface Events {
     /**
-     * A Session became visible to Session list consumers.
+     * A Session became visible or its Agent was created or disposed.
+     * Consumers upsert the summary and replace its current running and availability state.
      * @mode emit
-     * @param summary - initial list row for the Session.
+     * @param summary - current list row for the Session.
      */
     'api-session/added'(summary: SessionSummary): void
     /**
@@ -597,3 +707,6 @@ declare module '@deepseek-ai/cordis' {
 
 /** JSON-compatible projection value accepted by list consumers. */
 export type SessionProjectionValue = JsonValue
+
+/** Application metadata returned by the serving desktop for one file. */
+export type SessionWorkspacePathApplication = NativeFileApplication

@@ -14,34 +14,6 @@
 import { createContext, runInContext, Script } from 'node:vm'
 import { sandboxDefineTool, sandboxRegisterTool } from './guard.ts'
 
-/** Exact Host closure symbols exposed by the sandbox and guarded Context. */
-export const HOST_BUILTIN_INSPECTION = [
-  {
-    name: 'ctx',
-    description: 'Restricted Cordis Context. Prefer ctx.get(name) with an undefined check; use inject for hard dependencies.',
-    signatures: [
-      'ctx.get(name: string): unknown | undefined',
-      'ctx.on(name: string, listener: Function): () => void',
-      'ctx.provide(name: string, value: unknown): () => void',
-      'ctx.effect(callback: Function, label?: string): () => void',
-    ],
-  },
-  {
-    name: 'harness',
-    description: 'Host helpers for Package-private Client RPC and model-visible dynamic Tools.',
-    signatures: [
-      'harness.handle(method: string, handler: (args: JsonValue) => JsonValue | Promise<JsonValue>): () => void',
-      'harness.defineTool(definition: ToolDefinition): ToolDefinition',
-      'harness.registerTool(ctx: Context, tool: ToolDefinition): () => void',
-    ],
-  },
-  { name: 'console', description: 'Package-tagged Host logging.', signatures: ['console.log(...values): void', 'console.error(...values): void'] },
-  { name: 'btoa', description: 'Encode UTF-8 text as base64.', signatures: ['btoa(value: string): string'] },
-  { name: 'atob', description: 'Decode base64 as UTF-8 text.', signatures: ['atob(value: string): string'] },
-  { name: 'TextEncoder', description: 'Standard UTF-8 encoder constructor.', signatures: ['new TextEncoder()'] },
-  { name: 'TextDecoder', description: 'Standard text decoder constructor.', signatures: ['new TextDecoder(label?: string)'] },
-] as const
-
 /**
  * A write-through console for one package, tagging every line with the package
  * id. Write-through (host stdout/stderr), NOT buffered into the tool result:
@@ -96,7 +68,7 @@ const TIMER_REDIRECT
 const NODE_API_REDIRECTS: Record<string, string> = {
   require:
     'Node modules are unavailable. Use the cordis services on ctx instead — e.g. inject: [\'fs\'] for files, '
-    + '[\'web\'] for HTTP, [\'bash\'] for processes; query Service.listService with cordis_inspect_query first.',
+    + '[\'web\'] for HTTP, [\'bash\'] for processes; query Service.listService with cordis_inspect first.',
   setTimeout: TIMER_REDIRECT,
   setInterval: TIMER_REDIRECT,
   setImmediate: TIMER_REDIRECT,
@@ -104,7 +76,7 @@ const NODE_API_REDIRECTS: Record<string, string> = {
   clearInterval: TIMER_REDIRECT,
   fetch:
     'Network access goes through the cordis web service: declare inject: [\'web\'] and call ctx.web '
-    + '(query Host Service.listService with cordis_inspect_query for its methods).',
+    + '(query Host Service.listService with cordis_inspect for its methods).',
 }
 
 /** Build the trap functions for {@link NODE_API_REDIRECTS}: calling one throws the redirect. */

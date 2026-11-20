@@ -1,4 +1,4 @@
-/** Browser availability/choice state and the launch carrier for the split button. */
+/** Shared directory application catalog, preference, and launch carrier for controls and menus. */
 
 import { createSnapshotStore, type SnapshotStore } from '@deepseek-ai/dsh-client-store'
 import {
@@ -6,18 +6,21 @@ import {
   type OpenInAppAppsPayload, type OpenInAppOpenPayload,
 } from '@deepseek-ai/dsh-host-open-in-app/shared'
 
-type Fetch = (input: string | URL, init?: RequestInit) => Promise<Response>
+import { APP_LABEL_KEY } from './applications.ts'
+import type { OpenInAppOutcome } from './outcome.ts'
 
-/** Resolve the browser's Host base with the connection carrier's null-origin fallback. */
-function hostBase(): string {
-  const origin = (globalThis as { location?: { origin?: string } }).location?.origin
-  return origin !== undefined && origin !== 'null' ? origin : 'http://dsh.internal'
+/** Shared launch status for controls targeting the captured workspace path. */
+export interface OpenInAppLaunchState {
+  readonly phase: 'idle' | 'busy' | 'error'
+  readonly path: string | null
 }
+
+type Fetch = (input: string | URL, init?: RequestInit) => Promise<Response>
 
 /**
  * Owns the once-per-page availability read, the persisted last choice, and
  * the launch POST. Availability and choice publish through uSES-safe sources
- * so every Session header shares one truth.
+ * so Session menus and directory controls share the same catalog and choice.
  */
 export class OpenInAppController {
   /** Installed app ids in host menu order; null until the host answered. */
@@ -26,6 +29,19 @@ export class OpenInAppController {
   readonly choice: SnapshotStore<string> = createSnapshotStore<string>('', {
     persist: { name: 'dsh.open-in-app.choice' },
   })
+
+  /** Current launch, shared by pointer and keyboard gestures. */
+  readonly operation = createSnapshotStore<OpenInAppLaunchState>({ phase: 'idle', path: null })
+
+  /**
+   * Resolve the remembered nameable installed application, with the button's first-app fallback.
+   * @returns the installed app id, or undefined while unavailable.
+   */
+  currentApp(): string | undefined {
+    const apps = (this.apps.getSnapshot() ?? []).filter(id => APP_LABEL_KEY[id] !== undefined)
+    const choice = this.choice.getSnapshot()
+    return apps.includes(choice) ? choice : apps[0]
+  }
 
   private loading: Promise<void> | undefined
 
@@ -49,39 +65,53 @@ export class OpenInAppController {
    * @param appId - catalog id from the availability list.
    */
   choose(appId: string): void {
-    this.choice.set(appId)
+    if (this.operation.getSnapshot().phase !== 'busy') this.choice.set(appId)
   }
 
   /**
    * Launch one installed app on a workspace directory.
    * @param appId - catalog id from the availability list.
    * @param path - the session's absolute workspace directory.
-   * @returns after the host acknowledged the launch; rejects on any failure.
+   * Concurrent gestures are ignored until the current Host request settles.
+   * @returns the acknowledged handoff, or `{ kind: 'skipped' }` while another
+   * launch holds the operation, or a named failure when the Host refuses or
+   * cannot be reached. Host and transport failures resolve without rejecting.
    */
-  async launch(appId: string, path: string): Promise<void> {
+  async launch(appId: string, path: string): Promise<OpenInAppOutcome> {
+    if (this.operation.getSnapshot().phase === 'busy') return { kind: 'skipped' }
+    this.operation.set({ phase: 'busy', path })
     const body: OpenInAppOpenPayload = { app: appId, path }
-    const response = await this.fetcher(new URL(OPEN_IN_APP_OPEN_ROUTE, hostBase()), {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    })
-    if (!response.ok) throw new Error(`open failed: HTTP ${String(response.status)}`)
+    try {
+      const response = await this.fetcher(OPEN_IN_APP_OPEN_ROUTE, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      if (!response.ok) throw new Error(`open failed: HTTP ${String(response.status)}`)
+      this.operation.set({ phase: 'idle', path })
+      return { kind: 'opened' }
+    } catch (_error) {
+      // Refusal and transport failure share the same user-visible outcome.
+      this.operation.set({ phase: 'error', path })
+      return { kind: 'failed', failure: 'openError' }
+    }
   }
 
   private async run(): Promise<void> {
     let apps: readonly string[] = []
+    let payload: OpenInAppAppsPayload | undefined
     try {
-      const response = await this.fetcher(new URL(OPEN_IN_APP_APPS_ROUTE, hostBase()), {
-        headers: { accept: 'application/json' },
-      })
-      if (response.ok) {
-        const payload = await response.json() as OpenInAppAppsPayload
-        if (Array.isArray(payload.apps)) apps = payload.apps.filter(id => typeof id === 'string')
-      }
-    } catch {
-      // Swallows network failures: an unreachable host reads as no apps, and
-      // the header simply shows no button rather than a broken one.
+      payload = await this.readAppsPayload()
+    } catch (_appsUnavailable) {
+      // An unreachable Host or an unreadable reply supplies no directory openers in menus or controls.
     }
+    if (Array.isArray(payload?.apps)) apps = payload.apps.filter(id => typeof id === 'string')
     this.apps.set(apps)
+  }
+
+  /** The Host's opener payload, or `undefined` for a non-OK reply; rejects when the Host or its reply is unreadable. */
+  private async readAppsPayload(): Promise<OpenInAppAppsPayload | undefined> {
+    const response = await this.fetcher(OPEN_IN_APP_APPS_ROUTE, { headers: { accept: 'application/json' } })
+    return response.ok ? await response.json() as OpenInAppAppsPayload : undefined
   }
 }

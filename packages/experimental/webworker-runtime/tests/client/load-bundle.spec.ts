@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, expect, it, vi } from 'vitest'
 import { WorkerTunnel } from '../../src/client/client.ts'
+import { packTar } from '../../src/storage/tar.ts'
 
 type StubListener = (event: { data?: unknown }) => void
 
@@ -30,6 +31,7 @@ afterEach(() => {
 })
 
 it('loads a combo map through the tunnel and embeds it in the blob script', async () => {
+  document.head.innerHTML = '<base href="/static/preview/">'
   const { worker, sent, deliver } = stubWorker()
   const tunnel = new WorkerTunnel(worker)
   const blobs: Blob[] = []
@@ -52,10 +54,11 @@ it('loads a combo map through the tunnel and embeds it in the blob script', asyn
     }
   })
 
-  const scriptUrl = '/plugins/??a/client.js,b/client.js&rev=abc'
-  const mapUrl = '/plugins/??a/client.js.map,b/client.js.map&rev=abc'
+  // The worker's Host starts at '/', independently of the preview document directory.
+  const scriptUrl = 'plugins/??a/client.js,b/client.js&rev=abc'
+  const mapUrl = '??a/client.js.map,b/client.js.map&rev=abc'
   const loading = tunnel.loadBundle(scriptUrl)
-  expect(sent[0]?.url).toBe(`http://localhost:3000${scriptUrl}`)
+  expect(sent[0]?.url).toBe(`http://localhost:3000/${scriptUrl}`)
   deliver({
     t: 'res',
     id: 1,
@@ -64,8 +67,8 @@ it('loads a combo map through the tunnel and embeds it in the blob script', asyn
     body: new TextEncoder().encode(`factory();\n//# sourceMappingURL=${mapUrl}\n`).buffer,
   })
   await vi.waitFor(() => { expect(sent).toHaveLength(2) })
-  expect(sent[1]?.url).toBe(`http://localhost:3000${mapUrl}`)
-  const map = '{"version":3,"sections":[]}'
+  expect(sent[1]?.url).toBe(`http://localhost:3000/plugins/${mapUrl}`)
+  const map = '{"version":3,"names":["中文"],"sections":[]}'
   deliver({
     t: 'res',
     id: 2,
@@ -81,4 +84,26 @@ it('loads a combo map through the tunnel and embeds it in the blob script', asyn
   const decoded = Uint8Array.from(atob(encoded), char => char.charCodeAt(0))
   expect(new TextDecoder().decode(decoded)).toBe(map)
   expect(revoked).toEqual(['blob:fixture-1'])
+})
+
+it('reads the package-asset archive through the tunnel into a synchronous resolver', async () => {
+  const { worker, sent, deliver } = stubWorker()
+  const tunnel = new WorkerTunnel(worker)
+  const NativeURL = URL
+  class StubURL extends NativeURL {
+    static override createObjectURL(): string { return 'blob:fixture-asset' }
+  }
+  vi.stubGlobal('URL', StubURL)
+  const reference = 'plugins/@fixture/ui/assets/mark-0123456789ab.svg'
+
+  const reading = tunnel.packageAssets()
+  expect(sent[0]?.url).toBe('http://localhost:3000/__assets__')
+  deliver({ t: 'res', id: sent[0]!.id, status: 200, headers: { 'content-type': 'application/x-tar' }, body: packTar({ [reference]: new TextEncoder().encode('<svg/>') }).slice().buffer })
+  const resolve = await reading
+  expect(resolve(reference)).toBe('blob:fixture-asset')
+  expect(resolve('plugins/other/assets/a.svg')).toBe('plugins/other/assets/a.svg')
+
+  const failing = tunnel.packageAssets()
+  deliver({ t: 'res', id: sent[1]!.id, status: 503, headers: { 'content-type': 'text/plain' }, body: new TextEncoder().encode('host failed').buffer })
+  await expect(failing).rejects.toThrow('web-preview tunnel: package assets failed with HTTP 503: host failed')
 })

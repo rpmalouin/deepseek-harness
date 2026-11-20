@@ -6,8 +6,9 @@
 
 import type { Branded } from '@deepseek-ai/dsh-brand'
 import type { FileAttachmentRef, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
-import type { ToolCallId, ProviderRequestId, ReasoningEffortId } from './brand.ts'
-import type { Message } from './message.ts'
+import type { LocalizedText } from '@deepseek-ai/dsh-package-manifest'
+import type { MessageId, ToolCallId, ProviderRequestId, ReasoningEffortId } from './brand.ts'
+import type { Message, UserMessage } from './message.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Events {
@@ -21,11 +22,18 @@ declare module '@deepseek-ai/cordis' {
      * @mode emit
      */
     'llm/adapters-updated'(): void
+    /**
+     * A provider's advertised models or display metadata changed; consumers reload `listModels()`.
+     * @mode emit
+     * @param provider - route whose model catalog changed.
+     */
+    'llm/models-updated'(provider: string): void
   }
 }
 
 export type {
   AssistantMessage,
+  DeveloperMessage,
   AssistantProviderMetadata,
   Message,
   MessageSource,
@@ -110,17 +118,28 @@ export interface ToolCallBlock {
   arguments: string
 }
 
-/** The result of a tool invocation, sent back to the model. */
-export interface ToolResultBlock {
-  type: 'tool-result'
-  toolCallId: ToolCallId
-  content: ContentBlock[]
-  isError?: boolean
+/** Activates a tool definition from the developer event's referenced request header. */
+export interface ToolAdditionBlock {
+  type: 'tool-addition'
+  /** Name of exactly one tool in the referenced historical header. */
+  toolName: string
+  /**
+   * Reserved against inline definitions; the historical request header owns the schema.
+   * @persistenceReserved
+   */
+  tool?: never
+}
+
+/** Records the dynamic removal of a tool identified by its session-local name. */
+export interface ToolRemovalBlock {
+  type: 'tool-removal'
+  toolName: string
 }
 
 /**
  * Merge-extensible content blocks keyed by `type`. New core blocks must land
- * with adapter, UI, and compaction support.
+ * with adapter, UI, and compaction support. Tool-change blocks belong to
+ * developer messages; `projectToolUpdates` selects what each route receives.
  */
 export interface ContentBlockMap {
   'text': TextBlock
@@ -128,7 +147,8 @@ export interface ContentBlockMap {
   'image': ImageBlock
   'file': FileBlock
   'tool-call': ToolCallBlock
-  'tool-result': ToolResultBlock
+  'tool-addition': ToolAdditionBlock
+  'tool-removal': ToolRemovalBlock
 }
 
 /** The block `type` tag vocabulary; widens as plugins add entries to {@link ContentBlockMap}. */
@@ -250,8 +270,26 @@ export interface LlmConfigurableProvider {
    * from outside.
    */
   declared?: boolean
+  /**
+   * Route endpoint the adapter uses when the profile sets no `baseURL`; the
+   * adapter may still send an individual model to that model's own endpoint.
+   * Absent when the route has no fixed endpoint.
+   */
+  defaultBaseURL?: string
+  /** Environment variables used to construct a provider endpoint; absent when none are reported. */
+  baseURLEnv?: readonly string[]
+  /** Authentication the adapter performs when the profile names no credential reference; absent when it reports none. */
+  nativeAuth?: LlmNativeAuth
   /** Configuration diagnostic for repair; unaffected models may remain serviceable. */
   error?: string
+}
+
+/** Authentication a provider route performs without a credential reference in its profile. */
+export interface LlmNativeAuth {
+  /** Environment variables the route's authentication reads, in lookup order; empty when it reads none. */
+  env: readonly string[]
+  /** Whether a stored OAuth sign-in can authenticate the route. */
+  oauth: boolean
 }
 
 /**
@@ -313,6 +351,20 @@ export interface LlmDiscoveredModel {
   inputModalities?: readonly ModelModality[]
 }
 
+/**
+ * Emphasis of a model badge: `neutral` states a plain fact, `info` highlights
+ * the model, `success` marks a benefit, and `warning` asks for attention.
+ */
+export type LlmModelBadgeTone = 'neutral' | 'info' | 'success' | 'warning'
+
+/** Short provider-authored label a selector shows beside one advertised model name. */
+export interface LlmModelBadge {
+  /** One literal, or translations keyed by lowercase language id with a required English entry. */
+  text: LocalizedText
+  /** Emphasis of the label. */
+  tone: LlmModelBadgeTone
+}
+
 /** One adapter-discovered model; catalog membership is advisory, not request validation. */
 export interface LlmModelInfo {
   /** Provider route that owns this model entry. */
@@ -325,6 +377,11 @@ export interface LlmModelInfo {
   description?: string
   /** Accepted request modalities; absent means unknown, while an explicit omission is negative capability. */
   inputModalities?: readonly ModelModality[]
+  /**
+   * Selector label advertised by catalog discovery; exact-route resolution
+   * omits it, and no model request or Session event carries it.
+   */
+  badge?: LlmModelBadge
 }
 
 /** Provider-owned context capacity for one exact provider/model route. */
@@ -365,7 +422,7 @@ export interface LlmReasoningEffortInfo {
 
 /** Selectable reasoning efforts for one exact provider/model route. */
 export interface LlmModelReasoningInfo {
-  /** Supported efforts in adapter-preferred display order. */
+  /** Supported efforts from least to greatest selectable reasoning effort, not predicted token use or latency. */
   efforts: readonly LlmReasoningEffortInfo[]
   /**
    * Adapter-configured default materialized into requests when callers omit
@@ -382,6 +439,17 @@ export interface LlmModelReasoningInfo {
  */
 export type SystemPromptUpdate = 'in-history'
 
+/**
+ * How a model accepts native tool declarations that change mid-conversation.
+ * `'addition-only'`: the model reads a `tool-addition` block in a later
+ * developer message as activating a tool declared with `deferLoading`, so an
+ * added tool follows the cached history instead of rewriting the declaration
+ * list. `'in-history'`: the model additionally reads `tool-removal` blocks,
+ * so a removed tool keeps its declaration and the removal follows the history.
+ * Absent means every request declares the complete current tool list.
+ */
+export type ToolUpdate = 'in-history' | 'addition-only'
+
 /** Exact-route model metadata resolved by its owning adapter. */
 export interface LlmResolvedModelInfo extends LlmModelInfo {
   /** Provider-owned context capacity when known. */
@@ -392,6 +460,8 @@ export interface LlmResolvedModelInfo extends LlmModelInfo {
   reasoning?: LlmModelReasoningInfo
   /** Declared mid-conversation system prompt handling; absent means only a leading system message is read. */
   systemPromptUpdate?: SystemPromptUpdate
+  /** Declared mid-conversation tool declaration handling; absent means every request declares the complete tool list. */
+  toolUpdate?: ToolUpdate
 }
 
 /**
@@ -445,14 +515,53 @@ export type StreamChunk =
  * it from this package.
  */
 export interface ToolSchema {
+  /**
+   * Requests deferred loading of the tool definition into model context,
+   * independently of whether a tool-addition block records the tool.
+   * Uses Anthropic's defer_loading terminology.
+   */
+  deferLoading?: true
   name: string
   description: string
   /** JSON Schema object for the arguments. */
   parameters: Record<string, unknown>
 }
 
-/** A single model request, fully assembled. */
-export interface GenerateOptions {
+/** User input for one LLM request; it has no durable Session identity or source. */
+export interface RequestUserInput {
+  readonly role: 'user'
+  readonly content: UserMessage['content']
+  readonly id?: never
+  readonly source?: never
+}
+
+/** A durable conversation message or a user input used only for one request. */
+export type RequestMessage = Message | RequestUserInput
+
+/** Logged tool declarations and update identities since the last declaration reset. */
+export interface ToolHistory {
+  /** Complete active declarations at the start of this history. */
+  readonly tools: readonly ToolSchema[]
+  /** Ordered developer messages, with additions resolved from their historical headers. */
+  readonly updates: readonly {
+    /** Identity used to locate this update in the derived request history. */
+    readonly messageId: MessageId
+    /** Added definitions resolved from the event's referenced request header. */
+    readonly additions: readonly ToolSchema[]
+  }[]
+}
+
+/** Auxiliary request purposes declared by their producer packages. */
+export interface LlmRequestPurposeMap {}
+
+/** Declared auxiliary request purpose; ordinary conversation requests leave it absent. */
+export type LlmRequestPurpose = Extract<keyof LlmRequestPurposeMap, string>
+
+/**
+ * A single model request, fully assembled.
+ * @typeParam Purpose - declared purpose keys for callers; forwarding adapters may accept `string`.
+ */
+export interface GenerateOptions<Purpose extends string = LlmRequestPurpose> {
   /** Registered provider route selecting the adapter instance. */
   provider: string
   model: string
@@ -462,9 +571,9 @@ export interface GenerateOptions {
    * Ordered conversation messages, exactly as the provider sees them. A
    * loop-built request passes the derived history (dsh-agent-loop), whose
    * leading system-role message carries the system prompt; a hand-built
-   * one-shot passes any list.
+   * one-shot may include identity-free user inputs.
    */
-  messages: Message[]
+  messages: RequestMessage[]
   /**
    * System prompt text for one-shot callers; adapters map it to the provider's
    * system slot ahead of `messages`. Loop-built requests leave it undefined.
@@ -472,6 +581,8 @@ export interface GenerateOptions {
   system?: string
   /** Tool schemas (adapters map to the provider's `tools` field). */
   tools?: ToolSchema[]
+  /** Session-folded tool history used for route projection; omission sends complete declarations without tool updates. */
+  toolHistory?: ToolHistory
   temperature?: number
   maxTokens?: number
   /**
@@ -488,8 +599,10 @@ export interface GenerateOptions {
   sessionId?: Branded<'SessionId'>
   /**
    * Provider-neutral classification for an auxiliary model call. Adapters may
-   * map the purpose to model-hidden transport metadata or purpose-specific
-   * generation policy. Ordinary conversation requests leave it unset.
+   * map the purpose to model-hidden transport metadata. Ordinary conversation
+   * requests leave it unset.
    */
-  purpose?: 'compaction' | 'session-title'
+  purpose?: Purpose
 }
+
+export type { MessageId, ToolCallId, ProviderRequestId, LlmAttemptId, ReasoningEffortId } from './brand.ts'

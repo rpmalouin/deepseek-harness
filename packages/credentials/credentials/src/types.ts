@@ -60,9 +60,8 @@ export interface GrantRecord {
 export type CredentialRecord = ApiKeyRecord | GrantRecord
 
 /**
- * Source and writability facts for one reference, safe for configuration UIs —
- * never the value. The view has no slot a value could ride in, which is what
- * lets the whole read half cross the Remote wire.
+ * Configuration facts and an optional provider-masked preview for one
+ * reference. The full credential is never part of this view.
  */
 export interface CredentialInfo {
   /** Whether resolving the reference would currently return a value. */
@@ -71,6 +70,8 @@ export interface CredentialInfo {
   source?: string
   /** Whether the active provider can write this reference. */
   writable: boolean
+  /** Provider-generated masked preview of a stored value; never the full value. */
+  masked?: string
 }
 
 declare module '@deepseek-ai/cordis' {
@@ -80,10 +81,7 @@ declare module '@deepseek-ai/cordis' {
      * `unset`, or an external edit observed in storage. Ambient
      * process-environment changes are not observable and never emit. Listener
      * failures are contained and logged — a sync throw and an async rejection
-     * alike — without changing the committed operation's outcome, except
-     * `INVARIANT`-coded failures, which rethrow after every listener ran;
-     * that rethrow reaches the emitter only from synchronous listeners, so
-     * invariant checks on this event must not be async functions.
+     * alike — without changing the committed operation's outcome.
      * @param ref - the reference whose stored value changed.
      * @mode emit
      */

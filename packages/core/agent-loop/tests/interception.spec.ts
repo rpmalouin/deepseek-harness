@@ -1,14 +1,18 @@
+import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import LlmRuntime, { createUserMessage, ToolCallId  } from '@deepseek-ai/dsh-llm'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import LlmRuntime, { createUserMessage, type ToolCallId  } from '@deepseek-ai/dsh-llm'
+import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 import SessionStore, {
-  SessionId,
+  type SessionId,
   type SessionEvent,
   type TurnEndReason,
   type UserMessage,
 } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
-import ToolRuntime, { defineContentToolFixture, type PostToolDecision, type PreToolDecision } from '@deepseek-ai/dsh-tools'
+import ToolRuntime, { type PostToolDecision, type PreToolDecision } from '@deepseek-ai/dsh-tools'
+import { defineContentToolFixture } from '@deepseek-ai/dsh-tool-testkit'
 import AgentRegistry, {
   type Agent,
   type PreStepDecision,
@@ -18,6 +22,17 @@ import AgentRegistry, {
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import { MockAdapter, textResponse, toolCallResponse } from './mock-adapter.ts'
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'a': { kind: 'a' } & ContextFormed
+    'accepted source': { kind: 'accepted source' } & ContextFormed
+    'b': { kind: 'b' } & ContextFormed
+    'native-guard': { kind: 'native-guard' } & ContextFormed
+    'p': { kind: 'p' } & ContextFormed
+    'test': { kind: 'test' } & ContextFormed
+  }
+}
 
 /**
  * The interception points introduced by the hooks taxonomy: `agent/pre-step`,
@@ -35,6 +50,7 @@ async function harness(adapter: MockAdapter) {
   await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
+  await ctx.plugin(NativeToolExecutor)
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(AgentLoop, { agents: [] })
   ctx.llm.registerAdapter(['mock'], adapter)
@@ -64,7 +80,7 @@ describe('agent/pre-step', () => {
   it('enter (default via next) records the user/message unchanged', async () => {
     const adapter = new MockAdapter([textResponse('ok')])
     const ctx = await harness(adapter)
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
 
     const seen: string[] = []
     ctx.on('agent/pre-step', async ({ messages }, next) => {
@@ -92,7 +108,7 @@ describe('agent/pre-step', () => {
       parameters: { text: { type: 'string', required: true } },
       execute: async ({ text }) => [{ type: 'text', text }],
     }))
-    const agent = await ctx.agentLoop.create(SessionId('prompt-coordinates'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('prompt-coordinates'), { provider: 'mock', model: 'mock' })
     const seen: Array<{ turn: number; step: number; messages: number }> = []
     ctx.on('agent/pre-step', async ({ messages, turn, step }, next) => {
       seen.push({ turn, step, messages: messages.length })
@@ -111,7 +127,7 @@ describe('agent/pre-step', () => {
   it('publishes frozen input without replacing its identity', async () => {
     const adapter = new MockAdapter([textResponse('ok')])
     const ctx = await harness(adapter)
-    const agent = await ctx.agentLoop.create(SessionId('owned-input'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('owned-input'), { provider: 'mock', model: 'mock' })
     const entered = Promise.withResolvers<undefined>()
     const decision = Promise.withResolvers<PreStepDecision>()
     const observed: UserMessage[] = []
@@ -132,7 +148,7 @@ describe('agent/pre-step', () => {
     })
     const input: UserMessage = createUserMessage({
       content: [{ type: 'text', text: 'accepted text' }],
-      source: { kind: 'plugin', plugin: 'accepted source' },
+      source: { kind: 'accepted source' },
     })
 
     const idle = waitForIdle(ctx, agent)
@@ -143,7 +159,9 @@ describe('agent/pre-step', () => {
       if (block?.type === 'text') block.text = 'caller mutation'
     }).toThrow(TypeError)
     expect(() => {
-      if (input.source.kind === 'plugin') input.source.plugin = 'caller mutation'
+      if (input.source.kind === 'accepted source') {
+        (input.source as unknown as { plugin?: string }).plugin = 'caller mutation'
+      }
     }).toThrow(TypeError)
     decision.resolve({ kind: 'enter', messages: [input] })
     await idle
@@ -152,7 +170,7 @@ describe('agent/pre-step', () => {
     expect(observed[0]).not.toBe(input)
     expect(observed[0]).toMatchObject({
       content: [{ type: 'text', text: 'accepted text' }],
-      source: { kind: 'plugin', plugin: 'accepted source' },
+      source: { kind: 'accepted source' },
     })
     const userMsg = events(agent).find(event => event.type === 'user/message')
     expect(userMsg?.type === 'user/message' && userMsg.data).toEqual(input)
@@ -161,7 +179,7 @@ describe('agent/pre-step', () => {
   it('enter with content rewrites the prompt before it is recorded', async () => {
     const adapter = new MockAdapter([textResponse('ok')])
     const ctx = await harness(adapter)
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
 
     ctx.on('agent/pre-step', async ({ messages }): Promise<PreStepDecision> =>
       ({
@@ -182,14 +200,14 @@ describe('agent/pre-step', () => {
   it('enter with additional messages records separately sourced context in the turn', async () => {
     const adapter = new MockAdapter([textResponse('ok')])
     const ctx = await harness(adapter)
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
 
     ctx.on('agent/pre-step', async ({ messages }): Promise<PreStepDecision> =>
       ({
         kind: 'enter',
         messages: [...messages, createUserMessage({
           content: [{ type: 'text', text: '<system-reminder>extra ctx</system-reminder>' }],
-          source: { kind: 'plugin', plugin: 'test' },
+          source: { kind: 'test' },
         })],
       }))
 
@@ -198,10 +216,10 @@ describe('agent/pre-step', () => {
 
     const log = events(agent)
     const userMsg = log.find(e => e.type === 'user/message' && e.data.source.kind === 'user')
-    const ctxMsg = log.find(e => e.type === 'user/message' && e.data.source.kind === 'plugin')
+    const ctxMsg = log.find(e => e.type === 'user/message' && e.data.source.kind !== 'user')
     expect(userMsg).toBeDefined()
     expect(ctxMsg?.type === 'user/message' && ctxMsg.data.content).toEqual([{ type: 'text', text: '<system-reminder>extra ctx</system-reminder>' }])
-    expect(ctxMsg?.type === 'user/message' && ctxMsg.data.source).toEqual({ kind: 'plugin', plugin: 'test' })
+    expect(ctxMsg?.type === 'user/message' && ctxMsg.data.source).toEqual({ kind: 'test' })
     const sent = JSON.stringify(adapter.requests[0]!.messages)
     expect(sent).toContain('extra ctx')
   })
@@ -209,14 +227,14 @@ describe('agent/pre-step', () => {
   it('does not open another step when a completed turn rewrites pending input to empty', async () => {
     const adapter = new MockAdapter([textResponse('done')])
     const ctx = await harness(adapter)
-    const agent = await ctx.agentLoop.create(SessionId('empty-completed-continuation'), {
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('empty-completed-continuation'), {
       provider: 'mock',
       model: 'mock',
     })
     ctx.on('agent/turn-stopping', ({ agent: subject }) => {
       subject.inject(createUserMessage({
         content: [{ type: 'text', text: 'pending context' }],
-        source: { kind: 'plugin', plugin: 'test' },
+        source: { kind: 'test' },
       }))
     })
     ctx.on('agent/pre-step', async ({ step }, next) => {
@@ -236,7 +254,7 @@ describe('agent/pre-step', () => {
   it('reject closes the claimed prompt turn without a step or model call', async () => {
     const adapter = new MockAdapter([textResponse('should not run')])
     const ctx = await harness(adapter)
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
 
     ctx.on('agent/pre-step', async (): Promise<PreStepDecision> => ({ kind: 'reject' }))
 
@@ -259,7 +277,7 @@ describe('agent/pre-step', () => {
   it('stages inject and steer during pre-step for the entered turn', async () => {
     const adapter = new MockAdapter([textResponse('ok')])
     const ctx = await harness(adapter)
-    const agent = await ctx.agentLoop.create(SessionId('pre-step-outbox'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('pre-step-outbox'), { provider: 'mock', model: 'mock' })
     const entered = Promise.withResolvers<undefined>()
     const decision = Promise.withResolvers<PreStepDecision>()
     let claimed: UserMessage[] = []
@@ -280,7 +298,7 @@ describe('agent/pre-step', () => {
 
     agent.inject(createUserMessage({
       content: [{ type: 'text', text: 'attached context' }],
-      source: { kind: 'plugin', plugin: 'test' },
+      source: { kind: 'test' },
     }))
     agent.steer(createUserMessage({ content: [{ type: 'text', text: 'pre-step steering' }], source: { kind: 'user' } }))
     expect(events(agent).some(event => event.type === 'user/message')).toBe(false)
@@ -321,7 +339,7 @@ describe('agent/pre-step', () => {
   it('preserves input staged after the blocked batch was claimed', async () => {
     const adapter = new MockAdapter([textResponse('retried')])
     const ctx = await harness(adapter)
-    const agent = await ctx.agentLoop.create(SessionId('blocked-pre-step-outbox'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('blocked-pre-step-outbox'), { provider: 'mock', model: 'mock' })
     const entered = Promise.withResolvers<undefined>()
     const decision = Promise.withResolvers<PreStepDecision>()
     const disposeBlock = ctx.on('agent/pre-step', async () => {
@@ -334,7 +352,7 @@ describe('agent/pre-step', () => {
     await entered.promise
     agent.inject(createUserMessage({
       content: [{ type: 'text', text: 'staged context' }],
-      source: { kind: 'plugin', plugin: 'test' },
+      source: { kind: 'test' },
     }))
     agent.steer(createUserMessage({ content: [{ type: 'text', text: 'staged steering' }], source: { kind: 'user' } }))
     decision.resolve({ kind: 'reject' })
@@ -371,7 +389,7 @@ describe('agent/pre-step', () => {
       textResponse('wake reply'),
     ])
     const ctx = await harness(adapter)
-    const agent = await ctx.agentLoop.create(SessionId('rejected-pre-step-order'), {
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('rejected-pre-step-order'), {
       provider: 'mock',
       model: 'mock',
     })
@@ -387,7 +405,7 @@ describe('agent/pre-step', () => {
         message.content.some(block => block.type === 'text' && block.text === 'blocked prompt'))) {
         subject.inject(createUserMessage({
           content: [{ type: 'text', text: 'earlier state change' }],
-          source: { kind: 'plugin', plugin: 'test' },
+          source: { kind: 'test' },
         }))
         subject.steer(createUserMessage({
           content: [{ type: 'text', text: 'earlier steering' }],
@@ -426,7 +444,7 @@ describe('agent/pre-step', () => {
   it('preserves context-only injection staged after pre-step began', async () => {
     const adapter = new MockAdapter([textResponse('continued')])
     const ctx = await harness(adapter)
-    const agent = await ctx.agentLoop.create(SessionId('rejected-pre-step-context'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('rejected-pre-step-context'), { provider: 'mock', model: 'mock' })
     const entered = Promise.withResolvers<undefined>()
     const decision = Promise.withResolvers<PreStepDecision>()
     const disposeBlock = ctx.on('agent/pre-step', async () => {
@@ -439,7 +457,7 @@ describe('agent/pre-step', () => {
     await entered.promise
     agent.inject(createUserMessage({
       content: [{ type: 'text', text: 'independent context' }],
-      source: { kind: 'plugin', plugin: 'test' },
+      source: { kind: 'test' },
     }))
     decision.resolve({ kind: 'reject' })
     await idle
@@ -461,7 +479,7 @@ describe('agent/pre-step', () => {
   it('leaves inbox state unchanged when its durable append fails', async () => {
     const adapter = new MockAdapter([])
     const ctx = await harness(adapter)
-    const agent = await ctx.agentLoop.create(SessionId('rejected-pre-step-append-failure'), {
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('rejected-pre-step-append-failure'), {
       provider: 'mock',
       model: 'mock',
     })
@@ -484,7 +502,7 @@ describe('agent/pre-step', () => {
       textResponse('wake reply'),
     ])
     const ctx = await harness(adapter)
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
 
     ctx.on('agent/pre-step', async ({ messages }, next): Promise<PreStepDecision> => {
       const text = messages.flatMap(message => message.content)
@@ -520,7 +538,7 @@ describe('agent/pre-step', () => {
   it('a throwing pre-step listener reports the driver error and retains adjacent work', async () => {
     const adapter = new MockAdapter([textResponse('after')])
     const ctx = await harness(adapter)
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
 
     let threw = false
     ctx.on('agent/pre-step', async ({ messages }) => {
@@ -565,7 +583,7 @@ describe('agent/created', () => {
     const sources: SessionStartSource[] = []
     ctx.on('agent/created', ({ source }) => void sources.push(source))
 
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
     expect(sources).toEqual(['startup'])
     expect(events(agent).some(e => e.type === 'turn/start')).toBe(false)
 
@@ -579,18 +597,18 @@ describe('agent/created', () => {
     const ctx = await harness(adapter)
 
     ctx.on('agent/created', ({ agent }) => {
-      agent.inject(createUserMessage({ content: [{ type: 'text', text: 'session preamble' }], source: { kind: 'plugin', plugin: 'test' } }))
+      agent.inject(createUserMessage({ content: [{ type: 'text', text: 'session preamble' }], source: { kind: 'test' } }))
     })
 
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
     send(agent, 'go')
     await waitForIdle(ctx, agent)
 
     // the injected context reached the model on the first (only) request
     expect(JSON.stringify(adapter.requests[0]!.messages)).toContain('session preamble')
     // and is recorded with the plugin source, never mislabeled as a user prompt
-    const ctxMsg = events(agent).find(e => e.type === 'user/message' && e.data.source.kind === 'plugin')
-    expect(ctxMsg?.type === 'user/message' && ctxMsg.data.source).toEqual({ kind: 'plugin', plugin: 'test' })
+    const ctxMsg = events(agent).find(e => e.type === 'user/message' && e.data.source.kind !== 'user')
+    expect(ctxMsg?.type === 'user/message' && ctxMsg.data.source).toEqual({ kind: 'test' })
   })
 
   it('a throwing creation listener rolls back the agent before its first turn', async () => {
@@ -600,7 +618,7 @@ describe('agent/created', () => {
     const reason = new Error('creation hook broke')
     ctx.on('agent/created', () => { throw reason })
 
-    await expect(ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })).rejects.toBe(reason)
+    await expect(ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })).rejects.toBe(reason)
     expect(ctx.agents.list()).toEqual([])
     expect(ctx.sessions.list()).toEqual([])
     expect(adapter.requests).toHaveLength(0)
@@ -612,9 +630,9 @@ describe('tool additionalContexts buffering across a step', () => {
     // One assistant step with TWO tool calls; the second model response stops.
     const twoCalls = [
       { type: 'block-start' as const, index: 0, blockType: 'tool-call' as const },
-      { type: 'block-end' as const, index: 0, block: { type: 'tool-call' as const, id: ToolCallId('c1'), name: 'echo', arguments: '{"text":"a"}' } },
+      { type: 'block-end' as const, index: 0, block: { type: 'tool-call' as const, id: brandString<ToolCallId>('c1'), name: 'echo', arguments: '{"text":"a"}' } },
       { type: 'block-start' as const, index: 1, blockType: 'tool-call' as const },
-      { type: 'block-end' as const, index: 1, block: { type: 'tool-call' as const, id: ToolCallId('c2'), name: 'echo', arguments: '{"text":"b"}' } },
+      { type: 'block-end' as const, index: 1, block: { type: 'tool-call' as const, id: brandString<ToolCallId>('c2'), name: 'echo', arguments: '{"text":"b"}' } },
       { type: 'usage' as const, usage: { inputTokens: 5, outputTokens: 5 } },
       { type: 'finish' as const, reason: { kind: 'tool-calls' as const } },
     ]
@@ -624,7 +642,7 @@ describe('tool additionalContexts buffering across a step', () => {
       name: 'echo', description: 'echo', parameters: { text: { type: 'string' } },
       async execute(args) { return [{ type: 'text', text: String(args.text) }] },
     }))
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
 
     // Each call attaches one context naming itself.
     ctx.on('tools/post-execute', async (exec, _result): Promise<PostToolDecision> =>
@@ -632,7 +650,7 @@ describe('tool additionalContexts buffering across a step', () => {
         kind: 'accept',
         additionalContexts: [createUserMessage({
           content: [{ type: 'text', text: `ctx-${exec.callId}` }],
-          source: { kind: 'plugin', plugin: 'p' },
+          source: { kind: 'p' },
         })],
       }))
 
@@ -641,7 +659,7 @@ describe('tool additionalContexts buffering across a step', () => {
 
     // Event order in the log: both tool/results, THEN both injected contexts —
     // never interleaved (which would break tool-call/result adjacency).
-    const injected = events(agent).filter(e => e.type === 'user/message' && e.data.source.kind === 'plugin')
+    const injected = events(agent).filter(e => e.type === 'user/message' && e.data.source.kind !== 'user')
     const seqs = events(agent)
     const firstResult = seqs.findIndex(e => e.type === 'tool/result')
     const lastResult = seqs.map(e => e.type).lastIndexOf('tool/result')
@@ -663,27 +681,27 @@ describe('tool additionalContexts buffering across a step', () => {
       name: 'composite', description: 'composite', parameters: {},
       async execute(_args, exec) {
         exec.deferContext(createUserMessage({
-          content: [{ type: 'text', text: 'nested-a' }], source: { kind: 'plugin', plugin: 'a' },
+          content: [{ type: 'text', text: 'nested-a' }], source: { kind: 'a' },
         }))
         exec.deferContext(createUserMessage({
-          content: [{ type: 'text', text: 'nested-b' }], source: { kind: 'plugin', plugin: 'b' },
+          content: [{ type: 'text', text: 'nested-b' }], source: { kind: 'b' },
         }))
         return [{ type: 'text', text: 'outer result' }]
       },
     }))
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
 
     send(agent, 'go')
     await waitForIdle(ctx, agent)
 
     const log = events(agent)
     const resultIndex = log.findIndex(event => event.type === 'tool/result')
-    const contextEvents = log.filter(event => event.type === 'user/message' && event.data.source.kind === 'plugin')
+    const contextEvents = log.filter(event => event.type === 'user/message' && event.data.source.kind !== 'user')
     expect(resultIndex).toBeGreaterThanOrEqual(0)
     expect(log.findIndex(event => event === contextEvents[0])).toBeGreaterThan(resultIndex)
     expect(contextEvents.map(event => event.type === 'user/message' && event.data.source)).toEqual([
-      { kind: 'plugin', plugin: 'a' },
-      { kind: 'plugin', plugin: 'b' },
+      { kind: 'a' },
+      { kind: 'b' },
     ])
   })
 })
@@ -697,7 +715,7 @@ describe('tools/pre-execute gate (native-plugin permission pattern, end-to-end t
       name: 'danger', description: 'danger', parameters: {},
       async execute() { ran = true; return [{ type: 'text', text: 'should not run' }] },
     }))
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
 
     ctx.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
       if (exec.name === 'danger') return { kind: 'deny', reason: 'blocked dangerous tool' }
@@ -709,9 +727,9 @@ describe('tools/pre-execute gate (native-plugin permission pattern, end-to-end t
 
     expect(ran).toBe(false)
     const result = events(agent).find(e => e.type === 'tool/result')
-    expect(result?.type === 'tool/result' && result.data.message.content[0].isError).toBe(true)
+    expect(result?.type === 'tool/result' && result.data.message.isError).toBe(true)
     expect(result?.type === 'tool/result'
-      && result.data.message.content[0].content.some(b => b.type === 'text' && b.text.includes('blocked dangerous tool'))).toBe(true)
+      && result.data.message.content.some(b => b.type === 'text' && b.text.includes('blocked dangerous tool'))).toBe(true)
   })
 })
 
@@ -724,7 +742,7 @@ describe('worked example: a native hook plugin is just a cordis plugin on the se
     apply(ctx: Context) {
       // 1. SessionStart: seed a standing instruction.
       ctx.on('agent/created', ({ agent, source }) => {
-        agent.inject(createUserMessage({ content: [{ type: 'text', text: `policy active (started: ${source})` }], source: { kind: 'plugin', plugin: 'native-guard' } }))
+        agent.inject(createUserMessage({ content: [{ type: 'text', text: `policy active (started: ${source})` }], source: { kind: 'native-guard' } }))
       })
       // 2. PreStep: reject a forbidden prompt, annotate the rest.
       ctx.on('agent/pre-step', async ({ messages }, next): Promise<PreStepDecision> => {
@@ -745,7 +763,7 @@ describe('worked example: a native hook plugin is just a cordis plugin on the se
         const decision = await next()
         if (decision.kind === 'accept') {
           return { kind: 'accept', additionalContexts: [createUserMessage({
-            content: [{ type: 'text', text: 'audited' }], source: { kind: 'plugin', plugin: 'native-guard' },
+            content: [{ type: 'text', text: 'audited' }], source: { kind: 'native-guard' },
           })] }
         }
         return decision
@@ -761,20 +779,20 @@ describe('worked example: a native hook plugin is just a cordis plugin on the se
       name: 'echo', description: 'echo', parameters: { text: { type: 'string' } },
       async execute(args) { return [{ type: 'text', text: String(args.text) }] },
     }))
-    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a1'), { provider: 'mock', model: 'mock' })
 
     send(agent, 'please echo hi')
     await waitForIdle(ctx, agent)
 
     const log = events(agent)
     // session-start preamble injected
-    expect(log.some(e => e.type === 'user/message' && e.data.source.kind === 'plugin'
+    expect(log.some(e => e.type === 'user/message' && e.data.source.kind !== 'user'
       && e.data.content.some(b => b.type === 'text' && b.text.includes('policy active (started: startup)')))).toBe(true)
     // prompt allowed → user-sourced user/message recorded
     expect(log.some(e => e.type === 'user/message' && e.data.source.kind === 'user')).toBe(true)
     // tool ran (echo allowed) and post-execute attached "audited" context
-    expect(log.some(e => e.type === 'tool/result' && !e.data.message.content[0].isError)).toBe(true)
-    expect(log.some(e => e.type === 'user/message' && e.data.source.kind === 'plugin'
+    expect(log.some(e => e.type === 'tool/result' && !e.data.message.isError)).toBe(true)
+    expect(log.some(e => e.type === 'user/message' && e.data.source.kind !== 'user'
       && e.data.content.some(b => b.type === 'text' && b.text === 'audited'))).toBe(true)
     // NO hook/* events — a native plugin needs none
     expect(log.some(e => e.type.startsWith('hook/'))).toBe(false)
@@ -784,7 +802,7 @@ describe('worked example: a native hook plugin is just a cordis plugin on the se
     const adapter = new MockAdapter([textResponse('should not run')])
     const ctx = await harness(adapter)
     await ctx.plugin(NativeGuard)
-    const agent = await ctx.agentLoop.create(SessionId('a2'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a2'), { provider: 'mock', model: 'mock' })
 
     const reasons: TurnEndReason[] = []
     ctx.on('session/event', (_s, event: SessionEvent) => { if (event.type === 'turn/end') reasons.push(event.data.reason) })
@@ -803,7 +821,7 @@ describe('worked example: a native hook plugin is just a cordis plugin on the se
     await fiber.dispose()
 
     // After disposal, a destructive prompt is NOT blocked (the listener is gone).
-    const agent = await ctx.agentLoop.create(SessionId('a3'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('a3'), { provider: 'mock', model: 'mock' })
     send(agent, 'run rm -rf /')
     await waitForIdle(ctx, agent)
     // the prompt ran (not rejected) — proving the pre-step listener was disposed

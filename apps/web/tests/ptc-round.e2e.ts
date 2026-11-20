@@ -1,5 +1,5 @@
 // PTC mode browser round trip with nested sub-calls and details selection.
-// Record: DSH_SNAPSHOT=record writes session.v3.jsonl, then a keyless
+// Record: DSH_SNAPSHOT=record writes the current Session generation, then a keyless
 // DSH_SNAPSHOT=refresh regenerates ui.expected.md.
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
@@ -9,19 +9,21 @@ import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import {
   acknowledgeReloadConnectionLoss, captureExpandedTurnProcessAria, captureStableAria, compareOrRefreshGolden, fixtureUserPrompts,
-  launchWebScaffold, recordFixture, watchConsole, webSnapshotMode, type WebScaffold,
+  launchWebScaffold, recordFixture, selectedSessionFixture, watchConsole, webSnapshotMode, type WebScaffold,
 } from './scaffold.ts'
-import { connectFreshWorkspace, expandOwningTurnProcess, newEnglishPage, saveFailureShot } from './support.ts'
+import { connectFreshWorkspace, expandOwningTurnProcess, newEnglishPage, openSettings, saveFailureShot } from './support.ts'
 
 const FIXTURE = fileURLToPath(new URL('../../../snapshots/web/ptc-round/session.v3.jsonl', import.meta.url))
 const UI_EXPECTED = fileURLToPath(new URL('../../../snapshots/web/ptc-round/ui.expected.md', import.meta.url))
 const TRAJECTORY_EXPECTED = fileURLToPath(new URL('../../../snapshots/web/ptc-round/trajectory.expected.md', import.meta.url))
 const CODE_EXPECTED = fileURLToPath(new URL('../../../snapshots/web/ptc-round/code.expected.md', import.meta.url))
+const PREPARING_EXPECTED = fileURLToPath(new URL('../../../snapshots/web/ptc-round/preparing.expected.md', import.meta.url))
+const REQUEST_LIFECYCLE_EXPECTED = fileURLToPath(new URL('../../../snapshots/web/ptc-round/request-lifecycle.expected.md', import.meta.url))
 const MODE = webSnapshotMode()
 
 // Elicits the successful and failed sub-rows this scenario asserts.
 const PROMPT = 'Using ONE run_code program: run bash `echo CODE_ROUND_OK`, then read the file missing.txt '
-  + 'catching its error in the program. Return an object with both outcomes. Then reply DONE and stop.'
+  + 'catching its error in the program. Use `inspect(...)` to display an object with both outcomes. Then reply DONE and stop.'
 
 describe('web e2e: PTC mode round renders nested sub-calls', () => {
   let scaffold: WebScaffold
@@ -29,10 +31,11 @@ describe('web e2e: PTC mode round renders nested sub-calls', () => {
   let page: Page
   let tripwire: ReturnType<typeof watchConsole>
   const sessionEvents: SessionEvent[] = []
+  let releasePreparation: (() => void) | undefined
 
   beforeAll(async () => {
     scaffold = await launchWebScaffold({
-      agentPresets: { roots: [], default: 'ptc' },
+      agentPresets: { default: 'ptc' },
       compareReplaySession: true,
       ...(MODE === 'record' ? {} : { replayFixture: FIXTURE, paceMs: 15 }),
     })
@@ -46,23 +49,100 @@ describe('web e2e: PTC mode round renders nested sub-calls', () => {
   }, 120_000)
 
   afterAll(async () => {
+    releasePreparation?.()
     await browser?.close()
     await scaffold?.close()
   })
 
   it('drives the recorded prompt to a settled turn (all modes)', async () => {
     onTestFailed(() => saveFailureShot(page, 'web-e2e-ptc-drive'))
+    const requestStates: string[] = []
     if (MODE !== 'record') {
-      expect(fixtureUserPrompts(await readFile(FIXTURE, 'utf8'))).toEqual([PROMPT])
+      expect(fixtureUserPrompts(await readFile(await selectedSessionFixture(FIXTURE), 'utf8'))).toEqual([PROMPT])
     }
     const input = page.locator('[data-composer-input]').first()
     await input.waitFor({ timeout: 10_000 })
     const settled = scaffold.whenTurnSettled()
-    await input.fill(PROMPT)
-    await input.press('Enter')
-    const sessionId = await settled
-    if (MODE === 'record') {
-      await recordFixture(scaffold, sessionId, FIXTURE)
+    const gate = Promise.withResolvers<undefined>()
+    const waiting = Promise.withResolvers<undefined>()
+    const start = Promise.withResolvers<undefined>()
+    const dispose = scaffold.ctx.on('llm/stream', async function* (_options, next) {
+      waiting.resolve(undefined)
+      await start.promise
+      let held = false
+      for await (const chunk of next()) {
+        yield chunk
+        if (!held && chunk.type === 'tool-call-delta' && chunk.name) {
+          held = true
+          await gate.promise
+        }
+      }
+    }, { prepend: true })
+    releasePreparation = () => { start.resolve(undefined); gate.resolve(undefined); dispose() }
+    const observePreparation = async () => {
+      try {
+        await input.fill(PROMPT)
+        await input.press('Enter')
+        await waiting.promise
+        await page.getByRole('tab', { name: 'Trajectory', exact: true }).click()
+        const request = page.getByRole('table').getByRole('button', { name: 'Request #1', exact: true })
+        await request.click()
+        const panel = page.getByRole('tabpanel')
+        await panel.locator('dl').first().getByText('Pending', { exact: true }).waitFor()
+        expect(await panel.getByRole('button', { name: 'Assistant Message', exact: true }).count()).toBe(0)
+        requestStates.push('# Waiting for output', await panel.locator('dl').first().ariaSnapshot())
+        await page.getByRole('tab', { name: 'Chat', exact: true }).click()
+        start.resolve(undefined)
+        const row = page.locator('[data-chat-call-id] [data-state="preparing"]').first()
+        await row.waitFor({ state: 'attached', timeout: 30_000 })
+        await expandOwningTurnProcess(page, row)
+        await row.waitFor({ state: 'visible' })
+        await row.getByText('Code', { exact: true }).waitFor()
+        expect(await row.getAttribute('data-tool')).toBe('run_code')
+        expect(sessionEvents.some(event => event.type === 'tool/call')).toBe(false)
+        expect(await row.getByRole('button').count()).toBe(0)
+        expect(await row.locator('pre').count()).toBe(0)
+        const group = row.locator('xpath=ancestor::*[@data-chat-group-key][1]')
+        await compareOrRefreshGolden(PREPARING_EXPECTED, await group.ariaSnapshot(), MODE)
+        await page.getByRole('tab', { name: 'Trajectory', exact: true }).click()
+        const assistant = page.locator('tr[data-kind="message"][data-running="true"]').first()
+        await assistant.click()
+        await panel.locator('dl').first().getByText('Pending', { exact: true }).waitFor()
+        expect(await panel.getByText('Completed', { exact: true }).count()).toBe(0)
+        requestStates.push('# Streaming assistant', await panel.locator('dl').first().ariaSnapshot())
+        await panel.getByRole('button', { name: 'Request Timing', exact: true }).click()
+        expect(await panel.getByText('Not recorded', { exact: true }).count()).toBe(0)
+        expect(await panel.locator('dt').filter({ hasText: /^Started$/ }).locator('..').getByRole('button').count()).toBe(1)
+        await request.click()
+        await panel.locator('dl').first().getByText('Pending', { exact: true }).waitFor()
+        requestStates.push('# Streaming request', await panel.locator('dl').first().ariaSnapshot())
+        await page.getByRole('tab', { name: 'Chat', exact: true }).click()
+      } finally {
+        releasePreparation?.()
+      }
+    }
+    try {
+      const [sessionId] = await Promise.all([settled, observePreparation()])
+      expect(sessionEvents.filter(event => event.type === 'turn/end')).toMatchObject([
+        { data: { reason: { kind: 'completed' } } },
+      ])
+      await expect.poll(() => page.locator('[data-state="preparing"]').count(), { timeout: 15_000 }).toBe(0)
+      if (MODE === 'record') {
+        await recordFixture(scaffold, sessionId, FIXTURE)
+      } else {
+        await page.getByRole('tab', { name: 'Trajectory', exact: true }).click()
+        await page.getByRole('table').getByRole('button', { name: 'Request #1', exact: true }).click()
+        const panel = page.getByRole('tabpanel')
+        await panel.getByText('Completed', { exact: true }).waitFor()
+        requestStates.push('# Settled request', await panel.locator('dl').first().ariaSnapshot())
+        await panel.getByRole('button', { name: 'Assistant Message', exact: true }).click()
+        await panel.getByText('Completed', { exact: true }).waitFor()
+        requestStates.push('# Settled assistant', await panel.locator('dl').first().ariaSnapshot())
+        await compareOrRefreshGolden(REQUEST_LIFECYCLE_EXPECTED, requestStates.join('\n\n'), MODE)
+      }
+    } finally {
+      releasePreparation?.()
+      await page.getByRole('tab', { name: 'Chat', exact: true }).click()
     }
   }, 200_000)
 
@@ -118,6 +198,7 @@ describe('web e2e: PTC mode round renders nested sub-calls', () => {
         await page.reload({ waitUntil: 'load' })
         acknowledgeReloadConnectionLoss(tripwire, warningStart)
         await page.getByText('DONE', { exact: true }).waitFor({ timeout: 15_000 })
+        await expect.poll(() => page.locator('[data-state="preparing"]').count(), { timeout: 15_000 }).toBe(0)
       }
       const nest = page.locator('[data-subcalls]').first()
       const frame = page.locator('[style*="grid-template-columns"]').first()
@@ -192,6 +273,27 @@ describe('web e2e: PTC mode round renders nested sub-calls', () => {
     expect(await source.textContent()).toBe(args.code.endsWith('\n') ? args.code.slice(0, -1) : args.code)
     await page.getByRole('tab', { name: 'Summary', exact: true }).click()
     expect(await wrap.getAttribute('aria-pressed')).toBe('true')
+  })
+
+  it.skipIf(MODE === 'record')('renders the same recorded tool round in Japanese without translating model or tool data', async () => {
+    onTestFailed(() => saveFailureShot(page, 'web-e2e-ptc-japanese'))
+    await openSettings(page, 'en')
+    const settings = page.getByRole('dialog', { name: 'Settings', exact: true })
+    await settings.getByRole('button', { name: 'English', exact: true }).click()
+    await page.getByRole('menuitem', { name: '日本語', exact: true }).click()
+    await page.getByRole('dialog', { name: '設定', exact: true }).waitFor()
+    await page.keyboard.press('Escape')
+    await page.getByRole('tab', { name: 'チャット', exact: true }).click()
+    await page.getByText('DONE', { exact: true }).waitFor()
+    expect(await page.evaluate(() => document.documentElement.lang)).toBe('ja')
+    const row = page.locator('[data-subcalls] [data-sample="bash"]').first()
+    await expandOwningTurnProcess(page, row)
+    if (await row.getAttribute('aria-expanded') !== 'true') await row.click()
+    await row.locator('xpath=..').getByText('echo CODE_ROUND_OK', { exact: true }).waitFor()
+    const snapshot = await captureExpandedTurnProcessAria(page, '[class*="centerCol"]', scaffold.workspaceCwd)
+    await compareOrRefreshGolden(
+      fileURLToPath(new URL('../../../snapshots/web/ptc-round/ui-ja.expected.md', import.meta.url)), snapshot, MODE,
+    )
   })
 
   it.skipIf(MODE === 'record')('stayed clean: no page errors, no reconnect churn', () => {

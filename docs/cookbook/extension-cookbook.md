@@ -91,24 +91,67 @@ export function apply(ctx: Context) {
 }
 ```
 
+## A forge review extension
+
+Change request review opens to plugins through the [forge extension API](../subsystems/forge.md#extension-api). A Host plugin registers a filter lens, which keeps some of the files a changes view shows and names the lines it is about:
+
+```ts
+import type { Context } from '@deepseek-ai/cordis'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { ForgeLensId } from '@deepseek-ai/dsh-experimental-client-ui-forge'
+
+export const name = 'exports-lens'
+export const inject = ['forgePanel']
+
+export function apply(ctx: Context) {
+  // An effect of this plugin's fiber: unloading the plugin withdraws the lens and aborts its runs.
+  ctx.forgePanel.registerLens({
+    id: brandString<ForgeLensId>('example/exports'),
+    version: '1',
+    async classify(input, signal) {
+      const files: Record<string, { ranges: { old: []; new: { start: number; end: number }[] } }> = {}
+      for (const file of input.files) {
+        const lines = (await input.text('new', file.path, signal))?.split('\n') ?? []
+        const ranges = lines.flatMap((line, at) => line.startsWith('export') ? [{ start: at + 1, end: at + 1 }] : [])
+        if (ranges.length > 0) files[file.path] = { ranges: { old: [], new: ranges } }
+      }
+      return { files }
+    },
+  })
+}
+```
+
+A Client plugin names that lens and adds line annotations; `notesOf` returns one stable observable per view, and `NoteBody` is a module-scope component that draws one annotation inside the frame the view draws. The forge tests' [fixture plugin](../../apps/web/tests/fixtures/plugins/fixture-forge-extension/client.js) also uses the toolbar, file menu, comment form, and card slots.
+
+```ts ignore-check
+export const inject = ['forgeChanges', 'slots']
+
+export function apply(ctx: Context) {
+  ctx.effect(() => ctx.forgeChanges.describeLens({ id: brandString<ForgeLensId>('example/exports'), title: () => 'Exports' }))
+  ctx.effect(() => ctx.forgeChanges.registerAnnotations({ id: 'example-notes', observe: target => notesOf(target) }))
+  ctx.slots.inject('forge.diff.line.annotation', () => ctx.slots.register(
+    { name: 'forge.diff.line.annotation', key: 'example-notes' }, NoteBody))
+}
+```
+
 ## Runnable wirings
 
 Shipped applications contribute profile layers through `packages/bundle/*/cordis.patch.yml`, and the product `dsh` launcher owns Web, ACP, SDK, and one-shot headless execution through named profiles. Optional user-facing overlays live under `apps/cli/config/examples/`; profile integration tests live under `apps/cli/tests/profiles/`, while package-specific Loader compositions stay with their package tests.
 
 ## The feature → mechanism map
 
-Every product feature maps to a listener on a documented extension point — the microkernel claim made checkable ([microkernel Agent Note](../../.agents/notes/implemented/architecture/2026-06-11-microkernel-event-taxonomy.md)). No row modifies the loop.
+Every product feature maps to a listener on a documented extension point — the microkernel claim made checkable ([microkernel reference](../architecture.md)). No row modifies the loop.
 
 `system-prompt/assemble` is an expert cooperative whole-assembly transform: its returned assembly is authoritative, so listener authors own preserving active PTC mode and structured-output protocol contributions. Prefer `ctx.tools.restrict()` for tool filtering that must stay aligned across presentation, lookup, and execution.
 
 | Product feature | Plugin mechanism |
 |---|---|
-| Hook system (user + project level) | listeners on `agent/created`, `agent/pre-step`, `agent/request`, `tools/pre-execute`, `tools/post-execute`, and `agent/turn-stopping`; the waterfalls return typed decisions, while `agent/turn-stopping` may steer another step; the `dsh-hooks-claude-code` / `dsh-hooks-codex` bridges map hook config files onto these extension points |
+| Hook system (user + project level) | listeners on `agent/created`, `agent/pre-step`, `tools/pre-execute`, `tools/post-execute`, and `agent/turn-stopping`; the waterfalls return typed decisions, while `agent/turn-stopping` may steer another step; the `dsh-hooks-claude-code` / `dsh-hooks-codex` bridges map hook config files onto these extension points |
 | `/goal` | `ctx.goals` owns durable state, `dsh-goal-round-driver` schedules same-session rounds through the public `Agent`, and separate command/tool producers expose human/model control |
 | `/loop` | on the `turn/end` session event, `followup()` the next iteration; or force-continue |
 | Dynamic workflow | `ctx.workflowEngine` + the PTC workflow engine + the `workflow` tool; structured in-process children enforce output with scoped prompt/tool registrations, a monotonic tool guard, final `tools/result` commit (including enclosing `run_code`), and the structured-output execution's monotonic `concludeTurn()` marker |
 | Queued + steering messages | core `Agent.followup()` / `Agent.steer()` |
-| Context compaction (auto + manual) | the `ctx.compaction` seam + `dsh-compaction-basic`; automatic pressure runs on serial `agent/pre-step`, canonical overflow recovery runs on `agent/request-error`, and manual callers use the same compact service ([compaction Agent Note](../../.agents/notes/implemented/feature/2026-06-18-compaction-capability-seam.md)) |
+| Context compaction (auto + manual) | the `ctx.compaction` seam + `dsh-compaction-basic`; automatic pressure runs on serial `agent/pre-step`, canonical overflow recovery runs on `agent/request-error`, and manual callers use the same compact service ([compaction reference](../../packages/compaction/compaction/README.md)) |
 | System prompt configurability | `ctx.systemPrompt.section()` with ordering and scope-local shadowing |
 | AGENTS.md (root) | a section provider reading the file |
 | AGENTS.md (subdir, on-touch) + file-change notices | `agent.inject()` from a watcher / tool-result listener |
@@ -124,7 +167,7 @@ Every product feature maps to a listener on a documented extension point — the
 | MCP | one plugin per server: discover tools → `ctx.tools.register()` |
 | Skills | section + tool registration; `inject()` skill content on invocation |
 | Memory | section provider + tool |
-| Scheduled tasks (cron) | a plugin registers model-callable scheduling tools; timer fires → `followup(…, {source: {kind: 'plugin', plugin: 'schedule'}})` when idle / `inject()` notification when busy |
+| Scheduled tasks (cron) | a plugin registers model-callable scheduling tools; a due timer delivers through `followup(…, {source: {kind: 'schedule'}})` |
 | UI (GUI; CLI emits JSONL) | listen to `agent/assistant-stream` for live chunks and `session/event` for durable settlements, boundaries, and tool activity; input → `followup()` |
 | Web Client Chat business node | register a `ConversationNodeDefinition` and `conversation.chat.node` keyed renderer |
 | SessionTelemetryBackend / replayable trace | `session/event` → JSONL; replay = `sessions.create(id, { seed })` |

@@ -125,8 +125,8 @@ export class ClientConsoleObserver {
   }
 
   private readonly onError = (event: Event): void => {
-    const error = Reflect.get(event, 'error') as unknown
-    const message = Reflect.get(event, 'message') as unknown
+    const error: unknown = Reflect.get(event, 'error')
+    const message: unknown = Reflect.get(event, 'message')
     this.captureException(error ?? new Error(typeof message === 'string' ? message : 'Client error'))
   }
 
@@ -140,9 +140,8 @@ export class ClientConsoleObserver {
     queueMicrotask(() => {
       for (const sessionId of [...this.sessions]) {
         try {
-          const event = this.runtime.consoleEvent(sessionId, type, values, timestamp, stackTrace)
-          if (event !== undefined) this.sink(sessionId, event)
-        } catch {
+          this.deliver(sessionId, this.runtime.consoleEvent(sessionId, type, values, timestamp, stackTrace))
+        } catch (_observationFailed) {
           // Console observation must not affect the page's original console call.
         }
       }
@@ -155,22 +154,25 @@ export class ClientConsoleObserver {
     queueMicrotask(() => {
       for (const sessionId of [...this.sessions]) {
         try {
-          const event = this.runtime.exceptionEvent(sessionId, error, timestamp, stackTrace)
-          if (event !== undefined) this.sink(sessionId, event)
-        } catch {
+          this.deliver(sessionId, this.runtime.exceptionEvent(sessionId, error, timestamp, stackTrace))
+        } catch (_observationFailed) {
           // Exception observation must not affect browser error dispatch.
         }
       }
     })
   }
+
+  private deliver(sessionId: ClientRuntimeSessionId, event: RuntimeConsoleBackendEvent<ClientRemoteObjectHandle> | undefined): void {
+    if (event !== undefined) this.sink(sessionId, event)
+  }
 }
 
 function addGlobalListener(type: string, listener: EventListener): void {
-  const add = Reflect.get(globalThis, 'addEventListener') as unknown
+  const add: unknown = Reflect.get(globalThis, 'addEventListener')
   if (typeof add === 'function') Reflect.apply(add, globalThis, [type, listener])
 }
 
 function removeGlobalListener(type: string, listener: EventListener): void {
-  const remove = Reflect.get(globalThis, 'removeEventListener') as unknown
+  const remove: unknown = Reflect.get(globalThis, 'removeEventListener')
   if (typeof remove === 'function') Reflect.apply(remove, globalThis, [type, listener])
 }

@@ -1,15 +1,13 @@
 /* Cordis definition card: DisclosureRow chrome (leading/chevron/title come from
    that primitive) plus this card's own trailing run switch and source body.
-   No running sweep: `cordis_define` only registers a definition in host memory,
-   so the call settles in the same turn it starts and the state dot carries the
-   whole signal. */
+   No running sweep: `cordis_define` settles in the same turn it starts. */
 
 .card {
   display: flex;
   flex-direction: column;
 }
 
-/* The shared cordis accent (matches ui-tool's [data-tool^='cordis_'] rows). */
+/* Definition cards keep a brand accent to distinguish their editable source. */
 .card .title,
 .card .chevron {
   color: var(--dsw-alias-state-business-primary);
@@ -179,9 +177,11 @@
   font: var(--dsw-font-xs-13);
 }
 
-.sourceTab:hover:not(:disabled) {
-  background: var(--dsw-alias-interactive-bg-hover);
-  color: var(--dsw-alias-label-primary);
+@media (hover: hover) {
+  .sourceTab:hover:not(:disabled) {
+    background: var(--dsw-alias-interactive-bg-hover);
+    color: var(--dsw-alias-label-primary);
+  }
 }
 
 .sourceTab:disabled {
@@ -272,14 +272,19 @@
   transition: opacity 100ms ease;
 }
 
-.card:hover .inspectButton,
 .inspectButton:focus-visible {
   opacity: 1;
 }
 
-.inspectButton:hover {
-  background: var(--dsw-alias-interactive-bg-hover-solid);
-  color: var(--dsw-alias-label-primary);
+@media (hover: hover) {
+  .card:hover .inspectButton {
+    opacity: 1;
+  }
+
+  .inspectButton:hover {
+    background: var(--dsw-alias-interactive-bg-hover-solid);
+    color: var(--dsw-alias-label-primary);
+  }
 }
 
 .visuallyHidden {
@@ -294,5 +299,11 @@
 @media (prefers-reduced-motion: reduce) {
   .inspectButton {
     transition: none;
+  }
+}
+
+@media (hover: none) {
+  .inspectButton {
+    opacity: 1;
   }
 }

@@ -9,7 +9,7 @@ kind: "package-reference"
 
 ## 概述
 
-使用 `@deepseek-ai/dsh-llm` 可通过已配置的提供方适配器流式调用模型、发现模型，并解析模型能力与调用默认值。每个已分发请求都可以从会话日志重建。请求在分发前会被深度冻结，因此扩展与适配器可以读取但不能改写。每个流只尝试调用提供方一次：提供方特定的转换由对应适配器完成，可选包 `@deepseek-ai/dsh-llm-retry` 负责重跑失败的请求。流始终以终止结果结束，因此调用方可以一致地处理成功、失败与取消。
+使用 `@deepseek-ai/dsh-llm` 可通过已配置的提供方适配器流式调用模型、发现模型，并解析模型能力与调用默认值。调用方必须确保所有模型可见输入都可以从会话日志重建。Loop 构建的请求以深度冻结状态到达，因此扩展与适配器不能改写。每个流只尝试调用提供方一次：提供方特定的转换由对应适配器完成，可选包 `@deepseek-ai/dsh-llm-retry` 负责重跑失败的请求。流始终以终止结果结束，因此调用方可以一致地处理成功、失败与取消。
 
 ## 目录
 
@@ -25,7 +25,11 @@ kind: "package-reference"
 <a id="use-this-package"></a>
 ## 使用本包
 
+`listModels` 描述目录驱动界面提供的模型。核心解析与流式调用仍可接受未列出的 ID。GUI 的模型选择与提交要求模型出现在目录中；供 GUI 使用的适配器必须实现 `listModels`，公布其可用模型。基类实现返回空列表，因此不向 GUI 提供模型。条目可选的 `badge` 包含选择器文字（单一文字，或以小写语言 id 为键且包含 `en` 的译文）和 `neutral`、`info`、`success` 或 `warning` 语调；`resolveModelInfo` 不返回它，模型请求也不携带它。 提供方在公布的目录变化时发出 `llm/models-updated(provider)`；客户端重新加载完整目录，省略的角标也随之清除。
+
 任何调用模型提供方的组合——agent loop（智能体循环）、会话标题生成器、压缩（compaction）摘要器——都会通过本服务流式发起请求。与至少一个提供方适配器一起挂载它；服务本身没有任何配置，也不包含提供方协议代码。
+
+使用 `import type` 从 `@deepseek-ai/dsh-llm/types` 或包根入口导入消息、工具调用、提供方请求、尝试和推理强度标识符类型。通过 `@deepseek-ai/dsh-brand` 的 `brandString<IdentifierType>(value)` 为字符串添加品牌；此操作保留原字符串，不执行校验。
 
 ### 何时选择
 
@@ -33,11 +37,12 @@ kind: "package-reference"
 
 ### 最小组合
 
-挂载服务与至少一个适配器，然后在每个请求中按名称选择提供方：
+挂载服务与至少一个适配器，然后在每个请求中按名称选择提供方。下面的 DeepSeek 路由还要求挂载 [`dsh-deepseek-auth`](../../account/deepseek-auth/README.zh.md)，由它释放 API 密钥：
 
 ```yaml
 - name: '@deepseek-ai/dsh-llm'
-- name: '@deepseek-ai/dsh-llm-deepseek'
+- name: '@deepseek-ai/dsh-deepseek-auth'
+- name: '@deepseek-ai/dsh-llm-deepseek-api-key'
   config:
     apiKeyEnv: DEEPSEEK_API_KEY
 ```
@@ -48,7 +53,7 @@ kind: "package-reference"
 for await (const chunk of ctx.llm.stream({
   provider: 'deepseek-official',
   model: 'deepseek-v4-flash',
-  messages: [createUserMessage({ content: [{ type: 'text', text: 'Hello' }] })],
+  messages: [{ role: 'user', content: [{ type: 'text', text: 'Hello' }] }],
 })) {
   // chunks: block-start, text-delta, ..., usage, finish
 }
@@ -56,18 +61,42 @@ for await (const chunk of ctx.llm.stream({
 
 挂载成功后，`ctx.llm.listProviders()` 会按注册顺序报告已注册路由。
 
+辅助请求的生产方通过扩展 `@deepseek-ai/dsh-llm/types` 中的 `LlmRequestPurposeMap` 声明自己的 `purpose`，每个键映射到 `true`。`GenerateOptions.purpose` 接受已声明的键，普通对话请求则省略它。构造辅助请求前，应导入生产方包或其公开类型。适配器将用途作为模型不可见的传输元数据传递，并在遇到不熟悉的用途时继续处理请求。
+
+`GenerateOptions.messages` 接受持久 `Message` 值和仅供请求使用的 `RequestUserInput` 值。仅供请求使用的输入包含 user-role 内容，不含 `id` 或 `source`；Session 写入和 Agent 投递仍然要求持久消息。调用方必须在流结束前保持辅助输入不变。会记录完整请求的调用方（例如会话标题生成）必须使用持久消息。
+
+`prepareCall(config, signal, configure?)` 接受具体的 `LlmCallConfig` 值。可选的同步纯函数 `ConfigureCall` 接收已分离且深度冻结的 `LlmCallControls`，以及捕获的适配器代次所提供的模型元数据。调用方可组合普通函数来选择具体控制项；后执行的写入替换先前的值。准备操作保留捕获的路由，为省略的控制项应用默认值，校验结果，再返回用于记录与分发的冻结配置。回调失败或取消会在分发前拒绝。准备操作要求注册适配器。
+
+配置函数在适配器默认值物化之前选择控制项。例如，将最低强度选择与显式输出上限组合，再将 `configure(maxTokens)` 作为第三个参数传入：
+
+```ts
+import type { ConfigureCall } from '@deepseek-ai/dsh-llm'
+
+const leastReasoning: ConfigureCall = (controls, model) => {
+  const first = model.reasoning?.efforts[0]
+  return first === undefined ? controls : { ...controls, reasoningEffort: first.id }
+}
+
+const outputLimit = (maxTokens: number): ConfigureCall =>
+  controls => ({ ...controls, maxTokens })
+
+const configure = (maxTokens: number): ConfigureCall =>
+  (controls, model) => outputLimit(maxTokens)(leastReasoning(controls, model), model)
+```
+
 ### 你可以做什么
 
+- **提取内容文本**——从 `@deepseek-ai/dsh-llm/message` 导入的 `extractTextContent(content, options?)` 按顺序仅拼接 `text` 块，保留空白与空文本块，忽略所有其他块类型且不生成占位符。可选的 `options.separator` 默认为 `''`。它接受只读内容，没有文本块时返回 `''`。
 - **流式发起一次模型调用**——`ctx.llm.stream(options)` 为任何已注册提供方与模型产出原始分片（token 级增量）；消费方用 `BlockAssembler` 组装。
 - **注册提供方适配器**——一个适配器拥有一个或多个提供方路由，其注册会捕获该路由的重试策略；重复注册同一路由会以 `DUPLICATE_ADAPTER` 失败。
-- **通过配置暴露并激活提供方**——适配器声明可配置提供方路由与 settings namespace，配置界面因此可以激活休眠提供方并编辑连接信息，无需重启。`LlmConfigurableProvider.error` 报告供修复的配置诊断；未受影响的模型仍可提供服务。
+- **通过配置暴露并激活提供方**——适配器声明可配置提供方路由与 settings namespace，配置界面因此可以激活休眠提供方并编辑连接信息，无需重启。`LlmConfigurableProvider.error` 报告供修复的配置诊断；未受影响的模型仍可提供服务。条目还可携带 `defaultBaseURL`，即配置未设置端点时适配器使用的端点；以及 `nativeAuth`，即配置未指定凭据引用时适配器认证读取的环境变量与 OAuth 登录；`baseURLEnv` 列出配置端点所用的环境变量。配置界面直接从目录读取这些字段，无需调用适配器。
 - **发现与解析模型**——列出适配器公布的模型、询问端点它提供哪些模型（候选携带可选的 `inputModalities`；缺省表示未知），并解析某个精确模型的上下文窗口、输出默认值、推理（reasoning）强度、输入模态与系统提示词更新模式：当模型把任意位置最新的 `system` 消息读作有效系统提示词时，`LlmResolvedModelInfo.systemPromptUpdate` 为 `'in-history'`；只读取开头 system 消息时该字段缺失；`normalizeModelInfo` 以 `INVALID_MODEL_INFO` 拒绝任何其他值。
 - **校验调用配置**——显式或配置的推理强度会在任何提供方 I/O 之前对照精确模型校验；请求省略输出上限时，会填入适配器配置的输出上限。
 - **不展开即读取内嵌 Assistant 流**——`assistantStreamFirstTokenTime`（首 token）、`assistantStreamHasVisibleContent`（任一可见内容）与 `assistantStreamHasVisibleText`（任一可见文本）通过可提前退出的扫描直接从紧凑记录得出结果；`lastAssistantStreamChunk` 反向扫描到某一类型的最后一个原始 chunk，`assistantStreamChunks` 与 `joinAssistantStreamText` 扫描整个流，`assembleAssistantStream` 向 `BlockAssembler` 每个 run 喂一段拼接 delta，blocks／usage／replayState 与逐成员展开相同。`runFirstTokenTime` 与 `runFirstVisibleTime` 对单个打包 run 做提前退出扫描，`isTokenDelta`、`isVisibleChunk` 与 `chunkHasVisibleText` 定义单个 chunk 的 token 与可见性规则。`expandAssistantStream` 仍是持久边界读取记录的校验路径；它不被记忆化，因为保留的展开在事件生命周期内约花费紧凑流的十倍内存。
 
 ### 失败与恢复
 
-每个流都恰好以一个终止 `finish` 分片结束：失败为 `{ kind: 'error', failure }`，取消为 `{ kind: 'aborted', failure }`。失败携带稳定 code，如 `NO_ADAPTER`、`MISSING_CREDENTIAL`、`AUTH`、`RATE_LIMIT` 与 `CONTEXT_WINDOW_EXCEEDED`；消费方依据 code 路由，绝不解析消息文本。点名未注册提供方的请求会以 `NO_ADAPTER` 失败，格式错误的凭据会以 `INVALID_CREDENTIAL` 失败，而不是表现为不透明的 fetch 错误。本服务从不自行重跑请求：重试是 `dsh-llm-retry` 在 agent 失败步骤扩展点上的职责。
+每个流都恰好以一个终止 `finish` 分片结束：失败为 `{ kind: 'error', failure }`，取消为 `{ kind: 'aborted', failure }`。失败携带稳定 code，如 `NO_ADAPTER`、`MISSING_CREDENTIAL`、`AUTH`、`RATE_LIMIT` 与 `CONTEXT_WINDOW_EXCEEDED`；消费方依据 code 路由，绝不解析消息文本。`LLM_FAILURE_CODES` 定义内置提供方与本运行时会抛出的全部 code；`new LlmError` 只接受这些 code 或 `HTTP_<status>`，`LlmError.fromFailure` 用于重新抛出 code 由其他提供方决定的已观察失败。标记了 `retryChoice` 的 code 是提供方 `retryPolicy.retryableCodes` schema 向设置表单发布的选项；成为选项不会把它加入默认重试集合。`QUOTA` 表示提供方中立的额度耗尽，`ACCOUNT_QUOTA` 专用于当前产品能够充值的第一方账号余额不足。点名未注册提供方的请求会以 `NO_ADAPTER` 失败，格式错误的凭据会以 `INVALID_CREDENTIAL` 失败，而不是表现为不透明的 fetch 错误。本服务从不自行重跑请求：重试是 `dsh-llm-retry` 在 agent 失败步骤扩展点上的职责。
 
 -----
 
@@ -81,7 +110,7 @@ for await (const chunk of ctx.llm.stream({
 
 ### 设计理念
 
-本服务基于一项职责分离原则：**逻辑约定是提供方无关的，适配器拥有协议。** 它一次性地定义规范消息、内容块与流式分片词汇，每个提供方适配器只把自己的协议格式翻译为该词汇。注册表是拓扑的拥有者——适配器路由、可配置提供方条目与发现 offer 都在这里注册，并随其 fiber 一起 dispose（资源释放）——而请求始终是会话日志的纯函数：loop 构建的请求以深度冻结状态到达，因此监听器与适配器只能读取，绝不能改写。
+本服务基于一项职责分离原则：**逻辑约定是提供方无关的，适配器拥有协议。** 它一次性地定义规范消息、内容块与流式分片词汇，每个提供方适配器只把自己的协议格式翻译为该词汇。注册表是拓扑的拥有者——适配器路由、可配置提供方条目与发现 offer 都在这里注册，并随其 fiber 一起 dispose（资源释放）——而 agent loop 的请求始终是会话日志的纯函数：loop 构建的请求以深度冻结状态到达，因此监听器与适配器只能读取，绝不能改写。
 
 ### 源码地图
 
@@ -89,25 +118,24 @@ for await (const chunk of ctx.llm.stream({
 |---|---|
 | [`src/index.ts`](src/index.ts) | `LlmRuntime` 服务：适配器注册表、可配置提供方目录、模型发现、调用准备与流式边界 |
 | [`src/types.ts`](src/types.ts) | `StreamChunk` 协议、内容块映射、结束原因与共享词汇 |
-| [`src/message.ts`](src/message.ts) | 投递、历史与请求共享的不可变消息构造函数 |
+| [`src/message.ts`](src/message.ts) | 内容文本提取与投递、历史、请求共享的不可变消息构造函数 |
 | [`src/assembler.ts`](src/assembler.ts) | `BlockAssembler`：分片到块的增量组装 |
 | [`src/assistant-stream.ts`](src/assistant-stream.ts) | 带时间信息的紧凑 Assistant 流累积、严格校验、精确展开与记录级读取器 |
 | [`src/call-config.ts`](src/call-config.ts) | 调用配置校验、适配器默认值填入与请求冻结 |
 | [`src/retry-policy.ts`](src/retry-policy.ts) | 提供方自有重试策略解析（normal 与 always 模式） |
 | [`src/error.ts`](src/error.ts) | `HarnessError`/`LlmError` 分类体系与提供方无关失败 code |
 | [`src/content.ts`](src/content.ts) | 共享文件与图片辅助函数：内容遍历、文件投影、图片卸载计数与已卸载图片投影 |
-| [`src/api-key.ts`](src/api-key.ts) | 每个适配器共享的凭据格式校验 |
 | [`src/adapter-failure.ts`](src/adapter-failure.ts) | 把失败归一化为终止 finish 分片 |
 
 ### 主流程
 
-请求会对照其精确模型的能力校验，包括上下文窗口、输出默认值、推理强度、输入模态与 `systemPromptUpdate` 模式，填入任何适配器配置的默认值，然后整个请求被深度冻结。`prepareCall()` 把这些事实、分离的上下文与重试策略绑定到执行最终分发的精确适配器代次，因此 HMR（热模块替换）或动态设置无法把一个代次的图片能力与另一代次的端点混用。支持图片的适配器把持久引用投影为路由专用请求版本；`resolveImageAttachmentAccess()` 会单独把附件提供方的可选宿主对象映射进当前工具执行世界，而不改变请求图片或其 `variantId`。纯文本路由接收确定性的逐图片占位符，包括嵌套工具结果图片，而不会改写仅追加会话历史。持久 `FileBlock` 引用永远不会到达任何适配器：请求组装把每个引用（包括嵌套工具结果中的出现）替换为确定性 句柄文本，指出文件与其只读保存路径，路径经由挂载的附件与文件系统提供方解析。`ctx.llm.fileRequestText(ref)` 向请求计量公开相同的同步投影。派生后带有 `offloaded: true` 的图片出现位置，经 `projectOffloadedImages()` 以占位文本到达每条路由。支持图片的路由在保留的出现位置按精确字节超过其 `LlmImageRequestBudget` 时，以 `IMAGE_OFFLOAD_REQUIRED` 失败并说明还需省略多少最老的出现位置（`requiredImageOffload()`），绝不发送未记录的投影；`dsh-compaction-image-offload` 用一条 `image/offload` 事件记录所选位置并重试。对视觉 token 收费的适配器声明按路由的 `imageRequestPricing`，`ctx.llm.imageRequestPricing(provider, model)` 为 token meter 同步解析它。分发经过 `llm/stream` waterfall（瀑布式事件），随后分片以 token 级增量返回，每个适配器结果都以唯一一个终止 `finish` 分片到达消费方。
+请求会对照其精确模型的能力校验，包括上下文窗口、输出默认值、推理强度、输入模态与 `systemPromptUpdate` 模式，并填入任何适配器配置的默认值。运行时保留已冻结输入的冻结状态；手动构建请求的调用方负责保证输入不可变。`prepareCall()` 把这些事实、分离的上下文与重试策略绑定到执行最终分发的精确适配器代次，因此 HMR（热模块替换）或动态设置无法把一个代次的图片能力与另一代次的端点混用。支持图片的适配器把持久引用投影为路由专用请求版本；`resolveImageAttachmentAccess()` 会单独把附件提供方的可选宿主对象映射进当前工具执行世界，而不改变请求图片或其 `variantId`。纯文本路由接收确定性的逐图片占位符，包括 tool-role 结果图片，而不会改写仅追加会话历史。持久 `FileBlock` 引用永远不会到达任何适配器：请求组装把每个引用（包括 tool-role 结果中的出现）替换为确定性句柄文本，指出文件与其只读保存路径，路径经由挂载的附件与文件系统提供方解析。`ctx.llm.fileRequestText(ref)` 向请求计量公开相同的同步投影。派生后带有 `offloaded: true` 的图片出现位置，经 `projectOffloadedImages()` 以占位文本到达每条路由。支持图片的路由在保留的出现位置按精确字节超过其 `LlmImageRequestBudget` 时，以 `IMAGE_OFFLOAD_REQUIRED` 失败并说明还需省略多少最老的出现位置（`requiredImageOffload()`），绝不发送未记录的投影；`dsh-compaction-image-offload` 用一条 `image/offload` 事件记录所选位置并重试。对视觉 token 收费的适配器声明按路由的 `imageRequestPricing`，`ctx.llm.imageRequestPricing(provider, model)` 为 token meter 同步解析它。分发经过 `llm/stream` waterfall（瀑布式事件），随后分片以 token 级增量返回，每个适配器结果都以唯一一个终止 `finish` 分片到达消费方。 `imageRequestTarget(provider, model, image)` 向截图调用方提供与模型请求一致的图片尺寸和字节目标；不缩放图片的适配器保留归一化后的原图。
 
-文件检测在每次请求时读取当前内容，包括嵌套工具结果，不缓存消息身份或冻结状态。[文件扫描决策](../../../.agents/notes/implemented/simplification/2026-09-07-file-content-scan.zh.md)记录了实测遍历成本。
+文件检测在每次请求时读取当前内容，包括 tool-role 结果内容，不缓存消息身份或冻结状态。[已归档的文件扫描决策](../../../.agents/notes/archived/simplification/2026-09-07-file-content-scan.md)记录了实测遍历成本。
 
 ### 不变式
 
-- **模型可见 ⟺ 已记录**——到达提供方请求的任何内容都可以从会话日志重建；loop 构建的请求被深度冻结，绝不改写。
+- **模型可见 ⟺ 已记录**——调用方必须确保每个提供方请求中的模型可见输入都可以从会话日志重建；loop 构建的请求以深度冻结状态到达，不可改写。
 - **回放状态只在同一适配器内流动**——仅当同一适配器实例同时拥有历史路由与目标路由时，assistant 回放状态才会随行；否则在分发前被丢弃。
 - **已准备调用是一次性的**——已准备调用只能分发一次，且其调用配置字段必须与准备好的配置一致。
 - **图片投影遵循捕获的路由**——只有支持图片的模型会把持久 `ImageBlock` 引用转换为路由专用请求版本；纯文本模型接收稳定占位符。
@@ -125,7 +153,7 @@ for await (const chunk of ctx.llm.stream({
 当包级约定不够用时阅读以下页面。它们从共享类型逐步进入具体适配器、重试执行器与计量服务。
 
 - [LLM（大语言模型）流式子系统](../../../docs/subsystems/llm-streaming.zh.md)——消息与块类型、紧凑的 Assistant 流记录、`StreamChunk` 协议与适配器约定。
-- [llm-deepseek 适配器](../llm-deepseek/README.zh.md)——DeepSeek chat-completions 直连实现。
+- [llm-deepseek 适配器](../llm-deepseek/README.zh.md)——DeepSeek Messages 直连实现。
 - [llm-pi-ai 适配器](../llm-pi-ai/README.zh.md)——基于 pi-ai 的多提供方实现。
 - [llm-retry](../llm-retry/README.zh.md)——重跑失败模型请求的重试执行器。
 - [Token 计量](../token-meter/README.zh.md)——具备回放感知的请求与上下文压力测量。
@@ -151,10 +179,12 @@ for await (const chunk of ctx.llm.stream({
 这些限制说明本服务在哪里停止、由其他包或未来工作接续。它们是当前包约束，不是任务积压。
 
 - **本服务不提供重试执行、缓存或速率限制**——提供方注册会存储重试策略，但一次流仍是一次提供方尝试；`@deepseek-ai/dsh-llm-retry` 在持久 agent 步骤边界上执行该策略。
+- **只有 `attributionHeaders()` 携带 `DSH_USER_AGENT_SUFFIX` 标记**——DeepSeek 网页搜索和 web API 插件发送各自固定的 `User-Agent`，因此 profile 后缀不会出现在这些请求中。
 - **`GenerateOptions` 采样只包含 `temperature`／`maxTokens`／`stop`**——没有 `tool_choice`、`top_p` 或 penalty 字段；有产生方落地时词汇才会增长（见[已删除惰性旋钮](../../../.agents/notes/archived/simplification/2026-07-04-drop-inert-request-knobs.md)）。
-- **只有出现实际产生方后，相应变体才会加入**——`prefill`、逐工具 `strict`、内容块 `cache` 提示和 `agent` 消息来源变体都没有产生方（见 [Agent Note](../../../.agents/notes/archived/simplification/2026-07-04-prune-producerless-vocabulary-variants.md)）。
+- **变体通常要求实际产生方**——`prefill`、逐工具 `strict`、内容块 `cache` 提示和 `agent` 消息来源变体都没有产生方（见 [Agent Note](../../../.agents/notes/archived/simplification/2026-07-04-prune-producerless-vocabulary-variants.md)）。
 - **`BlockAssembler` 只处理核心块类型**——插件添加块类型的流若从未由 `block-end` 关闭，`blocks()` 会抛出异常。
 - **`GenerateOptions.sessionId` 是本地声明的品牌类型**——导入 dsh-session 的 `SessionId` 会产生依赖循环。
+- **工具更新需要会话历史** — `GenerateOptions.tools` 包含当前有效定义。`toolHistory` 提供 `Session.toolHistory()` 派生的初始声明及已解析历史定义的添加记录。适配器分发时，`projectToolUpdates` 构造延迟声明，并在 `in-history` 模式保留已移除定义；`addition-only` 省略已移除定义和移除消息。在 addition-only 路由移除任何工具或向空工具集添加工具时，使用该次更新后的可用声明重建基线。延迟声明也计入已有工具。已被取代的工具块会被省略，其他内容保留；后续添加仍保持延迟加载。不支持更新的路由接收有效工具，不携带 developer 消息或 `deferLoading`。缺少历史或请求前缀遗漏已记录更新时，回退为当前声明且不发送 developer 消息。显式延迟工具仅在已有添加记录将其激活时，才会在重建时变为立即加载；尚未激活的声明仍保持延迟加载。
 
 <a id="dev-note"></a>
 ### 开发备注

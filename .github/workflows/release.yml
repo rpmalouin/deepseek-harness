@@ -30,7 +30,8 @@ jobs:
     name: Dependency layout
     # Persistent runners accept only trusted, credential-free rehearsals.
     runs-on: >-
-      ${{ vars.DSH_CI_FAILOVER_LINUX == 'selfhosted'
+      ${{ vars.DSH_CI_FAILOVER_LINUX == 'blacksmith' && 'blacksmith-4vcpu-ubuntu-2404'
+        || vars.DSH_CI_FAILOVER_LINUX == 'selfhosted'
         && github.repository == 'deepseek-harness/deepseek-harness'
         && github.actor != 'dependabot[bot]'
         && ((github.event_name == 'push' && github.ref == 'refs/heads/master')
@@ -41,7 +42,7 @@ jobs:
         && fromJSON('["self-hosted", "linux", "x64", "vm-backup"]')
         || 'ubuntu-24.04' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
           clean: true
@@ -52,11 +53,11 @@ jobs:
           echo "npm_config_devdir=${{ runner.temp }}/node-gyp" >> "$GITHUB_ENV"
           echo "TMPDIR=${{ runner.temp }}" >> "$GITHUB_ENV"
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v5.0.0
         with:
           dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ env.PRIMARY_NODE_VERSION }}
           package-manager-cache: false
@@ -69,7 +70,7 @@ jobs:
           store_path=$(PNPM_CONFIG_STORE_DIR="$store_root" pnpm store path --silent)
           echo "path=$store_path" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@v6.1.0
         if: runner.environment == 'github-hosted'
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
@@ -80,11 +81,20 @@ jobs:
       - name: Install (immutable)
         run: pnpm install --frozen-lockfile
 
-      - name: Verify dependency policy
-        run: pnpm run verify-package-dependencies
-
-      - name: Verify npm install layout
-        run: pnpm run verify-npm-install-layout
+      # The two verifications read different inputs (manifests versus an npm
+      # install in a scratch directory), so they run beside each other.
+      - name: Verify dependency policy and npm install layout
+        run: |
+          pnpm run verify-package-dependencies &
+          dependencies_pid=$!
+          pnpm run verify-npm-install-layout &
+          layout_pid=$!
+          dependencies_status=0
+          wait "$dependencies_pid" || dependencies_status=$?
+          layout_status=0
+          wait "$layout_pid" || layout_status=$?
+          if (( dependencies_status != 0 )); then exit "$dependencies_status"; fi
+          exit "$layout_status"
 
   pack:
     name: Pack npm tarballs
@@ -102,7 +112,7 @@ jobs:
         || 'ubuntu-24.04' }}
     steps:
       # Complete history: the release scripts read tags.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -114,11 +124,11 @@ jobs:
           echo "npm_config_devdir=${{ runner.temp }}/node-gyp" >> "$GITHUB_ENV"
           echo "TMPDIR=${{ runner.temp }}" >> "$GITHUB_ENV"
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v5.0.0
         with:
           dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ env.PRIMARY_NODE_VERSION }}
           package-manager-cache: false
@@ -131,7 +141,7 @@ jobs:
           store_path=$(PNPM_CONFIG_STORE_DIR="$store_root" pnpm store path --silent)
           echo "path=$store_path" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@v6.1.0
         if: runner.environment == 'github-hosted'
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
@@ -146,7 +156,7 @@ jobs:
         run: pnpm run release:verify --family dsh
 
       - name: Build
-        run: pnpm run build:official
+        run: ${{ github.event_name == 'pull_request' && 'pnpm run build:artifacts --profile official' || 'pnpm run build:official' }}
 
       # Concurrency here is rehearsal-only: the credentialed publish workflows
       # invoke release:pack without the flag and keep the strictly serial path.
@@ -172,7 +182,7 @@ jobs:
       - name: Verify packed install
         run: pnpm run release:verify-packed-install --family dsh --from dist/npm --from dist/npm-vendor --from dist/npm-landlock
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: dsh-npm-tarballs
           path: dist/npm/*

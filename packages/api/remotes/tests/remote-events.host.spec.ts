@@ -52,7 +52,7 @@ function sourceOf(gateway: GatewayProbe): TypertRemoteEventSource {
 }
 
 function emitRaw(ctx: Context, event: string, args: readonly unknown[]): void {
-  const emit = ctx.emit.bind(ctx) as unknown as (name: string, ...values: readonly unknown[]) => void
+  const emit = ctx.emit.bind(ctx) as (name: string, ...values: readonly unknown[]) => void
   emit(event, ...args)
 }
 
@@ -63,7 +63,7 @@ function waterfallRaw(
   args: readonly unknown[],
   next: () => Promise<unknown>,
 ): Promise<unknown> {
-  const waterfall = ctx.waterfall.bind(ctx) as unknown as (
+  const waterfall = ctx.waterfall.bind(ctx) as (
     receiver: object,
     name: string,
     ...values: readonly unknown[]
@@ -123,6 +123,26 @@ describe('Remote event Host source', () => {
       },
     })
 
+    emitRaw(ctx, 'schedule/changed', [])
+    await expect(first.next()).resolves.toEqual({
+      done: false,
+      value: { event: 'schedule/changed', args: [] },
+    })
+    await expect(second.next()).resolves.toEqual({
+      done: false,
+      value: { event: 'schedule/changed', args: [] },
+    })
+
+    emitRaw(ctx, 'web/providers-changed', [])
+    await expect(first.next()).resolves.toEqual({
+      done: false,
+      value: { event: 'web/providers-changed', args: [] },
+    })
+    await expect(second.next()).resolves.toEqual({
+      done: false,
+      value: { event: 'web/providers-changed', args: [] },
+    })
+
     const firstDone = first.next()
     firstAbort.abort(new Error('first Client disconnected'))
     emitRaw(ctx, 'commands/change', [])
@@ -139,6 +159,33 @@ describe('Remote event Host source', () => {
     await fiber.dispose()
     expect(gateway.source).toBeUndefined()
     expect(gateway.removals).toBe(1)
+    await ctx.fiber.dispose()
+  })
+
+  it('attaches each declared resource reader to its forwarded notification', async () => {
+    const { ctx, gateway, fiber } = await setup()
+    const abort = new AbortController()
+    const stream = sourceOf(gateway)(abort.signal)[Symbol.asyncIterator]()
+    const cases: readonly (readonly [string, readonly unknown[], string])[] = [
+      ['api-session/activity', ['s-activity', 1], 's-activity'],
+      ['api-session/added', [{ sessionId: 's-added' }], 's-added'],
+      ['api-session/error', ['s-error', 'boom'], 's-error'],
+      ['api-session/removed', ['s-removed'], 's-removed'],
+      ['api-session/status', ['s-status', true], 's-status'],
+    ]
+    for (const [event, args, sessionId] of cases) {
+      emitRaw(ctx, event, args)
+      const next = await stream.next()
+      if (next.done === true || 'context' in next.value) throw new Error(`${event} was not forwarded as a notification`)
+      const frame = next.value
+      expect(frame).toMatchObject({ event, args })
+      expect(frame.resources?.['session']?.(...frame.args)).toBe(sessionId)
+    }
+    // An event that declares no resources carries no readers, so access control sees the global resource.
+    emitRaw(ctx, 'commands/change', [])
+    await expect(stream.next()).resolves.toEqual({ done: false, value: { event: 'commands/change', args: [] } })
+    abort.abort(new Error('Client disconnected'))
+    await fiber.dispose()
     await ctx.fiber.dispose()
   })
 

@@ -11,7 +11,6 @@
 - id: agent-instructions
   config:
     maxBytes: 65536
-    dshHome: !!js process.cwd() + '/.dsh'
 
 - id: session-persistence-jsonl
   config:
@@ -32,3 +31,9 @@
 - id: session-log-deepseek
   config:
     enabled: false
+
+- id: sandbox-policy
+  inject: []
+  config:
+    mode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'
+    workspaceRoot: !!js process.cwd()

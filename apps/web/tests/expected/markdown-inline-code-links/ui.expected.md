@@ -1,14 +1,15 @@
 - banner:
-  - navigation "Session hierarchy":
-    - button "Inline code links" [disabled]
-  - button "More actions":
-    - img
+  - navigation "Session hierarchy": Inline code links
+  - button "Session panel"
+  - button "More actions"
   - tablist:
     - tab "Chat" [selected]
     - tab "Trajectory"
+  - button "More conversation views"
 - text: Show the local preview URL. {{clock}}
-- button "Copy":
-  - img
+- button "Copy"
+- status: Completed
+- button "Completed in {{duration}}" [disabled]
 - heading "Inline code links" [level=2]
 - paragraph:
   - text: "Preview:"
@@ -26,26 +27,14 @@
   - text: "Unsafe:"
   - code: javascript:alert(1)
 - paragraph: INLINE_CODE_LINK_DONE
-- button "Copy":
-  - img
-- button "Good response":
-  - img
-- button "Bad response":
-  - img
-- button "Branch into a new conversation":
-  - img
-- button "Ran for {{duration}}":
-  - img
-  - text: Ran for {{duration}}
+- button "Copy"
+- button "Good response"
+- button "Bad response"
+- button "Branch into a new conversation"
 - text: {{clock}}
 - textbox "Message or run a task, / commands, @ files or sessions"
-- button "Add files or run commands":
-  - img
+- button "Add files or run commands"
 - 'button "Access mode, current: Workspace Write"': Workspace Write
-- button "Select model, current DeepSeek-V4-Flash":
-  - text: DeepSeek-V4-Flash
-  - img
+- button "Select model, current DeepSeek-V4-Flash": DeepSeek-V4-Flash
 - button "Send message" [disabled]
-- button "1 turns 1 steps":
-  - img
-  - text: 1 turns 1 steps
+- button "1 turns 1 steps"

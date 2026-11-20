@@ -29,7 +29,7 @@ kind: "package-reference"
 
 ### mention 语法
 
-输入开头或空白后的 `@path` token 会触发补全；其他 token 内部的 `@`（如电子邮件地址）不会。`@"path with spaces"` 打开带引号的 mention，目录候选在其尾斜杠后保持引号打开，使补全可以继续深入下一层。格式化器会拒绝含有语法无法安全表示的控制字符或内嵌引号的路径。
+输入开头或空白后的 `@path` token 会触发补全；其他 token 内部的 `@`（如电子邮件地址）不会。`@"path with spaces"` 打开带引号的 mention，目录候选在其尾斜杠后保持引号打开，使补全可以继续深入下一层。格式化器会拒绝含有语法无法安全表示的控制字符或内嵌引号的路径。 已完成的目录 chip 在末尾斜杠之后闭合引号。相对引用从工作区根目录解析，绝对引用保留主机路径。
 
 ### 获取候选
 
@@ -59,8 +59,7 @@ kind: "package-reference"
 |---|---|
 | [`src/index.ts`](src/index.ts) | 抽象 `FileReferenceService` 与 `FILE_REFERENCE_PROMPT` |
 | [`src/grammar.ts`](src/grammar.ts) | `activeAtToken` 识别与 `formatFileMention` 渲染 |
-| [`src/types.ts`](src/types.ts) | 仅含路径的结果类型 `FileReferenceCandidate` |
-| — | 不发布运行时不变式伴生入口；接口不保留 candidate 或 lifecycle 状态；具体提供方负责自己的 cache 与 invalidation 关系。 |
+| [`src/types.ts`](src/types.ts) | 仅含路径的 `FileReferenceCandidate` 结果和 `ActiveAtToken` 提及词元记录 |
 
 ### 主要流程
 

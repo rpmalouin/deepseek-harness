@@ -15,6 +15,8 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type { Session, SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-subprocess'
 import type {} from '@deepseek-ai/dsh-tools'
+import type {} from '@deepseek-ai/dsh-working-directory'
+import type { FsTarget } from '@deepseek-ai/dsh-fs'
 import { GitRunner } from './git.ts'
 import { TurnRecorder } from './recorder.ts'
 import type { WorkspaceChanges } from './types.ts'
@@ -26,8 +28,8 @@ export type {
 /** Stable Loader identity. */
 export const name = 'workspace-changes'
 
-/** Services used to run git and observe turns. */
-export const inject = ['subprocess']
+/** Services used to run git, resolve mutation targets, and observe turns. */
+export const inject = ['subprocess', 'fs']
 
 /** Snapshot, capture, and comparison bounds. Invalid values fail plugin load. */
 export interface Config {
@@ -55,6 +57,7 @@ export const Config: z<Config> = z.object({
   diffTimeoutMs: z.number().default(100),
 })
 
+/** The original directory of a summarized Session: a top-level Session with a recorded directory. */
 function eligible(session: Session): string | undefined {
   const { cwd, origin, delegationDepth } = session.header
   return origin === 'subagent' || (delegationDepth ?? 0) > 0 ? undefined : cwd
@@ -88,7 +91,7 @@ async function resolveGit(ctx: Context, signal: AbortSignal): Promise<string | n
  * Observe top-level turns of every Session with a working directory, capture
  * file-tool edits, announce change summaries, and serve them with their
  * comparisons as `workspaceChanges`.
- * @param ctx - host context with `subprocess`.
+ * @param ctx - host context with `subprocess` and `fs`.
  * @param config - validated bounds.
  */
 export function apply(ctx: Context, config: Config): void {
@@ -100,6 +103,7 @@ export function apply(ctx: Context, config: Config): void {
   }
   const lifetime = new AbortController()
   const recorders = new Map<Session, TurnRecorder>()
+  const mutations = new WeakMap<object, TurnRecorder>()
   const byId = new Map<SessionId, TurnRecorder>()
   const forget = (session: Session): Promise<void> => {
     const recorder = recorders.get(session)
@@ -127,10 +131,11 @@ export function apply(ctx: Context, config: Config): void {
     })
     return runner
   }
-  const recorderFor = (session: Session, cwd: string): TurnRecorder => {
+  const recorderFor = (session: Session, original: string): TurnRecorder => {
     let recorder = recorders.get(session)
     if (recorder === undefined) {
-      recorder = new TurnRecorder(session, cwd, {
+      // The Session's directory now; `workspace-root/change` events report later moves.
+      recorder = new TurnRecorder(session, ctx.get('workingDirectory')?.get(session) ?? original, {
         git: gitRunner(), tempRoot: tmpdir(), maxFiles: config.maxFiles,
         maxFileBytes: config.maxFileBytes, diffTimeoutMs: config.diffTimeoutMs,
         warn: (message) => { ctx.logger.warn(message) },
@@ -142,22 +147,44 @@ export function apply(ctx: Context, config: Config): void {
   }
   ctx.on('session/event', (session, event) => {
     if (event.type === 'turn/start') {
-      const cwd = eligible(session)
-      if (cwd !== undefined) recorderFor(session, cwd).start(event.data.turn)
+      const original = eligible(session)
+      if (original !== undefined) recorderFor(session, original).start(event.data.turn)
       return
     }
-    if (event.type === 'tool/result') recorders.get(session)?.observe(event)
+    if (event.type === 'workspace-root/change') recorders.get(session)?.moveTo(event.data.cwd)
+    else if (event.type === 'tool/result') recorders.get(session)?.observe(event)
     else if (event.type === 'turn/end') recorders.get(session)?.end(event.data.turn)
   })
   ctx.on('session/disposed', (session) => { void forget(session) })
   ctx.on('agent/turn-stopping', async ({ agent, turn }) => {
     await recorders.get(agent.session)?.stopping(turn)
   })
+  const capture = async (target: FsTarget, actor: object | undefined): Promise<void> => {
+    const recorder = actor === undefined ? undefined : mutations.get(actor)
+    if (recorder === undefined) return
+    recorder.capture(ctx.fs.processPath(target))
+    await recorder.settled()
+  }
+  ctx.on('fs/write-intent', async (target, actor, next) => {
+    const intent = await next()
+    await capture(target, actor)
+    return intent
+  }, { prepend: true })
+  ctx.on('fs/edit-intent', async (target, actor, next) => {
+    const intent = await next()
+    await capture(target, actor)
+    return intent
+  }, { prepend: true })
+  ctx.on('fs/delete-intent', async (target, actor, next) => {
+    const intent = await next()
+    await capture(target, actor)
+    return intent
+  }, { prepend: true })
   ctx.on('tools/pre-execute', async (exec, next) => {
     const session = exec.agent?.session
     const recorder = session === undefined ? undefined : recorders.get(session)
     if (recorder !== undefined) {
-      recorder.capture(exec.name, exec.arguments)
+      mutations.set(exec, recorder)
       await recorder.settled()
     }
     return next()

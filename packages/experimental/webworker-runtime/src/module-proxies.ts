@@ -44,6 +44,8 @@ export const MODULE_PROXIES: Record<string, string> = {
   // Sync-stack AsyncLocalStorage semantics.
   'node:async_hooks': './node/builtin_modules/implemented/async_hooks.ts',
   // Real implementations over browser primitives.
+  'node:assert/strict': './node/builtin_modules/implemented/assert/strict.ts',
+  'assert/strict': './node/builtin_modules/implemented/assert/strict.ts',
   'node:util': './node/builtin_modules/implemented/util.ts',
   'node:util/types': './node/builtin_modules/implemented/util/types.ts',
   'node:events': './node/builtin_modules/implemented/events.ts',
@@ -57,11 +59,16 @@ export const MODULE_PROXIES: Record<string, string> = {
   // the VFS, because a browser worker has no processes to fork.
   'node:child_process': './node/builtin_modules/implemented/child_process.ts',
   // Structural mocks: every symbol exists, every call throws.
+  'node:https': './node/builtin_modules/mock/https.ts',
   'node:dns/promises': './node/builtin_modules/mock/dns/promises.ts',
   'dns/promises': './node/builtin_modules/mock/dns/promises.ts',
   'node:net': './node/builtin_modules/mock/net.ts',
   'node:stream': './node/builtin_modules/implemented/stream.ts',
+  'node:string_decoder': './node/builtin_modules/implemented/string_decoder.ts',
+  'node:stream/promises': './node/builtin_modules/implemented/stream/promises.ts',
+  'stream/promises': './node/builtin_modules/implemented/stream/promises.ts',
   'node:vm': './node/builtin_modules/mock/vm.ts',
+  'node:repl': './node/builtin_modules/mock/repl.ts',
   'node:worker_threads': './node/builtin_modules/mock/worker_threads.ts',
   'node:sqlite': './node/builtin_modules/mock/sqlite.ts',
   // External npm replacements, named after the package each stands in for.
@@ -71,8 +78,12 @@ export const MODULE_PROXIES: Record<string, string> = {
   'sharp': './node/external_packages/sharp.ts',
   'node-pty': './node/external_packages/node-pty.ts',
   'execa': './node/external_packages/execa.ts',
+  'got': './node/external_packages/got.ts',
   '@vscode/ripgrep': './node/external_packages/ripgrep.ts',
   '@earendil-works/pi-ai': './node/external_packages/pi-ai.ts',
+  '@earendil-works/pi-coding-agent': './node/external_packages/pi-coding-agent.ts',
+  // Node internal modules for callers without `--expose-internals`.
+  'node-addon-require-builtin': './node/external_packages/node-addon-require-builtin.ts',
   // Constructible fakes whose methods are never reached.
   'ws': './node/external_packages/ws.ts',
 }

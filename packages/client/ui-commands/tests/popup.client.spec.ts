@@ -48,11 +48,40 @@ async function readyPopup(overrides: Partial<PopupSpec<Ctx>> = {}, deps = makeDe
 }
 
 describe('filterOptions', () => {
-  it('matches case-insensitively over label and detail; blank keeps all', () => {
-    expect(filterOptions(OPTIONS, '')).toBe(OPTIONS)
-    expect(filterOptions(OPTIONS, '  ')).toBe(OPTIONS)
+  const alpha = { name: 'alpha', label: 'Alpha provider' }
+  const beta = { name: 'beta', label: 'Beta provider' }
+  const grouped: SelectOption[] = [
+    { id: 'a-deep', label: 'DeepSeek Flash', group: alpha },
+    { id: 'b-flash', label: 'Flash Beta', group: beta },
+    { id: 'a-prefix', label: 'Flash Lite', group: alpha, active: true },
+  ]
+
+  it('keeps provider order while ranking fuzzy label matches within each group', () => {
+    expect(filterOptions(grouped, '')).toEqual([grouped[0], grouped[2], grouped[1]])
+    expect(filterOptions(grouped, ' FLASH ')).toEqual([grouped[2], grouped[0], grouped[1]])
+    expect(filterOptions(grouped, 'fslt')).toEqual([grouped[2]])
+    expect(filterOptions(grouped, 'Alpha provider')).toEqual([])
+  })
+
+  it('uses that same displayed order for highlighting and selection', async () => {
+    const onSelect = vi.fn()
+    const { popup } = await readyPopup({ options: () => Promise.resolve(grouped), onSelect })
+    expect(popup.state.getSnapshot().active).toBe(1)
+    popup.setSearch('flash')
+    expect(popup.state.getSnapshot().active).toBe(0)
+    popup.move(-1)
+    expect(popup.state.getSnapshot().active).toBe(2)
+    await popup.select(2)
+    expect(onSelect).toHaveBeenCalledWith(grouped[1], CTX_A)
+  })
+
+  it('matches labels fuzzily and details as substrings; blank keeps all', () => {
+    expect(filterOptions(OPTIONS, '')).toEqual(OPTIONS)
+    expect(filterOptions(OPTIONS, '  ')).toEqual(OPTIONS)
     expect(filterOptions(OPTIONS, 'DARK')).toEqual([OPTIONS[0]])
+    expect(filterOptions(OPTIONS, 'lgt')).toEqual([OPTIONS[1]])
     expect(filterOptions(OPTIONS, 'warm')).toEqual([OPTIONS[2]])
+    expect(filterOptions(OPTIONS, 'wrm')).toEqual([])
     expect(filterOptions(OPTIONS, 'nope')).toEqual([])
   })
 })

@@ -15,7 +15,7 @@ import {
   officialClientBuildEnvironment,
   readClientBuildRecord,
 } from '../client-build-environment.ts'
-import { validateTarballPayload } from '../publication-payload.ts'
+import { ON_DEMAND_BUNDLES } from '../../packages/util/official-bundles/src/bundles.ts'
 
 /**
  * Dependency sections a consumer must publish after, because npm resolves them
@@ -249,6 +249,13 @@ export abstract class ReleaseFamily {
   }
 
   /**
+   * Packages that must already be published before this member can advertise them.
+   * @param _member - Member being published.
+   * @returns Release prerequisites that do not become installed dependencies.
+   */
+  protected publicationPrerequisites(_member: ReleaseMember): readonly string[] { return [] }
+
+  /**
    * The family members one member declares in the given sections.
    * @param member - the dependent member.
    * @param byName - every family member by package name.
@@ -267,6 +274,13 @@ export abstract class ReleaseFamily {
       for (const name of Object.keys(dependencies)) {
         const dependency = byName.get(name)
         if (dependency !== undefined && dependency.name !== member.name) edges.push(dependency)
+      }
+    }
+    if (sections.includes('dependencies')) {
+      for (const name of this.publicationPrerequisites(member)) {
+        const prerequisite = byName.get(name)
+        if (prerequisite === undefined) throw new Error(`${member.name}: Official catalog prerequisite ${name} is missing from the public release family`)
+        if (!edges.some(edge => edge.name === name)) edges.push(prerequisite)
       }
     }
     return edges.sort((left, right) => left.name.localeCompare(right.name))
@@ -310,6 +324,17 @@ export abstract class ReleaseFamily {
    * @param files - every path inside its tarball.
    */
   abstract validatePayload(member: ReleaseMember, files: readonly string[]): void
+
+  /**
+   * Check the identity in the packed manifest before publishing its bytes.
+   * @param member - Source member selected for this release.
+   * @param manifest - Manifest read from its packed tarball.
+   */
+  validatePackedManifest(member: ReleaseMember, manifest: Readonly<Record<string, unknown>>): void {
+    if (manifest.name !== member.name || manifest.version !== member.version) {
+      throw new Error(`${member.name}: packed identity must match ${member.name}@${member.version}`)
+    }
+  }
 
   /**
    * The executable that proves this family's artifacts install and run, or
@@ -361,12 +386,44 @@ class DshFamily extends ReleaseFamily {
   }
 
   /**
-   * Reject source and declaration-map members, the repository's publication policy.
+   * Require the installed package to carry the documentation and source its
+   * manifest promises. `docs` exists only because `prepack` stages it, and a
+   * stale tree in the checkout would satisfy a weaker check, so the staged
+   * copy must be complete for the pack that publishes it.
    * @param member - the packed member.
    * @param files - every path inside its tarball.
    */
   validatePayload(member: ReleaseMember, files: readonly string[]): void {
-    validateTarballPayload(files, member.name)
+    if (member.name !== this.installedEntry.packageName) return
+    if (!files.some(file => file.startsWith('package/docs/') && file.endsWith('.md'))) {
+      throw new Error(`${member.name} packed no documentation`)
+    }
+    if (!files.includes('package/docs/upgrade-guide/README.md')) {
+      throw new Error(`${member.name} packed no upgrade guide index`)
+    }
+    if (!files.some(file => file.startsWith('package/src/') && file.endsWith('.ts'))) {
+      throw new Error(`${member.name} packed no source`)
+    }
+  }
+
+  /** Publish every advertised on-demand package before the installation that offers it. */
+  protected override publicationPrerequisites(member: ReleaseMember): readonly string[] {
+    return member.name === '@deepseek-ai/dsh' ? ON_DEMAND_BUNDLES : []
+  }
+
+  /** Require the packed DSH runtime graph to stay on the shared exact release version. */
+  override validatePackedManifest(member: ReleaseMember, manifest: Readonly<Record<string, unknown>>): void {
+    super.validatePackedManifest(member, manifest)
+    for (const section of ['dependencies', 'optionalDependencies', 'peerDependencies']) {
+      const dependencies = manifest[section]
+      if (dependencies === null || typeof dependencies !== 'object' || Array.isArray(dependencies)) continue
+      for (const [name, range] of Object.entries(dependencies)) {
+        if (name !== '@deepseek-ai/dsh' && !name.startsWith('@deepseek-ai/dsh-')) continue
+        if (range !== member.version) {
+          throw new Error(`${member.name}: packed ${section}.${name} must equal ${member.version}, got ${String(range)}`)
+        }
+      }
+    }
   }
 
   readonly installedEntry = { packageName: '@deepseek-ai/dsh', binPath: 'lib/bin.js' }
@@ -400,14 +457,12 @@ class VendorFamily extends ReleaseFamily {
   }
 
   /**
-   * Require the payload the vendored manifest declares, including upstream's
-   * `src` tree and declaration maps.
+   * Accept upstream's payload.
    *
-   * The harness policy that rejects both does not apply here: these manifests
-   * export `./src/*` for source navigation, so dropping `src` would publish a
-   * package whose export map points at absent files. What must hold instead is
-   * that every path the manifest selects is present, which `files` already
-   * decides and `pnpm pack` already enforces.
+   * Upstream's manifest owns that payload, so this family enforces no shape of
+   * its own beyond a nonempty tarball. What must hold is that every path the
+   * manifest selects is present, which `files` already decides and `pnpm pack`
+   * already enforces.
    * @param member - the packed member.
    * @param files - every path inside its tarball.
    */

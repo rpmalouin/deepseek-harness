@@ -139,6 +139,22 @@ const homeAndGuide = pairedPages([
     order: 3,
   },
   {
+    source: 'docs/user/guide/public-deployments.md',
+    route: 'guide/public-deployments.md',
+    label: { root: '公开部署', en: 'Public deployments' },
+    sidebar: { root: 'zh-guide', en: 'en-guide' },
+    section: { root: '入门', en: 'Guide' },
+    order: 4,
+  },
+  {
+    source: 'docs/user/guide/desktop-uninstall-cleanup.md',
+    route: 'guide/desktop-uninstall-cleanup.md',
+    label: { root: '卸载 DSH 桌面端', en: 'Uninstall DSH Desktop' },
+    sidebar: { root: 'zh-guide', en: 'en-guide' },
+    section: { root: '入门', en: 'Guide' },
+    order: 5,
+  },
+  {
     source: 'docs/user/guide/python-sdk.md',
     route: 'guide/python-sdk.md',
     label: { root: 'Python', en: 'Python' },
@@ -160,6 +176,14 @@ const homeAndGuide = pairedPages([
     label: { root: '会话内提醒', en: 'Session reminders' },
     sidebar: { root: 'zh-guide', en: 'en-guide' },
     section: { root: '自动化', en: 'Automation' },
+    order: 2,
+  },
+  {
+    source: 'docs/user/guide/plugin-market.md',
+    route: 'guide/plugin-market.md',
+    label: { root: '插件索引', en: 'Plugin indexes' },
+    sidebar: { root: 'zh-guide', en: 'en-guide' },
+    section: { root: '集成', en: 'Integrations' },
     order: 2,
   },
   {
@@ -300,7 +324,6 @@ const subsystemGroups = [
   ['内核与作用域', 'Core and scopes', [
     ['core.md', '核心', 'Core'],
     ['scope.md', '作用域', 'Scopes'],
-    ['invariants.md', '运行时不变式', 'Runtime invariants'],
   ]],
   ['会话与持久化', 'Sessions and persistence', [
     ['session.md', '会话', 'Sessions'],
@@ -330,7 +353,7 @@ const subsystemGroups = [
     ['web.md', 'Web 访问', 'Web access'],
     ['skills.md', '技能', 'Skills'],
     ['workflow.md', '工作流', 'Workflows'],
-    ['subagent.md', '子代理', 'Subagents'],
+    ['subagent.md', '子智能体', 'Subagents'],
   ]],
   ['策略与交互', 'Policy and interaction', [
     ['approval.md', '审批', 'Approvals'],
@@ -402,6 +425,7 @@ const reference = [
     ['docs/config-catalog.md', 'reference/config-catalog.md', '插件配置', 'Plugin configuration'],
     ['docs/tool-catalog.md', 'reference/tool-catalog.md', 'Tool Schema', 'Tool schemas'],
     ['docs/persistence-catalog.md', 'reference/persistence-catalog.md', '持久化事件', 'Persistence events', 'deep'],
+    ['docs/experimental-persistence-catalog.md', 'reference/experimental-persistence-catalog.md', '实验性持久化记录', 'Experimental persistence'],
   ] as const).map(([source, route, rootLabel, enLabel, outline], order): PairedPage => ({
     source,
     route,
@@ -440,7 +464,7 @@ const reference = [
     ['adding-a-package.md', '新增 Package', 'Adding a package'],
     ['adding-a-tool.md', '新增 Tool', 'Adding a tool'],
     ['adding-an-llm-adapter.md', '新增 LLM Adapter', 'Adding an LLM adapter'],
-    ['adding-a-settings-card.md', '新增设置卡片', 'Adding a settings card'],
+    ['adding-a-settings-card.md', '新增设置页', 'Adding a settings page'],
     ['extension-cookbook.md', '扩展模式', 'Extension patterns'],
   ] as const).map(([file, rootLabel, enLabel], order): PairedPage => ({
     source: `docs/cookbook/${file}`,

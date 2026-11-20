@@ -5,8 +5,30 @@
   display: flex;
   flex: 1 1 auto;
   flex-direction: column;
+  min-width: 0;
   height: 100%;
   min-height: 0;
+}
+
+/* Everything below the header: the body, then the navigator another plugin
+   contributes in a docked or floating pane. The navigator either narrows the
+   body or positions an overlay against this row, so the header always spans
+   the pane. */
+.content {
+  position: relative;
+  /* Child layers stay below the floating pane's resize handle. */
+  isolation: isolate;
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* Renderers' sticky toolbars stack inside the body, below an overlaying navigator. */
+.content > :first-child {
+  isolation: isolate;
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 /* One 38px row flush under the pane's strip: the path, then the type's
@@ -28,38 +50,20 @@
   border-bottom: 0.5px solid var(--dsw-alias-border-l3);
 }
 
-/* The path is never ellipsized. Its text sits at the left while it fits: the
-   auto margin takes the free space. Once it is wider than the box, the auto
-   margin is zero and `flex-end` holds the name at the right edge, so the
-   directories run off the left and the box clips them there, faded by the
-   mask while `data-textpreview-path-clipped` is set. The margin plus the row's
-   gap put the text 16px clear of the first control. */
-.path {
+/* Match the trailing icon box above, retaining its internal glyph whitespace. */
+.externalActions {
   display: flex;
-  flex: 1 1 auto;
-  justify-content: flex-end;
-  min-width: 0;
-  margin-right: 12px;
-  overflow: hidden;
-  font-size: 12px;
-  white-space: nowrap;
-}
-
-.path[data-textpreview-path-clipped] {
-  mask-image: linear-gradient(to right, transparent, black 28px);
-}
-
-.pathText {
   flex: none;
-  margin-right: auto;
+  margin-inline-start: 6px;
+  margin-inline-end: 6px;
 }
 
-.pathDirectory {
-  color: var(--dsw-alias-label-tertiary);
+.externalActions:not(:has(:global([data-slot]) > *)) {
+  display: none;
 }
 
-.pathName {
-  color: var(--dsw-alias-label-primary);
+.path {
+  margin-right: 12px;
 }
 
 /* Announced, not applied: the reader keeps the text they are looking at. */
@@ -84,6 +88,8 @@
   margin: 0;
   padding: 0;
   overflow: auto;
+  /* The remembered offset is a pixel distance; browser anchoring would move it when content above it reflows. */
+  overflow-anchor: none;
   /* The notice and retry surfaces in this sheet are elevated, so the file body's
      scroller rebinds the thumb indirection in a complete pair. */
   --dsh-scrollbar-thumb: var(--dsw-alias-scrollbar-bg-l2);
@@ -137,8 +143,27 @@
   padding: 0 10px;
 }
 
-.lineTarget {
-  background: var(--dsw-alias-interactive-bg-hover);
+/* A navigated line's mark: a band in the scrollport over the line, so renderer
+   re-renders such as syntax highlighting do not drop it. It holds briefly, then
+   fades out and removes itself. Reduced motion keeps the fade: it is an
+   opacity change, not movement, and its end removes the band. */
+.lineMark {
+  position: absolute;
+  left: 0;
+  background: var(--dsw-alias-interactive-bg-hover-accent);
+  pointer-events: none;
+  animation: line-mark-fade 2s ease-in forwards;
+}
+
+@keyframes line-mark-fade {
+  0%,
+  30% {
+    opacity: 1;
+  }
+
+  100% {
+    opacity: 0;
+  }
 }
 
 /* The failure with nothing read yet: the whole body, centred a little above
@@ -195,12 +220,14 @@
   font-family: inherit;
   background: transparent;
   border: 0.5px solid var(--dsw-alias-border-l2);
-  border-radius: 16px;
+  border-radius: var(--dsw-radius-md);
   cursor: pointer;
 }
 
-.retry:hover {
-  background: var(--dsw-alias-interactive-bg-hover);
+@media (hover: hover) {
+  .retry:hover {
+    background: var(--dsw-alias-interactive-bg-hover);
+  }
 }
 
 /* The type's 16px sheet before the chip's text; the chip's title row centres
@@ -225,21 +252,15 @@
    empty states below instead of sitting in the corner. */
 .status {
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
   gap: 8px;
   align-items: center;
   justify-content: center;
   box-sizing: border-box;
   height: 100%;
+  min-height: 0;
   padding: 12px 10px;
-}
-
-/* The first read, centred in the still-empty body; loaded content replaces it. */
-.bodyLoading {
-  justify-content: center;
-  box-sizing: border-box;
-  width: 100%;
-  height: 100%;
 }
 
 .action {
@@ -250,12 +271,14 @@
   white-space: normal;
   background: var(--dsw-alias-bg-layer-2);
   border: 0.5px solid var(--dsw-alias-border-l2);
-  border-radius: 6px;
+  border-radius: var(--dsw-radius-sm);
   cursor: pointer;
 }
 
-.action:hover {
-  background: var(--dsw-alias-bg-layer-3);
+@media (hover: hover) {
+  .action:hover {
+    background: var(--dsw-alias-bg-layer-3);
+  }
 }
 
 /* The next page, asked for where the loaded text ends. */
@@ -269,13 +292,15 @@
   white-space: normal;
   background: var(--dsw-alias-bg-layer-2);
   border: 0.5px solid var(--dsw-alias-border-l2);
-  border-radius: 6px;
+  border-radius: var(--dsw-radius-sm);
   cursor: pointer;
 }
 
-.more:hover:not(:disabled) {
-  color: var(--dsw-alias-label-primary);
-  background: var(--dsw-alias-bg-layer-3);
+@media (hover: hover) {
+  .more:hover:not(:disabled) {
+    color: var(--dsw-alias-label-primary);
+    background: var(--dsw-alias-bg-layer-3);
+  }
 }
 
 .more:disabled {
@@ -298,7 +323,7 @@
   line-height: 1;
   background: transparent;
   border: none;
-  border-radius: 28px;
+  border-radius: var(--dsw-radius-sm);
   cursor: pointer;
 }
 
@@ -307,7 +332,14 @@
   height: 15px;
 }
 
-.tool:hover {
+@media (hover: hover) {
+  .tool:hover {
+    color: var(--dsw-alias-label-primary);
+    background: var(--dsw-alias-interactive-bg-hover);
+  }
+}
+
+.tool[data-textpreview-tool='auto-refresh'][aria-pressed='true'] {
   color: var(--dsw-alias-label-primary);
   background: var(--dsw-alias-interactive-bg-hover);
 }

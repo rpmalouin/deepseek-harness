@@ -12,7 +12,9 @@
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type { SnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type { TokenSpan } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
-import type { SelectOption } from './contract.ts'
+import { TextSearchIndex } from '@deepseek-ai/dsh-util-text-search'
+import type { PopupSearchLabels, PopupSelectSpec, SelectOption } from './contract.ts'
+import { groupOptions } from './option-groups.ts'
 
 /**
  * The command token segment snapshotted at shell-open time, replayed to the
@@ -31,7 +33,7 @@ export type TokenSegment =
  * session wiring passes its session projection; the controller only carries
  * it from open() to the callbacks).
  */
-export interface PopupSpec<TCtx> {
+export interface PopupSpec<TCtx> extends Pick<PopupSelectSpec, 'searchLabels'> {
   /** Load the option rows once per open (retry after failure reuses the same signal). */
   options(context: TCtx, signal: AbortSignal): Promise<readonly SelectOption[]>
   /** Settle the picked option against the open-time context. */
@@ -63,6 +65,8 @@ export interface PopupState {
   readonly options: readonly SelectOption[]
   /** Local filter text over the loaded options. */
   readonly search: string
+  /** Command-owned copy for this opening; null uses generic shell labels. */
+  readonly searchLabels: PopupSearchLabels | null
   /**
    * Highlight index into the filtered row list: 0 until options land; afterwards
    * the row the loaded list marks as the current value
@@ -81,21 +85,20 @@ export interface PopupState {
 }
 
 const CLOSED: PopupState = {
-  open: false, command: null, status: 'pending', options: [], search: '', active: 0,
+  open: false, command: null, status: 'pending', options: [], search: '', searchLabels: null, active: 0,
   submitting: false, confirming: null, acknowledged: false, error: null,
 }
 
 /**
- * Filter option rows against the shell's local search text (case-insensitive
- * substring over label and detail; blank search keeps every row).
+ * Filter and rank rows within each group: labels match fuzzily, details as substrings.
+ * Blank search keeps every row; groups keep their order.
  * @param options - the loaded rows.
  * @param search - the shell's search text.
- * @returns the rows the shell shows and highlights over.
+ * @returns the original option objects in the order shown and used for selection.
  */
 export function filterOptions(options: readonly SelectOption[], search: string): readonly SelectOption[] {
-  const query = search.trim().toLowerCase()
-  if (query === '') return options
-  return options.filter(o => o.label.toLowerCase().includes(query) || (o.detail?.toLowerCase().includes(query) ?? false))
+  return groupOptions(options).flatMap(group =>
+    new TextSearchIndex(group.rows, option => ({ fuzzy: [option.label], substring: [option.detail] })).search(search))
 }
 
 /**
@@ -152,10 +155,11 @@ export class PopupSelectController<TCtx = unknown> {
    * @param segment - open-time token segment snapshot for post-select consumption.
    */
   open(command: string, spec: PopupSpec<TCtx>, context: TCtx, segment: TokenSegment): void {
+    const searchLabels = spec.searchLabels?.() ?? null
     this.binding?.abort.abort()
     const binding: OpenBinding<TCtx> = { command, spec, context, segment, abort: new AbortController() }
     this.binding = binding
-    this.state.set({ ...CLOSED, open: true, command })
+    this.state.set({ ...CLOSED, open: true, command, searchLabels })
     this.load(binding)
   }
 

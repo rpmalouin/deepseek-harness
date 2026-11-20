@@ -19,12 +19,15 @@
  * snapshot locally, so one session costs one RPC. The scope-birth warm hook
  * prewarms the session's key; a preset switch drops that one key (the
  * catalog is the preset's, and a blank session may switch after the warm);
- * connection/reset clears everything — the host
- * catalog may differ across generations. A shared in-flight fetch
- * deliberately outlives any single menu interaction: closing the menu must
- * not kill the prewarm other consumers will hit, so it carries its own
- * abort (fired only on invalidation/teardown) while a candidates caller
- * with an aborted signal just returns early.
+ * plugin-manager/changed clears everything — a manager operation may add or
+ * remove providers any session's catalog reads; connection/reset clears
+ * everything — the host catalog may differ across generations. A shared
+ * in-flight fetch deliberately outlives any single menu interaction: closing
+ * the menu must not kill the prewarm other consumers will hit, so it carries
+ * its own abort (fired only on invalidation/teardown) while a candidates
+ * caller with an aborted signal just returns early.
+ * Catalog RPCs retain an existing Client Session through completion and
+ * wait for its initial history open to succeed before contacting the Host.
  *
  * This browser half also owns the `skill` keyed toolview: a replay-stable
  * accent row derived only from each logged call/result slice.
@@ -34,16 +37,29 @@ import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type { SkillEntry } from '@deepseek-ai/dsh-api-remotes/client'
 import type {} from '@deepseek-ai/dsh-api-session-controller/client'
+// Type-only: the forwarded `plugin-manager/changed` declaration.
+import type {} from '@deepseek-ai/dsh-plugin-manager/types'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { InputTriggerServiceContract, InputTriggerSource } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
 import { fileAddressFor } from '@deepseek-ai/dsh-util-workspace-path'
-import { rankByName } from '@deepseek-ai/dsh-client-ui-primitives'
+import { TextSearchIndex } from '@deepseek-ai/dsh-util-text-search'
 // Type-only: pulls the locale plugin's Context merge (ctx.locale).
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 // Type-only: pulls the SlotRegistry service merge (ctx.slots).
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { SkillRow } from './SkillRow.tsx'
-import { en, NS, zh, type SkillKey } from './locales.ts'
+import { SkillReference, type SkillReferenceInjected } from './SkillReference.tsx'
+import { skillReferenceRule } from './user-text-rules.ts'
+export type {} from './user-text-rules.ts'
+import { en, ja, es, fr, de, ru, pt, NS, zh, type SkillKey } from './locales.ts'
+
+declare module '@deepseek-ai/dsh-api-session-controller/client' {
+  interface SessionReferenceSourceMap {
+    /** A skill-catalog fetch waiting for initial history and its RPC result. */
+    skillCatalog: unknown
+  }
+}
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -61,14 +77,15 @@ interface CatalogFetch {
 }
 
 /** Required services: reference source faces plus the tool-row and locale registries. */
-export const inject = ['inputTriggers', 'sessions', 'slots', 'locale', 'remote', 'remote.skills', 'sidebarRight']
+export const inject = ['inputTriggers', 'sessions', 'slots', 'locale', 'remote', 'remote.skills', 'sidebarRight', 'uiConversation']
 
 /**
  * Client plugin body: register the '/' source, dictionaries, and keyed tool row.
  * @param ctx - client root context.
  */
 export function apply(ctx: ClientContext): void {
-  ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'ui-skill: dictionaries')
+  ctx.effect(() => ctx.locale.register(NS, { zh, en, ja, es, fr, de, ru, pt }), 'ui-skill: dictionaries')
+  ctx.uiConversation.userText.register(skillReferenceRule)
   ctx.slots.inject('tool.call.toolview', () => ctx.slots.register(
     { name: 'tool.call.toolview', key: 'skill', locale: NS },
     SkillRow,
@@ -100,10 +117,20 @@ export function apply(ctx: ClientContext): void {
     if (existing !== undefined) return existing
     const abort = new AbortController()
     const promise = (async () => {
-      const result = await skills.list({ sessionId }, abort.signal)
-      abort.signal.throwIfAborted()
-      if (!result.ok) throw new Error(`skills/list failed: ${result.error.code}: ${result.error.message}`)
-      return result.value.skills
+      if (sessions.binding(sessionId) === undefined) {
+        throw new Error(`skill catalog requires a retained session "${sessionId}"`)
+      }
+      return sessions.using(sessionId, { source: 'skillCatalog', signal: abort.signal }, async (reference) => {
+        abort.signal.throwIfAborted()
+        const state = reference.binding.session.getSnapshot()
+        if (state.openState !== 'open') {
+          throw state.openError ?? new Error(`session "${sessionId}" is not open`)
+        }
+        const result = await skills.list({ sessionId }, abort.signal)
+        abort.signal.throwIfAborted()
+        if (!result.ok) throw new Error(`skills/list failed: ${result.error.code}: ${result.error.message}`)
+        return result.value.skills
+      })
     })()
     const entry: CatalogFetch = { promise, abort }
     fetches.set(sessionId, entry)
@@ -137,7 +164,7 @@ export function apply(ctx: ClientContext): void {
   // locale service's own fallback ladder; candidate-time reads stay plain text.
   const t = ctx.locale.bind(NS)
 
-  const source: InputTriggerSource = {
+  const source = {
     trigger: '/',
     name: 'skill',
     order: 2,
@@ -146,9 +173,8 @@ export function apply(ctx: ClientContext): void {
       const skills = await fetchCatalog(session.sessionId).promise
       // Superseded keystroke: the shared fetch stays warm, this caller yields.
       if (signal.aborted) return []
-      // The same ranking as the command group of this menu: case-insensitive
-      // ordered subsequence, prefix hits first.
-      return rankByName(skills, query)
+      // The same filter as the command group of this menu, over names only.
+      return new TextSearchIndex(skills, skill => ({ fuzzy: [skill.name] })).search(query)
         .map(skill => ({
           name: skill.name,
           // The user-only marker rides the description (the menu's only
@@ -204,11 +230,28 @@ export function apply(ctx: ClientContext): void {
       // line client-side before it ever becomes a prompt.
       return { text: `/${candidate.name} ` }
     },
-  }
+  } satisfies InputTriggerSource
+
+  ctx.slots.inject('conversation.user.text.node', () => ctx.slots.register({
+    name: 'conversation.user.text.node',
+    key: 'skill',
+    priority: 100,
+    inject: (sessionId): SkillReferenceInjected => ({
+      openSkill: (name) => {
+        if (sessions.scope(sessionId) === undefined) return
+        source.openReference({ sessionId }, { ref: `/${name}` })
+      },
+    }),
+  }, SkillReference))
+
   const inputTriggers = ctx.get('inputTriggers') as InputTriggerServiceContract
   // A preset decides which skill providers an agent reads, so a switched
   // session's cached catalog belongs to the composition it no longer runs.
   ctx.remote.$on('agent-preset/selected', invalidate)
+  // The Host announces every manager operation after its reload without
+  // naming what changed, and a switched plugin may register providers in the
+  // global layer every session reads, so each one drops every cached catalog.
+  ctx.remote.$on('plugin-manager/changed', clearAll)
   ctx.on('connection/reset', clearAll)
   ctx.effect(() => {
     const unregister = inputTriggers.registerSource(source)

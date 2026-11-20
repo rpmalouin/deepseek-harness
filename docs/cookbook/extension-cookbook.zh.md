@@ -93,6 +93,49 @@ export function apply(ctx: Context) {
 }
 ```
 
+## Forge 评审扩展
+
+变更请求评审经由 [forge 扩展 API](../subsystems/forge.zh.md#extension-api) 向插件开放。Host 插件注册一个筛选透镜，它保留变更视图所显示文件中的一部分，并给出它关心的行：
+
+```ts
+import type { Context } from '@deepseek-ai/cordis'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { ForgeLensId } from '@deepseek-ai/dsh-experimental-client-ui-forge'
+
+export const name = 'exports-lens'
+export const inject = ['forgePanel']
+
+export function apply(ctx: Context) {
+  // An effect of this plugin's fiber: unloading the plugin withdraws the lens and aborts its runs.
+  ctx.forgePanel.registerLens({
+    id: brandString<ForgeLensId>('example/exports'),
+    version: '1',
+    async classify(input, signal) {
+      const files: Record<string, { ranges: { old: []; new: { start: number; end: number }[] } }> = {}
+      for (const file of input.files) {
+        const lines = (await input.text('new', file.path, signal))?.split('\n') ?? []
+        const ranges = lines.flatMap((line, at) => line.startsWith('export') ? [{ start: at + 1, end: at + 1 }] : [])
+        if (ranges.length > 0) files[file.path] = { ranges: { old: [], new: ranges } }
+      }
+      return { files }
+    },
+  })
+}
+```
+
+Client 插件给这个透镜起名并添加行注解；`notesOf` 为每个视图返回一个稳定的可观察对象，`NoteBody` 是模块级组件，在视图所画的外框中绘制一条注解。forge 测试的[夹具插件](../../apps/web/tests/fixtures/plugins/fixture-forge-extension/client.js)还用到了工具栏、文件菜单、评论框和卡片的 slot。
+
+```ts ignore-check
+export const inject = ['forgeChanges', 'slots']
+
+export function apply(ctx: Context) {
+  ctx.effect(() => ctx.forgeChanges.describeLens({ id: brandString<ForgeLensId>('example/exports'), title: () => 'Exports' }))
+  ctx.effect(() => ctx.forgeChanges.registerAnnotations({ id: 'example-notes', observe: target => notesOf(target) }))
+  ctx.slots.inject('forge.diff.line.annotation', () => ctx.slots.register(
+    { name: 'forge.diff.line.annotation', key: 'example-notes' }, NoteBody))
+}
+```
+
 ## 可运行的组装示例
 
 交付应用通过 `packages/bundle/*/cordis.patch.yml` 提供 profile 层，产品 `dsh` 启动器通过具名 profile 负责 Web、ACP、SDK 与一次性 headless 执行。可选的用户 overlay 位于 `apps/cli/config/examples/`；profile 集成测试位于 `apps/cli/tests/profiles/`，包专属 Loader 组合则留在对应包的测试目录中。
@@ -101,18 +144,18 @@ export function apply(ctx: Context) {
 
 ## 功能→机制映射
 
-每个产品功能都映射到一个文档化扩展点上的监听器——微内核声明由此可验证（[微内核 Agent Note](../../.agents/notes/implemented/architecture/2026-06-11-microkernel-event-taxonomy.zh.md)）。没有任何一行修改循环本身。
+每个产品功能都映射到一个文档化扩展点上的监听器——微内核声明由此可验证（[微内核 reference](../architecture.zh.md)）。没有任何一行修改循环本身。
 
 `system-prompt/assemble` 是一个专家协作式的整体装配变换：其返回的装配结果具有权威性，因此监听器作者有责任保留活跃的 PTC mode 和结构化输出协议的贡献。对于需要在展示、查找和执行之间保持对齐的工具过滤，优先使用 `ctx.tools.restrict()`。
 
 | 产品功能 | 插件机制 |
 |---|---|
-| 钩子系统（用户级 + 项目级） | `agent/created`、`agent/pre-step`、`agent/request`、`tools/pre-execute`、`tools/post-execute` 和 `agent/turn-stopping` 上的监听器；waterfall 返回类型化决策，`agent/turn-stopping` 则可通过 steering（中途引导）触发下一步；`dsh-hooks-claude-code` / `dsh-hooks-codex` 桥接器将钩子配置文件映射到这些扩展点上 |
+| 钩子系统（用户级 + 项目级） | `agent/created`、`agent/pre-step`、`tools/pre-execute`、`tools/post-execute` 和 `agent/turn-stopping` 上的监听器；waterfall 返回类型化决策，`agent/turn-stopping` 则可通过 steering（中途引导）触发下一步；`dsh-hooks-claude-code` / `dsh-hooks-codex` 桥接器将钩子配置文件映射到这些扩展点上 |
 | `/goal` | `ctx.goals` 管理持久状态，`dsh-goal-round-driver` 通过公共 `Agent` 调度同会话 Round，独立的命令/工具生产方分别提供人类/模型控制 |
 | `/loop` | 在 `turn/end` 会话事件上 `followup()` 下一次迭代；或强制继续 |
 | 动态工作流 | `ctx.workflowEngine` + PTC 工作流引擎 + `workflow` 工具；结构化的进程内子任务通过作用域化的提示词/工具注册、单调工具守卫、最终 `tools/result` 提交（包括外层 `run_code`）和结构化输出执行的单调 `concludeTurn()` 标记来强制输出 |
 | 排队消息 + steering | 核心 `Agent.followup()` / `Agent.steer()` |
-| 上下文压缩（context compaction）（自动 + 手动） | `ctx.compaction` seam + `dsh-compaction-basic`；自动压力检查运行在串行 `agent/pre-step`，标准的溢出恢复机制运行在 `agent/request-error`，手动调用方使用同一个压缩服务（[压缩 Agent Note](../../.agents/notes/implemented/feature/2026-06-18-compaction-capability-seam.zh.md)） |
+| 上下文压缩（context compaction）（自动 + 手动） | `ctx.compaction` seam + `dsh-compaction-basic`；自动压力检查运行在串行 `agent/pre-step`，标准的溢出恢复机制运行在 `agent/request-error`，手动调用方使用同一个压缩服务（[压缩 参考](../../packages/compaction/compaction/README.zh.md)） |
 | 系统提示词可配置性 | `ctx.systemPrompt.section()`，支持排序与作用域局部覆盖 |
 | AGENTS.md（根目录） | 一个读取该文件的 section 提供方 |
 | AGENTS.md（子目录，按需触发）+ 文件变更通知 | 从 watcher / 工具结果监听器调用 `agent.inject()` |
@@ -128,7 +171,7 @@ export function apply(ctx: Context) {
 | MCP | 每个服务器一个插件：发现工具 → `ctx.tools.register()` |
 | skill（技能） | section + 工具注册；调用时通过 `inject()` 注入 skill 内容 |
 | 记忆 | section 提供方 + 工具 |
-| 定时任务（cron） | 插件注册面向模型的调度工具；定时器触发 → 空闲时 `followup(…, {source: {kind: 'plugin', plugin: 'schedule'}})`／忙碌时 `inject()` 通知 |
+| 定时任务（cron） | 插件注册面向模型的调度工具；定时器到期后通过 `followup(…, {source: {kind: 'schedule'}})` 投递 |
 | UI（GUI；CLI（命令行界面）输出 JSONL） | 监听 `agent/assistant-stream` 的实时 chunk，并监听 `session/event` 的持久 settlement、边界与工具活动；输入 → `followup()` |
 | Web Client Chat 业务节点 | 注册 `ConversationNodeDefinition` 与 `conversation.chat.node` keyed renderer |
 | 遥测 / 可回放 trace | `session/event` → JSONL；回放 = `sessions.create(id, { seed })` |

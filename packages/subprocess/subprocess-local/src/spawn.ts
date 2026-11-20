@@ -11,7 +11,7 @@
 import { type ChildProcess, type SpawnOptions, spawn, spawnSync } from 'node:child_process'
 import type { Readable } from 'node:stream'
 import { setTimeout as sleepMs } from 'node:timers/promises'
-import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
+import { scrubbedParentEnv, SubprocessError } from '@deepseek-ai/dsh-subprocess'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import type {
   SubprocessCollect,
@@ -24,8 +24,8 @@ import type { BoundProcessOwner, ManagedProcessLaunch } from './managed-owner.ts
 import { waitWithAbort } from './managed-owner.ts'
 import { controlEnvironment, controlPipe } from './control-spawn.ts'
 import { SUBPROCESS_CONTROL_FD } from '@deepseek-ai/dsh-subprocess/control'
-import { linuxProcessGroupHasLiveMembers } from './process-inspector.ts'
-import { OutputCollector, prepareManagedProcessBinding } from './output.ts'
+import { linuxProcessGroupLiveMember } from './process-inspector.ts'
+import { OutputCollector, prepareManagedProcessBinding, type SpillFailureReporter } from './output.ts'
 
 type SpawnProcess = (
   program: string,
@@ -59,12 +59,14 @@ export interface SpawnInternals {
   spawn?: SpawnProcess
   /** Directory for spill files (defaults to the OS temp dir). */
   spillDir?: string
+  /** Receives spill open/write failures; the runtime supplies its plugin logger, bare callers get a stderr line. */
+  onSpillFailure?: SpillFailureReporter
   /** Windows tree-termination runner (defaults to `taskkill /PID <pid> /T /F`). */
   taskkill?: (pid: number) => void
   /** Host platform override for signalling decisions. */
   platform?: NodeJS.Platform
-  /** Linux process-group member probe (defaults to `/proc` inspection). */
-  linuxProcessGroupHasLiveMembers?: (processGroupId: number) => boolean | undefined
+  /** Linux process-group live-member probe (defaults to `/proc` inspection); receives the member PID it last returned. */
+  linuxProcessGroupLiveMember?: (processGroupId: number, knownMember: number | undefined) => number | false | undefined
 }
 
 /**
@@ -98,8 +100,8 @@ export function killGroup(pid: number | undefined, sig: NodeJS.Signals): void {
   if (pid === undefined) return
   try {
     process.kill(-pid, sig)
-  } catch {
-    // Swallow: see contract above.
+  } catch (_groupSignalFailed) {
+    // The group may already have exited before delivery (ESRCH); see the contract above.
   }
 }
 
@@ -147,7 +149,7 @@ function signalTree(
        (EPERM-style), which POSIX CI cannot stage; the swallow keeps teardown idempotent. */
     try {
       child.kill(sig)
-    } catch {
+    } catch (_childAlreadyExited) {
       // The direct child already exited; teardown remains idempotent.
     }
     /* v8 ignore stop */
@@ -167,14 +169,17 @@ export function validateSubprocessSpec(spec: SubprocessSpawnSpec): void {
     let reason = 'aborted'
     try {
       reason = String(spec.signal.reason ?? reason)
-    } catch {
+    } catch (_reasonNotStringifiable) {
       // Arbitrary caller-owned reasons cannot escape the stable Error boundary.
     }
-    throw new Error(`aborted before spawn: ${reason}`)
+    // Named as a cancellation so the tool registry classifies it as the caller's abort.
+    const error = new Error(`aborted before spawn: ${reason}`)
+    error.name = 'AbortError'
+    throw error
   }
   const [program] = spec.argv
   if (program === undefined || program.length === 0) {
-    throw new Error('invalid argv: expected a non-empty program name at argv[0]')
+    throw new SubprocessError('invalid argv: expected a non-empty program name at argv[0]', 'SUBPROCESS_INVALID_ARGV')
   }
 }
 
@@ -202,12 +207,13 @@ function fallbackOwner(
   pid: number | undefined,
   child: ChildProcess,
   taskkill: (pid: number) => void,
-  linuxGroupHasLiveMembers: (processGroupId: number) => boolean | undefined,
+  linuxGroupLiveMember: (processGroupId: number, knownMember: number | undefined) => number | false | undefined,
   direct: Promise<SubprocessOutcome>,
 ): BoundProcessOwner {
   let stopped = false
   let directSettled = false
   let observation: Promise<void> | undefined
+  let liveMember: number | undefined
   void direct.then(
     () => { directSettled = true },
     () => { directSettled = true },
@@ -218,7 +224,11 @@ function fallbackOwner(
     if (platform === 'win32') return child.exitCode === null && child.signalCode === null
     try {
       process.kill(-pid, 0)
-      if (directSettled && platform === 'linux' && linuxGroupHasLiveMembers(pid) === false) return false
+      if (directSettled && platform === 'linux') {
+        const member = linuxGroupLiveMember(pid, liveMember)
+        if (member === false) return false
+        if (member !== undefined) liveMember = member
+      }
       return true
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code
@@ -259,15 +269,15 @@ function fallbackOwner(
  * Bind platform launch facts to the existing stdio, outcome, abort, and termination lifecycle.
  * @param spec - fully resolved argv, cwd, stdio, grace, cancellation, environment.
  * @param launch - platform streams, direct outcome, and managed-range owner.
- * @param internals - test-only spill-directory override.
+ * @param internals - spill-directory override and spill failure reporter.
  * @returns live subprocess handle.
  */
 export function bindManagedProcess(
   spec: SubprocessSpawnSpec,
   launch: ManagedProcessLaunch,
-  internals: Pick<SpawnInternals, 'spillDir'> = {},
+  internals: Pick<SpawnInternals, 'spillDir' | 'onSpillFailure'> = {},
 ): LocalSubprocessHandle {
-  const { spillDir } = prepareManagedProcessBinding(internals)
+  const { spillDir, onSpillFailure } = prepareManagedProcessBinding(internals)
   const { stdin, stdout, stderr } = launch
 
   const isCollect = (mode: SubprocessOutputMode): mode is SubprocessCollect =>
@@ -278,7 +288,11 @@ export function bindManagedProcess(
 
   const collectStream = (mode: SubprocessOutputMode, stream: Readable | null, label: string): OutputCollector | undefined => {
     if (!isCollect(mode) || stream === null) return undefined
-    const collector = new OutputCollector(mode.maxBytes, mode.spill?.maxBytes, label, spillDir)
+    const collector = new OutputCollector(
+      mode.maxBytes,
+      label,
+      mode.spill === undefined ? undefined : { maxBytes: mode.spill.maxBytes, dir: spillDir, onFailure: onSpillFailure },
+    )
     stream.on('data', (chunk: Buffer) => { collector.push(chunk) })
     return collector
   }
@@ -472,7 +486,7 @@ export function spawnSubprocess(spec: SubprocessSpawnSpec, internals: SpawnInter
     pid,
     child,
     internals.taskkill ?? taskkillProcessTree,
-    internals.linuxProcessGroupHasLiveMembers ?? linuxProcessGroupHasLiveMembers,
+    internals.linuxProcessGroupLiveMember ?? linuxProcessGroupLiveMember,
     direct,
   )
   return bindManagedProcess(spec, {

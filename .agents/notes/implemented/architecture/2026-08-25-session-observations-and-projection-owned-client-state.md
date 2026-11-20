@@ -24,9 +24,8 @@ The two ownership rules meet at the observation's projection snapshot. Lightweig
 flowchart LR
   List["list / search"] --> Corpus["SessionQuery corpus"]
   Follow["follow"] --> Observe["observeSession"]
-  Page["page / attachment / fork"] --> Observe
-  Subagent["subagent list / continuation"] --> Corpus
-  Subagent --> Observe
+  Page["page / fork"] --> Observe
+  Subagent["subagent list / continuation"] --> Observe
   Corpus --> Cache["projection cache hints"]
   Cache --> ClientList["Client Session list"]
   Cache -->|"small miss"| Observe
@@ -47,7 +46,7 @@ flowchart LR
 
 `SessionQueryEngine.observeSession(sessionId, options)` returns a disposable `SessionObservation` containing one source kind, header, contiguous event prefix, cursor, optional projection snapshot, and the durable revision for a prepared source. An attached Session wins. Otherwise the reader's own prepared cache — keyed by `stat().revision` and pinned by observation leases — serves the cold Session, sharing one persistence read (`open(id, 'read')` + `read`) across concurrent observations, including an in-flight cold load.
 
-Every owner disposes its observation. `retain()` creates another lease over the same cut, which lets `session.follow` publish a snapshot and then transfer that exact prepared source to background Agent promotion without rereading the log. A live Session that appears during cold resolution wins before publication; a disappeared live source is retried as cold.
+Every owner disposes its observation. `retain()` creates another lease over the same cut, which lets `session.follow` transfer that exact prepared source to background Agent promotion before delivering the snapshot, without rereading the log. A live Session that appears during cold resolution wins before publication; a disappeared live source is retried as cold.
 
 ### Source resolution and lifetime
 
@@ -57,7 +56,7 @@ Live preference is checked both before and after a cold borrow. The second check
 
 Persistence absence maps to Session-not-found only after no attached Session exists. Durable corruption, source-identity conflict, cancellation, and operational persistence failure remain distinct `SessionQueryError` outcomes so API owners can preserve their own public error vocabulary without duplicating source detection.
 
-The observation owns no mutation authority. Its event array is an immutable prefix, and its prepared Session remains unpublished. Promotion is an explicit ownership transfer performed by the Session Controller after it has emitted the opening snapshot; other readers cannot turn an observation into a live Agent.
+The observation owns no mutation authority. Its event array is an immutable prefix, and its prepared Session remains unpublished. Promotion is an explicit ownership transfer the Session Controller starts once the opening is computed, before delivering it; other readers cannot turn an observation into a live Agent.
 
 Projection work is deliberately `all | none`. `all` computes every registered projection at the observation's event cursor; `none` leaves projection state untouched. There is no per-key preparation state, `projectionKeys` mode, or cached `viewedState`/`viewedValue` layer. A publisher may filter the completed values for an audience, but the underlying observation is never partly projected.
 
@@ -71,9 +70,9 @@ The registry owns fold state; each domain owns its `init`, `apply`, `view`, sche
 
 `view` remains an uncached synchronous conversion over folded state. Its cost is bounded by the registered projection units and is paid at snapshot publication; introducing a second cache would add invalidation states without reducing event replay.
 
-Corpus listing remains a separate lightweight operation. `listSessions()` returns live-preferred headers without materializing every log. Session list and subagent list first use live projection state or durable projection-cache rows. Session list may take one complete observation for an individually stored artifact within its configured small-log limit when cached metadata cannot establish whether it is blank; a large or unreadable cache miss remains visible with unknown hints.
+Corpus listing remains a separate lightweight operation. `listSessions()` returns live-preferred headers without materializing every log. Session list first uses live projection state or durable projection-cache rows. Subagent discovery reads parent-catalog projections through exact observations. Session list may take one complete observation for an individually stored artifact within its configured small-log limit when cached metadata cannot establish whether it is blank; a large or unreadable cache miss remains visible with unknown hints.
 
-`session.follow` publishes a required opening snapshot containing header, cursor, the initial event window, and a complete projection baseline. Reconnect replaces the previous generation from another complete snapshot. `session.page` is reserved for older-history reads and gap repair. Observation-only reads never activate an Agent; only an ordinary follow may retain its prepared observation and request promotion after the opening snapshot has been delivered.
+`session.follow` publishes a required opening snapshot containing header, cursor, the initial event window, and a complete projection baseline. Reconnect replaces the previous generation from another complete snapshot. `session.page` supports current or fixed-cut history reads, older-history reads, and gap repair. Observation-only reads never activate an Agent; only an activation-enabled ordinary Follow may retain its prepared observation and request promotion once the opening snapshot is computed, before it is delivered. The [snapshot and subscription decision](2026-10-21-session-history-stream-and-snapshot.md) defines the Controller composition and passive subscription semantics.
 
 ### Read audiences
 
@@ -83,10 +82,11 @@ Each public operation chooses one query and projection policy. The choice is par
 |---|---|---|---|
 | `session.list` | Corpus headers, live state, and cached rows; bounded small-log fallback | Partial hints, or one full small-log observation | Never |
 | `session.search` | Corpus authorization plus the configured search provider | None for result listing | Never |
-| `session.follow` | One exact observation | All, carried in the opening snapshot | Ordinary cold Session only, after snapshot delivery |
+| `session.follow` | One exact observation | All, carried in the opening snapshot | Only with `activate: true`, for an ordinary cold Session once the opening is computed, before delivery |
 | `session.page` | One exact observation | None, except projection-backed subagent authorization | Never |
-| Attachment and fork source | One exact observation | None unless authorization requires it | Never for the source |
-| Subagent list and continuation | Corpus plus live/cache/observation resolution | All on a cold fallback; audience consumes identity or inherited values | Never for listing; continuation follows its explicit command semantics |
+| Fork source | One exact observation | None unless authorization requires it | Never for the source |
+| Attachment | Direct store read under the [image access rule](2026-10-23-store-scoped-image-reads.md) | None | Never |
+| Subagent list and continuation | Parent-catalog observations for listing; target observations for continuation | All; listing consumes catalog values, continuation consumes identity and inherited values | Never for listing; continuation follows its explicit command semantics |
 
 ### Replayable Client facts are projection-owned
 
@@ -106,13 +106,13 @@ These distinctions prevent one overloaded `undefined` from representing cache mi
 |---|---|---|---|
 | Session list hints | Partial | Last durable checkpoint or bounded fallback cut | Unknown |
 | Follow opening baseline | Complete for the Host composition | Exact opening cursor | Capability absent |
-| Projection frame | One whole key | Event sequence carried by the frame | Not applicable |
+| Projection frame | Every key the frame lists, each a whole value | Event sequence carried by the frame | Unchanged |
 
-The Client stores one row per key with its sequence number. A newer hint, baseline, or frame replaces a row; an equal or older input is ignored. Reconnect can therefore replace the event window without rolling back a projection frame that was already accepted at a later sequence.
+The Client stores one row per key. A row the connected Host computed carries its sequence number: a newer baseline or frame replaces it, an equal or older input is ignored, and reconnect can therefore replace the event window without rolling back a projection frame that was already accepted at a later sequence. A list hint viewed from the persisted cache carries no comparable sequence number and yields to every Host-sequenced write ([projection cache listing identity and cached rows](2026-09-19-projection-cache-listing-identity-and-cached-rows.md)).
 
 The list view reads the same per-Session store as the opened Session. Hints can populate title, preset, and other list presentation before follow completes; the opening baseline then converges that state without creating a second summary-only authority.
 
-The per-Session Client projection store accepts list hints, the follow baseline, and later whole-value frames under one higher-sequence-wins rule. It never folds Session events. A baseline or frame may advance a hinted value, while an older cut cannot overwrite a newer row.
+The per-Session Client projection store accepts list hints, the follow baseline, and later whole-value frames. Higher-sequence-wins applies among Host-sequenced values; cached list hints sit below all of them. It never folds Session events. A baseline or frame may advance a hinted value, while an older cut cannot overwrite a newer sequenced row.
 
 Data that is not derived from one Session remains outside projections. `session/modelCatalog` owns the Host-generation model catalog, and `agentPresets/list` owns the configurable preset roster. A selector combines the relevant catalog with the Session's `modelSelection` or `agentPreset` projection only when both inputs are ready. During refresh it may retain the last complete catalog; before the first complete pair it reports loading instead of rendering a guessed name or availability verdict.
 
@@ -120,10 +120,10 @@ Client-local interaction state also remains local: loading and error status, an 
 
 ### Domain applications
 
-- **Title and list metadata.** Cached projection hints may render an existing title and determine blankness or recency. Missing hints leave those facts unknown; only the bounded small-log policy may resolve them during listing.
+- **Title and list metadata.** Cached projection hints may render an existing title and determine blankness or recency. Missing hints leave those facts unknown; only the bounded small-log policy may resolve them during listing. The Client reconciles list rows with the current metadata projection: nonblank evidence excludes a Session from blank reuse, and the later prompt timestamp supplies recency. Projection stores outlive lazy Client Session instances, so instantiation reads retained metadata even before a list row is available. A stale list response cannot override a newer history or control projection.
 - **Model selection.** `model/selection` records a complete provider, model, and optional reasoning effort. `modelSelection` distinguishes the last request's route from a later selection pending consumption by a request header.
 - **Agent preset.** The projection initializes from immutable Session metadata and advances on preset-selection events. A missing or `null` value is not replaced with the deployment default for an existing Session.
-- **Subagent identity.** The `subagent` unit remains the sole descriptor interpreter. Listing obtains candidates from the shared corpus and resolves values through live state, projection cache, or an observation rather than scanning events itself.
+- **Subagent identity.** The `subagent` unit remains the sole descriptor interpreter for continuation and history authorization. Listing derives membership, mode, and label from the `subagentCatalog` projection through parent observations; descendant discovery recursively reads reachable catalogs ([parent-catalog decision](2026-09-01-parent-owned-subagent-catalog.md)).
 - **Subagent presentation.** Opening projection values establish timing and identity before the Client declares the child interactive or offline, so transport loading does not masquerade as a durable state.
 
 These migrations remove special-case Client state without making projection own provider catalogs or interaction mechanics. A domain still owns mutations and commands; projection owns only their replayable Session result.
@@ -167,20 +167,20 @@ These rules apply to new Session-derived Client state even when a direct event s
 - [Reusable Session preparation](../../archived/architecture/2026-08-05-session-preparation.md) owns cold materialization, repair, reservation, and publication. Observation adds a shared read lease over that prepared object; it does not move preparation into SessionQuery.
 - [Session history and Remote event transport](2026-08-18-session-history-and-event-transport.md) owns stream generations and replacement semantics. This decision supplies the exact snapshot that opens each journal generation.
 - [Projection state and Client views](../../archived/architecture/2026-08-19-session-projection-state-and-client-views.md) owns the distinction between Host fold state and Client values. This decision governs where those values are consumed and how partial list hints differ from a complete baseline.
-- [Subagent identity projection](../../archived/architecture/2026-08-06-subagent-list-identity-projection.md) continues to own descriptor folding, the serializable `null` sentinel, and the own-suffix sequence check. This decision supersedes only its independent corpus merge and direct cold-inspection path: listing now uses SessionQuery's corpus and observation.
+- [The parent-catalog decision](2026-09-01-parent-owned-subagent-catalog.md) owns subagent discovery. Descriptor folding, the serializable `null` sentinel, and the own-suffix sequence check remain relevant to continuation and history authorization, not catalog identity.
 - The broader [session projection and command-log proposal](../../proposed/architecture/2026-07-27-session-projection-and-command-log.md) remains proposed for the portions not represented by shipped code. This decision records the shipped observation and Client-ownership subset.
 
 ## Verification
 
-Persistence and SessionQuery tests pin shared cold loading, cancellation, live-source races, retained observations, disposal, and all-or-none projection calculation. Session Controller and Gateway tests pin snapshot-first opening, replacement reconnect, older-page reads, gap repair, list-cache hints, bounded small-log fallback, and promotion after snapshot delivery.
+Persistence and SessionQuery tests pin shared cold loading, cancellation, live-source races, retained observations, disposal, and all-or-none projection calculation. Session Controller and Gateway tests pin snapshot-first opening, replacement reconnect, older-page reads, gap repair, list-cache hints, bounded small-log fallback, and promotion once the opening is computed.
 
-Client tests pin higher-sequence-wins projection storage, title updates, model catalog and selection readiness, preset roster refresh and Session-specific selection, and subagent loading without transient offline presentation. Subagent tests pin corpus enumeration, cache and observation fallback, lifecycle witnesses, bounded cold reads, and no Agent activation during listing.
+Client tests pin higher-sequence-wins projection storage, title updates, model catalog and selection readiness, preset roster refresh and Session-specific selection, and subagent loading without transient offline presentation. Subagent tests pin parent-catalog order, recursive traversal, branch diagnostics, cancellation, fork isolation, and no Agent activation during listing.
 
 ## Alternatives considered
 
 **Keep source resolution in each consumer.** Rejected because every caller would continue to implement its own live race, persistence error mapping, preparation lifetime, cancellation, and projection cut, allowing both duplicate work and inconsistent results.
 
-**Activate an Agent for every exact read.** Rejected because list, history, attachment, search, and subagent inspection are read operations. Activation loads plugins and changes process state, and it has no natural retirement point for pagination or catalog reads.
+**Activate an Agent for every exact read.** Rejected because list, history, search, and subagent inspection are read operations. Activation loads plugins and changes process state, and it has no natural retirement point for pagination or catalog reads.
 
 **Prepare only requested projection keys.** Rejected because a partially projected Session creates another lifecycle state that every cache, restore, plugin-registration, and caller path must track. Projection units are pure and few; computing all registered units for an exact observation is simpler than maintaining `O(E*k)` partial state instead of `O(E*P)` complete state.
 

@@ -1,12 +1,14 @@
 // Sessions remain resident after creation so their open Remote sources keep running off-screen.
 
 import type { Context } from '@deepseek-ai/cordis'
-import type { InboxState } from '@deepseek-ai/dsh-agent/types'
+import type { InboxState, InboxTarget } from '@deepseek-ai/dsh-agent/types'
 import { randomUUID } from '@deepseek-ai/dsh-util-crypto'
-import type { AttachmentIdType, FileAttachmentRef, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
+import type { FileAttachmentRef, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import type { SubagentAddress } from '@deepseek-ai/dsh-subagent/client'
-import type { MessageId } from '@deepseek-ai/dsh-llm/brand'
+import type { MessageId } from '@deepseek-ai/dsh-llm/types'
+import type { UserMessage } from '@deepseek-ai/dsh-llm/types'
 import { SessionLogOffset, SessionSeq, type SessionId } from '@deepseek-ai/dsh-session/types'
+import { isDurableEntry, tailPageStart } from './buffered-pages.ts'
 import { SessionEventStream } from '../transport.ts'
 import type { SessionJournalChange } from '../transport.ts'
 import type {
@@ -25,7 +27,7 @@ import type {
 } from '../contract/snapshot.ts'
 import { MutableSessionEventSource } from '../contract/events.ts'
 import type {
-  SessionEventLikeEntry, SessionLiveEventEntry,
+  SessionEventLike, SessionEventLikeEntry, SessionLiveEventEntry,
 } from '../contract/events.ts'
 import { Notifier } from './notifier.ts'
 import { isRemoteFailure } from '@deepseek-ai/dsh-api-gateway/client'
@@ -47,25 +49,43 @@ function projectionsBaseline(value: SessionProjectionBaseline): ProjectionsBasel
   }
 }
 
-/** Messages requested per history page. */
+/** Minimum message count for ordinary history windows. */
 export const PAGE_MESSAGES = 50
 
-/** Messages requested per page while a turn jump loops backwards (fewer, larger round trips). */
+const HISTORY_PAGE_OPTIONS = { maxMessages: 500, turnWindow: { minMessages: PAGE_MESSAGES, minTurns: 2 } }
+
+/** Minimum messages per page while a turn jump loops backwards. */
 export const JUMP_PAGE_MESSAGES = 200
+
+const JUMP_PAGE_OPTIONS = {
+  ...HISTORY_PAGE_OPTIONS,
+  turnWindow: { ...HISTORY_PAGE_OPTIONS.turnWindow, minMessages: JUMP_PAGE_MESSAGES },
+}
+
+interface PendingHistory {
+  beforeSeq: SessionLogOffset
+  hasMore: boolean
+  readonly pages: (readonly SessionEventLikeEntry[])[]
+}
+
+interface OlderHistoryRequest {
+  readonly generation: number
+  readonly beforeSeq: SessionLogOffset
+  page: { readonly entries: readonly SessionEventLikeEntry[]; readonly hasMore: boolean } | null
+  invalidated: boolean
+  recovering: boolean
+  consuming: boolean
+  promise?: Promise<void>
+}
 
 /** Manager-owned observers of a Session object's local state edges. */
 export interface SessionOptions {
   /** Catalog-discovered address selecting non-activating subagent transport. */
   address?: SubagentAddress
-  /** Whether the exact direct parent Agent was live at the latest catalog read; absent before that read. */
-  parentAvailable?: boolean
   /**
-   * First ACCEPTED prompt on a blank session (fires at most once, on the
-   * prompt RPC's success response): the manager mirrors the blank→false flip
-   * into its list row so the session surfaces without waiting for a host
-   * frame. Acceptance is the flip point because it proves the user message
-   * is in the host log; a rejected first prompt keeps the session blank
-   * (hidden, still reusable by connectWorkspace).
+   * Publish each accepted prompt to the Manager, including after this Session
+   * object is replaced. Acceptance converts display state, but does not
+   * establish that a turn started or reached durable history.
    */
   onEngaged?(session: Session): void
   /**
@@ -86,40 +106,58 @@ export class Session implements SessionFace {
   // ---- Window and derived state (all private; the snapshot is the only read API) ----
   private baseSeq = SessionLogOffset(0)
   private hasMore = false
+  private historyWasPartial = false
   private openState: OpenState = 'cold'
   private openError: RemoteFailure | null = null
   private openPromise: Promise<void> | null = null
   /** Bumped by stream replacement to invalidate an in-flight doOpen. Stale
    *  passes drop all writes once the generation moves on. */
   private openGeneration = 0
-  private loadingOlder = false
+  private get loadingOlder(): boolean { return this.historyLoadStatus === 'loading' }
+  private historyLoadStatus: SessionSnapshot['historyLoadStatus'] = 'idle'
+  private olderRequest: OlderHistoryRequest | null = null
   /** Shared low-water target of the running jump loop; null when no jump is paging. */
   private jumpTargetSeq: SessionSeq | null = null
   /** The running jump loop's completion, shared by retargeting callers. */
   private jumpPromise: Promise<void> | null = null
+  private pendingHistory: PendingHistory | null = null
   private readonly stopObservingInbox: () => void
   private readonly assistantStream = new ClientAssistantStream()
   private running = false
   private address: SubagentAddress | undefined
-  private parentAvailable: boolean | undefined
   /**
    * Sticky send marker, private input of the composerPhase derivation: set
-   * synchronously before prompt()'s first await, never reset — the blank →
-   * engaging edge of the phase machine (see ComposerPhase).
+   * when the Host accepts a prompt, never reset — the blank → engaging edge of
+   * the phase machine (see ComposerPhase).
    */
   private promptAttempted = false
   /** A first accepted prompt stays in the engaging phase until its turn is observable. */
   private firstPromptPendingTurn = false
-  /** Empty-log mirror (see ConversationSnapshot.blank); unknown bare sessions begin conservatively blank. */
+  /** New Session display state; unknown bare sessions begin conservatively blank. */
   private blankBit = true
   private removed = false
   private promptError: PromptError | null = null
   private lastAgentError: string | null = null
-  /** Local submission echoes, insertion-ordered (see SessionSnapshot.pendingSubmissions). */
+  /** Local submission echoes, insertion-ordered, including those the Host has not accepted yet. */
   private pendingSubmissions: readonly PendingSubmission[] = []
+  /** The accepted echoes, published as SessionSnapshot.pendingSubmissions; rebuilt when one is accepted or removed. */
+  private acceptedSubmissions: readonly PendingSubmission[] = []
   /** Per-echo settlement state; `retiring` latches the first observation so a
    *  Inbox projection and its durable event cannot both retire one echo. */
   private readonly submissionSettlements = new Map<SessionRequestId, {
+    readonly placement: PendingSubmission['placement']
+    /** Latest received Inbox position; null means removed from that queue. */
+    receipt?: {
+      readonly target: InboxTarget
+      readonly seq: number
+      readonly index: number | null
+      readonly attachments: readonly (ImageAttachmentRef | FileAttachmentRef)[]
+    }
+    /** Durable admission may precede the Inbox projection acknowledging its claim. */
+    admitted?: readonly (ImageAttachmentRef | FileAttachmentRef)[]
+    /** Whether the Host accepted the prompt; the echo is published only from then on. */
+    accepted: boolean
+    readonly onAccept?: (() => void) | undefined
     readonly onRetire?: ((retirement: PendingSubmissionRetirement) => void) | undefined
     retiring: boolean
   }>()
@@ -130,8 +168,9 @@ export class Session implements SessionFace {
    * Per-session projection value store (push model; see the session-projection
    * subsystem page, docs/subsystems/session-projection.md): finished whole
    * values computed on the Host, seeded by the tail page's
-   * projections block and updated by Session Controller control frames under the
-   * one higher-seq-wins rule. Keys are read via `projections.faceOf(key)`
+   * projections block and updated by Session Controller control frames;
+   * Host-sequenced writes merge under higher-seq-wins and cached list blocks
+   * yield to them (projection-store.ts). Keys are read via `projections.faceOf(key)`
    * (the useProjection resolution face); the conversation snapshot never
    * carries projection values, and no client-side domain folding exists.
    * Manager-owned when constructed through SessionManager (frames route and
@@ -165,7 +204,6 @@ export class Session implements SessionFace {
   ) {
     this.projections = options.projections ?? new ProjectionValueStore()
     this.address = options.address
-    this.parentAvailable = options.parentAvailable
     this.notifier = new Notifier(() => {
       this.snapshotCache = this.buildSnapshot()
     })
@@ -196,33 +234,34 @@ export class Session implements SessionFace {
   // ---- Operations ----
 
   /**
-   * Register one local submission echo (see the ISession declaration).
-   * Synchronous through markDirty: the echo is in the very next snapshot, so
-   * the conversation can paint it before the caller starts serializing.
+   * Register one local submission echo (see the ISession declaration). The
+   * echo reconciles against Host events from now on, but it enters the
+   * snapshot only once the prompt receipt or an Inbox row carrying its
+   * request id shows that the Host accepted it.
    * @param input - echo content and the optional settlement callback.
    * @returns the minted identity for {@link prompt} plus the pre-prompt abandon path.
    */
   beginSubmission(input: BeginSubmissionInput): SubmissionHandle {
     const requestId = randomUUID() as SessionRequestId
+    const placement = this.running ? input.mode === 'steer' ? 'steering' : 'queued' : 'transcript'
     this.pendingSubmissions = [...this.pendingSubmissions, {
       requestId,
-      placement: this.running
-        ? input.mode === 'steer' ? 'steering' : 'queued'
-        : 'transcript',
+      placement,
       time: Date.now(),
       text: input.text,
       attachments: input.attachments,
     }]
-    this.submissionSettlements.set(requestId, { onRetire: input.onRetire, retiring: false })
-    // The blank → engaging edge flips here, ahead of prompt(): the composer
-    // docks and the echo renders on the click's own frame.
-    this.promptAttempted = true
-    this.notifier.markDirty()
+    this.submissionSettlements.set(requestId, {
+      placement, accepted: false, onAccept: input.onAccept, onRetire: input.onRetire, retiring: false,
+    })
     return { requestId, abandon: () => { this.retireFailedSubmission(requestId) } }
   }
 
   /**
-   * Send (queue/steer passed through 1:1); failures land in the snapshot's promptError.
+   * Send (queue/steer passed through 1:1); failures land in the snapshot's
+   * promptError. The Host can hold the prompt at its admission stage, so the
+   * call can stay open; the echo appears and the blank → engaging edge flips
+   * only once the Host accepts the prompt.
    * @param content - text, browser-owned temporary image uploads, and staged-file receipts.
    * @param mode - queue appends after the current turn; steer interrupts it.
    * @param signal - optional caller cancellation for the complete admission round-trip.
@@ -237,12 +276,9 @@ export class Session implements SessionFace {
   ): Promise<RemoteResult<{ accepted: true }>> {
     this.promptError = null
     this.lastAgentError = null
-    // Synchronous, before the first await: the blank → engaging edge must be
-    // visible on the session area's very first frame when a caller sends
-    // ahead of navigation (first-send flow).
-    this.promptAttempted = true
-    if (this.blankBit) this.firstPromptPendingTurn = true
-    this.notifier.markDirty()
+    // Before the first await, so a turn observed ahead of the receipt clears it.
+    const firstPrompt = this.blankBit && !this.firstPromptPendingTurn
+    if (firstPrompt) this.firstPromptPendingTurn = true
     let result: RemoteResult<{ accepted: true }>
     if (this.address === undefined) {
       const clientTimeZone = resolvedClientTimeZone()
@@ -267,10 +303,8 @@ export class Session implements SessionFace {
       // wire type is used; this array is not filtered or reordered.
       const routedContent = content as Exclude<PromptContentPart, { readonly type: 'file' }>[]
       const routed = await this.remote.subagents.prompt({
-        requestId: randomUUID() as SessionRequestId,
-        parentSessionId: this.address.parentSessionId,
+        requestId: requestId ?? randomUUID() as SessionRequestId,
         childSessionId: this.address.childSessionId,
-        mode: 'continuable',
         delivery: mode,
         content: routedContent,
         clientTimeZone: resolvedClientTimeZone(),
@@ -278,38 +312,50 @@ export class Session implements SessionFace {
       result = routed.ok ? { ok: true, value: { accepted: true } } : routed
     }
     if (!result.ok) {
+      // Rejection must leave a first prompt blank and eligible for workspace reuse.
+      if (firstPrompt) this.firstPromptPendingTurn = false
       if (requestId !== undefined) this.retireFailedSubmission(requestId)
       this.promptError = { op: 'send', error: result.error }
       this.notifier.markDirty()
       return result
     }
-    // Blank flips on ACCEPTANCE, not attempt: an accepted prompt starts the
-    // conversation's first turn on the host (the host criterion — a logged
-    // turn/start — is fact, not optimism; standalone command and projection
-    // events never flip it), while a rejected first prompt must keep the
-    // session blank — the client-side blank mirror only ever lowers, so
-    // flipping early on a failure would surface the session forever and
-    // strip its connectWorkspace reuse eligibility against the host's
-    // authority.
-    if (this.blankBit) {
-      this.blankBit = false
-      this.options.onEngaged?.(this)
-      this.notifier.markDirty()
-    }
+    this.acceptPrompt(requestId)
     return result
   }
 
   /**
-   * Resolve one image referenced by this session into browser-consumable bytes.
-   * @param attachmentId - opaque id found in the folded session log.
-   * @returns the authenticated reference and decoded bytes.
+   * Apply the Host's acceptance of one prompt: publish its echo, move a blank
+   * Session to engaging, and tell the submitter. The prompt receipt and an
+   * Inbox row carrying the prompt's request id both prove acceptance.
+   * Whichever arrives first publishes the echo; a later proof for an echo
+   * still pending changes nothing.
+   * @param requestId - identity from {@link beginSubmission}; absent for a prompt sent without an echo.
+   */
+  private acceptPrompt(requestId: SessionRequestId | undefined): void {
+    const settlement = requestId === undefined ? undefined : this.submissionSettlements.get(requestId)
+    if (settlement?.accepted === true) return
+    if (settlement !== undefined) {
+      settlement.accepted = true
+      this.refreshAcceptedSubmissions()
+    }
+    this.promptAttempted = true
+    this.blankBit = false
+    this.notifier.markDirty()
+    this.options.onEngaged?.(this)
+    settlement?.onAccept?.()
+  }
+
+  /**
+   * Resolve one stored image into browser-consumable bytes using this Session's gateway permission scope.
+   * @param attachment - complete image reference from the folded session log.
+   * @returns the supplied reference after storage verification, and decoded bytes.
    */
   async readAttachment(
-    attachmentId: AttachmentIdType,
+    attachment: ImageAttachmentRef,
   ): Promise<RemoteResult<{ attachment: ImageAttachmentRef; data: Uint8Array }>> {
     const result = await this.remote.session.attachment({
       sessionId: this.sessionId,
-      attachmentId,
+      attachment,
     })
     if (!result.ok) return result
     const binary = atob(result.value.data)
@@ -325,18 +371,14 @@ export class Session implements SessionFace {
   /**
    * Stop the active turn while the Host preserves pending inbox work; failures
    * land in promptError (same error-strip display slot). A subagent address
-   * routes through `subagents.interruptByParent`, whose durable parent-address
-   * authority works without a live parent Agent.
+   * routes through `subagents.interruptByUser`, authorized on the target Session
+   * without requiring a live parent Agent.
    * @returns the cancel result.
    */
   async cancel(): Promise<RemoteResult<{ accepted: true }>> {
     const address = this.address
     const result = address !== undefined
-      ? await this.remote.subagents.interruptByParent(
-        address.childSessionId,
-        address.parentSessionId,
-        'continuable',
-      )
+      ? await this.remote.subagents.interruptByUser(address.childSessionId)
       : await this.remote.session.cancel({ sessionId: this.sessionId })
     if (!result.ok) {
       this.promptError = { op: 'stop', error: result.error }
@@ -387,27 +429,95 @@ export class Session implements SessionFace {
     return promise
   }
 
-  /** Page up: pull one earlier page with the window's first seq as beforeSeq and prepend. */
-  async loadOlder(): Promise<void> {
-    if (this.openState !== 'open' || !this.hasMore || this.loadingOlder) return
+  /** @inheritdoc */
+  async loadOlder(options?: { deferConsumption?: boolean }): Promise<void> {
+    const request = this.prepareOlder()
+    await request?.promise
+    if (request !== null && this.olderRequest === request
+      && (!options?.deferConsumption || request.page?.entries.length === 0)) this.consumeOlder()
+  }
+
+  private prepareOlder(): OlderHistoryRequest | null {
+    if (this.olderRequest !== null) return this.olderRequest
     const events = this.events
-    if (events === undefined) return
-    this.loadingOlder = true
+    if (this.openState !== 'open' || !this.hasMore || this.loadingOlder || events === undefined) return null
+    const request: OlderHistoryRequest = {
+      generation: this.openGeneration,
+      beforeSeq: this.baseSeq,
+      page: null,
+      invalidated: false,
+      recovering: false,
+      consuming: false,
+    }
+    this.olderRequest = request
+    this.historyLoadStatus = 'loading'
     this.notifier.markDirty()
-    try {
-      await events.prepend({ beforeSeq: this.baseSeq, maxMessages: PAGE_MESSAGES })
-    } catch (error) {
-      if (!isRemoteFailure(error)) {
-        console.error('[session-controller] loadOlder failed:', error)
+    request.promise = (async () => {
+      try {
+        await events.prepend({ beforeSeq: request.beforeSeq, ...HISTORY_PAGE_OPTIONS })
+        if (this.olderRequest !== request) return
+        if (request.invalidated || request.generation !== this.openGeneration || request.beforeSeq !== this.baseSeq) return
+        const page = request.page
+        const first = page?.entries[0]
+        this.historyLoadStatus = page === null || (first === undefined ? page.hasMore : first.event.seq >= request.beforeSeq)
+          ? 'error' : 'pendingConsumption'
+      } catch (error) {
+        if (this.olderRequest !== request) return
+        request.page = null
+        this.historyLoadStatus = 'error'
+        if (!isRemoteFailure(error)) console.error('[session-controller] loadOlder failed:', error)
+      } finally {
+        if (this.olderRequest === request) {
+          if (request.invalidated && this.events === events) {
+            // A replacement restores the transport cursor before another page uses the visible window.
+            request.recovering = true
+            this.historyLoadStatus = 'loading'
+            events.restart()
+          } else if (this.historyLoadStatus === 'error') this.olderRequest = null
+          this.notifier.markDirty()
+        }
       }
+    })()
+    return request
+  }
+
+  /** @inheritdoc */
+  consumeOlder(): boolean {
+    const request = this.olderRequest
+    if (request === null || request.consuming || this.historyLoadStatus !== 'pendingConsumption' || request.page === null) return false
+    if (this.openState !== 'open' || request.invalidated || request.generation !== this.openGeneration
+      || request.beforeSeq !== this.baseSeq) {
+      this.clearOlderHistory()
+      return false
+    }
+    const page = request.page
+    // Retain the request through synchronous feed notification so subscribers cannot reenter consumption.
+    request.consuming = true
+    try {
+      this.prependWindow(page.entries, page.hasMore)
+      return true
+    } catch (error) {
+      if (this.olderRequest === request) this.historyLoadStatus = 'error'
+      throw error
     } finally {
-      this.loadingOlder = false
+      if (this.olderRequest === request) {
+        this.olderRequest = null
+        if (this.historyLoadStatus !== 'error') this.historyLoadStatus = 'idle'
+      }
       this.notifier.markDirty()
     }
   }
 
+  private clearOlderHistory(): void {
+    this.olderRequest = null
+    this.historyLoadStatus = this.pendingHistory === null ? 'idle' : 'loading'
+    this.notifier.markDirty()
+  }
+
   /** Jump loader: page backwards until the window covers seq (see ISession.loadThrough). */
   loadThrough(seq: SessionSeq): Promise<void> {
+    this.consumeOlder()
+    if (this.olderRequest !== null) return Promise.resolve()
     if (this.openState !== 'open' || !this.hasMore || this.baseSeq <= seq) return Promise.resolve()
     if (this.jumpPromise !== null) {
       // Retarget the running loop to the lowest requested seq.
@@ -419,8 +529,16 @@ export class Session implements SessionFace {
     // target behind — only the loop's finally clears that field, and no
     // loop starts here.
     if (this.loadingOlder) return Promise.resolve()
+    const events = this.events
+    if (events === undefined) return Promise.resolve()
+    const pending: PendingHistory = {
+      beforeSeq: this.baseSeq,
+      hasMore: this.hasMore,
+      pages: [],
+    }
+    this.pendingHistory = pending
     this.jumpTargetSeq = seq
-    this.loadingOlder = true
+    this.historyLoadStatus = 'loading'
     this.notifier.markDirty()
     // Stale-pass guard (the doOpen pattern): a resync mid-loop replaces the
     // stream generation; this pass then stops instead of paging the new
@@ -428,25 +546,35 @@ export class Session implements SessionFace {
     const generation = this.openGeneration
     this.jumpPromise = (async () => {
       try {
-        while (this.hasMore && this.jumpTargetSeq !== null && this.baseSeq > this.jumpTargetSeq) {
+        while (this.jumpTargetSeq !== null && pending.beforeSeq > this.jumpTargetSeq) {
           if (generation !== this.openGeneration) return
-          const events = this.events
-          if (events === undefined) return
-          const before = this.baseSeq
-          await events.prepend({ beforeSeq: this.baseSeq, maxMessages: JUMP_PAGE_MESSAGES })
+          const before = pending.beforeSeq
+          await events.prepend({ beforeSeq: before, ...JUMP_PAGE_OPTIONS })
+          if (generation !== this.openGeneration || this.pendingHistory !== pending) return
           // No-progress guard: an empty or dropped page that still claims more
           // history must end the loop, not spin it.
-          if (this.baseSeq >= before) return
+          if (pending.beforeSeq >= before) {
+            if (pending.hasMore) this.historyLoadStatus = 'error'
+            return
+          }
+          if (!pending.hasMore) return
         }
       } catch (error) {
+        if (generation === this.openGeneration && this.pendingHistory === pending) this.historyLoadStatus = 'error'
         if (!isRemoteFailure(error)) {
           console.error('[session-controller] loadThrough failed:', error)
         }
       } finally {
-        this.jumpTargetSeq = null
-        this.jumpPromise = null
-        this.loadingOlder = false
-        this.notifier.markDirty()
+        if (this.pendingHistory === pending) {
+          this.jumpTargetSeq = null
+          this.jumpPromise = null
+          this.pendingHistory = null
+          if (this.historyLoadStatus === 'loading') this.historyLoadStatus = 'idle'
+          if (generation === this.openGeneration && pending.pages.length > 0) {
+            this.prependWindow(pending.pages.reverse().flat(), pending.hasMore)
+          }
+          this.notifier.markDirty()
+        }
       }
     })()
     return this.jumpPromise
@@ -457,10 +585,13 @@ export class Session implements SessionFace {
    *  reconnecting control stream and remains untouched. */
   async resync(): Promise<void> {
     if (this.openState === 'cold') return // never opened: no window to rebuild (doOpen flips to 'loading' synchronously, so cold implies no in-flight open)
-    this.openGeneration++
+    const generation = ++this.openGeneration
+    this.clearOlderHistory()
     const events = this.events
     this.events = undefined
     await events?.dispose()
+    // A disconnect during teardown ends this rebuild; the Session stays cold.
+    if (generation !== this.openGeneration) return
     this.openPromise = null
     this.openState = 'cold'
     this.openError = null
@@ -496,8 +627,7 @@ export class Session implements SessionFace {
    * @param running - the new running state.
    */
   handleRunning(running: boolean): void {
-    // Turn-start conversion: a blank session never runs, so the first
-    // running:true proves another side's first message landed.
+    // Running converts display state without establishing durable turn history.
     if (running && this.blankBit) {
       this.blankBit = false
       this.notifier.markDirty()
@@ -512,36 +642,26 @@ export class Session implements SessionFace {
    * Install or clear the catalog-discovered transport address. A changed
    * address rebuilds an already-open window through its new history route.
    * @param address - direct parent/child address, or undefined for ordinary transport.
-   * @param parentAvailable - latest exact-parent availability hint, or undefined before a catalog read.
    */
-  configureSubagent(address: SubagentAddress | undefined, parentAvailable?: boolean): void {
+  configureSubagent(address: SubagentAddress | undefined): void {
     const same = this.address?.parentSessionId === address?.parentSessionId
       && this.address?.childSessionId === address?.childSessionId
       && this.address?.mode === address?.mode
     this.address = address
-    this.parentAvailable = parentAvailable
     if (!same && this.openState !== 'cold') void this.resync()
     else this.notifier.markDirty()
   }
 
   /**
-   * Update only the parent availability hint from a catalog refresh.
-   * @param available - whether the exact direct parent is live.
-   */
-  handleSubagentParentAvailable(available: boolean): void {
-    if (this.parentAvailable === available) return
-    this.parentAvailable = available
-    this.notifier.markDirty()
-  }
-
-  /**
-   * Blank-bit relay from the authoritative summary source (`session.list` and
-   * `api-session/added`). Monotone: once any signal (local first send,
-   * running flip, an earlier summary) cleared it, a stale true never
-   * re-blanks.
-   * @param blank - the summary's derived empty-log bit.
+   * Apply the Manager's effective display blank, further reconciled with the
+   * current `sessionListMetadata` projection. Local send attempts and current
+   * running state prevent re-blanking; an earlier false summary alone does not.
+   * The Manager retains acceptance and earlier running observations across
+   * Session-object replacement.
+   * @param blank - New Session display state after Manager reconciliation.
    */
   handleBlank(blank: boolean): void {
+    blank = blank && this.projections.values().sessionListMetadata?.blank !== false
     if (blank === this.blankBit) return
     if (blank && (this.promptAttempted || this.running)) return
     this.blankBit = blank
@@ -564,18 +684,62 @@ export class Session implements SessionFace {
   }
 
   /**
+   * Keep only the last page visible and buffer the older entries in the event stream, so paging back returns them
+   * without a request. Applies only to an open window longer than one page with no paging in progress.
+   */
+  bufferOlder(): void {
+    // A page that arrived but was not consumed joins the window first, so no remounted view finds it waiting.
+    this.consumeOlder()
+    const events = this.events
+    if (this.openState !== 'open' || events === undefined || this.olderRequest !== null || this.pendingHistory !== null) return
+    const { entries } = this.eventSource.getSnapshot()
+    const start = tailPageStart(entries, HISTORY_PAGE_OPTIONS.turnWindow)
+    const first = entries[start]
+    const older = entries.slice(0, start)
+    if (first === undefined || older.length === 0 || !older.every(isDurableEntry)) return
+    events.bufferOlder(older, first.event.seq, this.hasMore)
+    this.baseSeq = SessionLogOffset(first.event.seq)
+    this.hasMore = true
+    this.historyWasPartial = true
+    this.eventSource.replace(entries.slice(start), true)
+    this.notifier.markDirty()
+  }
+
+  /**
+   * Close the event connection and drop the window while keeping the Session object, including pending
+   * submission echoes; the next `open()` connects as the first open did.
+   * @returns when the Remote iterator has completed teardown.
+   */
+  async disconnect(): Promise<void> {
+    if (this.openState === 'cold') return
+    this.openGeneration++
+    this.clearOlderHistory()
+    const events = this.events
+    this.events = undefined
+    this.openPromise = null
+    this.openState = 'cold'
+    this.openError = null
+    this.baseSeq = SessionLogOffset(0)
+    this.hasMore = false
+    this.eventSource.replace([], false)
+    this.notifier.markDirty()
+    await events?.dispose()
+  }
+
+  /**
    * Stop the Session's live Remote source.
    * @returns when the Remote iterator has completed teardown.
    */
   async dispose(): Promise<void> {
     this.stopObservingInbox()
     // Unsettled echoes retire as failed so their owners can restore or
-    // release browser resources; echoes already scheduled as observed keep
-    // that settlement.
-    for (const requestId of [...this.submissionSettlements.keys()]) {
-      this.retireFailedSubmission(requestId)
+    // release browser resources; admitted echoes keep their observed outcome.
+    for (const [requestId, settlement] of [...this.submissionSettlements]) {
+      if (settlement.admitted !== undefined) this.scheduleObservedRetirement(requestId, settlement.admitted)
+      else this.retireFailedSubmission(requestId)
     }
     this.openGeneration++
+    this.clearOlderHistory()
     const events = this.events
     this.events = undefined
     await events?.dispose()
@@ -599,7 +763,7 @@ export class Session implements SessionFace {
     })
     this.events = events
     try {
-      await events.open({ maxMessages: PAGE_MESSAGES })
+      await events.open(HISTORY_PAGE_OPTIONS)
       if (generation !== this.openGeneration || this.events !== events) return
       this.openState = 'open'
     } catch (error) {
@@ -625,7 +789,9 @@ export class Session implements SessionFace {
         )
         return
       case 'prepend':
-        this.prependWindow(change.entries, change.hasMore)
+        if (this.olderRequest !== null) {
+          this.olderRequest.page = { entries: change.entries, hasMore: change.hasMore }
+        } else this.prependWindow(change.entries, change.hasMore)
         return
       case 'append':
         this.publishAssistantEntry(this.assistantStream.acceptDurable(change.entry))
@@ -646,12 +812,37 @@ export class Session implements SessionFace {
     // attempts makes a held notification reopen follow once for an atomic
     // page/baseline pair instead of applying it to an unrelated repair cut.
     const visible = this.assistantStream.replace(entries, assistantStream)
+    if (this.olderRequest !== null && this.loadingOlder && !this.olderRequest.recovering) {
+      this.olderRequest.invalidated = true
+      this.olderRequest.page = null
+    } else this.clearOlderHistory()
     this.baseSeq = SessionLogOffset(entries[0]?.event.seq ?? 0)
     this.hasMore = hasMore
+    this.historyWasPartial ||= hasMore
+    if (this.pendingHistory !== null) {
+      this.pendingHistory.beforeSeq = this.baseSeq
+      this.pendingHistory.hasMore = hasMore
+      this.pendingHistory.pages.length = 0
+    }
     if (visible.some(entry => entry.event.type === 'turn/start')) this.firstPromptPendingTurn = false
     if (projections !== undefined) this.projections.seed(projections)
     this.eventSource.replace(visible, hasMore)
+    // A new follow baseline replaces confirmed optimistic inputs with Host-owned rows.
+    // Receipt-backed inputs are accepted, not failed, even if their history is outside this window.
+    if (projections !== undefined) {
+      for (const [requestId, { receipt }] of this.submissionSettlements) {
+        if (receipt !== undefined && receipt.seq <= projections.asOfSeq) {
+          this.scheduleObservedRetirement(requestId, receipt.attachments)
+        }
+      }
+    }
     for (const entry of visible) this.observeSubmissionEvent(entry.event)
+    if (projections !== undefined) {
+      const inbox = projections.values.inbox as InboxState | undefined
+      for (const target of ['next-turn', 'next-step'] as const) {
+        this.observeSubmissionInsertions(target, inbox?.[target] ?? [], 0, projections.asOfSeq)
+      }
+    }
     this.notifier.markDirty()
   }
 
@@ -674,8 +865,10 @@ export class Session implements SessionFace {
       this.notifier.markDirty()
       return
     }
-    if (result?.type === 'publish' && this.appendLive(result.entry)) {
-      this.notifier.markDirty()
+    if (result?.type === 'publish') {
+      const changed = this.appendLive(result.entry)
+      if (result.retireAttemptId !== undefined) this.eventSource.settleAssistant(result.retireAttemptId)
+      if (changed || result.retireAttemptId !== undefined) this.notifier.markDirty()
     } else if (result?.type === 'transient') {
       this.eventSource.append(result.entry)
       this.notifier.markDirty()
@@ -684,8 +877,16 @@ export class Session implements SessionFace {
 
   /** Prepend one stream-validated history page. */
   private prependWindow(entries: readonly SessionEventLikeEntry[], hasMore: boolean): void {
+    if (this.pendingHistory !== null) {
+      const pending = this.pendingHistory
+      pending.beforeSeq = entries[0] === undefined ? pending.beforeSeq : SessionLogOffset(entries[0].event.seq)
+      pending.hasMore = hasMore
+      pending.pages.push(entries)
+      return
+    }
     this.baseSeq = entries[0] === undefined ? this.baseSeq : SessionLogOffset(entries[0].event.seq)
     this.hasMore = hasMore
+    this.historyWasPartial ||= hasMore
     this.eventSource.prepend(entries, hasMore)
   }
 
@@ -703,36 +904,88 @@ export class Session implements SessionFace {
   }
 
   /** Observe durable acceptance even when insertion and claim share one projection notification. */
-  private observeSubmissionEvent(event: { readonly type: string; readonly data?: unknown }): void {
+  private observeSubmissionEvent(event: SessionEventLike): void {
     if (this.submissionSettlements.size === 0) return
     if (event.type === 'agent/inbox/spliced') {
-      const splice = event.data as { readonly inserted?: unknown } | undefined
-      if (Array.isArray(splice?.inserted)) {
-        for (const message of splice.inserted) this.observeSubmissionEvent({ type: 'user/message', data: message })
+      const { target, start, removedCount = 0, inserted, outcome } = event.data
+      for (const [requestId, settlement] of this.submissionSettlements) {
+        const receipt = settlement.receipt
+        if (receipt?.target !== target || receipt.index === null || receipt.seq >= event.seq) continue
+        const removed = receipt.index >= start && receipt.index < start + removedCount
+        if (removed && outcome === 'canceled') this.retireFailedSubmission(requestId)
+        else settlement.receipt = {
+          ...receipt,
+          seq: event.seq,
+          index: removed ? null : receipt.index < start ? receipt.index : receipt.index + inserted.length - removedCount,
+        }
+      }
+      this.observeSubmissionInsertions(target, inserted, start, event.seq)
+      // A queued echo waits for the inbox projection the queue dock renders, which can arrive after this
+      // event; retiring it here would empty the dock for a frame. A claim in the same projection notification
+      // still retires it through the durable user message.
+      for (const message of inserted) this.observeSubmissionMessage(message, false, false)
+      return
+    }
+    if (event.type === 'request/context' || event.type === 'turn/end') {
+      for (const [requestId, settlement] of this.submissionSettlements) {
+        if (settlement.admitted === undefined && settlement.receipt?.index === null
+          && settlement.receipt.seq < event.seq) this.retireFailedSubmission(requestId)
       }
       return
     }
-    if (event.type !== 'user/message') return
-    // Structural read: window entries may be compact history records, so the
-    // fields are narrowed rather than trusted (same posture as Conversation
-    // assembly matchers).
-    const data = event.data as { readonly source?: unknown; readonly content?: unknown } | undefined
-    const source = data?.source as { readonly kind?: unknown; readonly rpcId?: unknown } | undefined
-    if (source?.kind !== 'user' || typeof source.rpcId !== 'string') return
-    this.scheduleObservedRetirement(source.rpcId as SessionRequestId, attachmentRefsIn(data?.content))
+    if (event.type === 'user/message') this.observeSubmissionMessage(event.data, true)
   }
 
-  /** Retire local echoes when their accepted messages appear in the durable Inbox projection. */
+  private observeSubmissionInsertions(target: InboxTarget, messages: readonly UserMessage[], start: number, seq: number): void {
+    for (const [index, message] of messages.entries()) {
+      const source = message.source
+      if (source.kind !== 'user' || !('rpcId' in source)) continue
+      const settlement = this.submissionSettlements.get(source.rpcId)
+      if (settlement === undefined || settlement.retiring || (settlement.receipt?.seq ?? -1) > seq) continue
+      // Either proof accepts a prompt; an Inbox row can reach the Client before the prompt receipt. Later splices
+      // move the recorded position, so a canceled splice that removes the row retires its echo, queued ones
+      // included; a queued echo otherwise leaves once the queue dock renders its row or its message is admitted.
+      settlement.receipt = { target, seq, index: start + index, attachments: attachmentRefsIn(message.content) }
+      this.acceptPrompt(source.rpcId)
+    }
+  }
+
+  private observeSubmissionMessage(message: UserMessage, admitted: boolean, retireQueued = true): void {
+    const source = message.source
+    if (source.kind !== 'user' || !('rpcId' in source)) return
+    const settlement = this.submissionSettlements.get(source.rpcId)
+    if (settlement === undefined || settlement.retiring) return
+    if (!admitted) {
+      if (settlement.placement === 'queued' && retireQueued) {
+        this.scheduleObservedRetirement(source.rpcId, attachmentRefsIn(message.content))
+      }
+      return
+    }
+    settlement.admitted = attachmentRefsIn(message.content)
+    this.retireAdmittedSubmission(source.rpcId)
+  }
+
+  /** Retire admitted Chat identities only after stale Inbox rows can no longer reappear. */
+  private retireAdmittedSubmission(requestId: SessionRequestId): void {
+    const settlement = this.submissionSettlements.get(requestId)
+    if (settlement?.admitted === undefined) return
+    const receipt = settlement.receipt
+    if (receipt?.index === null
+      && (this.projections.seqOf('inbox') ?? -1) < receipt.seq) return
+    this.scheduleObservedRetirement(requestId, settlement.admitted)
+  }
+
+  /** Inbox acceptance retires queued echoes; its watermark completes admitted Chat handoffs. */
   private observeSubmissionInbox(): void {
     if (this.submissionSettlements.size === 0) return
     const inbox = this.projections.get('inbox') as InboxState | undefined
     if (inbox === undefined) return
-    for (const message of [...inbox['next-turn'], ...inbox['next-step']]) {
-      const source = message.source
-      if (source.kind === 'user' && 'rpcId' in source) {
-        this.scheduleObservedRetirement(source.rpcId, attachmentRefsIn(message.content))
-      }
+    const seq = this.projections.seqOf('inbox')
+    for (const target of ['next-turn', 'next-step'] as const) {
+      if (seq !== undefined) this.observeSubmissionInsertions(target, inbox[target], 0, seq)
+      for (const message of inbox[target]) this.observeSubmissionMessage(message, false)
     }
+    for (const requestId of this.submissionSettlements.keys()) this.retireAdmittedSubmission(requestId)
   }
 
   /**
@@ -754,9 +1007,14 @@ export class Session implements SessionFace {
   /** Remove one unsettled echo immediately (prompt rejection, abort, or disposal). */
   private retireFailedSubmission(requestId: SessionRequestId): void {
     const settlement = this.submissionSettlements.get(requestId)
-    if (settlement === undefined || settlement.retiring) return
+    if (settlement === undefined || settlement.retiring || settlement.admitted !== undefined) return
     settlement.retiring = true
     this.finishSubmission(requestId, { reason: 'failed' })
+  }
+
+  private refreshAcceptedSubmissions(): void {
+    this.acceptedSubmissions = this.pendingSubmissions
+      .filter(echo => this.submissionSettlements.get(echo.requestId)?.accepted === true)
   }
 
   /** Single removal point: drop the echo, publish, then notify the owner. */
@@ -766,6 +1024,7 @@ export class Session implements SessionFace {
     if (settlement === undefined) return
     this.submissionSettlements.delete(requestId)
     this.pendingSubmissions = this.pendingSubmissions.filter(echo => echo.requestId !== requestId)
+    if (settlement.accepted) this.refreshAcceptedSubmissions()
     this.notifier.markDirty()
     settlement.onRetire?.(retirement)
   }
@@ -775,6 +1034,7 @@ export class Session implements SessionFace {
     if (generation !== this.openGeneration || this.events !== events) return
     if (!isRemoteFailure(error)) throw error
     this.openGeneration++
+    this.clearOlderHistory()
     this.events = undefined
     this.openPromise = null
     this.openState = 'error'
@@ -784,26 +1044,31 @@ export class Session implements SessionFace {
   }
 
   private buildSnapshot(): SessionSnapshot {
+    const identity = this.projections.values().subagent
     return {
       sessionId: this.sessionId,
-      pendingSubmissions: this.pendingSubmissions,
+      pendingSubmissions: this.acceptedSubmissions,
       running: this.running,
       subagent: this.address === undefined
         ? null
         : {
-          address: this.address,
-          ...(this.parentAvailable === undefined ? {} : { parentAvailable: this.parentAvailable }),
+          address: this.address.mode === 'unknown' && identity != null
+            ? { ...this.address, mode: identity.mode }
+            : this.address,
         },
       removed: this.removed,
       openState: this.openState,
       openError: this.openError,
       hasMore: this.hasMore,
+      historyWasPartial: this.historyWasPartial,
       loadingOlder: this.loadingOlder,
+      historyLoadStatus: this.historyLoadStatus,
       promptError: this.promptError,
       blank: this.blankBit,
       lastAgentError: this.lastAgentError,
       promptAttempted: this.promptAttempted,
-      awaitingFirstTurn: this.firstPromptPendingTurn,
+      // The flag is set before the receipt; the Session leaves blank only once the Host accepted the prompt.
+      awaitingFirstTurn: this.firstPromptPendingTurn && !this.blankBit,
     }
   }
 

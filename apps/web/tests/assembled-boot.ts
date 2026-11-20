@@ -11,7 +11,7 @@ import { globSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { act, cleanup } from '@testing-library/react'
+import { act, cleanup, fireEvent, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, vi } from 'vitest'
 import { bootInjections, orderByModuleGraph } from '@deepseek-ai/dsh-client-modules'
 import type { ClientModuleLoaderTarget, WebBootEntry, WebBootGraph } from '@deepseek-ai/dsh-client-modules/client'
@@ -20,6 +20,9 @@ import { AppWebEntry } from '@deepseek-ai/dsh-client-web'
 import {
   createAssembledRemote, type AssembledRemote, type AssembledRemoteOptions,
 } from './assembled-remote.ts'
+
+// Dynamic plugins use built bundles; this in-process shell shares source platform namespaces.
+vi.mock('@deepseek-ai/dsh-client-web/src/seed.ts', () => import('./source-static-modules.client.ts'))
 
 interface AssembledPlugin extends WebBootEntry {
   /** Absolute path to the built client artifact declared by this package. */
@@ -52,21 +55,16 @@ interface ComposedEntry {
 }
 
 interface BootComposition {
+  bundlePatchPaths(packageDir: string, bundle: { patch: string | string[] }): string[]
   loadOverlayPatches(binName: string, file: string): unknown[]
   composeEntries(layers: readonly unknown[][]): ComposedEntry[]
 }
 
 const REPO_ROOT = process.cwd()
-const BUNDLE_LAYERS = [
-  {
-    manifest: join(REPO_ROOT, 'packages/bundle/base/package.json'),
-    patch: join(REPO_ROOT, 'packages/bundle/base/cordis.patch.yml'),
-  },
-  {
-    manifest: join(REPO_ROOT, 'packages/bundle/web-app/package.json'),
-    patch: join(REPO_ROOT, 'packages/bundle/web-app/cordis.patch.yml'),
-  },
-] as const
+const BUNDLE_LAYERS = ['packages/bundle/base', 'packages/bundle/web-app'].map(dir => ({
+  dir: join(REPO_ROOT, dir),
+  manifest: join(REPO_ROOT, dir, 'package.json'),
+}))
 const bundleResolvers = BUNDLE_LAYERS.map(layer => createRequire(layer.manifest))
 const webBundleResolver = bundleResolvers[1]
 if (webBundleResolver === undefined) throw new Error('assembled boot: web bundle resolver missing')
@@ -91,13 +89,16 @@ function resolveClientExport(packagePath: string, pkg: ClientPackageManifest): s
   return resolve(dirname(packagePath), relative)
 }
 
-const comboUrl = (ids: readonly string[], rev: string): string =>
-  `/plugins/??${ids.map(id => `${id}/client.js`).join(',')}&rev=${rev}`
+/** App-directory-relative combo references, matching the wire the Host composes. */
+const comboReference = (ids: readonly string[], rev: string): string =>
+  `plugins/??${ids.map(id => `${id}/client.js`).join(',')}&rev=${rev}`
 
 /** Derive the assembled browser graph from the same bundle patches and package declarations as `dsh web`. */
 function loadAssembledPlugins(): readonly AssembledPlugin[] {
-  const entries = appBoot.composeEntries(BUNDLE_LAYERS.map(layer =>
-    appBoot.loadOverlayPatches('assembled boot', layer.patch)))
+  const entries = appBoot.composeEntries(BUNDLE_LAYERS.map((layer) => {
+    const declared = (JSON.parse(readFileSync(layer.manifest, 'utf8')) as { dsh: { bundle: { patch: string | string[] } } }).dsh.bundle
+    return appBoot.bundlePatchPaths(layer.dir, declared).flatMap(patch => appBoot.loadOverlayPatches('assembled boot', patch))
+  }))
   const plugins = new Map<string, AssembledPlugin>()
   for (const entry of entries) {
     if (entry.disabled === true || typeof entry.name !== 'string') continue
@@ -112,7 +113,7 @@ function loadAssembledPlugins(): readonly AssembledPlugin[] {
     plugins.set(entry.name, {
       id: entry.name,
       bundlePath: resolveClientExport(packagePath, pkg),
-      url: comboUrl([entry.name], 'fx'),
+      url: comboReference([entry.name], 'fx'),
       rev: 'fx',
       ...(declaration.inject === undefined ? {} : { inject: declaration.inject }),
       ...(declaration.external === undefined ? {} : { external: declaration.external }),
@@ -145,13 +146,13 @@ function bootGraph(plugins: readonly AssembledPlugin[]): WebBootGraph {
     batches: [
       ...(bootstrapEntries.length === 0 ? [] : [{
         phase: 'bootstrap' as const,
-        url: comboUrl(bootstrapEntries, 'fx'),
+        url: comboReference(bootstrapEntries, 'fx'),
         rev: 'fx',
         entries: bootstrapEntries,
       }]),
       ...(applicationEntries.length === 0 ? [] : [{
         phase: 'application' as const,
-        url: comboUrl(applicationEntries, 'fx'),
+        url: comboReference(applicationEntries, 'fx'),
         rev: 'fx',
         entries: applicationEntries,
       }]),
@@ -181,6 +182,7 @@ interface FixtureWindow extends Window {
   __DSH_BOOT__?: WebBootGraph
   __ModuleLoader__?: ClientModuleLoaderTarget
   __DSH_TRANSPORT__?: { readonly rpc: RemoteMock['rpc'] }
+  __DSH_FILE_UPLOAD__?: { readonly fetch: AssembledRemote['fileUpload'] }
 }
 
 class ResizeObserverStub {
@@ -189,21 +191,19 @@ class ResizeObserverStub {
   unobserve(): void {}
 }
 
-class EventSourceStub {
-  addEventListener(): void {}
-  close(): void {}
-}
-
 const win = window as FixtureWindow
 let unmount: (() => Promise<void>) | undefined
 let mountedRemote: RemoteMock | undefined
+/** Boot audit warnings of the current test; the product boot tolerates inactive optional entries, this lane does not. */
+let bootWarnings: string[] = []
 
 /**
  * Register the per-test jsdom setup and teardown the assembled boot needs:
  * English pinned before boot so role/text locators stay deterministic across
  * localized component migrations (the newEnglishPage e2e convention), the
- * observers and frame callbacks jsdom lacks, and a full reset of the document,
- * the boot globals, and the injected plugin styles afterwards.
+ * observers, font events, and frame callbacks jsdom lacks, and a full reset of the document,
+ * the boot globals, and the injected plugin styles afterwards. A boot audit warning about an
+ * inactive entry fails the test at teardown: every assembled composition must activate completely.
  */
 export function installAssembledBootEnv(): void {
   // jsdom implements no scroll geometry: the trigger menu reveals its
@@ -219,7 +219,18 @@ export function installAssembledBootEnv(): void {
       top: 0, bottom: 0, left: 0, right: 0, width: 0, height: 0, x: 0, y: 0, toJSON: () => ({}),
     })
   }
+  let fontsDescriptor: PropertyDescriptor | undefined
+  let restoreWarn: (() => void) | undefined
   beforeEach(() => {
+    bootWarnings = []
+    const warn = console.warn.bind(console)
+    const spy = vi.spyOn(console, 'warn').mockImplementation((message?: unknown, ...rest: unknown[]) => {
+      if (typeof message === 'string' && message.startsWith('web boot: warning')) bootWarnings.push(message)
+      warn(message, ...rest)
+    })
+    restoreWarn = () => { spy.mockRestore() }
+    fontsDescriptor = Object.getOwnPropertyDescriptor(document, 'fonts')
+    Object.defineProperty(document, 'fonts', { configurable: true, value: new EventTarget() })
     localStorage.clear()
     // The locale service derives its provisional locale from the browser and
     // takes an explicit choice only from Host settings. This scenario serves no
@@ -228,7 +239,6 @@ export function installAssembledBootEnv(): void {
     Object.defineProperty(navigator, 'language', { value: 'en-US', configurable: true })
     document.title = 'DeepSeek Harness'
     vi.stubGlobal('ResizeObserver', ResizeObserverStub)
-    vi.stubGlobal('EventSource', EventSourceStub)
     vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) =>
       setTimeout(() => { callback(0) }, 0) as unknown as number)
     vi.stubGlobal('cancelAnimationFrame', (id: number) => { clearTimeout(id) })
@@ -252,6 +262,7 @@ export function installAssembledBootEnv(): void {
     delete win.__DSH_BOOT__
     delete win.__ModuleLoader__
     delete win.__DSH_TRANSPORT__
+    delete win.__DSH_FILE_UPLOAD__
     document.body.innerHTML = ''
     document.head.querySelectorAll('style[data-plugin]').forEach((style) => { style.remove() })
     document.title = ''
@@ -262,6 +273,11 @@ export function installAssembledBootEnv(): void {
     delete ownNavigator.languages
     delete ownNavigator.language
     vi.unstubAllGlobals()
+    if (fontsDescriptor === undefined) Reflect.deleteProperty(document, 'fonts')
+    else Object.defineProperty(document, 'fonts', fontsDescriptor)
+    restoreWarn?.()
+    restoreWarn = undefined
+    if (bootWarnings.length > 0) failures.push(new Error(`assembled boot: every entry must activate\n${bootWarnings.join('\n')}`))
     if (failures.length > 0) throw new AggregateError(failures, 'assembled boot teardown failed')
   })
 }
@@ -278,6 +294,7 @@ export function mountAssembledApp(options: AssembledBootOptions = {}): Assembled
   const remote = createAssembledRemote(options.remote)
   mountedRemote = remote.mock
   win.__DSH_TRANSPORT__ = { rpc: remote.mock.rpc }
+  win.__DSH_FILE_UPLOAD__ = { fetch: remote.fileUpload }
   history.replaceState(null, '', '/')
   const root = document.createElement('div')
   root.id = 'root'
@@ -305,6 +322,29 @@ export function mountAssembledApp(options: AssembledBootOptions = {}): Assembled
     unmount = () => entry.dispose()
   })
   return remote
+}
+
+/**
+ * Create a fixture Session through the sidebar and wait for its own composer to mount.
+ * @param remote - fixture transport returned by mountAssembledApp.
+ * @returns composer inside the Session named by this creation's reply.
+ */
+export async function createAssembledSessionComposer(remote: AssembledRemote): Promise<HTMLElement> {
+  const tree = await screen.findByRole('tree', { name: 'Sessions' }, { timeout: 10_000 })
+  const start = tree.querySelector<HTMLButtonElement>('button[aria-label="New session in fixture"]')
+  if (start === null) throw new Error('fixture Workspace new-session action missing')
+  const previousCalls = remote.mock.log.calls('session/create').length
+  fireEvent.click(start)
+  return await waitFor(() => {
+    const creation = remote.mock.log.calls('session/create')[previousCalls]
+    if (creation?.state !== 'answered') throw new Error('fixture Session creation has not completed')
+    const { value: { sessionId } } = creation.result as { value: { sessionId: string } }
+    const conversation = [...document.querySelectorAll<HTMLElement>('[data-conversation-session]')]
+      .find(element => element.getAttribute('data-conversation-session') === sessionId)
+    const composer = conversation?.querySelector<HTMLElement>('[data-composer-input][contenteditable="true"]')
+    if (composer === undefined || composer === null) throw new Error(`composer for Session ${sessionId} has not mounted`)
+    return composer
+  }, { timeout: 10_000 })
 }
 
 /**

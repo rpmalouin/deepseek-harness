@@ -196,9 +196,8 @@ function fileEntryPath(ref: FileAttachmentRef): string {
 }
 
 /**
- * Collect every attachment reference inside one content array, descending into
- * nested tool results the way the live attachment route does.
- * @param content - an event content array (or nested tool-result content).
+ * Collect direct attachment blocks from one declared V4 content array.
+ * @param content - an event or message content array.
  * @param images - image dedupe map keyed by attachment id.
  * @param files - file dedupe map keyed by attachment id and stored name.
  */
@@ -208,12 +207,9 @@ function collectAttachmentRefs(
   files: Map<string, FileAttachmentRef>,
 ): void {
   if (!Array.isArray(content)) return
-  const pending: unknown[] = []
-  for (const item of content) pending.push(item)
-  while (pending.length > 0) {
-    const value = pending.pop()
+  for (const value of content) {
     if (typeof value !== 'object' || value === null || Array.isArray(value)) continue
-    const block = value as { type?: unknown; attachment?: unknown; content?: unknown }
+    const block = value as { type?: unknown; attachment?: unknown }
     if (block.type === 'image' && typeof block.attachment === 'object' && block.attachment !== null) {
       const ref = block.attachment as ImageAttachmentRef
       images.set(String(ref.attachmentId), ref)
@@ -222,16 +218,12 @@ function collectAttachmentRefs(
       const ref = block.attachment as FileAttachmentRef
       files.set(`${String(ref.attachmentId)}\u0000${ref.name}`, ref)
     }
-    if (Array.isArray(block.content)) {
-      for (const item of block.content) pending.push(item)
-    }
   }
 }
 
 /**
- * Collect every attachment reference one session event carries, across the same
- * carriers the live attachment route scans (direct content, message content,
- * inserted messages, and completed blocks in embedded Assistant streams).
+ * Collect references only from declared first-party content fields and completed
+ * Assistant blocks. Unknown events and unrelated payload fields remain opaque.
  * @param event - one parsed JSONL event object.
  * @param images - image dedupe map keyed by attachment id.
  * @param files - file dedupe map keyed by attachment id and stored name.
@@ -241,18 +233,43 @@ function collectEventAttachmentRefs(
   images: Map<string, ImageAttachmentRef>,
   files: Map<string, FileAttachmentRef>,
 ): void {
-  const data = (event as { data?: unknown }).data
+  if (typeof event !== 'object' || event === null || Array.isArray(event)) return
+  const row = event as { type?: unknown; data?: unknown }
+  const data = row.data
   if (typeof data !== 'object' || data === null) return
   const carrier = data as {
     content?: unknown
     message?: { content?: unknown }
-    inserted?: Array<{ content?: unknown }>
+    inserted?: unknown
+    summary?: unknown
+    rawOutput?: unknown
     stream?: Array<{ type?: unknown; chunk?: { type?: unknown; block?: unknown } }>
   }
-  collectAttachmentRefs(carrier.content, images, files)
-  if (carrier.message !== undefined) collectAttachmentRefs(carrier.message.content, images, files)
-  if (carrier.inserted !== undefined) {
-    for (const message of carrier.inserted) collectAttachmentRefs(message.content, images, files)
+  switch (row.type) {
+    case 'user/message': case 'tool/ptc-dispatch':
+      collectAttachmentRefs(carrier.content, images, files)
+      return
+    case 'system/message': case 'developer/message': case 'tool/result': case 'team/message/queued':
+      collectAttachmentRefs(carrier.message?.content, images, files)
+      return
+    case 'agent/inbox/spliced': {
+      const messages = carrier.inserted
+      if (!Array.isArray(messages)) return
+      for (const message of messages as readonly unknown[]) {
+        if (typeof message !== 'object' || message === null || Array.isArray(message)) continue
+        collectAttachmentRefs((message as { readonly content?: unknown }).content, images, files)
+      }
+      return
+    }
+    case 'compaction/summary':
+      collectAttachmentRefs(carrier.summary, images, files)
+      collectAttachmentRefs(carrier.rawOutput, images, files)
+      return
+    case 'assistant/message':
+      collectAttachmentRefs(carrier.message?.content, images, files)
+      break
+    case 'assistant/attempt': break
+    default: return
   }
   if (carrier.stream !== undefined) {
     for (const record of carrier.stream) {
@@ -371,19 +388,109 @@ export async function* sessionLogZipEntries(
     signal?.throwIfAborted()
     yield* collect(lineage.descendants)
   }
-  for (const ref of media.values()) {
-    signal?.throwIfAborted()
-    const stored = await deps.attachments.readImage(ref, signal)
-    signal?.throwIfAborted()
-    yield { path: mediaEntryPath(ref), data: stored.data }
-  }
-  for (const ref of files.values()) {
-    signal?.throwIfAborted()
-    yield {
-      path: fileEntryPath(ref),
-      chunks: deps.attachments.readFileStream(ref, signal),
+  const missing: string[] = []
+  const openStreams = new Set<() => Promise<void>>()
+  try {
+    for (const ref of media.values()) {
+      signal?.throwIfAborted()
+      try {
+        const stored = await deps.attachments.readImage(ref, signal)
+        signal?.throwIfAborted()
+        yield { path: mediaEntryPath(ref), data: stored.data }
+      } catch (error) {
+        if (!isUnreadableReference(error)) throw error
+        missing.push(`${mediaEntryPath(ref)}\t${error.message}`)
+      }
     }
+    for (const ref of files.values()) {
+      signal?.throwIfAborted()
+      let chunks: AsyncIterable<Uint8Array>
+      try {
+        chunks = await headOf(deps.attachments.readFileStream(ref, signal), openStreams)
+      } catch (error) {
+        if (!isUnreadableReference(error)) throw error
+        missing.push(`${fileEntryPath(ref)}\t${error.message}`)
+        continue
+      }
+      yield { path: fileEntryPath(ref), chunks }
+    }
+  } finally {
+    // A consumer that stops early leaves its entry's stream open. One close
+    // failing must not keep the others open or replace the failure in flight.
+    await Promise.allSettled([...openStreams].map(close => close()))
   }
+  if (missing.length > 0) {
+    yield { path: MISSING_ATTACHMENTS_FILENAME, content: `${missing.join('\n')}\n` }
+  }
+}
+
+/** Zip entry naming the attachment objects this export could not include. */
+const MISSING_ATTACHMENTS_FILENAME = 'attachments-missing.txt'
+
+/**
+ * Attachment codes that leave the reference nothing to read: the object was
+ * deleted or never stored, or the backend rejects the reference outright. Such
+ * a reference leaves the rest of the export intact; every other failure still
+ * fails it. The stable machine-routing codes identify them without importing
+ * the attachment package's class, which stays its owner's peer.
+ */
+const UNREADABLE_ATTACHMENT_CODES: ReadonlySet<string> = new Set([
+  'ATTACHMENT_NOT_FOUND',
+  'INVALID_ATTACHMENT_REF',
+])
+
+/**
+ * Whether an attachment read failed because the reference names nothing this
+ * backend can read.
+ * @param error - the thrown value.
+ * @returns whether it reports an unreadable reference.
+ */
+function isUnreadableReference(error: unknown): error is Error & { readonly code: string } {
+  if (!(error instanceof Error) || !('code' in error)) return false
+  const code: unknown = error.code
+  return typeof code === 'string' && UNREADABLE_ATTACHMENT_CODES.has(code)
+}
+
+/**
+ * Pull one chunk of a file stream before its ZIP entry is yielded, so an
+ * unreadable reference surfaces here instead of after part of the archive is
+ * written, and hand back the rest of the same iteration. The returned stream
+ * closes its iterator when drained or abandoned; `open` receives the same
+ * close so the entry's owner can release a stream no consumer started.
+ * @param stream - the stored file's chunks.
+ * @param open - close callbacks of the streams currently open.
+ * @returns the chunks, with the first one already read.
+ */
+async function headOf(
+  stream: AsyncIterable<Uint8Array>,
+  open: Set<() => Promise<void>>,
+): Promise<AsyncIterable<Uint8Array>> {
+  const iterator = stream[Symbol.asyncIterator]()
+  // Cancelling a stream twice is harmless: the second return reports it done.
+  const close = async (): Promise<void> => {
+    open.delete(close)
+    await iterator.return?.()
+  }
+  open.add(close)
+  let head: IteratorResult<Uint8Array>
+  try {
+    head = await iterator.next()
+  } catch (error) {
+    await close()
+    throw error
+  }
+  return (async function* (): AsyncGenerator<Uint8Array> {
+    try {
+      if (head.done !== true) yield head.value
+      for (;;) {
+        const next = await iterator.next()
+        if (next.done === true) return
+        yield next.value
+      }
+    } finally {
+      await close()
+    }
+  })()
 }
 
 /** How many code units of Session-log text one zip push carries (bounded encode memory). */

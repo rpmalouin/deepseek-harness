@@ -1,53 +1,47 @@
 - dialog "设置":
+  - text: 设置
   - navigation:
-    - text: 设置
-    - button "通用设置":
-      - img
-      - text: 通用设置
-    - button "模型":
-      - img
-      - text: 模型
-    - button "内置插件":
-      - img
-      - text: 内置插件
-    - button "Agent 预设":
-      - img
-      - text: Agent 预设
-    - button "已归档会话":
-      - img
-      - text: 已归档会话
+    - button "通用设置"
+    - button "模型"
+    - button "插件管理"
+    - button "Agent 预设"
   - button "打开配置文件"
-  - button "关闭":
-    - img
-    - text: 关闭
+  - button "关闭"
   - heading "模型" [level=2]
-  - paragraph: 填入各提供方的 API 密钥即可使用其模型。
+  - paragraph: 填入各提供商的 API 密钥即可使用其模型。
   - list:
     - listitem:
       - text: DeepSeek
       - img "API 密钥已配置"
       - button "编辑 DeepSeek (deepseek-official)": 编辑
       - text: DeepSeek deepseek-official API 密钥
+      - button "认证说明": "?"
       - textbox "API 密钥":
-        - /placeholder: 已配置——输入新值可替换
+        - /placeholder: dsh_onboa•••••••••••••••••••••••••••••••test
+      - paragraph: 使用已保存的 API key。
       - group:
         - text: 自定义设置 API 地址
         - textbox "API 地址":
-          - /placeholder: https://api.deepseek.com/anthropic
-        - text: 请填写与当前连接配置兼容的 API 地址。
+          - /placeholder: https://api.deepseek.com/anthropic（默认使用环境 DEEPSEEK_BASE_URL）
+        - text: 请填写兼容 Anthropic Messages 协议的 API 地址。
+        - group "重试策略":
+          - text: 重试策略
+          - combobox "重试策略":
+            - option "默认（仅临时错误）" [selected]
+            - option "仅临时错误"
+            - option "所有错误"
         - region "模型目录":
           - text: 模型目录 已自定义模型目录
           - button "恢复默认模型"
+          - button "调整模型顺序 1"
           - textbox "模型 ID 1":
             - /placeholder: 模型 ID
             - text: private-preview
+          - button "模型选项 1" [expanded]
+          - button "删除模型 1"
           - textbox "显示名称 1":
             - /placeholder: 显示名称
             - text: Private Preview
-          - button "模型选项 1" [expanded]:
-            - img
-          - button "删除模型 1":
-            - img
           - text: 上下文窗口
           - textbox "上下文窗口 1":
             - /placeholder: 1M
@@ -62,14 +56,7 @@
             - text: 文本
             - checkbox "图片" [checked]
             - text: 图片
-          - button "添加模型":
-            - img
-            - text: 添加模型
+          - button "添加模型"
       - button "取消"
       - button "保存"
-  - button "添加提供方":
-    - img
-    - text: 添加提供方
-  - button "添加自定义提供方":
-    - img
-    - text: 添加自定义提供方
+  - button "添加模型提供商"

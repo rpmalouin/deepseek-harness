@@ -1,10 +1,12 @@
-/** A file request elicits explicit SVG delivery without naming the present tool. */
+/** An explicit file-card request exercises SVG delivery without naming the present tool. */
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { monitorEventLoopDelay } from 'node:perf_hooks'
 import { fileURLToPath } from 'node:url'
 import { chromium, type Browser, type Page } from 'playwright'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import WebSocket from 'ws'
 import type {} from '@deepseek-ai/dsh-tool-present/types'
 import { deriveReplayScript, parseSessionLog } from '@deepseek-ai/dsh-llm-replay'
 import {
@@ -17,8 +19,20 @@ import { connectFreshWorkspaceZh, ZH_BROWSER_LOCALE } from './support.ts'
 const DIR = fileURLToPath(new URL('../../../snapshots/web/present-svg', import.meta.url))
 const FIXTURE = join(DIR, 'session.v3.jsonl')
 const MODE = webSnapshotMode()
-const PROMPT = '简单画一个 SVG 表示冯诺依曼架构, 保存为 von-neumann.svg'
+const RECORD_PROMPT = '简单画一个 SVG 表示冯诺依曼架构，保存为 von-neumann.svg，并提供独立文件卡片，方便打开。'
 const FILE = 'von-neumann.svg'
+
+/** Queue counters from the installed ws implementation; payload contents are never recorded. */
+type DiagnosticSocket = WebSocket & {
+  readonly _sender?: { readonly _state: number; readonly _bufferedBytes: number; readonly _queue: readonly unknown[] }
+  readonly _receiver?: { readonly _state: number; readonly _bufferedBytes: number }
+  readonly _socket?: {
+    readonly bytesRead: number
+    readonly bytesWritten: number
+    readonly readableLength: number
+    readonly writableLength: number
+  }
+}
 
 describe('web e2e: requested SVG is explicitly delivered', () => {
   let scaffold: WebScaffold
@@ -27,33 +41,80 @@ describe('web e2e: requested SVG is explicitly delivered', () => {
   let tripwire: ReturnType<typeof watchConsole>
   let cwd: string
   let replayRoot: string | undefined
+  let restoreTransportDiagnostics: (() => void) | undefined
+  const connectionDiagnostics: string[] = []
 
   beforeAll(async () => {
+    const loopDelay = monitorEventLoopDelay({ resolution: 20 })
+    loopDelay.enable()
+    const ping = vi.spyOn(WebSocket.prototype, 'ping')
+    const terminated = vi.spyOn(WebSocket.prototype, 'terminate').mockImplementation(function (this: WebSocket) {
+      const socket = this as DiagnosticSocket
+      connectionDiagnostics.push(`Host termination: ${JSON.stringify({
+        readyState: socket.readyState,
+        bufferedBytes: socket.bufferedAmount,
+        pingCalls: ping.mock.contexts.filter(context => context === socket).length,
+        senderState: socket._sender?._state,
+        senderBufferedBytes: socket._sender?._bufferedBytes,
+        senderQueueLength: socket._sender?._queue.length,
+        receiverState: socket._receiver?._state,
+        receiverBufferedBytes: socket._receiver?._bufferedBytes,
+        bytesRead: socket._socket?.bytesRead,
+        bytesWritten: socket._socket?.bytesWritten,
+        readableLength: socket._socket?.readableLength,
+        writableLength: socket._socket?.writableLength,
+        maxEventLoopDelayMs: loopDelay.max / 1e6,
+        p99EventLoopDelayMs: loopDelay.percentile(99) / 1e6,
+      })}`)
+      connectionDiagnostics.push(new Error('Host WebSocket termination').stack ?? 'Host WebSocket termination')
+      terminated.mockRestore()
+      this.terminate()
+    })
+    restoreTransportDiagnostics = () => {
+      terminated.mockRestore()
+      ping.mockRestore()
+      loopDelay.disable()
+    }
     let replayOverride: string | undefined
     if (MODE !== 'record') {
       replayRoot = await mkdtemp(join(tmpdir(), 'dsh-present-svg-replay-'))
       replayOverride = join(replayRoot, 'replay.override.json')
       const script = deriveReplayScript(parseSessionLog(await readFile(FIXTURE, 'utf8')))
       // Recorded absolute paths must follow each isolated Session's working directory.
-      const cwdToken = '{{fromRequest:Your working directory is ([^\\n]+)\\.}}'
+      const cwdToken = '{{fromRequest:Current working directory: "([^"]+)"}}'
       await writeFile(replayOverride, JSON.stringify(script).replaceAll('{{cwd}}', JSON.stringify(cwdToken).slice(1, -1)))
     }
     scaffold = await launchWebScaffold({
       compareReplaySession: true,
       extraOverlayPath: fileURLToPath(new URL('./present-svg.overlay.yml', import.meta.url)),
-      ...(replayOverride === undefined ? {} : { replayFixture: FIXTURE, replayOverride }),
+      // Replay the large SVG incrementally to avoid a zero-delay traffic burst.
+      ...(replayOverride === undefined ? {} : { replayFixture: FIXTURE, replayOverride, paceMs: 5 }),
     })
     browser = await chromium.launch()
     page = await browser.newPage({
       viewport: { width: 1680, height: 1000 }, locale: ZH_BROWSER_LOCALE, timezoneId: 'Asia/Shanghai',
     })
     tripwire = watchConsole(page)
+    page.on('console', (message) => {
+      if (message.text().startsWith('[connection]')) connectionDiagnostics.push(message.text())
+    })
+    page.on('websocket', (socket) => {
+      loopDelay.reset()
+      const openedAt = Date.now()
+      let received = 0
+      socket.on('framereceived', () => { received++ })
+      socket.on('socketerror', (error) => { connectionDiagnostics.push(error) })
+      socket.on('close', () => {
+        connectionDiagnostics.push(`WebSocket closed after ${Date.now() - openedAt}ms and ${received} received frames`)
+      })
+    })
     await page.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })
     await page.waitForSelector('[class*="frame"]')
     await connectFreshWorkspaceZh(page, scaffold.workspaceCwd)
   })
 
   afterAll(async () => {
+    restoreTransportDiagnostics?.()
     try {
       await browser?.close()
     } finally {
@@ -65,11 +126,12 @@ describe('web e2e: requested SVG is explicitly delivered', () => {
     }
   })
 
-  it('writes valid SVG and calls present before the final reply', async () => {
-    if (MODE !== 'record') expect(fixtureUserPrompts(await readFile(FIXTURE, 'utf8'))).toEqual([PROMPT])
+  it('writes valid SVG and provides the requested file card before the final reply', async () => {
+    const prompts = MODE === 'record' ? [RECORD_PROMPT] : fixtureUserPrompts(await readFile(FIXTURE, 'utf8'))
+    expect(prompts).toHaveLength(1)
     const settled = scaffold.whenTurnSettled()
     const input = page.locator('[data-composer-input]').first()
-    await input.fill(PROMPT)
+    await input.fill(prompts[0]!)
     await input.press('Enter')
     const sessionId = await settled
     const session = scaffold.ctx.agents.get(sessionId)?.session
@@ -78,7 +140,7 @@ describe('web e2e: requested SVG is explicitly delivered', () => {
     if (MODE === 'record') await recordFixture(scaffold, sessionId, FIXTURE)
 
     const svg = await readFile(join(cwd, FILE), 'utf8')
-    const document = await page.evaluate((source) => {
+    const parsedSvg = await page.evaluate((source) => {
       const parsed = new DOMParser().parseFromString(source, 'image/svg+xml')
       return {
         root: parsed.documentElement.localName,
@@ -86,12 +148,12 @@ describe('web e2e: requested SVG is explicitly delivered', () => {
         errors: parsed.querySelectorAll('parsererror').length,
       }
     }, svg)
-    expect(document).toEqual({ root: 'svg', namespace: 'http://www.w3.org/2000/svg', errors: 0 })
+    expect(parsedSvg).toEqual({ root: 'svg', namespace: 'http://www.w3.org/2000/svg', errors: 0 })
 
     const events = session.snapshotEvents()
     const declarations = events.filter(event => event.type === 'deliverables/presented')
     const delivery = declarations.find(event => event.data.files.some(file => resolve(cwd, file.path) === join(cwd, FILE)))
-    expect(delivery, 'the file request must produce a successful present declaration').toBeDefined()
+    expect(delivery, 'explicit file-card delivery requires a successful present declaration').toBeDefined()
     if (delivery === undefined) throw new Error('SVG was written but not delivered')
     expect(events.some(event => (
       event.type === 'tool/call' && event.data.name === 'present' && event.data.callId === delivery.data.callId
@@ -106,17 +168,60 @@ describe('web e2e: requested SVG is explicitly delivered', () => {
     await card.waitFor({ state: 'visible' })
     expect(await card.count()).toBe(1)
     expect(await page.getByText('产物', { exact: true }).count()).toBe(0)
-    // The scaffold workspace is not a git repository, so the changed-files card lists the written SVG from the write call alone.
-    expect(await page.locator('[data-changed-files]').count()).toBe(1)
+    // The scaffold workspace is not a git repository; the write call supplies its single changed file.
+    const changes = page.locator('[data-changed-files]')
+    // Changed-file cards wait for a separate summary request after the presentation events arrive.
+    await changes.waitFor({ state: 'visible' })
+    expect(await changes.count()).toBe(1)
+    expect(await changes.getByText(`已编辑 ${FILE}`, { exact: true }).count()).toBe(1)
+    expect(await changes.getByRole('list').count()).toBe(0)
+    expect(await changes.locator('svg').evaluate(icon => icon.innerHTML))
+      .toBe(await card.locator('svg').evaluate(icon => icon.innerHTML))
+    await expect.poll(() => changes.evaluate(element => element.isConnected
+      ? element.getBoundingClientRect().height : undefined), { timeout: 10_000 }).toBe(62)
+    // Earlier locator reads do not guarantee both cards remain mounted when the
+    // turn tail updates. Observe their presence and styles in one browser task.
+    await expect.poll(() => page.evaluate(() => {
+      const presentedCard = document.querySelector('[data-presented-file]')
+      const changedCard = document.querySelector('[data-changed-files]')
+      if (presentedCard === null || changedCard === null) return null
+      const previous = document.body.getAttribute('data-ds-dark-theme')
+      try {
+        return [false, true].map((dark) => {
+          document.body.toggleAttribute('data-ds-dark-theme', dark)
+          const appearance = [presentedCard, changedCard].map((card) => {
+            const tile = card.querySelector('svg')!.parentElement!
+            return { fill: getComputedStyle(tile).backgroundColor, tileBorder: getComputedStyle(tile).border,
+              cardBorder: getComputedStyle(card).border }
+          })
+          return { fills: appearance.map(card => card.fill), matchingTiles: appearance[0]!.tileBorder === appearance[1]!.tileBorder,
+            matchingCards: appearance[0]!.cardBorder === appearance[1]!.cardBorder }
+        })
+      } finally {
+        if (previous === null) document.body.removeAttribute('data-ds-dark-theme')
+        else document.body.setAttribute('data-ds-dark-theme', previous)
+      }
+    }), { timeout: 10_000 }).toEqual([
+      { fills: ['color(srgb 1 1 1 / 0.5)', 'color(srgb 1 1 1 / 0.5)'], matchingTiles: true, matchingCards: true },
+      { fills: ['color(srgb 1 1 1 / 0.05)', 'color(srgb 1 1 1 / 0.05)'], matchingTiles: true, matchingCards: true },
+    ])
     expect(tripwire.pageErrors).toEqual([])
-    expect(tripwire.warnings).toEqual([])
+    expect(tripwire.warnings, connectionDiagnostics.join('\n')).toEqual([])
   })
 
   it.skipIf(MODE === 'record')('replays the delivered file and Chinese conversation', async () => {
     await assertFinalWorkspaceSnapshot(DIR, cwd)
-    await expect.poll(() => page.getByRole('button', { name: `${FILE} 的更多文件操作`, exact: true }).isDisabled()).toBe(true)
+    expect(await page.locator('[data-presented-file] [data-open-target]').count()).toBe(0)
     // Delivery owns the transcript; navigation and composer chrome have separate scenarios.
     const aria = await captureExpandedTurnProcessAria(page, '[data-chat-flow]', scaffold.workspaceCwd)
     await compareOrRefreshGolden(join(DIR, 'ui.expected.md'), aria, MODE)
+  })
+
+  it('opens the single edited file from its compact card', async () => {
+    await page.locator('[data-changed-files]').getByRole('button', { name: `查看 ${FILE} 的改动` }).click()
+    const review = page.locator('[data-changes-review]')
+    await review.waitFor({ state: 'visible' })
+    expect(await review.getByRole('button', { name: '选择要查看的文件' }).innerText()).toContain(FILE)
+    expect(tripwire.pageErrors).toEqual([])
   })
 })

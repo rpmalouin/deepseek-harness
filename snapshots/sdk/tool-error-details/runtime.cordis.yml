@@ -1,3 +1,9 @@
+- id: tool-executor-native
+  disabled: false
+
+- id: tool-executor-ptc
+  disabled: true
+
 - insert:
     - id: ptc-runtime
       name: '@deepseek-ai/dsh-ptc-runtime-node'

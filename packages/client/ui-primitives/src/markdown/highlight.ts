@@ -6,16 +6,16 @@
  * dark blocks), never here — the repo's tokens-only styling rule.
  *
  * Only the three markdown-fence and `run_code` grammars (TypeScript, shell,
- * JSON) load into the singleton at boot — the set every session renders. The
- * read card's wider extension set (the file-extension language hints the read
- * tool's `langFromPath` emits — `packages/fs/tool-fs`: python, rust, yaml,
- * markup, …) is imported lazily and registered the first time such a language
- * is requested, so a session that never opens a read card in one of those
- * languages pays neither the ~1.6 MB of grammar modules nor their synchronous
- * init. The first render of a lazy language falls back to plain text while its
- * grammar loads, then {@link onGrammarLoaded} notifies subscribers to re-render
- * with highlighting. An unknown or absent language falls back to plain text (no
- * highlighting, still monospace) — never an error.
+ * JSON) load into the singleton at boot — the set every session renders. Every
+ * other language in the shared extension table
+ * (`@deepseek-ai/dsh-util-code-language`: python, rust, yaml, markup, …) is
+ * imported lazily and registered the first time such a language is requested,
+ * so a session that never opens a code surface in one of those languages pays
+ * neither the grammar modules nor their synchronous init. The first render of a
+ * lazy language falls back to plain text while its grammar loads, then
+ * {@link onGrammarLoaded} notifies subscribers to re-render with highlighting.
+ * An unknown or absent language falls back to plain text (no highlighting, still
+ * monospace) — never an error.
  */
 
 import { createHighlighterCoreSync, createCssVariablesTheme } from 'shiki/core'
@@ -36,14 +36,88 @@ type LangModule = { default: typeof langTs }
  * resolve to the TypeScript grammar rather than a separate one: it tokenizes
  * plain TS/JS exactly, and JSX/TSX approximately (shiki's TS grammar is not the
  * dedicated TSX grammar, so JSX elements tokenize imperfectly) — an accepted
- * trade to keep the boot set to one JS-family grammar. The read card's wider
- * set loads lazily through {@link LAZY_GRAMMARS}.
+ * trade to keep the boot set to one JS-family grammar. Every other language in
+ * the shared extension table loads lazily through {@link LAZY_GRAMMARS}.
  */
 const LANGS = [langTs, langBash, langJson]
 
 /**
- * The read card's extension grammars, each behind a dynamic import so its
- * module stays out of the boot chunk until a read of that language renders.
+ * Replace the Go grammar's repeated one-line struct-field rule with the rule
+ * worlpaker/go-syntax merged in 4a9b120a52c (https://github.com/worlpaker/go-syntax/pull/25):
+ * the repeated rule backtracks exponentially on lines such as a brace-bearing
+ * comment after `struct {`. Delete this patch once `@shikijs/langs` ships that
+ * commit; 4.5.0 does not. The rule is located as the only rule in
+ * `struct_variables_types_fields` containing the field-token literal below,
+ * taken from `@shikijs/langs` 4.4.3.
+ * @param grammars - the `@shikijs/langs/go` default export, left unmodified.
+ * @returns copies of `grammars` with that rule's match replaced in the `go` grammar.
+ * @throws When the module has no `go` grammar, the grammar lacks
+ * `struct_variables_types_fields`, or that entry has no or several such rules.
+ * The lazy load then rejects unhandled and Go code renders as plain text.
+ */
+export function patchGoGrammar(grammars: LangModule['default']): LangModule['default'] {
+  const go = grammars.find(grammar => grammar.name === 'go')
+  const fields = go?.repository.struct_variables_types_fields
+  const patterns = fields?.patterns ?? []
+  const rules = patterns.filter(rule => typeof rule.match === 'string' && rule.match.includes('[^"/`\\s]+;?'))
+  if (go === undefined || fields === undefined || rules.length !== 1) {
+    throw new Error(`ui-primitives: expected exactly one Go struct-field rule to patch for worlpaker/go-syntax#25, found ${
+      rules.length}; update or delete the patch`)
+  }
+  const repository = { ...go.repository }
+  repository.struct_variables_types_fields = {
+    ...fields,
+    patterns: patterns.map(rule => rule === rules[0]
+      ? { ...rule, match: '(?:(?<=\\{)([^/\\`"]*[^\\s/\\`"])\\s*(?=\\}))' }
+      : rule),
+  }
+  return grammars.map(grammar => grammar === go ? { ...go, repository } : grammar)
+}
+
+/** The Perl grammar's bare `/…/` rule begins a match only after these characters or at line start. */
+const PERL_FIND_BEGIN = '(?<=[\\&({|~]|if|unless|^)\\s*((/))'
+
+/**
+ * Words after which a Perl `/` starts a match rather than a division. A word
+ * counts only when no identifier character, sigil, `>`, `:` or `-` precedes it,
+ * so `$split / 2` and `$obj->return / 2` stay divisions. Each word is a
+ * separate fixed-length lookbehind alternative because the JavaScript engine's
+ * Oniguruma translator rejects nested lookbehinds.
+ */
+const PERL_FIND_WORDS = ['if', 'unless', 'split', 'grep', 'and', 'or', 'not', 'return', 'while', 'until']
+
+/**
+ * Widen the vendored Perl grammar's bare `/…/` match rule, which begins only
+ * after `&`, `(`, `{`, `|`, `~`, `if`, `unless` or at line start. Elsewhere,
+ * such as `split /^---\s*$/m, $text`, the pattern body tokenizes as code: its
+ * `m,` opens an `m` match delimited by commas that runs to the end of the
+ * source. The patched rule also begins after `,`, `!`, `=` and `=>`, and after
+ * the list operators `split` and `grep`, the low-precedence operators `and`,
+ * `or` and `not`, and `return`, `while`, `until`, `if` and `unless` when no
+ * identifier character, sigil, `>`, `:` or `-` precedes the word. The upstream
+ * textmate/perl.tmbundle grammar, which `@shikijs/langs` 4.4.3 ships through
+ * VS Code, has the same rule.
+ * @param grammars - the `@shikijs/langs/perl` default export, left unmodified.
+ * @returns copies of `grammars` with that rule's begin replaced in the `perl` grammar.
+ * @throws When the module has no `perl` grammar or that grammar has no or several
+ * top-level rules with the vendored begin pattern. The lazy load then rejects
+ * unhandled and Perl code renders as plain text.
+ */
+export function patchPerlGrammar(grammars: LangModule['default']): LangModule['default'] {
+  const perl = grammars.find(grammar => grammar.name === 'perl')
+  const rules = perl?.patterns.filter(rule => rule.begin === PERL_FIND_BEGIN) ?? []
+  if (perl === undefined || rules.length !== 1) {
+    throw new Error(`ui-primitives: expected exactly one Perl match rule to patch, found ${rules.length}; update or delete the patch`)
+  }
+  const words = PERL_FIND_WORDS.flatMap(word => [`[^\\w$@%&>:-]${word}`, `^${word}`]).join('|')
+  const begin = `(?<=[\\&({|~,!=]|=>|^|${words})\\s*((/))`
+  const patterns = perl.patterns.map(rule => rule === rules[0] ? { ...rule, begin } : rule)
+  return grammars.map(grammar => grammar === perl ? { ...perl, patterns } : grammar)
+}
+
+/**
+ * The non-boot extension grammars, each behind a dynamic import so its module
+ * stays out of the boot chunk until a code surface renders that language.
  * Keyed by the grammar id (`LanguageRegistration.name`) the aliases resolve to.
  * `@shikijs/langs`' default export is a `LanguageRegistration[]`; the loader
  * hands the whole array to `loadLanguageSync`, which registers each entry
@@ -53,7 +127,7 @@ const LANGS = [langTs, langBash, langJson]
 const LAZY_GRAMMARS = new Map<string, () => Promise<LangModule>>([
   ['python', () => import('@shikijs/langs/python')],
   ['ruby', () => import('@shikijs/langs/ruby')],
-  ['go', () => import('@shikijs/langs/go')],
+  ['go', async () => ({ default: patchGoGrammar((await import('@shikijs/langs/go')).default) })],
   ['rust', () => import('@shikijs/langs/rust')],
   ['java', () => import('@shikijs/langs/java')],
   ['c', () => import('@shikijs/langs/c')],
@@ -74,6 +148,40 @@ const LAZY_GRAMMARS = new Map<string, () => Promise<LangModule>>([
   ['sql', () => import('@shikijs/langs/sql')],
   ['xml', () => import('@shikijs/langs/xml')],
   ['lua', () => import('@shikijs/langs/lua')],
+  ['bat', () => import('@shikijs/langs/bat')],
+  ['powershell', () => import('@shikijs/langs/powershell')],
+  ['fish', () => import('@shikijs/langs/fish')],
+  ['dotenv', () => import('@shikijs/langs/dotenv')],
+  ['log', () => import('@shikijs/langs/log')],
+  ['csv', () => import('@shikijs/langs/csv')],
+  ['diff', () => import('@shikijs/langs/diff')],
+  ['http', () => import('@shikijs/langs/http')],
+  ['rst', () => import('@shikijs/langs/rst')],
+  ['latex', () => import('@shikijs/langs/latex')],
+  ['bibtex', () => import('@shikijs/langs/bibtex')],
+  ['asciidoc', () => import('@shikijs/langs/asciidoc')],
+  ['r', () => import('@shikijs/langs/r')],
+  ['julia', () => import('@shikijs/langs/julia')],
+  ['dart', () => import('@shikijs/langs/dart')],
+  ['scala', () => import('@shikijs/langs/scala')],
+  ['clojure', () => import('@shikijs/langs/clojure')],
+  ['erlang', () => import('@shikijs/langs/erlang')],
+  ['elixir', () => import('@shikijs/langs/elixir')],
+  ['haskell', () => import('@shikijs/langs/haskell')],
+  ['fsharp', () => import('@shikijs/langs/fsharp')],
+  ['vb', () => import('@shikijs/langs/vb')],
+  ['perl', async () => ({ default: patchPerlGrammar((await import('@shikijs/langs/perl')).default) })],
+  ['verilog', () => import('@shikijs/langs/verilog')],
+  ['system-verilog', () => import('@shikijs/langs/system-verilog')],
+  ['graphql', () => import('@shikijs/langs/graphql')],
+  ['proto', () => import('@shikijs/langs/proto')],
+  ['hcl', () => import('@shikijs/langs/hcl')],
+  ['nix', () => import('@shikijs/langs/nix')],
+  ['vue', () => import('@shikijs/langs/vue')],
+  ['svelte', () => import('@shikijs/langs/svelte')],
+  ['make', () => import('@shikijs/langs/make')],
+  ['cmake', () => import('@shikijs/langs/cmake')],
+  ['groovy', () => import('@shikijs/langs/groovy')],
 ])
 
 /**
@@ -81,9 +189,10 @@ const LAZY_GRAMMARS = new Map<string, () => Promise<LangModule>>([
  * plain. A Map, not an object: fence info strings are assistant-authored, so
  * a label like `constructor` or `__proto__` must miss instead of resolving an
  * inherited property and crashing the renderer inside shiki. Keys cover both
- * the markdown-fence aliases `CodeBlock` uses and the file-extension hint ids
- * the read tool's `langFromPath` emits, so both callers resolve the same
- * grammars. The JS family maps to the TypeScript grammar (see {@link LANGS} for
+ * the markdown-fence aliases `CodeBlock` uses, the file-extension language ids
+ * `@deepseek-ai/dsh-util-code-language` resolves, and the short ids
+ * `readLangHintForPath` persists, so every caller resolves the same grammars.
+ * A new short name in the shared table must be aliased here too. The JS family maps to the TypeScript grammar (see {@link LANGS} for
  * the JSX/TSX approximation). A value not in {@link LANGS} names a
  * {@link LAZY_GRAMMARS} entry loaded on first use.
  */
@@ -130,7 +239,85 @@ const LANG_ALIASES = new Map<string, string>([
   ['sql', 'sql'],
   ['xml', 'xml'],
   ['lua', 'lua'],
+  ['bat', 'bat'],
+  ['batch', 'bat'],
+  ['powershell', 'powershell'],
+  ['ps1', 'powershell'],
+  ['ps', 'powershell'],
+  ['fish', 'fish'],
+  ['properties', 'ini'],
+  ['dotenv', 'dotenv'],
+  ['env', 'dotenv'],
+  ['log', 'log'],
+  ['csv', 'csv'],
+  ['diff', 'diff'],
+  ['patch', 'diff'],
+  ['http', 'http'],
+  ['rst', 'rst'],
+  ['latex', 'latex'],
+  ['tex', 'latex'],
+  ['bibtex', 'bibtex'],
+  ['bib', 'bibtex'],
+  ['asciidoc', 'asciidoc'],
+  ['adoc', 'asciidoc'],
+  ['r', 'r'],
+  ['julia', 'julia'],
+  ['jl', 'julia'],
+  ['dart', 'dart'],
+  ['scala', 'scala'],
+  ['clojure', 'clojure'],
+  ['clj', 'clojure'],
+  ['erlang', 'erlang'],
+  ['erl', 'erlang'],
+  ['elixir', 'elixir'],
+  ['ex', 'elixir'],
+  ['exs', 'elixir'],
+  ['haskell', 'haskell'],
+  ['hs', 'haskell'],
+  ['fsharp', 'fsharp'],
+  ['fs', 'fsharp'],
+  ['fsi', 'fsharp'],
+  ['fsx', 'fsharp'],
+  ['vb', 'vb'],
+  ['vbnet', 'vb'],
+  ['perl', 'perl'],
+  ['pl', 'perl'],
+  ['pm', 'perl'],
+  ['verilog', 'verilog'],
+  // Shiki's own `v` grammar is the V language; the fence label and the `.v`
+  // extension both name Verilog here, so a future V registration needs a
+  // different alias.
+  ['v', 'verilog'],
+  ['system-verilog', 'system-verilog'],
+  ['systemverilog', 'system-verilog'],
+  ['sv', 'system-verilog'],
+  ['svh', 'system-verilog'],
+  ['graphql', 'graphql'],
+  ['gql', 'graphql'],
+  ['proto', 'proto'],
+  ['protobuf', 'proto'],
+  ['hcl', 'hcl'],
+  ['tf', 'hcl'],
+  ['tfvars', 'hcl'],
+  ['nix', 'nix'],
+  ['vue', 'vue'],
+  ['svelte', 'svelte'],
+  ['make', 'make'],
+  ['makefile', 'make'],
+  ['mk', 'make'],
+  ['cmake', 'cmake'],
+  ['groovy', 'groovy'],
+  ['gradle', 'groovy'],
 ])
+
+/**
+ * Resolve a language hint to the grammar id {@link LANG_ALIASES} selects.
+ * @param lang - Language hint from a code surface: a canonical grammar id or the read card's persisted short id.
+ * @returns The resolved grammar id, or `undefined` when the table aliases no grammar.
+ */
+export function grammarForHint(lang: string | undefined): string | undefined {
+  return lang === undefined ? undefined : LANG_ALIASES.get(lang.toLowerCase())
+}
 
 /**
  * Whether a language hint can use the shared syntax highlighter.
@@ -138,7 +325,7 @@ const LANG_ALIASES = new Map<string, string>([
  * @returns Whether the hint resolves to a supported grammar.
  */
 export function supportsHighlighting(lang: string | undefined): boolean {
-  return lang !== undefined && LANG_ALIASES.has(lang.toLowerCase())
+  return grammarForHint(lang) !== undefined
 }
 
 /** All token colors resolve through `--shiki-*` custom properties (theme package sheets). */
@@ -161,6 +348,16 @@ const regexEngine = createJavaScriptRegexEngine({
     lazyCompileLength: Number.POSITIVE_INFINITY,
   }),
 })
+
+/**
+ * Lines at least this many UTF-16 units long render as one uncolored token.
+ * With the JavaScript regex engine, scanning one JavaScript string-literal
+ * line costs about 70 ms at 1,000 units, 300 ms at 2,000, 600 ms at 5,000 and
+ * 2.5 s at 10,000, so this cap keeps one line within a few frames. A skipped
+ * line leaves the grammar state unchanged: a multi-line construct that opens
+ * or closes on it colors the following lines as if the line were absent.
+ */
+const TOKENIZE_MAX_LINE_LENGTH = 1000
 
 let singleton: HighlighterCore | undefined
 
@@ -270,10 +467,12 @@ const warmupTimer = setTimeout(() => { highlighter() }, 0)
  * @returns the highlighted HTML, or `undefined` for unknown or not-yet-loaded languages.
  */
 export function highlightToHtml(code: string, lang: string | undefined): string | undefined {
-  const resolved = lang === undefined ? undefined : LANG_ALIASES.get(lang.toLowerCase())
+  const resolved = grammarForHint(lang)
   if (resolved === undefined) return undefined
   if (!ensureGrammar(resolved)) return undefined
-  return highlighter().codeToHtml(code, { lang: resolved, theme: 'css-variables' })
+  return highlighter().codeToHtml(code, {
+    lang: resolved, theme: 'css-variables', tokenizeMaxLineLength: TOKENIZE_MAX_LINE_LENGTH,
+  })
 }
 
 /**
@@ -379,6 +578,7 @@ export class StreamingHighlightSession {
     return highlighter().codeToTokensBase(text, {
       lang: resolved,
       theme: 'css-variables',
+      tokenizeMaxLineLength: TOKENIZE_MAX_LINE_LENGTH,
       ...(this.state === undefined ? {} : { grammarState: this.state }),
     })
   }
@@ -396,7 +596,7 @@ export class StreamingHighlightSession {
     this.lastCode = code
     this.lastLang = lang
     this.lastResult = undefined
-    const resolved = lang === undefined ? undefined : LANG_ALIASES.get(lang.toLowerCase())
+    const resolved = grammarForHint(lang)
     if (resolved === undefined || !ensureGrammar(resolved)) {
       this.reset(undefined)
       return undefined
@@ -470,10 +670,12 @@ export interface StreamingHighlightFrame {
  * @returns one entry per source line (each an array of runs), or `undefined` for unknown or not-yet-loaded languages.
  */
 export function highlightLines(code: string, lang: string | undefined): HighlightSpan[][] | undefined {
-  const resolved = lang === undefined ? undefined : LANG_ALIASES.get(lang.toLowerCase())
+  const resolved = grammarForHint(lang)
   if (resolved === undefined) return undefined
   if (!ensureGrammar(resolved)) return undefined
-  const { tokens } = highlighter().codeToTokens(code, { lang: resolved, theme: 'css-variables' })
+  const { tokens } = highlighter().codeToTokens(code, {
+    lang: resolved, theme: 'css-variables', tokenizeMaxLineLength: TOKENIZE_MAX_LINE_LENGTH,
+  })
   // shiki tokenizes `a\nb` into two lines; a trailing newline (`a\n`) adds a
   // third, empty line the caller's own line array does not carry. Drop that
   // one terminator line so the two structures stay in step. The explicit

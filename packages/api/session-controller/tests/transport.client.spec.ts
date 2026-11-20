@@ -5,9 +5,11 @@ import {
   type RemoteStreamOptions,
 } from '@deepseek-ai/dsh-api-gateway/client'
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
-import { LlmAttemptId } from '@deepseek-ai/dsh-llm'
+import { streamHandle } from '@deepseek-ai/dsh-remote-mock'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { LlmAttemptId } from '@deepseek-ai/dsh-llm'
 import { SESSION_FORMAT_VERSION } from '@deepseek-ai/dsh-session/types'
-import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
+import type { RemoteResult, RemoteStreamHandle } from '@deepseek-ai/dsh-typert-protocol'
 import {
   createSessionControlStream,
   SessionEventStream,
@@ -24,7 +26,7 @@ import type {
   SessionFollowFrame,
   SessionFollowRequest,
   SessionHistoryRecord,
-  SessionPage,
+  SessionEventsPage,
   SessionPageRequest,
   SessionWireEvent,
 } from '../src/types.ts'
@@ -43,8 +45,8 @@ function entry(seq: number): SessionEventEntry {
   return { type: 'event', event: { type: 'turn/start', seq, time: seq, data: { turn: seq } } }
 }
 
-function page(records: readonly SessionHistoryRecord[], hasMore = false): SessionPage {
-  return { records, hasMore }
+function page(records: readonly SessionHistoryRecord[], hasMore = false): SessionEventsPage {
+  return { cursor: records.at(-1)?.event?.seq ?? -1, records, hasMore }
 }
 
 function snapshot(
@@ -81,9 +83,8 @@ function sessionClient(remote: SessionTransportRemote): SessionRemotes {
     ),
     commands: { execute: () => Promise.reject(new Error('stream tests never run commands')) },
     subagents: {
-      list: () => Promise.reject(new Error('stream tests never read the subagent catalog')),
       prompt: () => Promise.reject(new Error('stream tests never prompt a subagent')),
-      interruptByParent: () => Promise.reject(new Error('stream tests never interrupt a subagent')),
+      interruptByUser: () => Promise.reject(new Error('stream tests never interrupt a subagent')),
     },
   }
 }
@@ -102,12 +103,16 @@ class ScriptedSessionRemote implements SessionTransportRemote {
 
   constructor(
     private readonly generations: FollowGeneration[],
-    private readonly pages: RemoteResult<SessionPage>[],
+    private readonly pages: RemoteResult<SessionEventsPage>[],
     private readonly controlFrames: readonly SessionControlFrame[] = [],
     private readonly holdControl = true,
   ) {}
 
-  async *follow(request: SessionFollowRequest, signal = new AbortController().signal): AsyncIterable<SessionFollowFrame> {
+  follow(request: SessionFollowRequest, signal = new AbortController().signal): RemoteStreamHandle<SessionFollowFrame, never> {
+    return streamHandle(this.followFrames(request, signal))
+  }
+
+  private async *followFrames(request: SessionFollowRequest, signal: AbortSignal): AsyncIterable<SessionFollowFrame> {
     const generation = this.generations.shift()
     if (generation === undefined) throw new Error('no scripted Session generation')
     this.followRequests.push(request)
@@ -122,14 +127,18 @@ class ScriptedSessionRemote implements SessionTransportRemote {
     }
   }
 
-  page(request: SessionPageRequest): Promise<RemoteResult<SessionPage>> {
+  page(request: SessionPageRequest): Promise<RemoteResult<SessionEventsPage>> {
     this.pageRequests.push(request)
     const result = this.pages.shift()
     if (result === undefined) throw new Error('no scripted Session page')
     return Promise.resolve(result)
   }
 
-  async *control(signal = new AbortController().signal): AsyncIterable<SessionControlFrame> {
+  control(signal = new AbortController().signal): RemoteStreamHandle<SessionControlFrame, never> {
+    return streamHandle(this.controlSequence(signal))
+  }
+
+  private async *controlSequence(signal: AbortSignal): AsyncIterable<SessionControlFrame> {
     for (const frame of this.controlFrames) yield frame
     if (this.holdControl && !signal.aborted) {
       await new Promise<void>((resolve) => {
@@ -195,7 +204,7 @@ const invalidWireEvents: [string, unknown][] = [
   ...[false, undefined].map((isError): [string, unknown] => [
     `contradictory tool error ${String(isError)}`,
     { ...surfaceEvent('tool/result'), data: {
-      message: { content: [{ type: 'tool-result', content: [], ...(isError === undefined ? {} : { isError }) }] },
+      message: { role: 'tool', content: [], ...(isError === undefined ? {} : { isError }) },
       error: { name: 'Error', code: 'FAILURE' },
     } },
   ]),
@@ -243,11 +252,11 @@ describe('Session Client stream adapters', () => {
       { ...surfaceEvent(), surfaceOp: { op: 'replace', startSeq: 2, endSeq: 0 }, sourceEventSeqs: [2, 0] },
       { ...surfaceEvent('assistant/message'), data: { turn: 1, step: 1, message: {}, stream: [] } },
       { ...surfaceEvent('tool/result'), data: {
-        message: { content: [{ type: 'tool-result', content: [], isError: true }] },
+        message: { role: 'tool', content: [], isError: true },
         error: { name: 'Error', code: 'FAILURE' }, meta: { extension: ['retained'] },
       } },
       { ...surfaceEvent('tool/result'), sourceEventSeqs: [0], data: {
-        message: { content: [{ type: 'tool-result', content: [], isError: true }] },
+        message: { role: 'tool', content: [], isError: true },
       } },
       { type: 'request/header', seq: 10, time: 10, data: {
         reason: 'initial', header: { config: { provider: 'mock', model: 'mock' } },
@@ -289,7 +298,7 @@ describe('Session Client stream adapters', () => {
     }
   })
   it('opts into assistant notifications and publishes the reconnect baseline plus live frame', async () => {
-    const attemptId = LlmAttemptId('transport-attempt')
+    const attemptId = brandString<LlmAttemptId>('transport-attempt')
     const baseline: SessionAssistantStreamBaseline = {
       revision: 2,
       activeAttempt: {
@@ -318,7 +327,7 @@ describe('Session Client stream adapters', () => {
     await stream.open({})
     await vi.waitFor(() => { expect(changes).toHaveLength(2) })
 
-    expect(remote.followRequests).toEqual([{ address: ADDRESS, assistantStream: true }])
+    expect(remote.followRequests).toEqual([{ address: ADDRESS, activate: true, assistantStream: true }])
     expect(changes).toMatchObject([
       { type: 'replace', page: { assistantStream: baseline } },
       { type: 'assistant-stream', frame },
@@ -360,7 +369,7 @@ describe('Session Client stream adapters', () => {
   it('rejects an Assistant frame that arrives before the opening baseline', async () => {
     const remote = new ScriptedSessionRemote([{
       frames: [assistantFrame({
-        type: 'start', attemptId: LlmAttemptId('pre-opening-attempt'),
+        type: 'start', attemptId: brandString<LlmAttemptId>('pre-opening-attempt'),
         revision: 1, startedAfterSeq: -1, turn: 1, step: 1,
       })],
     }], [])
@@ -374,14 +383,14 @@ describe('Session Client stream adapters', () => {
         code: 'gateway/internal',
         message: 'session event stream emitted an entry before its opening cursor',
       })
-      expect(remote.followRequests).toEqual([{ address: ADDRESS, assistantStream: true }])
+      expect(remote.followRequests).toEqual([{ address: ADDRESS, activate: true, assistantStream: true }])
     } finally {
       await stream.dispose()
     }
   })
 
   it('rebaselines after a transient assistant revision gap without advancing the durable cursor', async () => {
-    const attemptId = LlmAttemptId('gapped-attempt')
+    const attemptId = brandString<LlmAttemptId>('gapped-attempt')
     const start: SessionAssistantStreamFrame = {
       type: 'start', attemptId, revision: 1, startedAfterSeq: -1,
       turn: 1, step: 1,
@@ -432,7 +441,7 @@ describe('Session Client stream adapters', () => {
   })
 
   it('rebaselines when a replacement Agent lifecycle restarts at revision one', async () => {
-    const attemptId = LlmAttemptId('replacement-lifecycle-attempt')
+    const attemptId = brandString<LlmAttemptId>('replacement-lifecycle-attempt')
     const previous: SessionAssistantStreamBaseline = {
       revision: 2,
       activeAttempt: {
@@ -534,15 +543,15 @@ describe('Session Client stream adapters', () => {
       failed: vi.fn(),
     })
 
-    await stream.open({ maxMessages: 50 })
+    await stream.open({ maxMessages: 500, turnWindow: { minMessages: 50, minTurns: 2 } })
     await vi.waitFor(() => { expect(changes).toHaveLength(2) })
-    await stream.prepend({ beforeSeq: 2, maxMessages: 50 })
+    await stream.prepend({ beforeSeq: 2, maxMessages: 500, turnWindow: { minMessages: 50, minTurns: 2 } })
 
     expect(remote.followRequests).toEqual([{
-      address: ADDRESS, assistantStream: true, maxMessages: 50,
+      address: ADDRESS, activate: true, assistantStream: true, maxMessages: 500, turnWindow: { minMessages: 50, minTurns: 2 },
     }])
     expect(remote.pageRequests).toEqual([
-      { address: ADDRESS, throughSeq: 4, beforeSeq: 2, maxMessages: 50 },
+      { address: ADDRESS, throughSeq: 4, beforeSeq: 2, maxMessages: 500, turnWindow: { minMessages: 50, minTurns: 2 } },
     ])
     expect(changes).toMatchObject([
       { type: 'replace', entries: [entry(2), entry(3)], hasMore: true },
@@ -573,12 +582,12 @@ describe('Session Client stream adapters', () => {
       failed: vi.fn(),
     })
 
-    await stream.open({ maxMessages: 50 })
+    await stream.open({ maxMessages: 500, turnWindow: { minMessages: 50, minTurns: 2 } })
     await vi.waitFor(() => { expect(remote.followRequests).toHaveLength(2) })
 
     expect(remote.followRequests).toEqual([
-      { address: ADDRESS, assistantStream: true, maxMessages: 50 },
-      { address: ADDRESS, assistantStream: true, maxMessages: 50 },
+      { address: ADDRESS, activate: true, assistantStream: true, maxMessages: 500, turnWindow: { minMessages: 50, minTurns: 2 } },
+      { address: ADDRESS, activate: true, assistantStream: true, maxMessages: 500, turnWindow: { minMessages: 50, minTurns: 2 } },
     ])
     expect(remote.pageRequests).toEqual([])
     expect(changes.map(change => change.type)).toEqual(['replace', 'append', 'replace'])
@@ -608,14 +617,14 @@ describe('Session Client stream adapters', () => {
     finish.resolve(undefined)
     await vi.waitFor(() => { expect(remote.followRequests).toHaveLength(2) })
     expect(remote.followRequests).toEqual([
-      { address: ADDRESS, assistantStream: true },
-      { address: ADDRESS, assistantStream: true },
+      { address: ADDRESS, activate: true, assistantStream: true },
+      { address: ADDRESS, activate: true, assistantStream: true },
     ])
     expect(remote.pageRequests).toEqual([])
     await stream.dispose()
   })
 
-  it.each([{}, { maxMessages: 50 }])('repairs a live gap preserving message limit %j', async (request) => {
+  it.each([{}, { maxMessages: 50 }, { maxMessages: 500, turnWindow: { minMessages: 50, minTurns: 2 } }])('repairs a live gap preserving history limits %j', async (request) => {
     const remote = new ScriptedSessionRemote(
       [{ frames: [snapshot(0, [entry(0)]), entry(2)], hold: true }],
       [{ ok: true, value: page([entry(0), entry(1), entry(2)]) }],
@@ -658,10 +667,10 @@ describe('Session Client stream adapters', () => {
   it('maps the Host-wide control baseline and deltas into one snapshot stream', async () => {
     const baseline: SessionControlFrame = {
       type: 'baseline',
-      value: { jobs: {}, projections: {} },
+      value: { projections: {} },
     }
     const update: SessionControlFrame = {
-      type: 'jobs', sessionId: 'session-1' as never, jobs: [],
+      type: 'projection', sessionId: 'session-1' as never, changes: [{ key: 'title', val: 'updated' }], seq: 1,
     }
     const remote = new ScriptedSessionRemote([], [], [baseline, update])
     const accept = vi.fn<(frame: SessionControlFrame) => void>()
@@ -693,7 +702,7 @@ describe('Session Client stream adapters', () => {
 
     const baseline: SessionControlFrame = {
       type: 'baseline',
-      value: { jobs: {}, projections: {} },
+      value: { projections: {} },
     }
     const carrierFailed = vi.fn()
     const failed = vi.fn()

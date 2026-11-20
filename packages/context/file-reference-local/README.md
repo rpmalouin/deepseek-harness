@@ -25,7 +25,9 @@ Agents and host UIs can complete `@file` mentions with ranked paths from each ag
 <a id="use-this-package"></a>
 ## Use this package
 
-Mount this provider when `@file` completion should discover the Harness host's own filesystem — the namespace the shipped `read` tool operates on. Each agent's workspace is indexed from its session working directory, falling back to the host process directory when the session has none.
+Changing the Session's working directory discards the previous directory's search index; the next completion searches the new directory.
+
+Mount this provider when `@file` completion should discover the Harness host's own filesystem — the namespace the shipped `read` tool operates on. Each agent's workspace is indexed from its Session's current working directory.
 
 ### Enabling the provider
 
@@ -71,7 +73,6 @@ The provider maintains one reusable `WorkspaceFileSearch` per agent, rooted at t
 |---|---|
 | [`src/index.ts`](src/index.ts) | `LocalFileReferenceService`: config validation, per-agent searches, prompt install |
 | [`src/search.ts`](src/search.ts) | `WorkspaceFileSearch`: traversal, ranking, exclusion, staleness and background rebuild |
-| — | No runtime invariant companion is published; per-agent indexes are private advisory caches whose invalidation and disposal are observed directly through service tests. |
 
 ### Main flow
 
@@ -105,7 +106,7 @@ When the addressed agent has an effective `read` tool, the provider contributes 
 ##### File-reference instruction
 
 ```markdown
-Tokens prefixed with @ are workspace paths the user explicitly referenced, relative to the workspace root. A trailing slash marks a directory: list it when its contents matter. Anything else is a file: use the read tool when its contents are needed, and do not claim to have inspected it before reading. @"..." quotes a path containing spaces.
+Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root; absolute paths identify files or directories on the host. A trailing slash marks a directory: list it when its contents matter. Anything else is a file: use the read tool when its contents are needed, and do not claim to have inspected it before reading. @"..." quotes a path containing spaces.
 ```
 
 #### Token effect

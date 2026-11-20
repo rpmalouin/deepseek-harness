@@ -17,6 +17,15 @@ export const DEFAULT_DSH_HOME_DISPLAY = `~/${DSH_HOME_DIR_NAME}`
 /** Environment variable that overrides the default DeepSeek Harness home. */
 export const DSH_HOME_ENV = 'DSH_HOME'
 
+/** Directory name for the default shared agent configuration root under the OS home. */
+export const AGENTS_HOME_DIR_NAME = '.agents'
+
+/** Stable user-facing display form for the default shared agent configuration root. */
+export const DEFAULT_AGENTS_HOME_DISPLAY = `~/${AGENTS_HOME_DIR_NAME}`
+
+/** Environment variable that overrides the default shared agent configuration root. */
+export const AGENTS_HOME_ENV = 'DSH_AGENTS_HOME'
+
 /**
  * Give a native filesystem watcher one canonical spelling of a path, even
  * when its final components do not exist yet. The deepest existing ancestor
@@ -63,6 +72,14 @@ export function defaultDshHome(): string {
 }
 
 /**
+ * Resolve the default shared agent configuration root using Node's platform path rules.
+ * @returns the absolute default shared agent configuration root.
+ */
+export function defaultAgentsHome(): string {
+  return join(homedir(), AGENTS_HOME_DIR_NAME)
+}
+
+/**
  * Expand supported tilde prefixes against the operating-system home.
  * @param path - configured path that may begin with `~`, `~/`, or `~\`.
  * @returns the expanded path, or the original value when no supported prefix is present.
@@ -71,6 +88,37 @@ export function expandHomePath(path: string): string {
   if (path === '~') return homedir()
   if (path.startsWith('~/') || path.startsWith('~\\')) return join(homedir(), path.slice(2))
   return path
+}
+
+/**
+ * Resolve one user-data root from an explicit path, an environment override, and a default.
+ * @param configured - explicit path, which has highest precedence.
+ * @param env - environment mapping to read.
+ * @param envName - environment variable that overrides the default.
+ * @param fallback - default root, used when neither the explicit path nor the environment provides one.
+ * @returns the normalized absolute root.
+ */
+function resolveRoot(
+  configured: string | undefined,
+  env: Record<string, string | undefined>,
+  envName: string,
+  fallback: () => string,
+): string {
+  const fromEnv = env[envName]
+  const selected = configured ?? (fromEnv !== undefined && fromEnv.trim().length > 0 ? fromEnv : fallback())
+  return resolve(expandHomePath(selected))
+}
+
+/**
+ * Label one resolved user-data root symbolically for user-facing display.
+ * @param resolvedRoot - absolute path returned by the matching resolver.
+ * @param defaultRoot - absolute default root whose symbolic label applies to a match.
+ * @param defaultLabel - symbolic label for the default root.
+ * @param envName - environment variable name that labels any other root.
+ * @returns the symbolic label.
+ */
+function rootDisplay(resolvedRoot: string, defaultRoot: string, defaultLabel: string, envName: string): string {
+  return resolvedRoot === resolve(defaultRoot) ? defaultLabel : `$${envName}`
 }
 
 /**
@@ -85,13 +133,28 @@ export function expandHomePath(path: string): string {
  * @returns the normalized absolute harness home path.
  */
 export function resolveDshHome(configured?: string, env: Record<string, string | undefined> = process.env): string {
-  const fromEnv = env[DSH_HOME_ENV]
-  const selected = configured ?? (fromEnv !== undefined && fromEnv.trim().length > 0 ? fromEnv : defaultDshHome())
-  return resolve(expandHomePath(selected))
+  return resolveRoot(configured, env, DSH_HOME_ENV, defaultDshHome)
 }
 
 /**
- * Join path segments onto the resolved DeepSeek Harness home.
+ * Resolve the shared agent configuration root.
+ *
+ * Precedence, highest first: an explicit configured path, `$DSH_AGENTS_HOME`,
+ * then `~/.agents`. The root holds configuration shared with other agent tools,
+ * so it stays independent of the DeepSeek Harness home. An empty or
+ * whitespace-only `$DSH_AGENTS_HOME` is treated as unset, so a blank override
+ * never resolves the root to the current working directory.
+ * @param configured - explicit shared-root override, which has highest precedence.
+ * @param env - environment mapping used to read `DSH_AGENTS_HOME`.
+ * @returns the normalized absolute shared agent configuration root.
+ */
+export function resolveAgentsHome(configured?: string, env: Record<string, string | undefined> = process.env): string {
+  return resolveRoot(configured, env, AGENTS_HOME_ENV, defaultAgentsHome)
+}
+
+/**
+ * Join path segments onto the resolved DeepSeek Harness home. It addresses the
+ * existing top-level entries; a new path uses {@link dshPath} with its category.
  * @param segments - path segments appended to the Harness home; an empty list returns the home itself.
  * @returns the normalized absolute joined path.
  */
@@ -106,8 +169,48 @@ export function dshHomePath(...segments: string[]): string {
  * @returns the normalized absolute cache path.
  */
 export function dshCachePath(optionsOrSegment: { dshHome?: string } | string = {}, ...segments: string[]): string {
-  if (typeof optionsOrSegment === 'string') return dshHomePath('cache', optionsOrSegment, ...segments)
-  return join(resolveDshHome(optionsOrSegment.dshHome), 'cache', ...segments)
+  if (typeof optionsOrSegment === 'string') return dshPath('cache', optionsOrSegment, ...segments)
+  return dshPath({ category: 'cache', dshHome: optionsOrSegment.dshHome }, ...segments)
+}
+
+/**
+ * Category directory under the Harness home, named after the XDG Base Directory
+ * kinds. A new file kept under `$DSH_HOME` belongs to exactly one category, and
+ * the category directory name equals the category. Existing top-level entries,
+ * such as `sessions/`, `profiles/`, and `.credentials.yaml`, keep their current
+ * locations; the [home path categories proposal](../../../../.agents/notes/proposed/architecture/2026-11-04-dsh-home-path-categories.md)
+ * lists every path and its category:
+ *
+ * - `config`: files a person writes or edits to configure the harness.
+ * - `data`: durable records whose loss loses user work, sign-ins, or installed
+ *   software, such as Sessions, profiles, attachments, credentials, and runtimes.
+ * - `state`: records that persist across runs but whose loss only resets
+ *   history or derived indexes, such as logs, upload indexes, and ids.
+ * - `cache`: content that can be rebuilt or downloaded again.
+ * - `backup`: backup archives the harness writes; deleting them never affects
+ *   a running harness or the records they copy.
+ */
+export type DshHomeCategory = 'config' | 'data' | 'state' | 'cache' | 'backup'
+
+/** A category directory under an explicitly configured Harness home. */
+export interface DshPathLocation {
+  /** Category directory to join under. */
+  category: DshHomeCategory
+  /** Explicit harness-home override, resolved by {@link resolveDshHome}; omission uses `$DSH_HOME`, then `~/.dsh`. */
+  dshHome?: string | undefined
+}
+
+/**
+ * Join path segments onto one category directory of the Harness home without
+ * creating it. An owner passes its own directory name, normally its package
+ * name without the `@deepseek-ai/dsh-` prefix, as the first segment.
+ * @param location - category under the resolved home, or a category with an explicit home override.
+ * @param segments - path segments appended to the category directory; an empty list returns the directory itself.
+ * @returns the normalized absolute path.
+ */
+export function dshPath(location: DshHomeCategory | DshPathLocation, ...segments: string[]): string {
+  const { category, dshHome } = typeof location === 'string' ? { category: location, dshHome: undefined } : location
+  return join(resolveDshHome(dshHome), category, ...segments)
 }
 
 /**
@@ -119,5 +222,17 @@ export function dshCachePath(optionsOrSegment: { dshHome?: string } | string = {
  * @returns `~/.dsh` for the default home, otherwise `$DSH_HOME`.
  */
 export function dshHomeDisplay(resolvedHome: string): string {
-  return resolvedHome === resolve(defaultDshHome()) ? DEFAULT_DSH_HOME_DISPLAY : `$${DSH_HOME_ENV}`
+  return rootDisplay(resolvedHome, defaultDshHome(), DEFAULT_DSH_HOME_DISPLAY, DSH_HOME_ENV)
+}
+
+/**
+ * Describe a resolved shared agent configuration root symbolically for user-facing display.
+ *
+ * It never returns an absolute machine path: the default root is labelled
+ * `~/.agents`, and any configured root is labelled `$DSH_AGENTS_HOME`.
+ * @param resolvedHome - the absolute path returned by {@link resolveAgentsHome}.
+ * @returns `~/.agents` for the default root, otherwise `$DSH_AGENTS_HOME`.
+ */
+export function agentsHomeDisplay(resolvedHome: string): string {
+  return rootDisplay(resolvedHome, defaultAgentsHome(), DEFAULT_AGENTS_HOME_DISPLAY, AGENTS_HOME_ENV)
 }

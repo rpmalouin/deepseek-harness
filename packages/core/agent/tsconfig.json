@@ -15,6 +15,9 @@
       "path": "../../../vendor/cordis"
     },
     {
+      "path": "../../util/brand"
+    },
+    {
       "path": "../../core/scope"
     },
     {
@@ -30,10 +33,10 @@
       "path": "../../core/system-prompt"
     },
     {
-      "path": "../../runtime-diagnostics/invariants"
+      "path": "../../typert/protocol"
     },
     {
-      "path": "../../typert/protocol"
+      "path": "../../workspace/workspace"
     }
   ]
 }

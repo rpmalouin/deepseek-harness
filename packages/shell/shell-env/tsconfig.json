@@ -25,6 +25,12 @@
     },
     {
       "path": "../../core/tools"
+    },
+    {
+      "path": "../../boot/app-boot"
+    },
+    {
+      "path": "../../util/error"
     }
   ]
 }

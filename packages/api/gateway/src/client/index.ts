@@ -5,7 +5,7 @@
  */
 
 import { Service } from '@deepseek-ai/cordis'
-import { RemoteError, remoteErrorOf } from '@deepseek-ai/dsh-typert-protocol'
+import { RemoteError, isRemoteUplinkItem, remoteErrorOf } from '@deepseek-ai/dsh-typert-protocol'
 export type { TypertGatewayFaultDetails } from '../remote-error-codes.ts'
 import type { Context } from '@deepseek-ai/cordis'
 import type {
@@ -17,12 +17,14 @@ import type {
   TypertClientRemote,
   RemoteFailure,
   RemoteResult,
+  RemoteStreamHandle,
   TypertCodec,
   TypertDisposer,
   TypertRemoteContribution,
   TypertRemoteEvent,
 } from '@deepseek-ai/dsh-typert-protocol'
 import {
+  ClientUplinkQueue,
   RemoteStreamCarrierError,
   RemoteStreamMuxClient,
 } from './stream-client.ts'
@@ -32,7 +34,8 @@ import {
   type RemoteStreamOptions,
 } from './remote-stream.ts'
 
-export { RemoteStreamCarrierError } from './stream-client.ts'
+export { isRemoteStreamCarrierFailure, RemoteStreamCarrierError } from './stream-client.ts'
+export type { RemoteStreamCarrierFailure } from './stream-client.ts'
 export { RemoteJournalStream } from './journal-stream.ts'
 export type {
   RemoteJournalChange,
@@ -100,7 +103,8 @@ interface InstalledMethod {
 /** Typed Remote service augmented by generated direct namespaces and Gateway stream supervision. */
 export interface ClientRemote extends TypertClientRemote {
   /**
-   * Create one independently cancellable, reconnecting logical stream.
+   * Create an independently cancellable, reconnecting logical stream.
+   * Requires interactions=answer; passive Clients use generated stream methods.
    * @param options - domain-owned opener and generation-end classification.
    * @returns a single-consumer stream annotated with physical generation ids.
    */
@@ -144,8 +148,8 @@ class ClientRemoteService extends Service implements ClientRemote {
   private readonly connection: ConnectionHandle
   private readonly namespaces = new Map<string, RemoteNamespaceHandle>()
   private hostFacts: RemoteHostFacts | undefined
-  private readonly streams = new RemoteStreamMuxClient()
-  private readonly events: ClientRemoteEvents
+  private readonly streams: RemoteStreamMuxClient
+  private readonly events: ClientRemoteEvents | undefined
   private mutations = Promise.resolve()
 
   constructor(ctx: Context) {
@@ -153,16 +157,24 @@ class ClientRemoteService extends Service implements ClientRemote {
     this.ownerCtx = ctx
     const connection = ctx.get('connection') as ConnectionHandle
     this.connection = connection
-    this.events = new ClientRemoteEvents(
-      ctx,
-      connection,
-      (endpoint, payload, signal) => this.openRemoteStream(endpoint, payload, signal),
+    this.streams = new RemoteStreamMuxClient(
+      path => connection.openWebSocket(path),
+      connection.interactions === 'answer',
     )
+    if (connection.interactions === 'answer') {
+      this.events = new ClientRemoteEvents(
+        ctx,
+        connection,
+        (endpoint, payload, signal) => this.openRemoteStream(endpoint, payload, signal),
+      )
+    }
+    // API callers retain a lifecycle socket even when they do not receive events.
+    // HTTP dispatch never waits for this independent connection attempt.
     if (connection.rpc.open === undefined) this.streams.start()
     let disposed = false
     let loop: ReturnType<ConnectionHandle['start']> | undefined
     const start = (): void => {
-      if (disposed) return
+      if (disposed || connection.interactions === 'none') return
       if (connection.rpc.open === undefined) this.streams.start()
       loop = connection.start({
         onConnected: () => { this.ownerCtx.emit('connection/reset') },
@@ -177,12 +189,15 @@ class ClientRemoteService extends Service implements ClientRemote {
     ctx.effect(() => async () => {
       disposed = true
       loop?.stop()
-      await this.events.dispose()
+      await this.events?.dispose()
       await this.streams.close()
     }, 'api-gateway.client.transport')
   }
 
   $stream<Item>(options: RemoteStreamOptions<Item>): RemoteStream<Item> {
+    if (this.connection.interactions === 'none') {
+      throw new Error('client api: $stream requires interactions=answer; use a generated stream method')
+    }
     return new RemoteStream(this.connection, options)
   }
 
@@ -211,6 +226,7 @@ class ClientRemoteService extends Service implements ClientRemote {
     event: Event,
     listener: TypertClientEventListener<Event>,
   ): () => void {
+    if (this.events === undefined) throw new Error('client api: forwarded events require interactions=answer')
     return this.events.subscribe(this.ctx, event, listener)
   }
 
@@ -219,13 +235,14 @@ class ClientRemoteService extends Service implements ClientRemote {
     endpoint: string,
     payload: unknown,
     signal: AbortSignal,
+    uplink?: AsyncIterable<unknown>,
     noConnection = `client api: ${endpoint} has no active Connection`,
   ): AsyncIterable<unknown> {
     const connection = this.ownerCtx.get('connection') as ConnectionHandle | undefined
     if (connection === undefined) throw new Error(noConnection)
-    const local = connection.rpc.open?.('/api', endpoint, payload, signal)
+    const local = connection.rpc.open?.('/api', endpoint, payload, signal, uplink)
     return local === undefined
-      ? this.streams.open(endpoint, payload, signal)
+      ? this.streams.open(endpoint, payload, signal, uplink)
       : normalizeConnectionStream(local)
   }
 
@@ -387,7 +404,7 @@ class ClientRemoteService extends Service implements ClientRemote {
     scoped: ScopedMethod | undefined,
     callerCtx: Context,
     values: readonly unknown[],
-  ): Promise<RemoteResult<unknown>> | AsyncIterable<unknown> {
+  ): Promise<RemoteResult<unknown>> | RemoteStreamHandle<unknown, unknown> {
     if (scoped !== undefined) {
       const adapter = this.ownerCtx.typert.contexts.getClient(scoped.projection.context)
       const identity = adapter?.identity(callerCtx)
@@ -418,8 +435,8 @@ class ClientRemoteService extends Service implements ClientRemote {
     callerCtx: Context,
     values: readonly unknown[],
     boundIdentity?: BoundContextIdentity,
-  ): Promise<RemoteResult<unknown>> | AsyncIterable<unknown> {
-    if (descriptor.mode === 'stream') {
+  ): Promise<RemoteResult<unknown>> | RemoteStreamHandle<unknown, unknown> {
+    if (descriptor.mode !== undefined) {
       return this.invokeStream(descriptor, projection, token, callerCtx, values, boundIdentity)
     }
     return this.invoke(descriptor, projection, token, callerCtx, values, boundIdentity)
@@ -441,8 +458,12 @@ class ClientRemoteService extends Service implements ClientRemote {
     try {
       const result = await connection.rpc.call('/api', endpoint, { args: prepared.args }, prepared.signal)
       if (!mountActive(token)) return withdrawn(endpoint)
+      prepared.signal.throwIfAborted()
       if (!result.ok) return { ok: false, error: rebuiltFailure(result.error) }
-      return { ok: true, value: result.value }
+      const value = descriptor.result.mode === 'strict' && descriptor.result.decode !== undefined
+        ? descriptor.result.decode(result.value)
+        : result.value
+      return { ok: true, value }
     } catch (error) {
       // Carrier throws (offline or abort) are outcomes of the call, not assembly
       // faults, so they join the same error branch. A caller-aborted call is a
@@ -453,22 +474,27 @@ class ClientRemoteService extends Service implements ClientRemote {
     }
   }
 
-  private async *invokeStream(
+  /** Open the logical stream now and hand back its handle; `send()` before the first read queues behind the `open` frame. */
+  private invokeStream(
     descriptor: InvocationDescriptor,
     projection: ScopedProjection | undefined,
     token: MountToken,
     callerCtx: Context,
     values: readonly unknown[],
     boundIdentity?: BoundContextIdentity,
-  ): AsyncGenerator {
+  ): RemoteStreamHandle<unknown, unknown> {
     const endpoint = endpointOf(descriptor)
     if (!token.active) throw new Error(withdrawn(endpoint).error.message)
     const prepared = this.prepareInvocation(descriptor, projection, token, callerCtx, values, boundIdentity)
-    const stream = this.openRemoteStream(endpoint, { args: prepared.args }, prepared.signal)
-    for await (const value of stream) {
-      if (!mountActive(token)) throw new Error(withdrawn(endpoint).error.message)
-      yield value
-    }
+    const generation = new AbortController()
+    const uplink = new ClientUplinkQueue(endpoint)
+    const downlink = this.openRemoteStream(
+      endpoint,
+      { args: prepared.args },
+      AbortSignal.any([prepared.signal, generation.signal]),
+      uplink,
+    )
+    return new ClientStreamHandle(endpoint, downlink, uplink, generation, token)
   }
 
   private prepareInvocation(
@@ -521,12 +547,94 @@ class ClientRemoteService extends Service implements ClientRemote {
   }
 }
 
+/**
+ * The handle a generated stream method returns: one generation of one logical
+ * stream. The downlink is iterated once; `send`/`end` feed the uplink queue the
+ * carrier pump drains; `dispose` aborts the generation and returns the carrier
+ * iterator, which sends `cancel` unless a terminal frame arrived, drops what was
+ * buffered, and ends the iteration quietly.
+ */
+class ClientStreamHandle implements RemoteStreamHandle<unknown, unknown> {
+  private readonly downlink: AsyncIterator<unknown>
+  private primed: Promise<IteratorResult<unknown>> | undefined
+  private consumed = false
+  private disposed = false
+
+  constructor(
+    private readonly endpoint: string,
+    downlink: AsyncIterable<unknown>,
+    private readonly uplink: ClientUplinkQueue,
+    private readonly generation: AbortController,
+    private readonly token: MountToken,
+  ) {
+    this.downlink = downlink[Symbol.asyncIterator]()
+    // The carrier opens the logical stream on the first pull; pulling now puts
+    // the `open` frame on the wire before any `send()`. The first read is kept
+    // for the consumer, and a failure waits for it instead of surfacing here;
+    // it also terminates the stream, so the queue closes and `send()` throws.
+    this.primed = this.downlink.next()
+    void this.primed.catch(() => { this.uplink.close() })
+  }
+
+  send(item: unknown): void {
+    if (!isRemoteUplinkItem(item)) throw new Error(`client api: ${this.endpoint} uplink item is not a lossless JSON value`)
+    this.uplink.push(item)
+  }
+
+  end(): void {
+    this.uplink.end()
+  }
+
+  dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
+    this.uplink.close()
+    this.generation.abort(new Error(`client api: ${this.endpoint} stream disposed`))
+    // Returning the carrier iterator reaches its `finally` even while nobody
+    // reads the downlink, so `cancel` goes out now and the pump stops.
+    void Promise.resolve(this.downlink.return?.()).catch(() => undefined)
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<unknown> {
+    if (this.consumed) throw new Error(`client api: ${this.endpoint} stream has one consumer`)
+    this.consumed = true
+    const iteration = this.iterate()
+    return {
+      next: () => iteration.next(),
+      // A return before the first read ends a generator that never started, so its `finally` would not dispose.
+      return: (value?: unknown) => {
+        this.dispose()
+        return iteration.return(value)
+      },
+    }
+  }
+
+  private async *iterate(): AsyncGenerator {
+    try {
+      while (true) {
+        const next = await (this.primed ?? this.downlink.next())
+        this.primed = undefined
+        if (this.disposed || next.done === true) return
+        if (!mountActive(this.token)) throw new Error(withdrawn(this.endpoint).error.message)
+        yield next.value
+      }
+    } catch (error) {
+      if (this.disposed) return
+      throw error
+    } finally {
+      // Ending early is a dispose; a terminated stream accepts no more uplink.
+      this.dispose()
+      await this.downlink.return?.()
+    }
+  }
+}
+
 type InvokeRemote = (
   direct: DirectMethod | undefined,
   scoped: ScopedMethod | undefined,
   callerCtx: Context,
   args: readonly unknown[],
-) => Promise<RemoteResult<unknown>> | AsyncIterable<unknown>
+) => Promise<RemoteResult<unknown>> | RemoteStreamHandle<unknown, unknown>
 
 class RemoteNamespaceService extends Service {
   private readonly methods = new Map<string, RemoteMethodRecord>()
@@ -698,6 +806,7 @@ function requireStrictInputs(descriptor: InvocationDescriptor): void {
   for (const parameter of descriptor.parameters) {
     requireStrictCodec(parameter.codec, endpoint, parameter.wire)
   }
+  if (descriptor.uplink !== undefined) requireStrictCodec(descriptor.uplink.codec, endpoint, 'uplink')
   if (descriptor.invocation.kind === 'context') {
     requireStrictCodec(descriptor.invocation.codec, endpoint, descriptor.invocation.wire)
   }

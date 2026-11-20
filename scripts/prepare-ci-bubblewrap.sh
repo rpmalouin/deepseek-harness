@@ -4,9 +4,18 @@ set -euo pipefail
 # Ubuntu's package transaction scans the hosted image's full dpkg database and
 # runs post-install hooks. CI needs only the signed-archive payload, so pin and
 # verify that payload before extracting it into the ephemeral runner directory.
-readonly BUBBLEWRAP_VERSION='0.9.0-1ubuntu0.1'
-readonly BUBBLEWRAP_SHA256='1b506492bd9c7fd0cdb4f02ac822f1d3e336b0aead5113c1239baf8db5db562a'
-readonly BUBBLEWRAP_URL="https://archive.ubuntu.com/ubuntu/pool/main/b/bubblewrap/bubblewrap_${BUBBLEWRAP_VERSION}_amd64.deb"
+# This amd64 build needs glibc 2.38+ and Linux 5.10+; Ubuntu 24.04 satisfies both.
+readonly BUBBLEWRAP_VERSION='0.12.0-1'
+readonly BUBBLEWRAP_SHA256='db4d572a7927bfd34cc9b8e24b56983efa8e0483d03da6c810f6caae081dcc36'
+# The recorded build remains addressable after Ubuntu prunes its live package pool.
+readonly BUBBLEWRAP_URL="https://launchpad.net/ubuntu/+source/bubblewrap/${BUBBLEWRAP_VERSION}/+build/33546835/+files/bubblewrap_${BUBBLEWRAP_VERSION}_amd64.deb"
+# Workflows that run on ephemeral runners restore and save this directory as
+# `~/.cache/dsh-ci/bubblewrap` with actions/cache, so a warm cache needs no
+# Launchpad request; the persistent self-hosted pool keeps the directory itself.
+readonly BUBBLEWRAP_CACHE_DIR="${HOME}/.cache/dsh-ci/bubblewrap"
+
+# shellcheck source=scripts/ci-verified-download.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/ci-verified-download.sh"
 
 : "${RUNNER_TEMP:?prepare-ci-bubblewrap requires RUNNER_TEMP}"
 : "${GITHUB_PATH:?prepare-ci-bubblewrap requires GITHUB_PATH}"
@@ -16,11 +25,10 @@ if [[ "$(uname -s)" != 'Linux' || "$(uname -m)" != 'x86_64' ]]; then
   exit 1
 fi
 
-archive="${RUNNER_TEMP}/bubblewrap_${BUBBLEWRAP_VERSION}_amd64.deb"
+archive="${BUBBLEWRAP_CACHE_DIR}/bubblewrap_${BUBBLEWRAP_VERSION}_amd64.deb"
 root="${RUNNER_TEMP}/dsh-bubblewrap"
 
-curl --fail --silent --show-error --location --retry 3 --retry-all-errors --output "$archive" "$BUBBLEWRAP_URL"
-printf '%s  %s\n' "$BUBBLEWRAP_SHA256" "$archive" | sha256sum --check --status
+acquire_verified_archive "$BUBBLEWRAP_URL" "$BUBBLEWRAP_SHA256" "$archive"
 mkdir -p "$root"
 dpkg-deb --extract "$archive" "$root"
 printf '%s\n' "$root/usr/bin" >> "$GITHUB_PATH"

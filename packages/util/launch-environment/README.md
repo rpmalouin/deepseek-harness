@@ -47,6 +47,8 @@ const endpoint = launchEnvironmentOf(ctx).get('DEEPSEEK_BASE_URL')?.value
 | `<invocation cwd>/.env` | The project the harness was launched in, which the product trusts to configure its own agent |
 | `$DSH_HOME/.env` | The user's own machine-level defaults |
 
+The `dsh` launcher refuses to start when the project `.env` sets a name that decides how the process starts or reaches the network, and when `$DSH_HOME/.env` sets any such name other than the proxy and DeepSeek endpoint names; [app-boot](../../boot/app-boot/README.md) describes those names and the exceptions.
+
 Names match the way the platform matches them: exactly on POSIX, case-insensitively on Windows. A case-sensitive lookup on Windows would rank the wrong layer — a shell's `deepseek_api_key` and a project `.env`'s `DEEPSEEK_API_KEY` are one variable to the OS.
 
 ### When no launcher booted the tree
@@ -68,7 +70,6 @@ The snapshot is built on one separation: the launcher owns which files exist, an
 | File | Role |
 |---|---|
 | [`src/index.ts`](src/index.ts) | `createLaunchEnvironmentSnapshot`, `launchEnvironmentOf`, and the `ctx.launchEnvironment` slot |
-| — | No runtime invariant companion is published; the snapshot is frozen before any fiber starts and this package owns no event stream or mutable runtime data; its lookup and rejection rules are enforced by unit tests. |
 
 ### How the snapshot stays frozen
 

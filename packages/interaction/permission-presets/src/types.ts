@@ -9,6 +9,8 @@
  * @module @deepseek-ai/dsh-permission-presets/types
  */
 
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
+
 /** Presentation for an available preset or the derived `custom` current value. */
 export interface PresetOption {
   /** Stable option value: a configured preset key, live `auto`, or derived `custom`. */
@@ -26,12 +28,28 @@ export interface PresetOption {
 export interface PermissionCatalog {
   /** Every currently selectable preset, in contribution order. */
   options: PresetOption[]
+  /** Configured presets eligible as defaults for future sessions. */
+  defaultOptions: PresetOption[]
+  /** Effective default when the Config field is omitted. */
+  defaultPreset: string
 }
 
 /** Whole `permissions` Session projection: current durable selection only. */
 export interface PermissionSelection {
   /** The effective current value: a configured preset key, `auto`, or `custom`. */
   currentValue: string
+}
+
+/**
+ * Request of the `permissionPresets.set` Remote: switch one live Session to
+ * another preset. The call's `session` resource is the Session named here, so
+ * the Gateway decides access before any preset is resolved or written.
+ */
+export interface PermissionPresetSetRequest {
+  /** Live Session whose knobs the switch writes. */
+  readonly sessionId: SessionId
+  /** Preset name to switch to; an unknown name refuses the call without writing. */
+  readonly preset: string
 }
 
 declare module '@deepseek-ai/cordis' {

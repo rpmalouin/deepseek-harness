@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
+import { brandString } from '@deepseek-ai/dsh-brand'
 import type { DynamicCordisLivePackage } from '@deepseek-ai/dsh-cordis-client-runner/client'
+import { PartialArguments } from '@deepseek-ai/dsh-util-values'
 import type {
   CordisDynamicPackageId, CordisDynamicPluginId, CordisDynamicPluginRunId,
   DynamicCordisInventoryRow,
@@ -8,9 +10,9 @@ import { cordisDefineCard, cordisRunCard } from '../src/client/card-model.ts'
 import { CordisRunCardRegistry, cordisToolViewKey } from '../src/client/run-card-index.ts'
 import { cordisVisibleStatus } from '../src/client/status.ts'
 
-const PLUGIN = 'clock-1' as CordisDynamicPluginId
-const PACKAGE = 'pkg-1' as CordisDynamicPackageId
-const RUN = 'run-1' as CordisDynamicPluginRunId
+const PLUGIN = brandString<CordisDynamicPluginId>('clock-1')
+const PACKAGE = brandString<CordisDynamicPackageId>('pkg-1')
+const RUN = brandString<CordisDynamicPluginRunId>('run-1')
 
 const row = (client: boolean): DynamicCordisInventoryRow => ({
   pluginId: PLUGIN,
@@ -28,15 +30,16 @@ const row = (client: boolean): DynamicCordisInventoryRow => ({
 
 describe('versioned Cordis card models', () => {
   it('reads symmetric Host and Client source fields from cordis_define', () => {
+    const argsRaw = JSON.stringify({
+      plugin: { kind: 'new', idPrefix: 'clock' },
+      name: 'Clock',
+      purpose: 'show time',
+      code: { host: 'HOST_CODE', client: 'CLIENT_CODE' },
+    })
     const card = cordisDefineCard({
-      callId: 'call-1',
+      phase: 'start' as const, args: PartialArguments.fromText(argsRaw), callId: 'call-1',
       name: 'cordis_define',
-      argsRaw: JSON.stringify({
-        plugin: { kind: 'new', idPrefix: 'clock' },
-        name: 'Clock',
-        purpose: 'show time',
-        code: { host: 'HOST_CODE', client: 'CLIENT_CODE' },
-      }),
+      argsRaw,
       turn: 1,
       step: 1,
       time: 1,
@@ -58,6 +61,7 @@ describe('versioned Cordis card models', () => {
       seq: 9,
       time: 2,
       callId: 'call-2',
+      name: 'cordis_run', args: PartialArguments.fromText(JSON.stringify({ pluginId: PLUGIN, packageId: PACKAGE, mode: 'run' })),
       call: { name: 'cordis_run', argsRaw: JSON.stringify({ pluginId: PLUGIN, packageId: PACKAGE, mode: 'run' }) },
       callTime: 1,
       content: [{ type: 'text', text: 'running' }],
@@ -78,7 +82,7 @@ describe('versioned Cordis card models', () => {
 
   it('keeps the target identities while cordis_run waits for approval', () => {
     const card = cordisRunCard({
-      callId: 'call-3',
+      phase: 'start' as const, args: PartialArguments.fromText(JSON.stringify({ pluginId: PLUGIN, packageId: PACKAGE, mode: 'update' })), callId: 'call-3',
       name: 'cordis_run',
       argsRaw: JSON.stringify({ pluginId: PLUGIN, packageId: PACKAGE, mode: 'update' }),
       turn: 1,
@@ -105,7 +109,7 @@ describe('Cordis run-card ownership', () => {
     const key = cordisToolViewKey(PLUGIN, PACKAGE)
 
     store.observe({ key, callId: 'new', seq: 20, pluginRunId: RUN })
-    store.observe({ key, callId: 'old', seq: 10, pluginRunId: 'run-0' as CordisDynamicPluginRunId })
+    store.observe({ key, callId: 'old', seq: 10, pluginRunId: brandString<CordisDynamicPluginRunId>('run-0') })
 
     expect(store.getSnapshot().get(key)?.callId).toBe('new')
     expect(changed).toHaveBeenCalledTimes(1)

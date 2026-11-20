@@ -1,15 +1,21 @@
 ---
 name: office-pptx
-description: Create, read, edit, and check PowerPoint presentations (.pptx), including slide text, tables, images, and charts. Use when a PPTX file is an input or requested deliverable.
+description: Create, read, edit, and validate PowerPoint presentations (.pptx).
 ---
 
 # PowerPoint presentations
 
-Follow an explicit user or applicable AGENTS.md requirement for an environment or library. Otherwise call `load_workspace_dependencies` and use its Python executable and bundled presentation libraries. Do not install npm or pip packages or locate a system interpreter for the default workflow. If the tool is unavailable, use an already configured environment and report a missing dependency only when it prevents the requested operation.
+Use `python-pptx` unless an explicit user or applicable AGENTS.md requirement names another library. Run Python as described in the Python environment section below. Do not install npm packages for the default workflow.
 
 Keep scripts and output files in the task workspace. The runtime and skill directory contain shared read-only resources. Match the requested slide language and the supplied presentation's design when editing it.
 
+Name Python scripts for their task, such as `edit_pptx.py`; avoid module names such as `inspect.py`, `pptx.py`, or `zipfile.py` that shadow imported libraries.
+
 ## Create and edit
+
+If `office_render`, `office_convert`, or `office_recalculate` is not in your tools, load `office` with `skill`; they appear next step.
+
+python-pptx cannot read legacy `.ppt` files. Use `office_convert` with `format: "pptx"`, copy the result into the workspace, then edit the copy.
 
 Use `python-pptx` to inspect or modify an existing presentation. Inspect slide layouts, text runs, images, tables, and charts before editing. Change only the requested content, preserve mixed text formatting, and save to a new file unless the user requests an in-place edit. Rebuilding slides can discard unsupported animation, SmartArt, or other extension content.
 
@@ -51,20 +57,14 @@ for shape in presentation.slides[0].shapes:
 presentation.save("report-edited.pptx")
 ```
 
-Check that text and images fit the slide dimensions, titles form a useful sequence, and chart labels agree with source values. A native chart's embedded workbook is part of the deliverable and must contain the intended data. Library support for writing PPTX is not a rendering engine or a guarantee that every PowerPoint feature survives editing.
+Check that text and images fit the slide dimensions, titles form a useful sequence, and chart labels agree with source values. Paragraph alignment does not move a text box: when a title must be centered on the slide, center both its paragraph and the text box against `presentation.slide_width`, then reopen to verify both. A native chart's embedded workbook is part of the deliverable and must contain the intended data.
 
 ## Check and deliver
 
-Run the shared checker with the selected Python executable; `<skill-directory>` is this loaded skill's resource base:
+Reopen the saved presentation with python-pptx to verify the requested slide count, content, formatting, chart data, and notes, including unchanged content that must be preserved. python-pptx reads text and properties but cannot measure layout: slide text sits in fixed-size boxes, so wrapping, overflow, overlap, and contrast appear only in a rendering.
 
-```text
-<python> <skill-directory>/../scripts/check_office.py <presentation.pptx> --out <checks.json>
-```
+Call `office_render` once on the new or changed slides after any edit to what a slide shows, including its text, images, charts, sizes, positions, and styling; a request to skip rendering takes precedence. python-pptx checks alone cover speaker notes and document properties. Deliver after these checks. For PDF output, call `office_convert` with `format: "pdf"`, then copy the returned temporary file to the destination.
 
-It checks ZIP/XML integrity and internal relationships and reports slide count and extracted text. Use repeated `--contains TEXT` arguments for required slide text and `--count N` for a requested slide count; `--contains` excludes chart text and speaker notes. Reopen the file to check the requested edits, chart data, and notes. Structural success does not establish text fit, alignment, readable contrast, or rendering fidelity.
-
-If `render_document` is available and visual inspection is useful, call it on the final PPTX, initially omitting `pages` to prepare page 1 and obtain `pageCount`. The tool checks the current main model's actual image capability; do not choose a second model. If `status` is `skipped`, complete structural and content checks and deliver the PPTX, briefly stating that visual layout was not inspected. If ready, call `read_image` on its returned `pages[].imagePath`, then inspect remaining slides in small batches such as `pages: [2, 3, 4]`. Check clipping, alignment, contrast, chart labels, and consistency with the requested design or supplied reference; fix the source and render the affected pages again.
-
-Use the available rendering tool for this check. Inspect `warnings`, especially missing fonts. LibreOffice previews do not certify pixel-identical PowerPoint or Keynote output, animation, or media playback. If the rendering tool is unavailable or fails, retain the usable source and report the inspection limit; do not require the user to install another tool.
+A fully transparent or uniformly blank image of populated content means the renderer failed, which ends visual checks for the task and leaves the source as it is. When content and structure checks pass, state the visual status only as "Content and structure checks passed; visual inspection was not completed." or "内容与结构检查通过；视觉检查未完成。".
 
 Call `present({"files":[{"path":"report-edited.pptx"}]})` with the actual final PPTX path. It exposes the current source file without copying or preserving its bytes, so keep that file in place and leave intermediate images and reports out of delivery unless requested. If `present` is unavailable, use the session's supported file delivery method.

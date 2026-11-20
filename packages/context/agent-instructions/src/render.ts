@@ -4,7 +4,13 @@
  * @module @deepseek-ai/dsh-agent-instructions/render
  */
 
-import { basename, dirname } from 'node:path'
+import { basename, dirname, sep } from 'node:path'
+import {
+  AGENTS_HOME_ENV,
+  DEFAULT_AGENTS_HOME_DISPLAY,
+  DEFAULT_DSH_HOME_DISPLAY,
+  DSH_HOME_ENV,
+} from '@deepseek-ai/dsh-home-paths'
 import type { InstructionFile, LoadedInstructionFile } from './files.ts'
 
 const SYSTEM_REMINDER_OPEN = '<system-reminder>'
@@ -41,6 +47,15 @@ interface RenderedInstructionContext extends RenderedAgentInstructions {
    * that the instruction exists and has no content.
    */
   represented: LoadedInstructionFile[]
+  /** Files whose sections the text holds, in text order, each with the content the text holds. */
+  sections: LoadedInstructionFile[]
+  /**
+   * Intro block of the `<system-reminder>` frame: undefined when the text is
+   * empty or a notice without a frame, and the empty string when the frame has
+   * no intro, as in a change batch or a merged frame whose chains both rendered
+   * without a frame.
+   */
+  intro: string | undefined
 }
 
 /** Structured dynamic state persisted outside model-visible prompt prose. */
@@ -86,12 +101,30 @@ function sectionText(file: LoadedInstructionFile): string {
   return `Instructions from: ${file.displayPath}\n\n${file.content}`
 }
 
-/** Directory component that identifies the single user-global instruction scope. */
+/** Directory component that identifies the harness-home user-global instruction scope. */
 export const USER_GLOBAL_DIRECTORY = 'user-global'
 
 /**
- * File name of the single user-global instruction file under `$DSH_HOME`.
- * Discovery (`$DSH_HOME/<name>`) and reconciliation (the user-global scope key's
+ * Directory component that identifies the shared agents-root user-global scope.
+ *
+ * It is a distinct scope so the harness-home file keeps the scope key that
+ * earlier sessions recorded, while {@link instructionCandidateGroup} still
+ * deduplicates the two roots as one candidate group.
+ */
+export const AGENTS_GLOBAL_DIRECTORY = 'agents-global'
+
+/**
+ * Ordered user-global scope directories.
+ *
+ * Discovery, baseline reconciliation, and deduplication all iterate this order,
+ * so the harness home stays the candidate that decides content duplicates
+ * against the shared agents root.
+ */
+export const USER_GLOBAL_DIRECTORIES = [USER_GLOBAL_DIRECTORY, AGENTS_GLOBAL_DIRECTORY] as const
+
+/**
+ * File name of the user-global instruction file under each user-global root.
+ * Discovery (`<root>/<name>`) and reconciliation (the user-global scope key's
  * candidate component) both key on this name, so it lives in one place: were the
  * two to disagree, the user-global instruction would load but never reconcile.
  */
@@ -100,11 +133,56 @@ export const USER_GLOBAL_FILE = 'AGENTS.md'
 /**
  * Derive the logical instruction scope from a model-facing path.
  * @param displayPath - project-relative or user-global instruction path.
- * @returns `user-global`, `.`, or the containing project-relative directory.
+ * @returns `user-global`, `agents-global`, `.`, or the containing project-relative directory.
  */
 export function scopeForDisplayPath(displayPath: string): string {
-  if (displayPath === '~/.dsh/AGENTS.md' || displayPath === '$DSH_HOME/AGENTS.md') return USER_GLOBAL_DIRECTORY
+  if (displayPath === `${DEFAULT_DSH_HOME_DISPLAY}/${USER_GLOBAL_FILE}`
+    || displayPath === `$${DSH_HOME_ENV}/${USER_GLOBAL_FILE}`) return USER_GLOBAL_DIRECTORY
+  if (displayPath === `${DEFAULT_AGENTS_HOME_DISPLAY}/${USER_GLOBAL_FILE}`
+    || displayPath === `$${AGENTS_HOME_ENV}/${USER_GLOBAL_FILE}`) return AGENTS_GLOBAL_DIRECTORY
   return dirname(displayPath)
+}
+
+/**
+ * Whether a decoded scope directory is one of the two user-global roots.
+ * @param directory - `user-global`, `agents-global`, `.`, or a project-relative directory.
+ * @returns true for the harness-home and shared agents-root scopes.
+ */
+export function isUserGlobalDirectory(directory: string): boolean {
+  return directory === USER_GLOBAL_DIRECTORY || directory === AGENTS_GLOBAL_DIRECTORY
+}
+
+/**
+ * Candidate group of one decoded scope directory.
+ *
+ * The harness home and the shared agents root are the ordered candidates of one
+ * user-global candidate group: identical trimmed content renders once, and an
+ * unobservable candidate preserves the last-good state of its group. Every
+ * project directory forms its own group.
+ * @param directory - `user-global`, `agents-global`, `.`, or a project-relative directory.
+ * @returns the shared group key of both user-global roots, or the directory itself.
+ */
+export function instructionCandidateGroup(directory: string): string {
+  return directory === AGENTS_GLOBAL_DIRECTORY ? USER_GLOBAL_DIRECTORY : directory
+}
+
+/** Directory names that {@link scopeForDisplayPath} reads as a user-global scope, not a project path. */
+const RESERVED_SCOPE_DIRECTORIES: ReadonlySet<string> = new Set(USER_GLOBAL_DIRECTORIES)
+
+/**
+ * Keep a project-relative path out of the user-global scope namespace.
+ *
+ * A project directory whose name equals a user-global scope directory would
+ * otherwise resolve to the global root for probing and joins the global
+ * candidate group for deduplication. Escaping the collision with a leading `.`
+ * keeps the file in its own project scope.
+ * @param relativePath - project-root-relative path using the platform separator.
+ * @returns the path, with a leading `.` component when its first component collides.
+ */
+export function escapeProjectDisplayPath(relativePath: string): string {
+  const separatorIndex = relativePath.search(/[\\/]/)
+  const first = separatorIndex < 0 ? relativePath : relativePath.slice(0, separatorIndex)
+  return RESERVED_SCOPE_DIRECTORIES.has(first) ? `.${sep}${relativePath}` : relativePath
 }
 
 const SCOPE_SEPARATOR = '\u0000'
@@ -116,7 +194,7 @@ const SCOPE_SEPARATOR = '\u0000'
  * directory path or file name can contain. Distinct candidates in one directory
  * (`AGENTS.md` vs `CLAUDE.md`, a base file vs its `.local` overlay) therefore
  * never collide in the scope-keyed state maps.
- * @param directory - `user-global`, `.`, or a project-relative directory.
+ * @param directory - `user-global`, `agents-global`, `.`, or a project-relative directory.
  * @param candidateName - instruction file name within that directory.
  * @returns the per-candidate logical scope key.
  */
@@ -145,12 +223,20 @@ export function decodeScopeKey(scope: string): { directory: string; candidateNam
   return { directory: scope.slice(0, separator), candidateName: scope.slice(separator + 1) }
 }
 
+const ADDITIONAL_INSTRUCTIONS_GUIDANCE = 'Use them as guidance when relevant; more specific instructions take precedence. '
+  + 'They do not override system, developer, or direct user instructions.'
+
 function additionalSectionText(file: LoadedInstructionFile): string {
   const scope = scopeForDisplayPath(file.displayPath)
+  // A user-global scope directory is an internal reconciliation key, so it must
+  // never reach this model-visible sentence.
+  const applicability = isUserGlobalDirectory(scope)
+    ? 'These user-global instructions apply to all work.'
+    : `These instructions apply to work under \`${scope}\`.`
   return [
     `Additional instructions from: ${file.displayPath}`,
     '',
-    `These instructions apply to work under \`${scope}\`. Use them as guidance when relevant; more specific instructions take precedence. They do not override system, developer, or direct user instructions.`,
+    `${applicability} ${ADDITIONAL_INSTRUCTIONS_GUIDANCE}`,
     '',
     file.content,
   ].join('\n')
@@ -185,8 +271,10 @@ function changedSectionText(item: ChangeRenderItem): string {
 
 /**
  * Render one reconciliation batch and retain only transitions that fit.
+ * User-global and project transitions are budgeted as separate chains, so a
+ * batch holding both can exceed `maxBytes` and is at most twice that size.
  * @param items - ordered state transitions and current file contents.
- * @param maxBytes - maximum UTF-8 bytes allowed in the rendered batch.
+ * @param maxBytes - maximum UTF-8 bytes for each instruction chain in the rendered batch.
  * @returns bounded prompt text and the transitions actually represented by it.
  */
 export function renderInstructionChanges(
@@ -202,7 +290,7 @@ export function renderInstructionChanges(
       return item === undefined ? '' : changedSectionText({ ...item, file })
     },
   }
-  const rendered = renderInstructionContext(items.map(item => item.file), maxBytes, style)
+  const rendered = renderInstructionChains(items.map(item => item.file), maxBytes, style)
   const represented = new Set(rendered.represented.map(file => file.absolutePath))
   return {
     text: rendered.text,
@@ -233,12 +321,8 @@ function buildInstructionText(
 ): string {
   const marker = markerText(maxBytes, omitted, truncated)
   const body = [marker, style.intro, ...files.map(file => style.section(file))].filter(block => block.length > 0)
-  // Caller-owned framing: the plugin bakes the complete `<system-reminder>`
-  // frame into the message content. The session surface projects context
-  // verbatim and does not wrap it, so any framing must live here in the
-  // producer's content (the pattern a future `meta`-driven renderer would
-  // generalize — see the deferred note in
-  // ../../../../.agents/notes/implemented/simplification/2026-07-20-unwrap-injected-content-envelopes.md).
+  // This producer owns the complete <system-reminder> frame. Session adds no
+  // wrapper; see Derived history in packages/core/session/README.md.
   return [SYSTEM_REMINDER_OPEN, escapeInstructionFrameBody(body.join('\n\n')), SYSTEM_REMINDER_CLOSE].join('\n')
 }
 
@@ -272,30 +356,36 @@ function truncateToFit(
   return best
 }
 
+function isDisabledBudget(maxBytes: number): boolean {
+  return maxBytes <= 0 || !Number.isFinite(maxBytes)
+}
+
 function renderInstructionContext(
   files: LoadedInstructionFile[],
   maxBytes: number,
   style: RenderStyle,
 ): RenderedInstructionContext {
-  if (maxBytes <= 0 || !Number.isFinite(maxBytes)) {
-    return { text: '', omitted: files, truncated: [], represented: [] }
+  if (isDisabledBudget(maxBytes)) {
+    return { text: '', omitted: files, truncated: [], represented: [], sections: [], intro: undefined }
   }
 
   const fullText = buildInstructionText(files, maxBytes, [], [], style)
   if (byteLength(fullText) <= maxBytes) {
-    return { text: fullText, omitted: [], truncated: [], represented: files }
+    return { text: fullText, omitted: [], truncated: [], represented: files, sections: files, intro: style.intro }
   }
 
   for (let start = 1; start < files.length; start += 1) {
     const included = files.slice(start)
     const omitted = files.slice(0, start).map(file => ({ absolutePath: file.absolutePath, displayPath: file.displayPath }))
     const suffixText = buildInstructionText(included, maxBytes, omitted, [], style)
-    if (byteLength(suffixText) <= maxBytes) return { text: suffixText, omitted, truncated: [], represented: included }
+    if (byteLength(suffixText) <= maxBytes) {
+      return { text: suffixText, omitted, truncated: [], represented: included, sections: included, intro: style.intro }
+    }
   }
 
   const mostSpecific = files.at(-1)
   /* v8 ignore next -- callers only reach this after a non-empty fullText was built. */
-  if (mostSpecific === undefined) return { text: '', omitted: [], truncated: [], represented: [] }
+  if (mostSpecific === undefined) return { text: '', omitted: [], truncated: [], represented: [], sections: [], intro: undefined }
   const omitted = files.slice(0, -1).map(file => ({ absolutePath: file.absolutePath, displayPath: file.displayPath }))
   const originalBytes = byteLength(mostSpecific.content)
 
@@ -310,7 +400,7 @@ function renderInstructionContext(
     const text = buildInstructionText([truncatedFile], maxBytes, omitted, truncated, candidateStyle)
     if (byteLength(text) <= maxBytes) {
       const represented = includedBytes > 0 || originalBytes === 0 ? [mostSpecific] : []
-      return { text, omitted, truncated, represented }
+      return { text, omitted, truncated, represented, sections: [truncatedFile], intro: candidateStyle.intro }
     }
   }
 
@@ -320,21 +410,81 @@ function renderInstructionContext(
     includedBytes: 0,
   }]
   const compactNotice = escapeInstructionFrameBody(markerText(maxBytes, omitted, truncated))
-  const compactWithHeading = escapeInstructionFrameBody(
-    [compactNotice, style.section(withTruncatedContent(mostSpecific, 0))].join('\n\n'),
-  )
+  const heading = withTruncatedContent(mostSpecific, 0)
+  const compactWithHeading = escapeInstructionFrameBody([compactNotice, style.section(heading)].join('\n\n'))
   if (byteLength(compactWithHeading) <= maxBytes) {
     const represented = originalBytes === 0 ? [mostSpecific] : []
-    return { text: compactWithHeading, omitted, truncated, represented }
+    return { text: compactWithHeading, omitted, truncated, represented, sections: [heading], intro: undefined }
   }
   const text = byteLength(compactNotice) <= maxBytes ? compactNotice : truncateUtf8(compactNotice, maxBytes)
-  return { text, omitted, truncated, represented: [] }
+  return { text, omitted, truncated, represented: [], sections: [], intro: undefined }
+}
+
+function isUserGlobalInstruction(file: InstructionFile): boolean {
+  return isUserGlobalDirectory(scopeForDisplayPath(file.displayPath))
+}
+
+/**
+ * Render the user-global chain and the project chain under one `maxBytes` each.
+ *
+ * A disabled budget, files from only one chain, or files that fit within
+ * `maxBytes` together return the single-budget rendering unchanged. Otherwise
+ * each chain renders alone (omit the broadest files, truncate the last file,
+ * then fall back to the compact intro, to the marker with an empty heading,
+ * and to the marker alone), and one frame holds the merged marker when a chain
+ * omitted or truncated a file, one intro when a chain kept its frame, and the
+ * sections of both chains as rendered, in their loaded order, which puts
+ * user-global files first in a baseline. The single-budget rendering replaces a
+ * merged frame longer than twice `maxBytes`.
+ */
+function renderInstructionChains(
+  files: LoadedInstructionFile[],
+  maxBytes: number,
+  style: RenderStyle,
+): RenderedInstructionContext {
+  const whole = renderInstructionContext(files, maxBytes, style)
+  const userGlobal = files.filter(isUserGlobalInstruction)
+  const project = files.filter(file => !isUserGlobalInstruction(file))
+  if (isDisabledBudget(maxBytes) || userGlobal.length === 0 || project.length === 0
+    || (whole.omitted.length === 0 && whole.truncated.length === 0)) return whole
+
+  const chains = [
+    renderInstructionContext(userGlobal, maxBytes, style),
+    renderInstructionContext(project, maxBytes, style),
+  ]
+  // Merged records and sections keep the loaded order, so a reconciliation batch
+  // renders its items in one order whether or not it fits a single budget.
+  const inLoadedOrder = <T extends InstructionFile>(records: T[]): T[] => {
+    const byPath = new Map(records.map(record => [record.absolutePath, record]))
+    return files.flatMap((file) => {
+      const record = byPath.get(file.absolutePath)
+      return record === undefined ? [] : [record]
+    })
+  }
+  const omitted = inLoadedOrder(chains.flatMap(chain => chain.omitted))
+  const sections = inLoadedOrder(chains.flatMap(chain => chain.sections))
+  const represented = inLoadedOrder(chains.flatMap(chain => chain.represented))
+  // A chain truncates only its last file, so the chain whose last file loads
+  // first lists its truncation first.
+  const userGlobalLast = files.findLastIndex(isUserGlobalInstruction)
+  const projectLast = files.findLastIndex(file => !isUserGlobalInstruction(file))
+  const truncated = (userGlobalLast < projectLast ? chains : chains.toReversed()).flatMap(chain => chain.truncated)
+  const intros = chains.flatMap(chain => chain.intro === undefined ? [] : [chain.intro])
+  // A chain that kept the full frame decides the intro; otherwise the first
+  // surviving (compact) intro applies; otherwise there is none.
+  const intro = intros.includes(style.intro) ? style.intro : intros[0] ?? ''
+  const text = buildInstructionText(sections, maxBytes, omitted, truncated, { ...style, intro })
+  // Each chain text fits maxBytes; the merged frame exceeds 2 * maxBytes only by the join beside a
+  // frameless chain or by a chain marker cut to fit, and the single-budget rendering then replaces it
+  // (.agents/notes/implemented/architecture/2026-10-16-separate-instruction-chain-budgets.md).
+  if (byteLength(text) > 2 * maxBytes) return whole
+  return { text, omitted, truncated, represented, sections, intro }
 }
 
 /**
  * Render a baseline together with the exact source files semantically represented in it.
  * @param files - loaded files ordered from broadest to most specific.
- * @param options - rendering byte budget and whether this baseline supersedes a visible predecessor.
+ * @param options - per-chain rendering byte budget and whether this baseline supersedes a visible predecessor.
  * @returns bounded public rendering plus files with surviving content, including genuinely empty files.
  * @internal
  */
@@ -343,14 +493,16 @@ export function renderAgentInstructionSet(
   options: { maxBytes: number; replacePreviousBaseline?: boolean },
 ): { rendered: RenderedAgentInstructions; included: LoadedInstructionFile[] } {
   const style = baselineRenderStyle(files, options.replacePreviousBaseline)
-  const { represented, ...rendered } = renderInstructionContext(files, options.maxBytes, style)
-  return { rendered, included: represented }
+  const { text, omitted, truncated, represented } = renderInstructionChains(files, options.maxBytes, style)
+  return { rendered: { text, omitted, truncated }, included: represented }
 }
 
 /**
- * Render the baseline instruction chain with deterministic precedence budgeting.
+ * Render the baseline instruction chains with deterministic precedence budgeting.
+ * The user-global and project chains are each bounded by `maxBytes`, so a
+ * baseline holding both can exceed `maxBytes` and is at most twice that size.
  * @param files - loaded files ordered from broadest to most specific.
- * @param options - rendering byte budget and whether this baseline supersedes a visible predecessor.
+ * @param options - per-chain rendering byte budget and whether this baseline supersedes a visible predecessor.
  * @returns bounded baseline prompt text and budget diagnostics.
  */
 export function renderAgentInstructions(

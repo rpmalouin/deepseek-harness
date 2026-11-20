@@ -1,11 +1,12 @@
 // @vitest-environment jsdom
+import { contextMenuHook } from '@deepseek-ai/dsh-client-test-runtime'
 import type { GlobalStandardProps } from '@deepseek-ai/dsh-client-ui-slots'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import type { SessionListState } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { WorkspaceSnapshot } from '@deepseek-ai/dsh-api-workspace-controller/client'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
-import { bindSnapshotSelector } from '@deepseek-ai/dsh-client-test-runtime'
+import { allowAllAccess, bindSnapshotSelector } from '@deepseek-ai/dsh-client-test-runtime'
 import { AppearanceRow } from '../src/client/AppearanceRow.tsx'
 import type { AppearanceRowComponentProps } from '../src/client/AppearanceRow.tsx'
 import { createAppearanceRowStore } from '../src/client/settings-store.ts'
@@ -26,12 +27,12 @@ const COPY: Record<string, string> = {
 
 function emptySessions() {
   const store = createSnapshotStore<SessionListState>(
-    { ids: [], byId: {}, phase: 'ready', subagentsByParent: {}, jobsBySession: {} })
+    { ids: [], byId: {}, phase: 'ready', projectionsBySession: {} })
   return bindSnapshotSelector(store)
 }
 function emptyWorkspaces() {
   const store = createSnapshotStore<WorkspaceSnapshot>({
-    items: [], archivedSessionIds: [], state: 'idle', phase: 'ready', error: null,
+    items: [], archivedSessionIds: [], pinnedSessionIds: [], state: 'idle', phase: 'ready', error: null,
   })
   return bindSnapshotSelector(store)
 }
@@ -50,6 +51,8 @@ function mount(preference: ThemePreference = 'system') {
     useSessionStatus,
     usePanelInfo, useSessionRetainInfo: () => undefined, useResource,
     useWorkspaces: emptyWorkspaces(),
+    ...allowAllAccess,
+    useContextMenu: contextMenuHook(),
     useStore: bindSnapshotSelector(store),
     actions: store.actions,
     t: (key: string) => COPY[key] ?? key,

@@ -1,14 +1,14 @@
-import { useMemo, useRef, useState, type ChangeEvent, type KeyboardEvent } from 'react'
+import {
+  useEffect, useId, useMemo, useRef, useState,
+  type ChangeEvent, type FocusEvent, type KeyboardEvent,
+} from 'react'
 import clsx from 'clsx'
 import {
-  Button, IconCheckOutline14, IconChevronDownOutline14, IconChevronLeftOutline14,
-  IconChevronRightOutline14, IconChevronUpOutline14, IconCloseOutline16,
-  IconEditOutline16, MarkdownText,
+  Button, IconCheckOutlineRegular, IconChevronDownOutlineRegular, IconChevronLeftOutlineRegular,
+  IconChevronRightOutlineRegular, IconChevronUpOutlineRegular, IconCloseOutlineRegular,
+  IconEditOutlineRegular, MarkdownText, Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives'
-import {
-  planReviewOf,
-  type QuestionAnswer, type QuestionComposerProps,
-} from './contract/slots.ts'
+import { planReviewOf, type QuestionAnswer, type QuestionCardSnapshot, type QuestionComposerProps } from './contract/slots.ts'
 import type { PendingQuestion } from './contract/slots.ts'
 import type { QuestionDraftAnswer, QuestionDraftProgress } from './draft-store.ts'
 import { PlanReviewPanel } from './PlanReviewPanel.tsx'
@@ -20,7 +20,22 @@ import css from './QuestionComposer.module.css'
  * runtime failure messages (finished strings from the wire) pass through
  * verbatim.
  */
-type Feedback = { key: 'error.incomplete' | 'error.unanswered' } | { text: string }
+type Feedback = { key: 'error.incomplete' | 'error.unanswered' | 'error.unavailable' | 'error.resubmit' | 'status.sent' } | { text: string }
+
+/** A removed card can remain mounted until the composer seat updates. */
+const REMOVED_CARD: QuestionCardSnapshot = {
+  state: 'open', waitState: 'counting', countdown: undefined, channel: 'none', closed: true,
+}
+
+/** Long copy the user expanded on one question: the question itself or an option description by index. */
+interface ExpandedCopy {
+  /** Index of the question the expansions belong to. */
+  readonly index: number
+  /** Expanded copy of that question: `'question'` or an option index. */
+  readonly copies: ReadonlySet<'question' | number>
+}
+
+const NOTHING_EXPANDED: ExpandedCopy['copies'] = new Set()
 
 /**
  * Split the conventional recommendation suffix without changing the answer value.
@@ -34,11 +49,36 @@ export function parseRecommendedLabel(label: string): { label: string; recommend
     : { label, recommended: false }
 }
 
+/**
+ * Implicit draft selection the user still submits: every marked choice of a
+ * multi-select question, or a marked first choice of a single-select question.
+ */
+function recommendedOptions(question: PendingQuestion['questions'][number]): string[] {
+  const labels = (question.options ?? []).map(option => option.label)
+  const candidates = question.multiSelect === true ? labels : labels.slice(0, 1)
+  return candidates.filter(label => parseRecommendedLabel(label).recommended)
+}
+
+/** Accept persisted progress only when it still describes this question batch. */
+function isQuestionDraftProgress(value: unknown, questionCount: number): value is QuestionDraftProgress {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  const progress = value as Record<string, unknown>
+  if (typeof progress.index !== 'number' || !Number.isInteger(progress.index)
+    || progress.index < 0 || progress.index >= questionCount
+    || !Array.isArray(progress.drafts) || progress.drafts.length !== questionCount
+    || (progress.wait !== undefined && progress.wait !== 'editing' && progress.wait !== 'waiting')) return false
+  return progress.drafts.every((item: unknown) => {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) return false
+    const draft = item as Record<string, unknown>
+    return Array.isArray(draft.selected) && draft.selected.every((label: unknown) => typeof label === 'string')
+      && typeof draft.custom === 'string' && typeof draft.skipped === 'boolean'
+  })
+}
+
 /** Return whether a text-field key event belongs to an active IME composition. */
 function isComposing(event: KeyboardEvent<HTMLTextAreaElement>): boolean {
   // keyCode 229 is the legacy IME-composition signal engines emit without isComposing.
-  // oxlint-disable-next-line typescript/no-deprecated
-  return event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229
+  return event.nativeEvent.isComposing || Reflect.get(event.nativeEvent, 'keyCode') === 229
 }
 
 /** The free-text answer field shared by both question variants. */
@@ -120,6 +160,7 @@ export function QuestionComposer(props: QuestionComposerProps) {
         pending={question}
         t={props.t}
         useStore={props.useStore}
+        useQuestionCard={props.useQuestionCard}
         actions={props.actions}
       />
     )
@@ -127,26 +168,79 @@ export function QuestionComposer(props: QuestionComposerProps) {
 }
 
 type QuestionFlowProps =
-  { pending: PendingQuestion } & Pick<QuestionComposerProps, 't' | 'useStore' | 'actions'>
+  { pending: PendingQuestion } & Pick<QuestionComposerProps, 't' | 'useStore' | 'useQuestionCard' | 'actions'>
 
-function QuestionFlow({ pending, t, useStore, actions }: QuestionFlowProps) {
+function QuestionFlow({ pending, t, useStore, useQuestionCard, actions }: QuestionFlowProps) {
+  const descriptionIdPrefix = useId()
   const questions = pending.questions
+  // A read-only card built from a settled call's transcript: the same panel
+  // over the recorded answers, with nothing left to submit.
+  const review = pending.review
   const markdownLabels = useMemo(() => ({
-    code: { copyLabel: t('copy'), copiedLabel: t('copied') },
+    code: { copyLabel: t('copy'), copiedLabel: t('copied'), toolbarLabels: { codeLabel: t('codeBlock.title'), wrapLabel: t('codeBlock.wrap'), unwrapLabel: t('codeBlock.unwrap') } },
     footnotes: t('markdown.footnotes'),
   }), [t])
-  const initialProgress = useMemo<QuestionDraftProgress>(() => ({
-    index: 0,
-    drafts: questions.map(() => ({ selected: [], custom: '', skipped: false })),
-  }), [questions])
-  const storedProgress = useStore(state => (
-    state.requestKey === pending.key && state.progress.drafts.length === questions.length
-      ? state.progress
-      : undefined
-  ))
-  const { index, drafts } = storedProgress ?? initialProgress
+  const initialDrafts = useMemo<QuestionDraftAnswer[]>(() => {
+    // Recorded answers echo the question ids rather than their order.
+    const recorded = new Map((review ?? []).map(answer => [answer.id, answer]))
+    return questions.map((item) => {
+      const answer = recorded.get(item.id)
+      const custom = answer?.custom ?? ''
+      return {
+        selected: answer !== undefined ? [...answer.selected] : review === undefined ? recommendedOptions(item) : [],
+        custom,
+        // A recorded answer with no selection and no custom text was skipped.
+        skipped: answer !== undefined && answer.selected.length === 0 && custom === '',
+      }
+    })
+  }, [questions, review])
+  const stored = useStore(state => state.progressByRequest[pending.key])
+  const validStored = isQuestionDraftProgress(stored, questions.length) ? stored : undefined
+  // A review card renders the record itself, so a draft its live card left
+  // behind can never surface as an answer; only the page position is restored.
+  const storedProgress = review === undefined ? validStored : undefined
+  const index = validStored?.index ?? 0
+  const drafts = storedProgress?.drafts ?? initialDrafts
+  const restoredWait = storedProgress?.wait
+    ?? (storedProgress?.drafts.some((item, itemIndex) =>
+      item.selected.length !== initialDrafts[itemIndex]?.selected.length
+      || item.selected.some((label, labelIndex) => label !== initialDrafts[itemIndex]?.selected[labelIndex])
+      || item.custom !== '' || item.skipped) === true
+      ? 'editing' : undefined)
   const [busy, setBusy] = useState<'answer' | 'cancel' | null>(null)
   const [error, setError] = useState<Feedback | null>(null)
+  const card = useQuestionCard(pending.key, snapshot => snapshot ?? REMOVED_CARD)
+  const canSubmit = card.channel !== 'none'
+  // The answer surface freezes while a submission is in flight, and for good on
+  // a review card: its call has already settled.
+  const locked = busy !== null || review !== undefined
+  // A waterfall submission is only "sent": the gateway drops an outcome that
+  // arrives after another Client settled the event, without telling anyone.
+  // The draft therefore survives until the projection closes the card, and a
+  // card that flips to continued while a submission is in flight re-arms the
+  // controls so the same draft can go through the Remote path.
+  const sentVia = useRef<'waterfall' | null>(null)
+  useEffect(() => {
+    if (sentVia.current !== 'waterfall' || card.state !== 'continued') return
+    sentVia.current = null
+    setBusy(null)
+    setError({ key: 'error.resubmit' })
+  }, [card.state])
+  useEffect(() => {
+    if (card.closed) actions.clear(pending.key)
+  }, [actions, card.closed, pending.key])
+  useEffect(() => {
+    actions.prune(pending.liveKeys())
+  }, [actions, pending])
+  const waitDisposition = useRef<'editing' | 'waiting' | undefined>(restoredWait)
+  useEffect(() => {
+    if (waitDisposition.current === 'waiting') pending.takeTime()
+    if (waitDisposition.current === 'editing') pending.engage()
+  }, [pending])
+  // The countdown belongs to the carrier, not to this component: the user can
+  // close the panel and reopen it from the tool call row, and a timer that died
+  // with the mount would leave the tool call waiting past its deadline.
+  const countdown = card.countdown
   // Collapsed to the header strip so the conversation above stays readable
   // while the user decides; answer drafts live in the Session store above.
   const [minimized, setMinimized] = useState(false)
@@ -154,23 +248,97 @@ function QuestionFlow({ pending, t, useStore, actions }: QuestionFlowProps) {
   // collapsed question must not steal focus from the expand toggle back into
   // the input, so focus is granted once per question index.
   const focusedQuestions = useRef(new Set<number>())
+  const answerSurface = useRef<HTMLDivElement>(null)
   // Every navigation write stays in bounds and drafts mirrors questions 1:1.
   // oxlint-disable-next-line typescript/no-non-null-assertion
   const question = questions[index]!
   // oxlint-disable-next-line typescript/no-non-null-assertion
   const draft = drafts[index]!
   const hasOptions = (question.options?.length ?? 0) > 0
+  // CSS decides which copy is clipped; only the user's expansions are state,
+  // and they apply only while their question is the one shown.
+  const [expandedCopy, setExpandedCopy] = useState<ExpandedCopy>({ index, copies: NOTHING_EXPANDED })
+  const expanded = expandedCopy.index === index ? expandedCopy.copies : NOTHING_EXPANDED
 
-  const replaceProgress = (nextIndex: number, nextDrafts: QuestionDraftAnswer[]): void => {
-    actions.replace(pending.key, { index: nextIndex, drafts: nextDrafts })
+  const questionToggleLabel = t(expanded.has('question') ? 'text.collapse' : 'text.expand')
+
+  const toggleCopy = (copy: 'question' | number): void => {
+    const copies = new Set(expanded)
+    if (!copies.delete(copy)) copies.add(copy)
+    setExpandedCopy({ index, copies })
   }
 
-  const cancelFlow = (): void => {
+  const replaceProgress = (nextIndex: number, nextDrafts: QuestionDraftAnswer[]): void => {
+    if (nextIndex !== index) {
+      // Another question starts at its top with its long copy collapsed.
+      if (answerSurface.current !== null) answerSurface.current.scrollTop = 0
+      setExpandedCopy({ index: nextIndex, copies: NOTHING_EXPANDED })
+    }
+    actions.replace(pending.key, {
+      index: nextIndex,
+      drafts: nextDrafts,
+      ...(waitDisposition.current === undefined ? {} : { wait: waitDisposition.current }),
+    })
+  }
+
+  const takeTime = (): void => {
+    waitDisposition.current = 'waiting'
+    pending.takeTime()
+    replaceProgress(index, drafts)
+  }
+
+  const engage = (): void => {
+    if (waitDisposition.current !== undefined) return
+    waitDisposition.current = 'editing'
+    pending.engage()
+  }
+
+  const focusAnswerSurface = (event: FocusEvent<HTMLDivElement>): void => {
+    if (!event.currentTarget.contains(event.relatedTarget)) pending.holdFocus()
+  }
+
+  const blurAnswerSurface = (event: FocusEvent<HTMLDivElement>): void => {
+    if (!event.currentTarget.contains(event.relatedTarget)) pending.releaseFocus()
+  }
+
+  useEffect(() => {
+    const release = (): void => { pending.releaseFocus() }
+    const refocus = (): void => {
+      if (waitDisposition.current === 'editing') {
+        pending.engage()
+        return
+      }
+      if (answerSurface.current?.contains(document.activeElement) === true) pending.holdFocus()
+    }
+    const visibilityChanged = (): void => { if (document.hidden) release(); else refocus() }
+    window.addEventListener('blur', release)
+    window.addEventListener('focus', refocus)
+    document.addEventListener('visibilitychange', visibilityChanged)
+    return () => {
+      release()
+      window.removeEventListener('blur', release)
+      window.removeEventListener('focus', refocus)
+      document.removeEventListener('visibilitychange', visibilityChanged)
+    }
+  }, [pending])
+
+  const dismissFlow = (): void => {
+    // A tool-call-keyed panel only leaves the seat; nothing is sent and nothing
+    // is persisted, and the tool call row brings it back.
+    if (pending.dismissal === 'hide') {
+      void pending.dismiss()
+      return
+    }
+    if (!canSubmit) {
+      setError({ key: 'error.unavailable' })
+      return
+    }
     setBusy('cancel')
     setError(null)
-    void pending.cancel()
-      .then(() => { actions.clear(pending.key) })
+    sentVia.current = 'waterfall'
+    void pending.dismiss()
       .catch((cause: unknown) => {
+        sentVia.current = null
         setBusy(null)
         setError({ text: cause instanceof Error ? cause.message : String(cause) })
       })
@@ -180,6 +348,7 @@ function QuestionFlow({ pending, t, useStore, actions }: QuestionFlowProps) {
     update: (current: QuestionDraftAnswer) => QuestionDraftAnswer,
     nextIndex = index,
   ): void => {
+    engage()
     const nextDrafts = drafts.map((item, itemIndex) => itemIndex === index ? update(item) : item)
     replaceProgress(nextIndex, nextDrafts)
     setError(null)
@@ -209,6 +378,10 @@ function QuestionFlow({ pending, t, useStore, actions }: QuestionFlowProps) {
       setError({ key: 'error.incomplete' })
       return
     }
+    if (!canSubmit) {
+      setError({ key: 'error.unavailable' })
+      return
+    }
     const answer: QuestionAnswer = {
       answers: questions.map((item, itemIndex) => {
         const value = values[itemIndex] as QuestionDraftAnswer
@@ -223,9 +396,20 @@ function QuestionFlow({ pending, t, useStore, actions }: QuestionFlowProps) {
     }
     setBusy('answer')
     setError(null)
+    // The external-store render can lag the carrier as a timed call continues.
+    // Read the channel used by answer() in this same event turn.
+    const channel = pending.snapshot().channel
+    sentVia.current = channel === 'waterfall' ? 'waterfall' : null
     void pending.answer(answer)
-      .then(() => { actions.clear(pending.key) })
+      .then(() => {
+        if (channel !== 'rpc') return
+        sentVia.current = null
+        setBusy(null)
+        setError(null)
+        void pending.dismiss().catch(() => { setError({ key: 'status.sent' }) })
+      })
       .catch((cause: unknown) => {
+        sentVia.current = null
         setBusy(null)
         setError({ text: cause instanceof Error ? cause.message : String(cause) })
       })
@@ -264,6 +448,7 @@ function QuestionFlow({ pending, t, useStore, actions }: QuestionFlowProps) {
   }
 
   const skipQuestion = (): void => {
+    engage()
     const nextDrafts = drafts.map((item, itemIndex) => itemIndex === index
       ? { selected: [], custom: '', skipped: true }
       : item)
@@ -282,13 +467,36 @@ function QuestionFlow({ pending, t, useStore, actions }: QuestionFlowProps) {
         aria-labelledby={`question-${pending.key}-${String(index)}`}
       >
         <header className={css.header}>
-          <div className={css.headingBlock}>
-            {question.header !== undefined && <div className={css.eyebrow}>{question.header}</div>}
-            <h2 className={css.title} id={`question-${pending.key}-${String(index)}`}>
-              {question.question}
-            </h2>
-          </div>
+          {(question.header !== undefined || minimized) && (
+            <div className={css.headingBlock}>
+              {question.header !== undefined && <div className={css.eyebrow}>{question.header}</div>}
+              {minimized && (
+                <h2 className={css.title} id={`question-${pending.key}-${String(index)}`}>
+                  {question.question}
+                </h2>
+              )}
+            </div>
+          )}
           <div className={css.headerActions}>
+            {countdown !== undefined && card.waitState !== 'waiting' && card.waitState !== 'editing' && card.waitState !== 'continued' && (
+              <span className={css.waitStatus}>
+                {t(countdown.running ? 'wait.countdown' : 'wait.paused', {
+                  seconds: Math.ceil(countdown.remainingMs / 1000),
+                })}
+              </span>
+            )}
+            {countdown !== undefined && card.waitState !== 'waiting' && card.waitState !== 'editing' && card.waitState !== 'continued' && (
+              <Button variant="outline" className={css.waitButton} onClick={takeTime}>
+                {t('wait.takeTime')}
+              </Button>
+            )}
+            {card.state === 'continued' && <span className={css.waitStatus}>{t('wait.continued')}</span>}
+            {/* A held or frozen countdown says so; a request that never carried
+                one waits silently, as the blocking question always has. */}
+            {countdown !== undefined && (card.waitState === 'waiting' || card.waitState === 'editing') && (
+              <span className={css.waitStatus}>{t('wait.held')}</span>
+            )}
+            {review !== undefined && <span className={css.waitStatus}>{t('review.status')}</span>}
             <button
               type="button" className={css.iconButton}
               aria-label={t(minimized ? 'nav.maximize' : 'nav.minimize')}
@@ -297,21 +505,49 @@ function QuestionFlow({ pending, t, useStore, actions }: QuestionFlowProps) {
               disabled={busy !== null}
               onClick={() => { setMinimized(current => !current) }}
             >
-              {minimized ? <IconChevronUpOutline14 /> : <IconChevronDownOutline14 />}
+              {minimized ? <IconChevronUpOutlineRegular size={18} /> : <IconChevronDownOutlineRegular size={18} />}
             </button>
             <button
-              type="button" className={css.iconButton} aria-label={t('nav.cancel')}
-              title={t('nav.cancel')}
-              disabled={busy !== null} onClick={cancelFlow}
+              type="button" className={css.iconButton}
+              aria-label={t(pending.dismissal === 'hide' ? 'nav.close' : 'nav.cancel')}
+              title={t(pending.dismissal === 'hide' ? 'nav.close' : 'nav.cancel')}
+              disabled={busy !== null} onClick={dismissFlow}
             >
-              <IconCloseOutline16 />
+              <IconCloseOutlineRegular size={15} />
             </button>
           </div>
         </header>
 
         {!minimized && (
           <>
-            <div className={css.body} data-question-scroll>
+            <div
+              ref={answerSurface}
+              className={css.body}
+              data-question-scroll
+              onFocusCapture={focusAnswerSurface}
+              onBlurCapture={blurAnswerSurface}
+            >
+              <div className={css.questionTitle} data-expanded={expanded.has('question') || undefined}>
+                <h2
+                  className={clsx(css.title, css.titlePreview)}
+                  id={`question-${pending.key}-${String(index)}`}
+                >
+                  {question.question}
+                </h2>
+                <Tooltip label={questionToggleLabel} side="top" portal>
+                  <button
+                    type="button"
+                    className={clsx(css.iconButton, css.copyToggle, css.questionToggle)}
+                    aria-label={questionToggleLabel}
+                    aria-expanded={expanded.has('question')}
+                    aria-controls={`question-${pending.key}-${String(index)}`}
+                    aria-describedby={`question-${pending.key}-${String(index)}`}
+                    onClick={() => { toggleCopy('question') }}
+                  >
+                    {expanded.has('question') ? <IconChevronUpOutlineRegular /> : <IconChevronDownOutlineRegular />}
+                  </button>
+                </Tooltip>
+              </div>
               {question.detail !== undefined && (
                 <div className={css.detail}><MarkdownText text={question.detail} labels={markdownLabels} /></div>
               )}
@@ -319,64 +555,110 @@ function QuestionFlow({ pending, t, useStore, actions }: QuestionFlowProps) {
                 {(question.options ?? []).map((option, optionIndex) => {
                   const selected = draft.selected.includes(option.label)
                   const display = parseRecommendedLabel(option.label)
+                  const hasDescription = option.description !== undefined && option.description.trim() !== ''
+                  const descriptionExpanded = expanded.has(optionIndex)
+                  const descriptionToggleLabel = t(descriptionExpanded ? 'text.collapse' : 'text.expand')
+                  const descriptionId = `${descriptionIdPrefix}-question-${String(index)}-option-${String(optionIndex)}-description`
                   return (
-                    <button
-                      type="button" key={`${option.label}-${String(optionIndex)}`}
-                      className={clsx(css.option, selected && question.multiSelect !== true && css.optionSelected)}
-                      role={question.multiSelect === true ? 'checkbox' : 'radio'}
-                      aria-checked={selected}
-                      aria-label={display.label}
-                      disabled={busy !== null}
-                      onClick={() => { choose(option.label) }}
-                      onKeyDown={(event) => {
-                        if (event.key !== 'Enter' || !drafts.every(completed)) return
-                        event.preventDefault()
-                        submitDrafts(drafts)
-                      }}
+                    <div
+                      key={`${option.label}-${String(optionIndex)}`}
+                      className={clsx(
+                        css.optionRow,
+                        !locked && css.optionRowInteractive,
+                        selected && question.multiSelect !== true && css.optionSelected,
+                      )}
+                      data-option-row
+                      data-expanded={descriptionExpanded || undefined}
                     >
-                      {question.multiSelect === true
-                        ? (
-                          <span className={clsx(css.checkbox, selected && css.checkboxChecked)} aria-hidden="true">
-                            {selected && <IconCheckOutline14 size={12} />}
+                      <button
+                        type="button"
+                        className={css.option}
+                        role={question.multiSelect === true ? 'checkbox' : 'radio'}
+                        aria-checked={selected}
+                        aria-label={display.label}
+                        aria-describedby={hasDescription ? descriptionId : undefined}
+                        disabled={locked}
+                        onClick={() => { choose(option.label) }}
+                        onKeyDown={(event) => {
+                          if (event.key !== 'Enter') return
+                          event.preventDefault()
+                          submitDrafts(drafts)
+                        }}
+                      >
+                        {question.multiSelect === true
+                          ? (
+                            <span className={clsx(css.checkbox, selected && css.checkboxChecked)} aria-hidden="true">
+                              {selected && <IconCheckOutlineRegular size={12} />}
+                            </span>
+                          )
+                          : <span className={css.number}>{optionIndex + 1}</span>}
+                        <span className={css.optionCopy}>
+                          <span className={css.optionLine} data-option-line>
+                            <span className={css.optionLabel}>{display.label}</span>
+                            {display.recommended && (
+                              <span className={css.badge}>{t('option.recommended')}</span>
+                            )}
                           </span>
-                        )
-                        : <span className={css.number}>{optionIndex + 1}</span>}
-                      <span className={css.optionCopy}>
-                        <span className={css.optionLine}>
-                          <span className={css.optionLabel}>{display.label}</span>
-                          {display.recommended && (
-                            <span className={css.badge}>{t('option.recommended')}</span>
-                          )}
-                          {option.description !== undefined && (
-                            <span className={css.description}>{option.description}</span>
+                          {hasDescription && (
+                            <span id={descriptionId} className={css.description} data-option-description>
+                              {option.description}
+                            </span>
                           )}
                         </span>
-                      </span>
-                    </button>
+                      </button>
+                      {hasDescription && (
+                        <Tooltip label={descriptionToggleLabel} side="top" portal>
+                          <button
+                            type="button"
+                            className={clsx(css.iconButton, css.copyToggle, css.descriptionToggle)}
+                            aria-label={descriptionToggleLabel}
+                            aria-expanded={descriptionExpanded}
+                            aria-controls={descriptionId}
+                            aria-describedby={descriptionId}
+                            onClick={() => { toggleCopy(optionIndex) }}
+                          >
+                            {descriptionExpanded ? <IconChevronUpOutlineRegular /> : <IconChevronDownOutlineRegular />}
+                          </button>
+                        </Tooltip>
+                      )}
+                    </div>
                   )
                 })}
 
-                {hasOptions
+                {review !== undefined && draft.skipped && (
+                  <p className={css.reviewNote}>{t('review.skipped')}</p>
+                )}
+
+                {/* A review card keeps the free-text field only when the
+                    recorded answer used it; an empty disabled box with a
+                    placeholder would read as somewhere to type. */}
+                {(review === undefined || draft.custom !== '') && (hasOptions
                   ? (
-                    <div className={clsx(css.customRow, draft.custom !== '' && css.customRowActive)}>
+                    <div
+                      className={clsx(
+                        css.customRow,
+                        draft.custom !== '' && css.customRowActive,
+                        question.multiSelect !== true && draft.selected.length > 0 && css.customRowYielded,
+                      )}
+                    >
                       {question.multiSelect === true
                         ? (
                           <span
                             className={clsx(css.checkbox, draft.custom !== '' && css.checkboxChecked)}
                             aria-hidden="true"
                           >
-                            {draft.custom !== '' && <IconCheckOutline14 size={12} />}
+                            {draft.custom !== '' && <IconCheckOutlineRegular size={12} />}
                           </span>
                         )
                         : (
                           <span className={css.number} aria-hidden="true">
-                            <IconEditOutline16 size={12} />
+                            <IconEditOutlineRegular size={12} />
                           </span>
                         )}
                       <AnswerField
                         variant="inline"
                         value={draft.custom}
-                        disabled={busy !== null}
+                        disabled={locked}
                         placeholder={t('custom.placeholder')}
                         onChange={draftCustom}
                         onKeyDown={continueFromCustom}
@@ -385,16 +667,18 @@ function QuestionFlow({ pending, t, useStore, actions }: QuestionFlowProps) {
                   )
                   : (
                     <AnswerField
-                      autoFocus={!focusedQuestions.current.has(index)}
+                      // A missing countdown does not imply an indefinite request:
+                      // a timed request can still be awaiting its claim's first frame.
+                      autoFocus={canSubmit && countdown === undefined && !locked && !focusedQuestions.current.has(index)}
                       variant="block"
                       value={draft.custom}
-                      disabled={busy !== null}
+                      disabled={locked}
                       placeholder={t('custom.placeholder')}
                       onFocus={() => { focusedQuestions.current.add(index) }}
                       onChange={draftCustom}
                       onKeyDown={continueFromCustom}
                     />
-                  )}
+                  ))}
               </div>
             </div>
 
@@ -405,7 +689,7 @@ function QuestionFlow({ pending, t, useStore, actions }: QuestionFlowProps) {
                   disabled={index === 0 || busy !== null}
                   onClick={() => { replaceProgress(index - 1, drafts); setError(null) }}
                 >
-                  <IconChevronLeftOutline14 />
+                  <IconChevronLeftOutlineRegular />
                 </button>
                 <span className={css.progress}>{index + 1} / {questions.length}</span>
                 <button
@@ -413,25 +697,29 @@ function QuestionFlow({ pending, t, useStore, actions }: QuestionFlowProps) {
                   disabled={index === questions.length - 1 || busy !== null}
                   onClick={() => { replaceProgress(index + 1, drafts); setError(null) }}
                 >
-                  <IconChevronRightOutline14 />
+                  <IconChevronRightOutlineRegular />
                 </button>
               </div>
               <div className={css.feedback} role="status">
                 {error === null ? null : 'key' in error ? t(error.key) : error.text}
               </div>
-              <div className={css.footerActions}>
-                <Button variant="outline" disabled={busy !== null} onClick={skipQuestion}>
-                  {t('action.skip')}
-                </Button>
-                <Button
-                  variant="primary"
-                  disabled={busy !== null || !answered(draft)} onClick={continueFlow}
-                >
-                  {busy === 'answer'
-                    ? t('submitting')
-                    : index === questions.length - 1 ? t('submit') : t('action.next')}
-                </Button>
-              </div>
+              {/* A review card has nothing to send: the pager alone walks the record. */}
+              {review === undefined && (
+                <div className={css.footerActions}>
+                  <Button variant="outline" disabled={busy !== null} onClick={skipQuestion}>
+                    {t('action.skip')}
+                  </Button>
+                  <Button
+                    variant="primary"
+                    disabled={busy !== null || !answered(draft) || (index === questions.length - 1 && !canSubmit)}
+                    onClick={continueFlow}
+                  >
+                    {busy === 'answer'
+                      ? t('submitting')
+                      : index === questions.length - 1 ? t('submit') : t('action.next')}
+                  </Button>
+                </div>
+              )}
             </footer>
           </>
         )}

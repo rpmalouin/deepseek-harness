@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { contextMenuHook } from '@deepseek-ai/dsh-client-test-runtime'
 /**
  * QueueDock rendering and operations: authoritative rows, inline editing,
  * collapse state, removal, QueueDock Steer, failure notices, and live retirement.
@@ -12,18 +13,20 @@ import type {
 } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { InboxState } from '@deepseek-ai/dsh-agent/types'
 import type { UserMessage } from '@deepseek-ai/dsh-llm/types'
-import type { MessageId } from '@deepseek-ai/dsh-llm/brand'
+import type { MessageId } from '@deepseek-ai/dsh-llm/types'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { SnapshotSelectorHook } from '@deepseek-ai/dsh-client-ui-slots'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import {
-  bindSnapshotSelector, conversationSnapshot, makeTranslate,
+  allowAllAccess, bindSnapshotSelector, conversationSnapshot, makeTranslate,
 } from '@deepseek-ai/dsh-client-test-runtime'
-import type { SessionStatusSnapshot } from '@deepseek-ai/dsh-client-ui-session/client'
+import type { SessionStatusSnapshot } from '@deepseek-ai/dsh-client-ui-session-status/client'
 import { zh as commonZh } from '@deepseek-ai/dsh-client-locale/src/locales/zh.ts'
 import type { InputState } from '../src/client/contract/input.ts'
 import { zh } from '../src/client/locales.ts'
 import { QueueDock, queueDockEntry, type QueueDockInjected, type QueueDockProps } from '../src/client/queue/QueueDock.tsx'
+import type { UserTextInput } from '../src/client/index.ts'
+import { createUserTextFixture } from './user-text-component-fixture.client.tsx'
 
 // Every session-scope fixture carries the resource hook the resources plugin merges into GlobalStandardProps.
 const useResource = (() => ({ status: 'none' as const, value: undefined, failure: undefined })) as GlobalStandardProps['useResource']
@@ -53,7 +56,7 @@ interface TestSnapshot extends SessionSnapshot {
 function snapshotWith(queue: UserMessage[], nextStep: UserMessage[] = []): TestSnapshot {
   return {
     sessionId: SID, running: true, removed: false, openState: 'open', openError: null,
-    hasMore: false, loadingOlder: false, promptError: null, blank: false, subagent: null,
+    hasMore: false, loadingOlder: false, historyLoadStatus: 'idle', historyWasPartial: false, promptError: null, blank: false, subagent: null,
     pendingSubmissions: [],
     lastAgentError: null, promptAttempted: true, awaitingFirstTurn: false,
     testInbox: { 'next-turn': queue, 'next-step': nextStep },
@@ -98,17 +101,25 @@ const t: QueueDockProps['t'] = makeTranslate(zh, commonZh)
 const usePanelInfo: GlobalStandardProps['usePanelInfo'] = selector => selector({ activePanelId: null })
 
 function kitFor(snapshot: SessionSnapshot, injected: Partial<QueueDockInjected> = {}) {
+  const renderText = createUserTextFixture()
+  const renderFactorySlot: QueueDockProps['renderFactorySlot'] = (name, owner) => {
+    if (name !== 'conversation.user.text') throw new Error(`Unexpected queue Factory: ${name}`)
+    return renderText(owner as UserTextInput)
+  }
   return {
     sessionId: SID,
+    renderFactorySlot,
     t,
     usePanelInfo,
-    useSessions: (() => { throw new Error('unused') }) as unknown as SnapshotSelectorHook<SessionListState>,
+    useSessions: (() => { throw new Error('unused') }) as SnapshotSelectorHook<SessionListState>,
     useSessionRetainInfo: () => undefined,
     useResource,
     useSessionStatus: bindSnapshotSelector(
       createSnapshotStore<SessionStatusSnapshot>(new Map()),
     ),
     useWorkspaces: (() => { throw new Error('unused') }) as never,
+    ...allowAllAccess,
+    useContextMenu: contextMenuHook(),
     useProjection: (() => undefined) as never,
     useConversation: bindSnapshotSelector(createSnapshotStore(conversationSnapshot())),
     useChat: (() => { throw new Error('unused') }) as QueueDockProps['useChat'],
@@ -139,6 +150,50 @@ function imageRow(id: string, refId: string, text = ''): UserMessage {
 }
 
 describe('QueueDock', () => {
+  it('keeps the same quote preview when a queued echo hands off to Host content', () => {
+    const requestId = 'quote-handoff' as SessionSnapshot['pendingSubmissions'][number]['requestId']
+    const content = [{ type: 'text' as const, text: '> @literal /review' }]
+    const initial = { ...snapshotWith([]), pendingSubmissions: [{ requestId, placement: 'queued' as const,
+      time: 1000, text: content[0]!.text, attachments: [] }] }
+    const source = liveSession(initial)
+    const view = render(<QueueDock {...kitFor(initial)} useSession={source.useSession} useProjection={source.useProjection} />)
+    expect(view.container.querySelector('[data-quote-preview-text]')?.textContent).toBe('@literal /review')
+    const queued: UserMessage = { ...row('accepted-quote', ''), content, source: { kind: 'user', rpcId: requestId } }
+    act(() => { source.push(snapshotWith([queued])) })
+    expect(view.container.querySelectorAll('[data-quote-preview]')).toHaveLength(1)
+    expect(view.container.querySelector('[data-quote-preview-text]')?.textContent).toBe('@literal /review')
+    expect(view.container.querySelector('[data-ref-chip]')).toBeNull()
+  })
+
+  it.each(['ABC', 'ACB', 'BAC', 'BCA', 'CAB', 'CBA'])(
+    'keeps repeated queued submissions in Dock through acceptance and FIFO claims (%s)', (hostOrder) => {
+      const pending: SessionSnapshot['pendingSubmissions'] = ['A', 'B', 'C'].map(id => ({
+        requestId: id as never, placement: 'queued', time: 1_000,
+        text: `input ${id}`, attachments: [],
+      }))
+      const initial = { ...snapshotWith([]), pendingSubmissions: pending }
+      const source = liveSession(initial)
+      const view = render(<QueueDock {...kitFor(initial)} useSession={source.useSession} useProjection={source.useProjection} />)
+      fireEvent.click(view.getByRole('button', { name: /3 条排队消息/ }))
+      const order = () => [...view.container.querySelectorAll('[data-queue-dock] li')]
+        .map(element => pending.find(input => element.textContent?.includes(input.text))!.requestId)
+      expect(order()).toEqual(['A', 'B', 'C'])
+      const queued: UserMessage[] = []
+      for (const id of hostOrder) {
+        const submission = pending.find(input => input.requestId === id)!
+        queued.push({ ...row(id, submission.text), source: { kind: 'user', rpcId: submission.requestId } })
+        const remaining = pending.filter(input => !hostOrder.slice(0, queued.length).includes(input.requestId))
+        act(() => { source.push({ ...snapshotWith([...queued]), pendingSubmissions: remaining }) })
+        expect(order()).toEqual([...queued.map(item => item.id), ...remaining.map(input => input.requestId)])
+      }
+      for (let claimed = 1; claimed <= queued.length; claimed++) {
+        act(() => { source.push(snapshotWith(queued.slice(claimed))) })
+        expect(order()).toEqual(hostOrder.slice(claimed).split(''))
+      }
+      expect(view.container.querySelector('[data-queue-dock]')).toBeNull()
+    },
+  )
+
   it('renders null while the queue is empty', () => {
     const snap = snapshotWith([])
     const source = liveSession(snap)
@@ -198,7 +253,29 @@ describe('QueueDock', () => {
       expect((view.getByRole('button', { name }) as HTMLButtonElement).disabled).toBe(false)
     }
     fireEvent.click(view.getByRole('button', { name: '编辑排队消息' }))
-    expect((view.getByRole('textbox') as HTMLInputElement).value).toBe('等待上传')
+    expect((view.getByRole('textbox') as HTMLTextAreaElement).value).toBe('等待上传')
+  })
+
+  it('omits a local Chat submission while keeping other queued rows and queued echoes', () => {
+    const local = { ...row('idle', '留在正文'), source: { kind: 'user' as const, rpcId: 'idle-request' as never } }
+    const pending: TestSnapshot = {
+      ...snapshotWith([local, row('older', '原有排队')]),
+      pendingSubmissions: [{
+        requestId: 'idle-request' as never, placement: 'transcript', time: 1, text: '留在正文', attachments: [],
+      }],
+    }
+    const source = liveSession(pending)
+    const view = render(<QueueDock {...kitFor(pending)} useSession={source.useSession} useProjection={source.useProjection} />)
+    expect(view.queryByText('留在正文')).toBeNull()
+    expect(view.getByText('原有排队')).toBeTruthy()
+    expect((view.getByRole('button', { name: '编辑排队消息' }) as HTMLButtonElement).disabled).toBe(false)
+    act(() => { source.push({ ...pending, pendingSubmissions: [...pending.pendingSubmissions, {
+      requestId: 'queued-request' as never, placement: 'queued', time: 2, text: '新排队回显', attachments: [],
+    }] }) })
+    fireEvent.click(view.getByRole('button', { name: '2 条排队消息发送中…' }))
+    expect(view.queryByText('留在正文')).toBeNull()
+    expect(view.getByText('原有排队')).toBeTruthy()
+    expect(view.getByText('新排队回显').closest('[data-submission-echo]')).not.toBeNull()
   })
 
   it('loads the durable thumbnail after replacing a local image echo', async () => {
@@ -277,16 +354,21 @@ describe('QueueDock', () => {
     const header = view.getByRole('button', { name: '2 条排队消息' })
     expect(header.getAttribute('aria-expanded')).toBe('false')
     expect(document.getElementById(header.getAttribute('aria-controls')!)).toBeTruthy()
+    // Collapsed exposes the count header only: the row actions are not rendered.
+    expect(view.getAllByRole('button')).toEqual([header])
     expect(view.queryByText('one')).toBeNull()
     expect(view.queryByText('two')).toBeNull()
 
     fireEvent.click(header)
     expect(header.getAttribute('aria-expanded')).toBe('true')
+    // Expanded renders one Edit/Remove/Steer group per row, plus the header.
+    expect(view.getAllByRole('button')).toHaveLength(1 + 2 * 3)
     expect(view.getByText('one')).toBeTruthy()
     expect(view.getByText('two')).toBeTruthy()
 
     fireEvent.click(header)
     expect(header.getAttribute('aria-expanded')).toBe('false')
+    expect(view.getAllByRole('button')).toEqual([header])
     expect(view.queryByText('one')).toBeNull()
   })
 
@@ -311,6 +393,22 @@ describe('QueueDock', () => {
     expect(header).toHaveProperty('disabled', false)
     expect(header.getAttribute('aria-expanded')).toBe('false')
     expect(view.queryByText('second')).toBeNull()
+  })
+
+  it('portals a row action tooltip out of the panel, where the input card cannot cover it', () => {
+    vi.useFakeTimers()
+    try {
+      const single = snapshotWith([row('i-tip', 'queued draft')])
+      const source = liveSession(single)
+      const view = render(<QueueDock {...kitFor(single)} useSession={source.useSession} useProjection={source.useProjection} />)
+      fireEvent.pointerEnter(view.getByLabelText('删除排队消息'))
+      act(() => { vi.advanceTimersByTime(500) })
+      const tooltip = view.getByRole('tooltip')
+      expect(tooltip.textContent).toBe('删除排队消息')
+      expect(tooltip.parentElement).toBe(document.body)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('keeps an in-flight row action visible when another item arrives', async () => {
@@ -362,14 +460,47 @@ describe('QueueDock', () => {
     expect(view.queryByText('three')).toBeNull()
   })
 
-  it('flattens and caps previews at 200 code points while preserving complete editable text', () => {
-    const text = `  before   ${'🙂'.repeat(201)}  after`
+  it('displays complete previews with compressed whitespace and CSS ellipsis while preserving editable text', () => {
+    const text = `  before \n  ${'🙂'.repeat(201)}  after`
     const snap = snapshotWith([row('long-preview', text)])
     const source = liveSession(snap)
-    const view = render(<QueueDock {...kitFor(snap)} useSession={source.useSession} useProjection={source.useProjection} />)
-    expect(view.getByText(`before ${'🙂'.repeat(193)}…`)).toBeTruthy()
+    const props = kitFor(snap)
+    const renderFactory = vi.spyOn(props, 'renderFactorySlot')
+    const view = render(<QueueDock {...props} useSession={source.useSession} useProjection={source.useProjection} />)
+    expect(renderFactory).toHaveBeenCalledWith('conversation.user.text', {
+      text, facts: { collapseWhitespace: true, trimWhitespace: true }, interactive: false, ellipsis: true,
+    })
+    expect(view.getByRole('listitem').textContent).toBe(`before ${'🙂'.repeat(201)} after`)
     fireEvent.click(view.getByLabelText('编辑排队消息'))
-    expect((view.getByRole('textbox') as HTMLInputElement).value).toBe(text)
+    expect((view.getByRole('textbox') as HTMLTextAreaElement).value).toBe(text)
+  })
+
+  it('keeps line breaks while re-editing a multiline queued message', async () => {
+    const text = 'line one\n  line two\n\nline four'
+    const snap = snapshotWith([row('i-lines', text)])
+    const source = liveSession(snap)
+    const updateQueue = vi.fn(() => Promise.resolve())
+    const { getByLabelText } = render(
+      <QueueDock {...kitFor(snap, { updateQueue })} useSession={source.useSession} useProjection={source.useProjection} />,
+    )
+
+    fireEvent.click(getByLabelText('编辑排队消息'))
+    const editor = getByLabelText('编辑排队消息') as HTMLTextAreaElement
+    expect(editor.value).toBe(text)
+
+    // Shift+Enter keeps the native line break: the handler must not consume it.
+    expect(fireEvent.keyDown(editor, { key: 'Enter', shiftKey: true })).toBe(true)
+    expect(updateQueue).not.toHaveBeenCalled()
+
+    fireEvent.change(editor, { target: { value: `${text}\nline five` } })
+    fireEvent.keyDown(editor, { key: 'Enter' })
+
+    await waitFor(() => {
+      expect(updateQueue).toHaveBeenCalledWith(iid('i-lines'), {
+        kind: 'edit',
+        content: [{ type: 'text', text: `${text}\nline five` }],
+      })
+    })
   })
 
   it('renders active actions and disables editing for mixed-content rows', () => {
@@ -477,7 +608,7 @@ describe('QueueDock', () => {
     )
 
     fireEvent.click(getByLabelText('编辑排队消息'))
-    const editor = getByLabelText('编辑排队消息') as HTMLInputElement
+    const editor = getByLabelText('编辑排队消息') as HTMLTextAreaElement
     expect(getByLabelText('保存排队消息')).toBeTruthy()
     expect(getByLabelText('取消编辑')).toBeTruthy()
     expect(queryByLabelText('删除排队消息')).toBeNull()
@@ -573,7 +704,6 @@ describe('QueueDock', () => {
           childSessionId: SID,
           mode: 'continuable' as const,
         },
-        parentAvailable: false,
       },
     }
     const source = liveSession(snap)
@@ -596,7 +726,6 @@ describe('QueueDock', () => {
           childSessionId: SID,
           mode: 'one-shot' as const,
         },
-        parentAvailable: true,
       },
     }
     const source = liveSession(snap)

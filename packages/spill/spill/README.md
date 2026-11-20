@@ -33,13 +33,13 @@ Choose spill storage when a deployment needs to keep full text retrievable after
 
 ### Smallest working composition
 
-Mount a backend and the policy together; with `maxInlineBytes` set, any oversized plain-text tool result becomes a preview plus a locator automatically.
+Mount a backend and the policy together; with `maxInlineTokens` set, an oversized text/image tool result becomes a preview plus a locator automatically.
 
 ```yaml
 - name: '@deepseek-ai/dsh-spill-local'
 - name: '@deepseek-ai/dsh-spill-policy'
   config:
-    maxInlineBytes: 50000
+    maxInlineTokens: 12500
 ```
 
 ### Saving text
@@ -89,7 +89,6 @@ The package is built on one separation and a deliberate minimum:
 |---|---|
 | [`src/index.ts`](src/index.ts) | Plugin entry: the abstract `SpillStore` service and its `saveText` contract |
 | [`src/types.ts`](src/types.ts) | Vocabulary: `SaveTextSpill`, `SpillRef`, branded `SpillLocator`, `SpillOwner`, `SpillSource` |
-| — | No runtime invariant companion is published; this package exposes no independent event sequence or mutable data relation beyond contracts enforced at its owning seam. |
 
 ### Data model
 

@@ -9,6 +9,7 @@
  */
 
 import type { Root } from 'mdast'
+import { recoverLocalImages } from './local-image-syntax.ts'
 import { fromMarkdown } from 'mdast-util-from-markdown'
 import { gfmFromMarkdown } from 'mdast-util-gfm'
 import { mathFromMarkdown } from 'mdast-util-math'
@@ -16,6 +17,10 @@ import { gfm } from 'micromark-extension-gfm'
 import { math } from 'micromark-extension-math'
 import { cjkFriendlyStrong } from './cjkFriendlyStrong.ts'
 import { mathCompatibility } from './mathCompatibility.ts'
+import { windowsPathDestinations } from './windows-path-destinations.ts'
+
+/** GFM strikethrough requires `~~`; a single `~` stays literal, as in ranges such as `10~20`. */
+const gfmOptions = { singleTilde: false }
 
 /**
  * Parse GFM markdown (the streaming arm's grammar: no math, so incomplete
@@ -24,10 +29,10 @@ import { mathCompatibility } from './mathCompatibility.ts'
  * @returns The mdast root.
  */
 export function parseGfm(text: string): Root {
-  return fromMarkdown(text, {
-    extensions: [gfm(), cjkFriendlyStrong()],
-    mdastExtensions: [gfmFromMarkdown()],
-  })
+  return recoverLocalImages(fromMarkdown(text, {
+    extensions: [gfm(gfmOptions), cjkFriendlyStrong()],
+    mdastExtensions: [gfmFromMarkdown(), windowsPathDestinations()],
+  }), text)
 }
 
 /**
@@ -37,8 +42,8 @@ export function parseGfm(text: string): Root {
  * @returns The mdast root.
  */
 export function parseGfmWithMath(text: string): Root {
-  return fromMarkdown(text, {
-    extensions: [gfm(), cjkFriendlyStrong(), mathCompatibility(), math()],
-    mdastExtensions: [gfmFromMarkdown(), mathFromMarkdown()],
-  })
+  return recoverLocalImages(fromMarkdown(text, {
+    extensions: [gfm(gfmOptions), cjkFriendlyStrong(), mathCompatibility(), math()],
+    mdastExtensions: [gfmFromMarkdown(), mathFromMarkdown(), windowsPathDestinations()],
+  }), text)
 }

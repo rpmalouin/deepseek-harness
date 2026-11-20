@@ -1,5 +1,5 @@
 ---
-description: "Shared resolution of the DeepSeek Harness home and user-data paths for packages that need one consistent root, tilde expansion, and stable watch paths."
+description: "Shared resolution of the DeepSeek Harness home, its config, data, state, cache, and backup category paths, and the shared agent configuration root, plus tilde expansion and stable watch paths."
 kind: "package-library"
 ---
 
@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-`@deepseek-ai/dsh-home-paths` lets package authors resolve one DeepSeek Harness data root and derive child paths from it. An explicit path wins over `$DSH_HOME`, which wins over `~/.dsh`; blank environment values are ignored. Its public helpers can render the root without revealing an absolute machine path, expand only bare or current-user tilde forms, and canonicalize watch targets whose final components do not yet exist. Use it as a direct library dependency, not through `cordis.yml`.
+`@deepseek-ai/dsh-home-paths` lets package authors resolve the DeepSeek Harness data root and the shared agent configuration root their consumers read. An explicit path wins over the environment variable, which wins over the default under the operating-system home; blank environment values are ignored. Its public helpers can render a root without revealing an absolute machine path, expand only bare or current-user tilde forms, and canonicalize watch targets whose final components do not yet exist. Use it as a direct library dependency, not through `cordis.yml`.
 
 ## Table of Contents
 
@@ -40,9 +40,34 @@ An explicit configured path has the highest precedence, then `$DSH_HOME`, then t
 
 `dshCachePath(...segments)` derives paths from the resolved home's `cache` directory. With no segments it returns the cache directory itself. Pass an initial options object, `dshCachePath({ dshHome: home }, ...segments)`, to use an explicit configured home with the same precedence and tilde expansion. It returns an absolute path without creating directories.
 
+<a id="choosing-a-category"></a>
+### Choosing a category for a new path
+
+```ts
+import { dshPath } from '@deepseek-ai/dsh-home-paths'
+
+const index = dshPath('state', 'my-plugin', 'index.json')             // $DSH_HOME/state/my-plugin/index.json
+const models = dshPath({ category: 'cache', dshHome: '~/other-dsh' }, 'my-plugin') // ~/other-dsh/cache/my-plugin
+```
+
+A new file under the home uses `dshPath(category, ...segments)` and passes its owner's directory name, normally the package name without the `@deepseek-ai/dsh-` prefix, as the first segment. Use `config` for files a person writes to configure the harness, `data` for records whose loss loses user work, sign-ins, or installed software, `state` for logs, indexes, ids, and other records the harness can lose without losing user work, `cache` for content it can rebuild or download again, and `backup` for backup archives, which users can delete at any time without affecting the harness. Loader `!!js` config expressions receive the same function, for example `root: !!js dshPath('data', 'my-plugin')`. `dshPath` returns an absolute path without creating directories.
+
+Existing entries keep their current locations: conventional top-level entries such as `sessions/`, `profiles/`, `skills/`, `AGENTS.md`, `.env`, and `.credentials.yaml` stay at the top level, and the [home path categories proposal](../../../.agents/notes/proposed/architecture/2026-11-04-dsh-home-path-categories.md) lists the category of every other existing path.
+
+### Resolving the shared agents root
+
+```ts
+import { resolveAgentsHome, agentsHomeDisplay } from '@deepseek-ai/dsh-home-paths'
+
+const agents = resolveAgentsHome()   // configured path, else $DSH_AGENTS_HOME, else ~/.agents
+agentsHomeDisplay(agents)            // ~/.agents, or $DSH_AGENTS_HOME for any configured root
+```
+
+`resolveAgentsHome` applies the same precedence, blank-value handling, and tilde expansion as `resolveDshHome`. The root is deliberately outside `$DSH_HOME` because other agent tools share it; `dsh-agent-instructions` reads its user-global `AGENTS.md`, and `dsh-skill-filesystem` scans its `skills/` directory.
+
 ### Displaying a home
 
-For user-facing paths, render the root symbolically rather than as a machine path: the default home displays as `~/.dsh` and any configured home displays as `$DSH_HOME`. The display form never leaks an absolute machine path.
+For user-facing paths, render a root symbolically rather than as a machine path: the default harness home displays as `~/.dsh`, any configured harness home as `$DSH_HOME`, the default shared agents root as `~/.agents`, and any configured shared agents root as `$DSH_AGENTS_HOME`. Neither display form leaks an absolute machine path.
 
 ### Expanding user paths
 
@@ -60,18 +85,17 @@ For user-facing paths, render the root symbolically rather than as a machine pat
 <details>
 <summary>Implementation internals — click to expand</summary>
 
-The package is built on one principle: all harness user data lives under one root, and every other helper derives from that decision.
+The package is built on one principle: harness user data lives under one root, and the shared agent configuration root stays separate because other agent tools read it too. `resolveRoot` and `rootDisplay` own the precedence and display rules for both roots, so neither can drift from the other.
 
 ### Source map
 
 | File | Role |
 |---|---|
 | [`src/index.ts`](src/index.ts) | Home resolution, path joining, display, tilde expansion, and watch-path canonicalization |
-| — | No runtime invariant companion is published; this pure utility owns no event stream or mutable runtime data; its resolution rules and value algebra are enforced by unit tests. |
 
 ### Resolution rules
 
-`resolveDshHome` reads the explicit override, then `$DSH_HOME`, then falls back to the operating-system home joined with `.dsh`. The chosen value is tilde-expanded and normalized to an absolute path; `dshHomePath` joins child segments with Node's platform path rules. `dshHomeDisplay` compares the resolved path against the default root and returns the symbolic label, so a configured home never leaks its absolute path.
+`resolveDshHome` reads the explicit override, then `$DSH_HOME`, then falls back to the operating-system home joined with `.dsh`. `resolveAgentsHome` reads the same three levels for `$DSH_AGENTS_HOME` and `~/.agents`. The chosen value is tilde-expanded and normalized to an absolute path; `dshHomePath` and `dshPath` join child segments with Node's platform path rules. `dshHomeDisplay` and `agentsHomeDisplay` compare the resolved path against the default root and return the symbolic label, so a configured root never leaks its absolute path.
 
 ### Canonicalization mechanics
 

@@ -56,6 +56,8 @@ function stableRequestPromptAnchor(
  * their step's input; in-history updates stay at their own positions. The
  * request-prompt Definition owns replacement and later-series cards. Positional
  * replacements advance the effective prompt without changing historical cards.
+ * A published node becomes `hidden` under the same key while a prepended replacement
+ * leaves its prompt order unknown, and `visible` again once older history resolves it.
  * @param inspect - Pure surface interpretation supplied by uiConversation.
  * @returns The Chat system-prompt Definition.
  */
@@ -68,13 +70,18 @@ export function systemMessageDefinition(inspect: SystemPromptInspector): Convers
       ? { id: String(event.seq), role: 'start' }
       : null,
     start: (_context, match, reader) => {
+      if (match.event.type === 'assistant/live-chunk') throw new Error('system-message requires a durable event')
       return inspect(reader.previous<SystemPromptState>('system-message')?.state, match.event)
     },
     update: context => context.state,
     buildViewNode: (context) => {
       const state = context.state?.introduced
       if (state === undefined || state.text === ''
-        || context.start?.event.type !== 'system/message' || context.start.event.surfaceOp !== 'append') return null
+        || context.start?.event.type !== 'system/message' || context.start.event.surfaceOp !== 'append') {
+        const current = context.current.get('chat') as ChatNode | null | undefined
+        if (current?.kind !== 'system-prompt') return null
+        return chatNode(context, 'system-prompt', current.anchorSeq, current.data, { visibility: 'hidden' })
+      }
       const anchor = state.update ? state.seq : requestPromptAnchor(context.start, undefined, true)
       return chatNode(context, 'system-prompt', anchor, { text: state.text, ...state.update ? { update: true } : {} })
     },

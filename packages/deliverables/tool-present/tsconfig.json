@@ -27,10 +27,10 @@
       "path": "../../core/session"
     },
     {
-      "path": "../../session/session-projection"
+      "path": "../../core/tools"
     },
     {
-      "path": "../../core/tools"
+      "path": "../../session/working-directory"
     }
   ]
 }

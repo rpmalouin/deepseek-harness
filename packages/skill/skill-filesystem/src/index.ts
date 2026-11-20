@@ -12,17 +12,17 @@
 import { access, lstat, readdir, readFile, realpath, stat } from 'node:fs/promises'
 import { unwatchFile, watchFile, type Stats } from 'node:fs'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { homedir } from 'node:os'
 import type { Context } from '@deepseek-ai/cordis'
 import chokidar from 'chokidar'
 import z from '@deepseek-ai/schemastery'
 import type Schema from '@deepseek-ai/schemastery'
 import { parse as parseYaml } from 'yaml'
 import type { FileSystem, FsDirEntry, FsTarget } from '@deepseek-ai/dsh-fs'
-import { canonicalizeWatchPath, resolveDshHome } from '@deepseek-ai/dsh-home-paths'
+import { canonicalizeWatchPath, resolveAgentsHome, resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import {
   BUNDLED_SKILL_RANK,
   isSkillName,
+  SkillError,
   type SkillCandidate,
   type SkillDefinition,
   type SkillInvocationPolicy,
@@ -165,7 +165,7 @@ export class FileSystemSkillProvider implements SkillProvider {
     this.name = config.providerName ?? 'filesystem'
     this.includeDefaultRoots = config.includeDefaultRoots ?? true
     this.dshHome = resolveDshHome(config.dshHome)
-    this.agentsHome = resolve(config.agentsHome ?? process.env.DSH_AGENTS_HOME ?? join(homedir(), '.agents'))
+    this.agentsHome = resolveAgentsHome(config.agentsHome)
     this.customSkillDirs = (config.customSkillDirs ?? []).map(root => resolve(root))
     this.watchManager = new SkillWatchManager(ctx, control.invalidate, resolveWatchConfig(config))
     control.signal.addEventListener('abort', () => { void this.dispose() }, { once: true })
@@ -180,8 +180,8 @@ export class FileSystemSkillProvider implements SkillProvider {
   /**
    * Discover local skill summaries for a cwd-sensitive workspace.
    * @param options - lookup options; `cwd` selects the project roots to scan.
-   * @returns local provider candidates with stable root ranks; watcher startup
-   *   failure returns readable candidates as an incomplete observation.
+   * @returns candidates from readable roots with stable ranks. Failed roots are
+   *   logged and omitted; root or watcher failures make the observation incomplete.
    */
   async list(options: SkillLookupOptions): Promise<SkillCandidate[] | SkillProviderObservation> {
     const roots = await this.roots(options.cwd)
@@ -194,8 +194,15 @@ export class FileSystemSkillProvider implements SkillProvider {
     }
     const candidates: SkillCandidate[] = []
     for (const root of roots) {
-      for (const skill of await discoverRoot(root, this.ctx, this.name)) {
-        candidates.push(skill)
+      options.signal?.throwIfAborted()
+      try {
+        const discovered = await discoverRoot(root, this.ctx, this.name)
+        options.signal?.throwIfAborted()
+        candidates.push(...discovered)
+      } catch (error) {
+        options.signal?.throwIfAborted()
+        complete = false
+        this.ctx.logger.warn(`skill root "${root.path}" skipped: ${errorMessage(error)}. Other roots remain available; check this directory's permissions and symlinks. Discovery retries on the next lookup.`)
       }
     }
     return complete ? candidates : { candidates, complete }
@@ -504,19 +511,9 @@ class SkillWatchManager {
       usePolling: this.config.usePolling,
       interval: this.config.pollIntervalMs,
     })
-    const handle: WatchHandle = {
-      mode,
-      close: () => watcher.close(),
-    }
     let ready = false
     const readiness = Promise.withResolvers<undefined>()
     const signal = this.lifecycle.signal
-    if (signal.aborted) {
-      await this.closeWatcher(handle)
-      signal.throwIfAborted()
-    }
-    const onAbort = (): void => { readiness.reject(signal.reason) }
-    signal.addEventListener('abort', onAbort, { once: true })
     const onError = (error: unknown): void => {
       if (!ready) {
         readiness.reject(error)
@@ -524,6 +521,24 @@ class SkillWatchManager {
       }
       this.handleWatcherError(state, error)
     }
+    const handle: WatchHandle = {
+      mode,
+      close: () => {
+        // `close()` drops every listener but leaves a scheduled write-settle
+        // poll; its straggler stats a file this teardown is deleting, which
+        // Windows reports as EPERM, and an 'error' emission with no listener
+        // is rethrown as an uncaught exception. Re-attach across the close.
+        const closing = watcher.close()
+        watcher.on('error', onError)
+        return closing
+      },
+    }
+    if (signal.aborted) {
+      await this.closeWatcher(handle)
+      signal.throwIfAborted()
+    }
+    const onAbort = (): void => { readiness.reject(signal.reason) }
+    signal.addEventListener('abort', onAbort, { once: true })
     watcher.on('error', onError)
     watcher.once('ready', () => {
       ready = true
@@ -604,7 +619,7 @@ async function settleWatcherOpening(opening: Promise<void> | undefined): Promise
   if (opening === undefined) return
   try {
     await opening
-  } catch {
+  } catch (_watchStartupFailed) {
     // Watch startup already logged the underlying failure; teardown only contains it.
   }
 }
@@ -855,7 +870,7 @@ async function readSkillText(ctx: Context, path: string, signal?: AbortSignal, t
   } catch (error) {
     signal?.throwIfAborted()
     if (isAbsentSkillPathError(error)) return undefined
-    throw error
+    throw new SkillError(`failed to read skill file ${path}: ${errorMessage(error)}`, 'SKILL_READ_FAILED', { cause: error })
   }
 }
 
@@ -923,7 +938,7 @@ function parseFrontmatter(raw: string): { data: Record<string, unknown>; body: s
   const closing = findClosingFrontmatter(raw, start)
   if (closing === undefined) return undefined
   const yaml = raw.slice(start, closing.start)
-  const parsed = parseYaml(yaml) as unknown
+  const parsed: unknown = parseYaml(yaml)
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
   return { data: parsed as Record<string, unknown>, body: raw.slice(closing.bodyStart) }
 }

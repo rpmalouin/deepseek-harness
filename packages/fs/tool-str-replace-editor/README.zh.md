@@ -25,6 +25,8 @@ kind: "package-reference"
 <a id="use-this-package"></a>
 ## 使用本包
 
+此非实验性的独立插件面向自定义组合。Plugins 页面不将它作为可选 bundle 提供。
+
 当模型应通过熟悉的 `view`/`create`/`str_replace`/`insert` 命令词汇在绝对路径上编辑文件时，把工具与 `ctx.fs` 后端（以及需要防护变更时的策略插件）一起挂载。
 
 ### 最小组合
@@ -50,7 +52,7 @@ kind: "package-reference"
 
 ### 失败与恢复
 
-`view`、`str_replace` 或 `insert` 发生元数据未命中时，工具会在返回 `FS_NOT_FOUND` 前记录确认缺失，因此后续 `create` 可以通过已挂载策略的防护创建流程恢复外部删除的路径；缺失状态绝不会授权 `str_replace` 或 `insert`。防护变更继承策略插件的错误码与恢复指令——`FS_NOT_OBSERVED`（先读取文件再重试）、`FS_STALE_VERSION`（先重新读取再重试）——沙箱拒绝则表现为 `[sandbox: file access denied under <mode> mode]` 标记。路径必须是绝对路径；相对路径会被拒绝并给出提示。
+`view`、`str_replace` 或 `insert` 发生元数据未命中时，工具会在返回 `FS_NOT_FOUND` 前记录确认缺失，因此后续 `create` 可以通过已挂载策略的防护创建流程恢复外部删除的路径；缺失状态绝不会授权 `str_replace` 或 `insert`。防护变更继承策略插件的错误码与恢复指令——`FS_NOT_OBSERVED`（先读取文件再重试）、`FS_STALE_VERSION`（先重新读取再重试）——沙箱拒绝则表现为 `[sandbox: file access denied under <mode> mode]` 标记。路径必须是绝对路径；相对路径会被拒绝并给出提示。参数模式无法表达的参数错误，例如相对路径、缺少命令参数或 `view_range`、`insert_line` 越界，抛出 `ToolArgsError`，错误码为 `INVALID_ARGS`；对已存在路径执行 `create` 报告 `FS_ALREADY_EXISTS`。
 
 -----
 
@@ -145,5 +147,3 @@ kind: "package-reference"
 无。
 
 </details>
-
-**运行时不变式：** 不发布伴生入口。工具适配器不持有独立持久状态；文件系统修改关系属于提供方与策略插件。

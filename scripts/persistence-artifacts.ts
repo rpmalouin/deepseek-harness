@@ -2,10 +2,12 @@
 
 import { readFileSync } from 'node:fs'
 import { hasLanguageSwitcher } from './translation-links.ts'
-import { translationPairPaths } from './translation-pairing-record.ts'
 import {
-  blobHash, languageSwitcherTargets, parseTranslationMarkdown, parseTranslationPairingManifest,
-  renderPairMeta, requiresSourceLanguageSwitcher, translationPairSourcePredicate,
+  computeTranslationPairingRecord, renderTranslationPairingRecord, translationPairPaths,
+} from './translation-pairing-record.ts'
+import {
+  languageSwitcherTargets, parseTranslationMarkdown, parseTranslationPairingManifest,
+  requiresSourceLanguageSwitcher, translationPairSourcePredicate,
   translationStructureDiff, translationStructureSignature,
 } from './translation-pairing.ts'
 
@@ -21,8 +23,7 @@ export interface PersistenceArtifact {
 
 /**
  * Check a pair's code, structure and localized links, then render its three files.
- * Link existence remains the Markdown gate's responsibility. Pair hashes are
- * computed in-process; staging the documents stores the corresponding Git blobs.
+ * Link existence remains the Markdown gate's responsibility.
  * @param root - checkout root used to resolve relative link identities.
  * @param source - repository-relative English document path.
  * @param en - complete authored or generated English Markdown.
@@ -45,9 +46,10 @@ export function renderPersistencePair(root: string, source: string, en: string, 
     translationStructureSignature(zhTree, sourceTargets, { ...context, sourcePath: paths.zh, markdown: zh }),
   )
   if (errors.length > 0) throw new Error(`${source}: bilingual structure mismatch: ${errors.join('; ')}`)
+  const record = computeTranslationPairingRecord(paths, en, zh, context, { en: sourceTree, zh: zhTree })
   return [
     { path: paths.source, content: en },
     { path: paths.zh, content: zh },
-    { path: paths.meta, content: renderPairMeta(paths.source, blobHash(Buffer.from(en)), paths.zh, blobHash(Buffer.from(zh))) },
+    { path: paths.meta, content: renderTranslationPairingRecord(paths, record) },
   ]
 }

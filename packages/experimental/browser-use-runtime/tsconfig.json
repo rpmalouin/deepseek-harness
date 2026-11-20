@@ -9,6 +9,9 @@
   ],
   "references": [
     {
+      "path": "../../util/brand"
+    },
+    {
       "path": "../../../vendor/cordis"
     },
     {
@@ -21,6 +24,9 @@
       "path": "../../core/tools"
     },
     {
+      "path": "../../util/error"
+    },
+    {
       "path": "../../core/scope"
     },
     {
@@ -31,6 +37,9 @@
     },
     {
       "path": "../../core/system-prompt"
+    },
+    {
+      "path": "../../session/working-directory"
     }
   ]
 }

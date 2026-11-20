@@ -24,9 +24,6 @@
       "path": "../../core/session"
     },
     {
-      "path": "../../session/session-projection"
-    },
-    {
       "path": "../../core/tools"
     },
     {
@@ -34,6 +31,9 @@
     },
     {
       "path": "../../util/home-paths"
+    },
+    {
+      "path": "../../session/working-directory"
     }
   ]
 }

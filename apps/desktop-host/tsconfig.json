@@ -8,12 +8,13 @@
     "src"
   ],
   "references": [
+    { "path": "../../packages/host/authentication-desktop" },
     { "path": "../../vendor/cordis" },
     { "path": "../../packages/core/agent" },
+    { "path": "../../packages/api/workspace-files/tsconfig.host.json" },
     { "path": "../../packages/jobs/jobs" },
-    { "path": "../../packages/skill/skill-office" },
-    { "path": "../../packages/util/home-paths" },
-    { "path": "../../packages/core/tools" },
+    { "path": "../../packages/schedule/schedule" },
+    { "path": "../../packages/workspace/workspace" },
     {
       "path": "../cli"
     },
@@ -25,6 +26,30 @@
     },
     {
       "path": "../../packages/host/webserver"
+    },
+    {
+      "path": "../../packages/account/deepseek-account"
+    },
+    {
+      "path": "../../packages/boot/plugin-manager"
+    },
+    {
+      "path": "../../packages/fs/fs"
+    },
+    {
+      "path": "../../packages/core/session"
+    },
+    {
+      "path": "../../packages/session/session-persistence"
+    },
+    {
+      "path": "../../packages/sandbox/sandbox-policy"
+    },
+    {
+      "path": "../../packages/util/workspace-path"
+    },
+    {
+      "path": "../../packages/util/brand"
     }
   ]
 }

@@ -30,11 +30,12 @@ interface AssistantState {
   readonly turn: number
   readonly step: number
   readonly blocks: readonly (AssistantBlock | undefined)[]
+  /** Missing indices are invisible; same-kind appends preserve already-visible blocks. */
+  readonly visibleByIndex: readonly boolean[]
   readonly visibleBlocks: number
   readonly firstVisibleSeq: number | undefined
   readonly firstVisibleTime: number | undefined
   readonly firstTokenTime: number | undefined
-  readonly hidden: boolean
   readonly final: ConversationMatch | undefined
   readonly usage: unknown
 }
@@ -44,11 +45,11 @@ function initialState(turn: number, step: number): AssistantState {
     turn,
     step,
     blocks: [],
+    visibleByIndex: [],
     visibleBlocks: 0,
     firstVisibleSeq: undefined,
     firstVisibleTime: undefined,
     firstTokenTime: undefined,
-    hidden: false,
     final: undefined,
     usage: undefined,
   }
@@ -62,12 +63,6 @@ function blockIsVisible(block: AssistantBlock | undefined): boolean {
   if (block === undefined || block.kind === 'tool-call') return false
   if (block.kind === 'text' || block.kind === 'reasoning') return block.text.trim() !== ''
   return true
-}
-
-function countVisibleBlocks(blocks: readonly AssistantBlock[]): number {
-  let count = 0
-  for (const block of blocks) if (blockIsVisible(block)) count++
-  return count
 }
 
 function hasVisibleContent(blocks: readonly AssistantBlock[]): boolean {
@@ -85,7 +80,6 @@ function resetForRetry(state: AssistantState): AssistantState {
   return {
     ...initialState(state.turn, state.step),
     firstTokenTime: state.firstTokenTime,
-    hidden: true,
   }
 }
 
@@ -95,48 +89,57 @@ function updateChunk(
   seq: number,
   time: number,
 ): AssistantState {
+  if (chunk.type === 'tool-call-delta') {
+    const previous = state.blocks[chunk.index]
+    if (previous?.kind === 'tool-call' && previous.callId !== ''
+      && (chunk.name === undefined || chunk.name === previous.name)
+      && (state.firstTokenTime !== undefined || !isTokenDelta(chunk))) return state
+  }
   const blocks = [...state.blocks]
   let changedIndex = -1
   let previousVisible = false
+  let nextVisible = false
   switch (chunk.type) {
     case 'block-start':
       changedIndex = chunk.index
-      previousVisible = blockIsVisible(blocks[chunk.index])
+      previousVisible = state.visibleByIndex[chunk.index] === true
       blocks[chunk.index] = emptyAssistantBlock(chunk.blockType)
+      nextVisible = blockIsVisible(blocks[chunk.index])
       break
     case 'text-delta': {
       const previous = blocks[chunk.index]
       changedIndex = chunk.index
-      previousVisible = blockIsVisible(previous)
+      previousVisible = state.visibleByIndex[chunk.index] === true
       blocks[chunk.index] = { kind: 'text', text: (previous?.kind === 'text' ? previous.text : '') + chunk.text }
+      nextVisible = (previous?.kind === 'text' && previousVisible) || chunk.text.trim() !== ''
       break
     }
     case 'reasoning-delta': {
       const previous = blocks[chunk.index]
       changedIndex = chunk.index
-      previousVisible = blockIsVisible(previous)
+      previousVisible = state.visibleByIndex[chunk.index] === true
       blocks[chunk.index] = { kind: 'reasoning', text: (previous?.kind === 'reasoning' ? previous.text : '') + chunk.text }
+      nextVisible = (previous?.kind === 'reasoning' && previousVisible) || chunk.text.trim() !== ''
       break
     }
     case 'tool-call-delta': {
       const previous = blocks[chunk.index]
       changedIndex = chunk.index
-      previousVisible = blockIsVisible(previous)
-      const base = previous?.kind === 'tool-call'
-        ? previous
-        : { kind: 'tool-call' as const, callId: '', name: '', argsRaw: '' }
+      previousVisible = state.visibleByIndex[chunk.index] === true
+      // Tool Nodes own streamed arguments; Assistant protocol blocks retain identity until full settlement.
       blocks[chunk.index] = {
         kind: 'tool-call',
-        callId: base.callId || String(chunk.id),
-        name: chunk.name ?? base.name,
-        argsRaw: base.argsRaw + chunk.argumentsDelta,
+        callId: (previous?.kind === 'tool-call' ? previous.callId : '') || String(chunk.id),
+        name: chunk.name ?? (previous?.kind === 'tool-call' ? previous.name : ''),
+        argsRaw: previous?.kind === 'tool-call' ? previous.argsRaw : '',
       }
       break
     }
     case 'block-end':
       changedIndex = chunk.index
-      previousVisible = blockIsVisible(blocks[chunk.index])
+      previousVisible = state.visibleByIndex[chunk.index] === true
       blocks[chunk.index] = toAssistantBlock(chunk.block)
+      nextVisible = blockIsVisible(blocks[chunk.index])
       break
     case 'usage':
       return { ...state, usage: chunk.usage }
@@ -145,13 +148,19 @@ function updateChunk(
   }
   const visibleBlocks = state.visibleBlocks
     - Number(previousVisible)
-    + Number(blockIsVisible(blocks[changedIndex]))
+    + Number(nextVisible)
+  let visibleByIndex = state.visibleByIndex
+  if (previousVisible !== nextVisible) {
+    const next = [...visibleByIndex]
+    next[changedIndex] = nextVisible
+    visibleByIndex = next
+  }
   const firstToken = isTokenDelta(chunk)
   return {
     ...state,
     blocks,
+    visibleByIndex,
     visibleBlocks,
-    hidden: visibleBlocks > 0 ? false : state.hidden,
     ...visibleBlocks > 0 && state.firstVisibleSeq === undefined
       ? { firstVisibleSeq: seq, firstVisibleTime: time }
       : {},
@@ -167,11 +176,12 @@ function settleMessage(
   event: SessionEvent<'assistant/message'>,
 ): AssistantState {
   const blocks = toAssistantBlocks(event.data.message.content)
+  const visibleByIndex = blocks.map(blockIsVisible)
   return {
     ...state,
     blocks,
-    visibleBlocks: countVisibleBlocks(blocks),
-    hidden: false,
+    visibleByIndex,
+    visibleBlocks: visibleByIndex.reduce((count, visible) => count + Number(visible), 0),
     final: match,
     usage: event.data.usage,
   }
@@ -264,7 +274,8 @@ function projectAssistant(context: ConversationNodeContext<AssistantState>): Ass
   const status = settled?.interrupted === true
     ? 'interrupted'
     : settled === undefined ? 'running' : 'settled'
-  const anchorSeq = settled?.seq ?? state.firstVisibleSeq ?? context.matches[0]?.event.seq ?? 0
+  const anchorSeq = (settled?.interrupted === true ? settled.seq : state.firstVisibleSeq ?? settled?.seq)
+    ?? context.matches[0]?.event.seq ?? 0
   const time = settled?.time ?? state.firstVisibleTime ?? context.matches[0]?.event.time ?? 0
   return {
     anchorSeq,
@@ -289,7 +300,7 @@ function publishedAssistantData(
   return location?.kind === 'step' ? location.step.data.get('assistant-step') : undefined
 }
 
-/** Per-step Assistant streaming/final/interruption Definition. */
+/** Per-step Assistant lifecycle; materialized keys survive cleared stream content as hidden Nodes. */
 export const assistantDefinition: ConversationNodeDefinition<AssistantState> = {
   kind: 'assistant-step',
   target: 'chat',
@@ -337,17 +348,18 @@ export const assistantDefinition: ConversationNodeDefinition<AssistantState> = {
     }
   },
   buildViewNode: (context) => {
+    const current = context.current.get('chat')
     const state = context.state ?? fallbackState(context)
-    if (state === undefined) return null
     const data = publishedAssistantData(context)
-    if (data === undefined) return null
+    if (state === undefined || data === undefined) {
+      return current == null ? null : { ...current, visibility: 'hidden' }
+    }
     const settled = data.finalNode
     const visible = settled === undefined ? state.visibleBlocks > 0 : hasVisibleContent(data.blocks)
-    if (settled === undefined && !visible) {
-      const current = context.current.get('chat')
-      if (!state.hidden || current === undefined || current === null) return null
-    }
-    const anchorSeq = settled?.seq ?? state.firstVisibleSeq ?? context.matches[0]?.event.seq ?? 0
+    if (settled === undefined && !visible && current == null) return null
+    // A successful message retains its live anchor alongside pending Tool calls.
+    const anchorSeq = (settled?.interrupted === true ? settled.seq : state.firstVisibleSeq ?? settled?.seq)
+      ?? context.matches[0]?.event.seq ?? 0
     return chatNode(context, 'assistant-step', anchorSeq, data, {
       visibility: settled?.interrupted === true || visible ? 'visible' : 'hidden',
     })
@@ -359,5 +371,14 @@ export const assistantDefinition: ConversationNodeDefinition<AssistantState> = {
  * @param ctx - owning UI Conversation context.
  */
 export function registerAssistantConversationNode(ctx: Context): void {
-  ctx.uiConversation.events.register(assistantDefinition)
+  const match = assistantDefinition.match.bind(assistantDefinition)
+  ctx.uiConversation.events.register({
+    ...assistantDefinition,
+    match: {
+      'step/start': match,
+      'assistant/live-chunk': match,
+      'assistant/message': match,
+      'llm/retry': match,
+    },
+  })
 }

@@ -76,7 +76,7 @@ kind: "package-reference"
 ### 设计
 
 - **语法，而非自由文本。** 解析器只在控制词（`clear`、`pause`、`resume`、`edit`）填满整个输入时识别它们；其他任何非空后缀都是目标。单独的 `edit` 无效，且 `edit` 拒绝直接替换未完成的 goal。
-- **领域拒绝变成稳定错误。** `GoalError` 结果会转换为带固定消息的直接命令错误；意外失败会重新抛出，使适配器报告命令失败而非领域结果。渲染输出绝不暴露带品牌类型的 id 或 revision。
+- **领域拒绝变成稳定错误。** 除 `GOAL_STATE_CORRUPT` 外的 `GoalError` 结果会转换为带固定消息的直接命令错误；goal 状态损坏与意外失败会重新抛出，使适配器报告命令失败而非领域结果。渲染输出绝不暴露带品牌类型的 id 或 revision。
 - **附件随目标提交。** create 或 edit 成功时，命令提交一条用户 followup 消息，按选择顺序携带已准入的图片块与文件块，再附加固定文本 `Reference attachments for the goal objective.`。其他路径不提交消息，因此分发方 composer 保留草稿和附件卡。
 
 ### 源码地图
@@ -84,7 +84,6 @@ kind: "package-reference"
 | 文件 | 职责 |
 |---|---|
 | [`src/index.ts`](src/index.ts) | 插件入口：命令语法、状态渲染、附件提交 |
-| — | 不发布运行时不变式伴生入口；此命令适配器不拥有事件流或状态投影；已接受的变更由 goal 领域检查，命令分发行为由包测试覆盖。 |
 
 </details>
 
@@ -97,7 +96,7 @@ kind: "package-reference"
 
 - [goal 服务](../goal/README.zh.md)——命令变更的状态与生命周期。
 - [命令服务](../../interaction/commands/README.zh.md)——命令注册表约定与分发。
-- [Harness 层目标式执行 Agent Note](../../../.agents/notes/implemented/feature/2026-07-16-harness-level-loop.zh.md)——用户体验与组合决策。
+- [历史Harness 层目标式执行 Agent Note](../../../.agents/notes/archived/feature/2026-07-16-harness-level-loop.md)——用户体验与组合决策。
 
 -----
 

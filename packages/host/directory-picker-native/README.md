@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-An operator at the host's display picks a workspace directory through a native OS chooser: `dsh-host-directory-picker-native` opens one platform directory chooser per pick and resolves the chosen absolute path (`null` on cancel). macOS drives `osascript`, Linux uses Zenity with a KDialog fallback, and Windows opens the modern `IFileOpenDialog` in a spawned child process. Only viable when the operator sits at the host's display — remote deployments compose the [browse backend](../directory-picker-browse/README.md) instead. One composition row also registers the matching browser-side interaction in the workspace flow, so it selects both sides.
+An operator at the host's display picks a workspace directory through a native OS chooser: `dsh-host-directory-picker-native` opens one platform directory chooser per pick and resolves the chosen absolute path (`null` on cancel). macOS drives a scripted AppKit panel that carries the standard Edit menu, Linux uses Zenity with a KDialog fallback, and Windows opens the modern `IFileOpenDialog` in a spawned child process. Only viable when the operator sits at the host's display — remote deployments compose the [browse backend](../directory-picker-browse/README.md) instead. One composition row also registers the matching browser-side interaction in the workspace flow, so it selects both sides.
 
 ## Table of Contents
 
@@ -53,7 +53,7 @@ The backend is a thin service over a platform chooser: `NativeDirectoryPicker` r
 
 ### Platform mechanics
 
-Platform tools run without a shell: `osascript` on macOS, and Zenity with a KDialog fallback on Linux; the caller's abort terminates the native process. Windows opens the modern `IFileOpenDialog` in a spawned child process — a koffi-driven COM conversation on the child's main thread with the best thread DPI awareness the host accepts (per-monitor-v2 first), aborted by posting `WM_CLOSE` to the dialog thread. Immediately before `Show`, the child synthesizes one Alt press through `keybd_event`, which lets the dialog activate as the foreground window even when a background host process spawned the child.
+Platform tools run without a shell: on macOS one `osascript -l JavaScript` script runs through the system JXA host, installs a main menu carrying the standard Edit key equivalents, and opens `NSOpenPanel`. Application activation is queued on the main operation queue to run inside the panel's modal event loop; requesting activation synchronously before that loop starts can leave the panel inactive. A native panel resolves ⌘C/⌘V/⌘A/⌘X against that menu rather than the focused field, which AppleScript's menu-less `choose folder` dialog could not provide. Linux uses Zenity with a KDialog fallback, and the caller's abort terminates the native process. Windows opens the modern `IFileOpenDialog` in a spawned child process — a koffi-driven COM conversation on the child's main thread with the best thread DPI awareness the host accepts (per-monitor-v2 first), aborted by posting `WM_CLOSE` to the dialog thread. Immediately before `Show`, the child synthesizes one Alt press through `keybd_event`, which lets the dialog activate as the foreground window even when a background host process spawned the child.
 
 ### Source map
 
@@ -96,6 +96,7 @@ None; this package neither assembles nor sends a provider request.
 
 These limits define when the native interaction is unavailable or fragile. They are current package constraints, not a task backlog.
 
+- **macOS controls application activation** — Queued activation does not guarantee immediate focus. First-click directory selection with a physical mouse has been validated on macOS 26.6.2 only.
 - **Linux requires desktop tooling** — with neither Zenity nor KDialog installed, `pick` rejects with an actionable error; it does not fall back to a typed-path prompt (the browse backend is that fallback at the composition level).
 - **Windows has no mechanism fallback** — the child-process picker through packaged koffi is the only native tier, so a COM refusal or dialog crash surfaces the failure; the browse backend remains the fallback at the composition level.
 - **Windows foreground grant relies on injected input** — the child synthesizes an Alt press before `Show` so the dialog can take the foreground from a background host; where synthesized input is suppressed (secure desktops, restricted remote sessions, an elevated foreground window), the dialog may still open behind other windows. The technique is validated on Windows 11 only.
@@ -109,5 +110,3 @@ These limits define when the native interaction is unavailable or fragile. They 
 None.
 
 </details>
-
-**Runtime invariant:** No companion is published. Each pick is one stateless subprocess round trip; the chooser outcome is only the returned path.

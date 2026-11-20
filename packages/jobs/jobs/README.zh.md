@@ -1,5 +1,5 @@
 ---
-description: "后台任务注册表约定，供组合、实现或排查后台工作的用户与维护者阅读：id、归属、生命周期与完成监听器。"
+description: "后台任务注册表约定，供组合、实现或排查后台工作的用户与维护者阅读：id、归属、生命周期、输出环与事件流。"
 kind: "package-reference"
 ---
 
@@ -9,7 +9,7 @@ kind: "package-reference"
 
 ## 概述
 
-`dsh-jobs` 让工具可以在 agent（智能体）继续推进时保持长时间工作运行。每项任务都会获得稳定的 `<kind>-N` id，拥有它的 agent 可以读取输出、带超时等待或请求取消。归属范围限定在 agent 会话内，因此其他 agent 无法查看或停止任务；任务完成时会通过会话内通知送达，无需轮询。只有部署提供任务执行能力时，后台任务才能启动。
+`dsh-jobs` 让工具可以在 agent（智能体）继续推进时保持长时间工作运行。每项任务都会获得稳定的 `<kind>-<short-uuid>` id，拥有它的 agent 可以读取输出、带超时等待或请求取消。归属范围限定在 agent 会话内，因此其他 agent 无法查看或停止任务；任务完成时会通过会话内通知送达，无需轮询。用户可以查看保留的实时输出，而不消耗 agent 可读取的内容。只有部署提供任务执行能力时，后台任务才能启动。
 
 ## 目录
 
@@ -29,11 +29,15 @@ kind: "package-reference"
 
 ### 后台任务提供什么
 
-生产方以 kind 和一行标签注册工作；注册表返回 `<kind>-N` id，例如 `bash-1`。拥有任务的任何一方都可以读取输出、列出任务、带超时等待结算或请求取消——每次调用都返回任务状态的全新快照，从 `running`、`stopping` 到终止态的 `completed`、`killed` 或 `failed`。任务结算时，拥有它的 agent 会通过 `dsh-tool-jobs` 转成会话内通知的完成监听器得到通知，因此无需轮询。生产方还可以附加可选的字节上限，让每次完整的模型侧输出读取或完成通知保持有界。
+生产方以 kind 和一行标签注册工作；注册表返回 `<kind>-<short-uuid>` id，例如 `bash-<short-uuid>`，其中后缀是 UUID 的 16 位小写十六进制字符。拥有任务的任何一方都可以读取输出、列出任务、带超时等待结算或请求取消——每次调用都返回任务状态的全新投影，从 `running`、`stopping` 到终止态的 `completed`、`killed` 或 `failed`。任务结算时，注册表的事件流宣布它，`dsh-tool-jobs` 把结算变成会话内通知，因此无需轮询。生产方可以附加一个可选的字节上限，让每次完整的模型侧读取或通知保持有界。
+
+生产方通过在 spec 上声明拉取源——由注册表按自己的节奏泵送的非消耗偏移读取器——或经 starter 收到的 `JobHandle` 推送块来流式输出；二者都落入该 job 的有界环，其中 `stdout` 与 `stderr` 块到达模型，`log` 块只到达观察者。观察者按绝对字节偏移读取保留块并在推进时收到信号；结束 job 的结算同时封流，在此之前 `updateProgress` 把实时进度行发布进每个投影。观测对模型不可见：`readAt` 不消耗任何东西，也从不触碰通知状态。
+
+随附提供方还会在 Session 中记录有所有者 job 的生命周期元数据。工具创建 job 时，生产方附加 `JobSpec.toolCall`，保留嵌套调用与根调用标识。时间与重启语义见[持久化事件字段](../../../docs/subsystems/jobs.zh.md#session-lifecycle-records)。
 
 ### 归属边界
 
-任务属于启动它的 agent 会话：其他 agent 无法读取或停止它。`bash-1` 这样的 id 可预测，因此这道隔离是授权，而非保密。没有所有者启动的任务对任何调用方开放，并持续到服务被释放为止。
+任务属于启动它的 agent 会话：其他 agent 无法读取或停止它。id 可能出现在工具输出中；注册表按所有者校验每次控制操作。没有所有者启动的任务对任何调用方开放，并持续到服务被释放为止。
 
 ### 启动后台工作需要一个控制器
 
@@ -50,7 +54,7 @@ kind: "package-reference"
 
 ### 可能出什么问题
 
-任何预检拒绝都不会留下 job id 或已注册的工作。由随附的进程内注册表管理的任务会随 harness 进程终止而消失；跨重启的持久执行需要一个实现本约定的不同后端。
+任何预检拒绝都不会留下 job id 或已注册的工作。接缝导出 `JobError`：它是 `HarnessError`，code 取自 `JOB_ERROR_CODES`（如 `JOB_NOT_FOUND`、`JOB_FOREIGN_SESSION`、`JOB_LIMIT_REACHED`），供实现和任务工具报告预期的任务失败，使结果带有可路由的 `error.name` 和 `error.code`。由随附的进程内注册表管理的任务会随 harness 进程终止而消失；跨重启的持久执行需要一个实现本约定的不同后端。
 
 -----
 
@@ -67,7 +71,7 @@ kind: "package-reference"
 - **约定与实现分属不同包。** `JobRegistry` 是抽象 Cordis 服务；直接加载该类会抛出异常，因此错误配置的组合会在加载时失败，而不是注册一个空的 `ctx.jobs`。
 - **每个进程一个注册表，按所有者返回结果。** 一个实例服务进程内的每套组合，因此注册与投递都相对注册方所在 scope：从不带 scope 的上下文注册的控制器或监听器服务于每个所有者；在某套 agent 组合的 scope 下注册的，恰好服务于该组合下组合出的 agent。
 - **访问以所有者的会话 id 为界。** id 可预测，因此是授权——而非保密——构成边界。
-- **结算首次优先，完成最后宣布。** 一条终止记录、释放的等待方，以及一轮受到隔离的监听器通知；完成在记录提交且该结算的所有其他观察者都已看到之后才宣布，因为报告方可能同步开启一个模型轮次。
+- **结算首次优先，其事件跟在每个被释放的等待方之后。** 一条终止记录、释放的等待方，然后是一轮受到隔离的事件投递；`settled` 事件报告它是否释放了一个存活的 `wait`（`awaited`），因此无论是哪个插件在等待，`dsh-tool-jobs` 永远不会播报等待方已经收走的完成。
 - **注册的存续期长于生产方与控制器 fiber。** 所有者与服务释放会取消正在运行的工作并等待守约的生产方；销毁期间的取消若抛出异常，只会将记录强制标记为失败。
 
 ### 源码地图
@@ -75,13 +79,17 @@ kind: "package-reference"
 | 文件 | 职责 |
 |---|---|
 | [`src/index.ts`](src/index.ts) | 插件入口：抽象 `JobRegistry` 服务及其约定 |
-| [`src/types.ts`](src/types.ts) | 共享词汇：`JobKindMap`、`JobStart`、`JobHooks`、`JobSnapshot`、监听器类型 |
-| [`src/brand.ts`](src/brand.ts) | `JobId` 带类型标记的标识符，无需 agent 依赖即可导入 |
-| [`src/invariant.ts`](src/invariant.ts) | 不变式伴生插件：校验快照标识、状态、时间戳与所有者字段 |
+| [`src/types.ts`](src/types.ts) | 纯类型 `/types` 入口：共享 job 类型和 `JobId` 再导出 |
+| [`src/brand.ts`](src/brand.ts) | `JobId` 定义与兼容构造函数 |
+| [`src/view.ts`](src/view.ts) | 客户端安全叶子：`JobView`、`JobChunk`、`JobStatus` 与可合并扩展的 `JobKindMap` |
+| [`src/error.ts`](src/error.ts) | `JobError` 及其封闭的 `JOB_ERROR_CODES` 列表 |
+| [`src/archive-admission.ts`](src/archive-admission.ts) | Workspace 注册表归档准入中的 `job` 族，由接缝构造函数为每个实现安装 |
 
 ### 服务操作
 
-每个操作都是已注册任务之上的薄投影：`get` 与 `list` 返回非消费式快照，`read` 推进唯一的流游标，`kill` 在改变状态前调用生产方取消，`wait` 最多阻塞至超时，`start()` 在调用生产方 `run()` 一次之前预检访问、校验与准入，同时拒绝任何没有已附加控制器服务的所有者；监听器按所有者粒度观察终止记录与可见集变化，`attachController` 把控制器可用性限定在其 effect 生命周期内。确切签名与行为见 [`src/index.ts`](src/index.ts) 的 JSDoc 与生成的 [`ctx.jobs` Cordis 接口面](../../../docs/subsystems/jobs.zh.md)。
+每个读取或控制操作接收可选的调用方 `SessionId`，省略时仅允许访问无主 job：`list` 与 `get` 返回全新投影，`read` 推进模型游标并在结算后把生产方的 result 交出一次，`readAt` 按绝对偏移读取保留块且不消耗任何东西，`kill` 在改变状态前调用生产方取消并为终态 `detail` 记录原因，`wait` 阻塞至超时，`remove` 丢弃调用方经自己的等待收走且从未交出的已结算记录，`start()` 在调用生产方 `run()` 一次之前预检访问、校验与准入，同时拒绝任何没有已附加控制器服务的所有者；`events.subscribe` 按所有者、scope 或进程粒度投递注册、进度、停止中、结算、移除与输出提交。
+
+每个实现还会回答 Workspace 注册表的归档准入（[接缝](../../workspace/workspace/README.zh.md)），由接缝的构造函数只通过抽象的 `list` 与 `kill` 安装：`workspace/session-activity` 把被询问会话拥有的运行中或停止中任务作为 `job` 族报告，每个任务一项、附其 label；`workspace/session-stop` 以原因 `session archived` 逐个 kill 它们，因此一个在取消时抛错的生产方只记日志，该会话的其他任务仍会停止。无主任务不属于任何会话，绝不会为某个会话被报告或 kill。
 
 </details>
 
@@ -92,12 +100,13 @@ kind: "package-reference"
 
 当包级约定不够用时阅读以下页面。它们从任务类型逐步进入随附实现、模型侧控制与设计记录。
 
-- [后台任务运行时子系统](../../../docs/subsystems/jobs.zh.md)——任务类型、快照字段与 `ctx.jobs` 的 Cordis 接口面。
+- [后台任务运行时子系统](../../../docs/subsystems/jobs.zh.md)——任务类型、投影字段与 `ctx.jobs` 的 Cordis 接口面。
 - [jobs 组映射](../README.zh.md)——同级组页面及其包表格。
 - [进程本地注册表](../jobs-local/README.zh.md)——在本进程中运行任务的随附实现。
 - [模型侧任务控制](../tool-jobs/README.zh.md)——`job_output`、`job_list` 与 `job_kill` 工具及完成通知。
-- [通用长时间运行工具运行时 Agent Note](../../../.agents/notes/implemented/architecture/2026-06-20-generic-long-running-tool-runtime.zh.md)——后台任务运行时背后的设计。
+- [Jobs 生命周期与输出归属](../../../.agents/notes/implemented/architecture/2026-09-03-jobs-seam-consolidation.zh.md)——一套生命周期、输出环与观测流。
 - [任务注册表 seam Agent Note](../../../.agents/notes/archived/architecture/2026-07-26-job-registry-seam.md)——按所有者隔离的注册表约定及其理由。
+- [jobs seam 收敛 Agent Note](../../../.agents/notes/implemented/architecture/2026-09-03-jobs-seam-consolidation.zh.md)——一个输出环、一个投影、一条事件流。
 
 -----
 
@@ -117,9 +126,9 @@ kind: "package-reference"
 
 这些限制说明约定何时不合适。它们是当前包约束，不是任务积压。
 
-- **约定是进程内的**——`JobStart.run()` 传入回调和确切的 `Agent` 对象；持久化或跨进程后端必须先重塑身份、重启、所有权与观察语义，才能实现此 seam。
-- **流输出只有一个消费游标**——独立观察者需要游标或快照 API。
-- **前台工作无法转为后台**——生产方在启动前选择前台或后台。
+- **约定是进程内的**——`JobSpec.run()` 传入回调，注册表解析拥有者会话背后的活体 `Agent`；持久化或跨进程后端必须先重塑身份、重启、所有权与观察语义，才能实现此 seam。
+- **模型游标是唯一的消耗式读取**——独立观察者使用非消耗的 `readAt`，从不移动它。
+- **已结算记录会一直列出直到被移除**——由持有者释放、服务释放，或收走它的调用方显式 `remove`；注册表不对已结算 job 保留任何数量上限。
 
 <a id="dev-note"></a>
 ### 开发备注

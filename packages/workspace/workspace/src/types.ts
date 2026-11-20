@@ -6,8 +6,8 @@
  */
 
 import type { Branded } from '@deepseek-ai/dsh-brand'
-import type { SessionId } from '@deepseek-ai/dsh-session/types'
-import type {} from '@deepseek-ai/dsh-typert-protocol'
+import type { SessionHeader, SessionId } from '@deepseek-ai/dsh-session/types'
+import type { TypertResource } from '@deepseek-ai/dsh-typert-protocol'
 
 /**
  * Identifies one workspace record. A generated uuid, never the path: path
@@ -16,6 +16,11 @@ import type {} from '@deepseek-ai/dsh-typert-protocol'
 export type WorkspaceId = Branded<'WorkspaceId'>
 
 declare module '@deepseek-ai/dsh-typert-protocol' {
+  interface TypertResourceMap {
+    /** One Workspace; the Workspace Controller registers its default `workspaceId` wire field. */
+    workspace: TypertResource<WorkspaceId>
+  }
+
   interface RemoteErrorDetailsMap {
     /** No registration carries that Workspace identity. */
     'workspace/not-found': { readonly workspaceId: WorkspaceId }
@@ -23,10 +28,43 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
 }
 
 /**
+ * Activity families a `workspace/session-activity` listener may report. This
+ * package declares none: each provider merges its own key from a module both
+ * its Host and Client faces import, so a consumer that renders the families
+ * sees exactly the keys its program compiled and falls through to a generic
+ * description for any other. The shipped providers merge `turn` (the Agent
+ * registry), `job` (the job registry seam), `subagent` (the Subagent
+ * runtime), and `schedule` (the Schedule plugin).
+ */
+export interface SessionActivityKindMap {}
+
+/** One activity family key. */
+export type SessionActivityKind = keyof SessionActivityKindMap
+
+/** One active item of a family that has per-item identity. */
+export interface SessionActivityItem {
+  /** Family-specific identity: a session id, a job id, or a schedule id. */
+  readonly id: string
+  /** Display label when the family carries one (a job label, a subagent label). */
+  readonly label?: string
+}
+
+/**
+ * One reason a session counts as active for archive admission. Families with
+ * per-item identity list their items so a caller can name what must stop.
+ */
+export interface SessionActivity {
+  readonly kind: SessionActivityKind
+  /** Active items of the family; absent for a family without per-item identity (`turn`). */
+  readonly items?: readonly SessionActivityItem[]
+}
+
+/**
  * One workspace: a stable id over an existing directory, a display title, and
- * an ordered candidate account of sessions. Membership requires both an id in
- * that account and a session header whose canonical cwd equals the workspace
- * path. Consumers only see this interface; the implementation stays private.
+ * an ordered candidate account of sessions. Membership validates header cwd
+ * against the workspace path, but preserves an existing account when its
+ * fully qualified cwd is missing. Consumers only see this interface; the
+ * implementation stays private.
  */
 export interface Workspace {
   /** Stable record id (generated uuid). */
@@ -53,10 +91,19 @@ export interface Workspace {
    * prepended at attach, explicit reordering goes through
    * `insertSessionBefore`, and activity never reorders. The durable candidate
    * account is filtered synchronously: missing headers, invalid cwd values,
-   * and canonical cwd mismatches are never returned. A subsequent workspace
-   * mutation prunes those filtered candidates durably.
+   * and canonical cwd mismatches are never returned. A fully qualified cwd
+   * whose realpath or directory stat fails with ENOENT preserves an existing
+   * candidate, including a dangling symlink; other filesystem failures do not.
+   * A subsequent mutation prunes filtered candidates, not missing-directory
+   * candidates. This does not admit new sessions or recreate directories.
    */
   readonly sessionIds: readonly SessionId[]
+
+  /**
+   * List the stored headers of the current members.
+   * @returns a new array with one header per entry of {@link sessionIds}, in the same order.
+   */
+  getSessionHeaders(): readonly SessionHeader[]
 
   /**
    * Replace the display title durably.

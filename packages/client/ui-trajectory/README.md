@@ -25,21 +25,25 @@ The Trajectory tab lets you inspect agent activity as a turn-aware ledger and in
 <a id="use-this-package"></a>
 ## Use this package
 
-Open the Trajectory tab in the conversation's view ring to inspect agent activity as an event ledger and timeline. The ledger covers records with an explicit loading row until the initial tail is positioned; while an older prefix remains unloaded, a first-row control loads one earlier page on click and shows a disabled loading status while that page is pending.
+Open the Trajectory tab in the conversation's view ring to inspect agent activity as an event ledger and timeline. The ledger covers records with an explicit loading row until the initial tail is positioned; while an older prefix remains unloaded, a first-row control loads one earlier page on click and shows the shared ongoing loader while that page is pending.
 
 ### Inspecting records
 
-Calls are identified by their recorded tool name. For `run_code`, the row shows the program description and the inspector opens numbered, highlighted source. The Code tab provides wrapping, a `{}` toggle for the original JSON arguments, and exact source copying, including trailing newlines. Copying the original arguments retains their recorded JSON whitespace. Each newly opened code view takes the last wrapping choice; changing it leaves other open views as they are. Output preserves the recorded text, using a tree for complete JSON objects or arrays. Highlighting uses only an unambiguous TypeScript or Python hint in the recorded tool schema; missing or conflicting hints leave plain source. See the [PTC inspection decision](../../../.agents/notes/implemented/feature/2026-09-09-ptc-trajectory-code-inspection.md) for replay constraints.
+The toolbar folds turns, calls, and subcalls independently. Subcalls fold into a summary beneath their parent tool; click the summary or press Enter or Space to expand it. Search includes folded subcalls, and cross-view inspection expands the requested call. Toolbar controls and search wrap onto additional lines when the pane is narrow.
 
-Selection, timeline navigation, folding, and search cover the React-visible window. Request numbers and cumulative usage cover the complete resident snapshot. Selecting a record opens a local inspector for token usage, duration, Input, Output, Timing, and durable images. Image URLs use the Conversation-owned per-session cache, so Chat and Trajectory share one authorized read per attachment. A user record shows both nonzero image and ordinary-file counts beside its text, including attachment-only records. A standalone compaction request appears chronologically in its own `Between turns` section, while a numbered compaction remains inside its owning turn.
+Calls are identified by their recorded tool name. For `run_code` and `cua_run_code`, the row shows the program description and the inspector opens numbered, highlighted source. The Code tab provides wrapping, a `{}` toggle for the original JSON arguments, and exact source copying, including trailing newlines. Copying the original arguments retains their recorded JSON whitespace. Each newly opened code view takes the last wrapping choice; changing it leaves other open views as they are. Output preserves the recorded text, using a tree for complete JSON objects or arrays. Highlighting reads the leading `Execute a program in` language declaration and the legacy `code` parameter description from the recorded tool schema. Only TypeScript and Python are supported. Missing or conflicting hints, or an explicit declaration of another language, leave plain source; later examples in the tool description do not affect language selection.
+
+Selection, timeline navigation, folding, and search cover the React-visible window. Request numbers and cumulative usage cover the complete resident snapshot. Selecting a record opens a local inspector for token usage, duration, Input, Output, Timing, and durable images. Image URLs use the Conversation-owned per-session cache, so Chat and Trajectory share one authorized read per attachment. The Trajectory view declares `conversation.trajectory.images`; ledger children call this Slot through the framework `renderSlot` seat, passing image references, display options, and the authorized loader explicitly. Its official `MessageImages` entry calls the shared `conversation.images.content` Factory. A user record shows both nonzero image and ordinary-file counts beside its text, including attachment-only records. A standalone compaction request appears chronologically in its own `Between turns` section, while a numbered compaction remains inside its owning turn.
 
 Summary and Preview share one ordered attachment list after the message text, preserving repeated references. Each row shows a contained image thumbnail or file-type icon, the recorded filename (a localized numbered label for unnamed images), and recorded size, type, and image dimensions where available. Zero-byte files retain their size, and truncated filenames expose the full name in a tooltip. Images open the existing lightbox. Raw keeps content-block order and unrendered text, with images and files in initially collapsed disclosures containing their complete recorded fields.
+
+Requests remain pending while awaiting output, streaming, or retrying. A request without assistant output has no result link; interrupted output remains inspectable and both the request and assistant record show failure, including when the Step start is outside the loaded history. Retry counts and the last attempt error remain available after recovery; they do not change the current request status. A completed model response does not imply that its tools or turn have finished.
 
 Thinking in the inspector uses compact Markdown at the inspector's fixed 13px size and 20px line height, independent of the content-size setting. Headings add bold weight without increasing size or line height. Assistant output keeps its regular Markdown typography.
 
 ### The timing overview
 
-Historical replies retain TTFT, generation duration, and throughput when their recorded streams contain token timestamps. TTFT measures from the Step start to its first token, including output from an earlier retry attempt; an unloaded Step start or a stream without tokens leaves the corresponding metric unavailable.
+Streaming replies retain their known start time and TTFT. After settlement, token timestamps provide generation duration; throughput also requires recorded usage. Historical replies retain the same recorded timing. TTFT measures from the Step start to its first token, including output from an earlier retry attempt; an unloaded Step start or a stream without tokens leaves the corresponding metric unavailable.
 
 A fixed Overview above the ledger projects real record start/duration timing from left to right; Assistant spans divide recorded TTFT from decoding, and a 500 ms hover reveals exact clock and duration details. Dragging an interval focuses the ledger on every record active at any point in that inclusive range; wheel gestures zoom the time domain; a right-button click clears the selected interval, and a right-button drag pans an already zoomed viewport. The initial view and streaming updates stay at the tail; scrolling upward suspends following so new records do not interrupt inspection of earlier rows.
 
@@ -53,9 +57,17 @@ A fixed Overview above the ledger projects real record start/duration timing fro
 
 The view is a pure projection: Trajectory-owned Definitions assemble business records from the shared Session window — including durable cancellation-finalized prefixes, chunk-only interruption fallbacks, and interrupted Tool records — so Trajectory neither reads nor changes the Chat conversation snapshot. Its steering classifier retains only next-step Inbox IDs through persistent splice state and shares each current claimed batch across later Contexts.
 
-Native and nested PTC Tool results retain their raw structured error details. Failed records show the error code in the ledger and the error name and code in the inspector.
+User, steering, and context inputs and request prompt changes share their request's Step group in log order, before the request separator and assistant output.
+
+Native and nested PTC Tool results retain their raw structured error details and presentation metadata. The Result tab stacks the live canonical value above the rendered content, with one scroll area for the entire panel and no section height limits. Both JSON trees preview long strings up to 12 lines and allow expansion. In-flight PTC calls show “Running…” until a result is available. Historical, failed, evicted, and unloaded raw results show “Raw results are only available for live tool calls” while rendered content remains available. There is no result-mode preference. The inspector subscribes only to the selected result while the Result tab is open, releasing it on selection changes or disposal; Session unload and connection loss clear the displayed value. JSON primitives, including `null`, remain inspectable. Summary previews continue to show rendered content.
+
+Failed records use non-empty recorded result text for ledger previews, inspector output, and output copying, preserving whitespace-only text. JSON failure output stays as recorded text in Summary and the rendered section of Result. With that text present, structured error names and codes are neither displayed nor separately indexed for search. Only failures without any non-empty text block fall back to the error code in the ledger and the error name and code in the inspector; image content remains visible beside that fallback.
+
+Tool records begin at durable tool/call events and retain complete argument text with a lazy `args` view, reused by paired results. Chat's transient preparing stage does not create Trajectory tool rows or alter historical tool timing.
 
 A complete appended prompt without a loaded request header appears as a standalone system row; only its known text is available, with no inferred request options or tool catalog. Prepending its request history replaces that standalone presentation without duplicating the prompt. In-history system prompt changes compare against the most recent request state, including earlier prompt updates without a new request header. Each request retains the prompt and change that applied at its own position. Surface replacements, including compaction, restore the last nonempty surviving system prompt even without a new system event; an unloaded prompt remains unavailable until its page arrives.
+
+The Trajectory Host plugin owns `ctx.sessionToolResults` and its `toolResults.watch` Remote stream, which inspects a successful tool’s final post-policy value by Session and result-event sequence. Values are held only in memory for the exact live Session instance: unloading the Session clears pending and committed values and invalidates open inspectors. Cold reads, restored sessions, forks, and exports do not recover or inherit values. A new inspector or reconnect can read retained values while that instance survives. Unloading the Trajectory plugin also clears every value; remounting starts empty even when the Session stays live. The Host config `maxResultsPerSession` defaults to 1000 and must be a positive integer. Pending and committed results share this per-Session count limit; new results evict the oldest entries and notify open inspectors. Committing a retained pending value moves it to the tail; inspection does not extend retention. This limit counts results, not bytes. This capability never writes Session events or projection checkpoints. The browser subscribes only to the selected result, and ordinary failures leave rendered content usable.
 
 ### Virtual rows
 
@@ -63,7 +75,7 @@ Long ledgers initially derive React data from 50 target Nodes ending at the moun
 
 ### Layout
 
-Trajectory asks the conversation shell to float the composer over the full-height ledger, while its responsive vertical scrollers reserve the composer's live height so final rows remain reachable. Scrollable Summary regions keep their scrollbar thumbs transparent until hovered or focused, without changing the reserved scroll geometry. The package provides no service and declares no Context merge.
+Trajectory asks the conversation shell to float the composer over the full-height ledger, while its responsive vertical scrollers reserve the composer's live height so final rows remain reachable. Scrollable Summary regions keep their scrollbar thumbs transparent until hovered or focused, without changing the reserved scroll geometry. The Host and Client compile separately; the Host service loads and unloads with the Trajectory plugin.
 
 </details>
 
@@ -84,7 +96,7 @@ These pages cover the conversation host and the session data this view projects.
 <a id="model-experience"></a>
 ## Model Experience
 
-None, as the package is a browser-side UI plugin layer that registers nothing model-facing.
+None, as the Trajectory UI and its read-only Host inspector register nothing model-facing.
 
 #### KV Cache effect
 
@@ -93,6 +105,8 @@ None; this package neither assembles nor sends a provider request.
 ## Known Limitations and Deferred Work
 
 <a id="known-limitations-and-deferred-work"></a>
+
+- **Tool-change presentation** — Tool-only developer messages name a single added or removed tool inline without expansion. Multiple changes show added/removed counts and expand to comma-separated tool lists, one line per change kind. Mixed content uses the generic context presentation.
 
 
 These limits define what the view can show while work is in flight; they are current package constraints.
@@ -108,5 +122,3 @@ These limits define what the view can show while work is in flight; they are cur
 None.
 
 </details>
-
-**Runtime invariant:** No companion is published. It is a pure-consumer plugin: it emits no Cordis events and owns no mutable cross-plugin state; its view-slot registration is a plain effect whose disposal the slot ledger's own specs and this package's behavior specs observe directly.

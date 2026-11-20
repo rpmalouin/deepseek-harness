@@ -21,8 +21,9 @@ import { fileURLToPath } from 'node:url'
 import type { Browser, Page } from 'playwright'
 import { chromium } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
-import { ToolCallId, createAssistantMessage, createToolResultMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
-import { SESSION_FORMAT_VERSION, Session, SessionId } from '@deepseek-ai/dsh-session'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import { type ToolCallId, createAssistantMessage, createToolResultMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
+import { SESSION_FORMAT_VERSION, Session, type SessionId } from '@deepseek-ai/dsh-session'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import type {} from '@deepseek-ai/dsh-session-title'
 import {
@@ -35,7 +36,7 @@ import {
   webSnapshotMode,
   type WebScaffold,
 } from './scaffold.ts'
-import { newEnglishPage, saveFailureShot } from './support.ts'
+import { openSettings, expandTurnProcesses, newEnglishPage, saveFailureShot } from './support.ts'
 
 const SNAPSHOT_DIR = fileURLToPath(new URL('./expected/clickable-links-gallery', import.meta.url))
 const UI_EXPECTED = fileURLToPath(new URL('./expected/clickable-links-gallery/ui.expected.md', import.meta.url))
@@ -77,6 +78,8 @@ interface GalleryCall {
 
 /** The five successful writes; docs/press.md and src/tokens.css join via other tools. */
 const WRITES = ['site/report.html', 'a/style.css', 'b/style.css', 'site/index.html', 'site/app.js']
+
+const LONG_COMMAND_DESCRIPTION = 'Check every generated stylesheet and component theme against the shared design tokens, inspect the application pages for inconsistent colors, and report all remaining lint failures before publishing the production build'
 
 /** The gallery turn's tool calls, in surface order. */
 const CALLS: GalleryCall[] = [
@@ -167,6 +170,16 @@ const CALLS: GalleryCall[] = [
     result: 'style.css: unexpected hex literal\n[exit code: 1]',
   },
   {
+    name: 'bash',
+    args: { command: 'pnpm run lint:styles', description: LONG_COMMAND_DESCRIPTION, workdir: 'site' },
+    result: 'theme.css: unexpected hex literal\n[exit code: 1]',
+  },
+  {
+    name: 'bash',
+    args: { command: 'pnpm run build', description: 'Build the site', workdir: 'site' },
+    result: '(no output)\n[timed out after 100ms]\n[exit code: null]',
+  },
+  {
     name: 'web_search',
     args: { queries: ['clickable link styles', 'produced files ui'] },
     result: 'Two sources found.',
@@ -198,7 +211,7 @@ const CALLS: GalleryCall[] = [
  *   the tripwire stays clean; the varying origin is tokenized in the golden).
  */
 function galleryFixture(imageUrl: string): string {
-  const session = Session.create(SessionId('clickable-links-gallery-source'))
+  const session = Session.create(brandString<SessionId>('clickable-links-gallery-source'))
   session.append('turn/start', { turn: 1 })
   const user = session.append('user/message', createUserMessage({
     content: text('Assemble the link gallery: write the report and styles, inspect the sources, and summarize.'),
@@ -212,7 +225,7 @@ function galleryFixture(imageUrl: string): string {
   session.append('step/start', { turn: 1, step: 1 })
   const calls = CALLS.map((call, index) => ({
     ...call,
-    callId: ToolCallId(`gallery-${String(index)}`),
+    callId: brandString<ToolCallId>(`gallery-${String(index)}`),
     argsJson: JSON.stringify(call.args),
   }))
   session.append('assistant/message', {
@@ -318,7 +331,7 @@ describe('web e2e: clickable links gallery', () => {
     await seedSession(scaffold, galleryFixture(imageUrl), SEED_ID, undefined, { createdAt: GALLERY_TIME })
     browser = await chromium.launch()
     page = await newEnglishPage(browser)
-    await page.route(/https?:\/\/docs\.example\.test\/.*/u, async route => route.fulfill({
+    await page.context().route(/https?:\/\/docs\.example\.test\/.*/u, async route => route.fulfill({
       contentType: 'text/html',
       body: `<h1>${new URL(route.request().url()).pathname}</h1>`,
     }))
@@ -372,12 +385,73 @@ describe('web e2e: clickable links gallery', () => {
     // — TOOL_VARIANTS has no entry for it, so it falls to the generic row with
     // no openable path even though its create still joins the produced chips.
     expect(await page.locator('button[class*="fileLink"]').count()).toBe(7)
+    // The collapsed web-fetch row's summary is its URL, opened in a new tab.
+    const fetchSummaryLink = page.locator(`a[class*="fileLink"][href="${FETCH_URL}"]`)
+    expect(await fetchSummaryLink.count()).toBe(1)
+    expect(await fetchSummaryLink.getAttribute('target')).toBe('_blank')
 
-    // Expanded cards. The turn-process group collapses a multi-call turn, so
-    // it opens first. Rows expand via a right-edge click: the row center can
-    // land on the nested fileLink button, which would hand the path to the
-    // Host's opener.
-    await page.getByRole('button', { name: `${String(CALLS.length)} tool calls` }).click()
+    await expandTurnProcesses(page)
+    const failedCommands = [
+      { description: 'Run the lint gate', long: false },
+      { description: LONG_COMMAND_DESCRIPTION, long: true },
+    ].map(({ description, long }) => ({
+      row: page.locator('[data-sample="bash"]').filter({ hasText: description }),
+      long,
+    }))
+    try {
+      for (const colorScheme of ['light', 'dark'] as const) {
+        await page.emulateMedia({ colorScheme })
+        await expect.poll(() => page.locator('body').evaluate(element => element.hasAttribute('data-ds-dark-theme'))).toBe(colorScheme === 'dark')
+        for (const { row, long } of failedCommands) {
+          const exitBadge = row.getByText('exit code 1', { exact: true })
+          await exitBadge.waitFor()
+          for (const width of ['760px', '260px']) {
+            await row.evaluate((element, value) => { element.style.width = value }, width)
+            const geometry = await exitBadge.evaluate((badge) => {
+              const description = badge.previousElementSibling!
+              const row = badge.closest('[data-sample]')!
+              const textRect = description.getBoundingClientRect()
+              const badgeRect = badge.getBoundingClientRect()
+              const rowRect = row.getBoundingClientRect()
+              return {
+                neutral: getComputedStyle(description).color === getComputedStyle(row).color,
+                fits: badgeRect.right <= rowRect.right + 1 && badgeRect.bottom <= rowRect.bottom + 1,
+                inline: Math.abs(badgeRect.top - textRect.top) < 5,
+                truncated: description.scrollWidth > description.clientWidth,
+                ellipsis: getComputedStyle(description).textOverflow === 'ellipsis',
+                singleLine: Math.abs(rowRect.height - textRect.height) < 1,
+                height: rowRect.height,
+                gap: badgeRect.left - textRect.right,
+              }
+            })
+            const context = JSON.stringify({ width, colorScheme, long, ...geometry })
+            expect(geometry.neutral, context).toBe(true)
+            expect(geometry.fits, context).toBe(true)
+            expect(geometry.inline, context).toBe(true)
+            expect(geometry.singleLine, context).toBe(true)
+            expect(geometry.height, context).toBeCloseTo(24, 0)
+            if (long || width === '760px') expect(geometry.truncated, context).toBe(long)
+            expect(geometry.ellipsis, context).toBe(true)
+            expect(geometry.gap, context).toBeCloseTo(8, 0)
+          }
+        }
+      }
+    } finally {
+      for (const { row } of failedCommands) await row.evaluate((element) => { element.style.width = '' })
+      await page.emulateMedia({ colorScheme: null })
+    }
+    // Clicking the collapsed summary link opens the page without expanding the row.
+    const fetchPopupPromise = page.waitForEvent('popup')
+    await fetchSummaryLink.click()
+    const fetchPopup = await fetchPopupPromise
+    try {
+      await fetchPopup.waitForURL(FETCH_URL)
+    } finally {
+      await fetchPopup.close()
+    }
+    expect(await page.locator('[data-web="fetch"]').count()).toBe(0)
+    // A row-center click can hit a nested summary link and invoke its opener;
+    // right-edge clicks expand the card itself.
     for (const row of [
       /^Search clickable link styles/,
       /^Fetch /,
@@ -385,12 +459,20 @@ describe('web e2e: clickable links gallery', () => {
       /^Edit src\/tokens\.css/,
       /^Grep linkColor/,
       /Run the lint gate|pnpm run lint/,
+      /Build the site/,
     ]) {
       const toggle = page.getByRole('button', { name: row }).first()
       await toggle.waitFor({ timeout: 10_000 })
       const box = await toggle.boundingBox()
       await toggle.click(box === null ? {} : { position: { x: box.width - 8, y: box.height / 2 } })
     }
+    const noExitCommand = page.locator('[data-sample="bash"]').filter({ hasText: 'Build the site' })
+    expect(await noExitCommand.getAttribute('data-state')).toBe('error')
+    expect(await noExitCommand.getByText('no exit code', { exact: true }).count()).toBe(1)
+    const noExitTerminal = page.locator('[data-terminal]').filter({ hasText: 'pnpm run build' })
+    expect(await noExitTerminal.getByText('no exit code', { exact: true }).count()).toBe(1)
+    expect(await noExitTerminal.getByText('[timed out after 100ms]', { exact: true }).count()).toBe(1)
+    expect(await noExitTerminal.getByText('[exit code: null]', { exact: true }).count()).toBe(0)
     // Both generic rows (the unclassified str_replace_editor and the unknown
     // design_tokens_sync) expand to their IN/OUT surfaces.
     const genericRows = page.getByRole('button', { name: /^Tool call/ })
@@ -402,7 +484,7 @@ describe('web e2e: clickable links gallery', () => {
     const sourceLink = page.locator(`a[href="${SOURCE_URL}"]`)
     await expect.poll(() => sourceLink.count(), { timeout: 10_000 }).toBe(1)
     expect(await page.locator('a[href^="ftp:"]').count()).toBe(0)
-    expect(await page.locator(`a[href="${FETCH_URL}"]`).count()).toBe(1)
+    expect(await page.locator(`a[href="${FETCH_URL}"]`).count()).toBe(2)
     expect(await page.locator(`a[href="${GUIDE_URL}"]`).count()).toBe(2)
 
     const snapshot = (await captureStableAria(page, '[class*="centerCol"]', scaffold.workspaceCwd))
@@ -425,7 +507,7 @@ describe('web e2e: clickable links gallery', () => {
       ['markdown anchor', guideLink],
       ['file mention', mentions.first()],
       ['search source', sourceLink.first()],
-      ['fetch url', page.locator(`a[href="${FETCH_URL}"]`).first()],
+      ['fetch url', page.locator(`[data-web="fetch"] a[href="${FETCH_URL}"]`)],
     ] as const) {
       expect.soft(await styleOf(link, 'color'), `${name} color`).toBe(LINK_BLUE)
       expect.soft(await styleOf(link, 'font-weight'), `${name} weight`).toBe('500')
@@ -436,8 +518,8 @@ describe('web e2e: clickable links gallery', () => {
     // globe in the same seat.
     const repoLink = markdown.locator(`a[href="${REPO_URL}"]`)
     expect(await repoLink.count()).toBe(1)
-    const repoMark = await repoLink.locator('svg path').getAttribute('d')
-    const globeMark = await guideLink.locator('svg path').getAttribute('d')
+    const repoMark = await repoLink.locator('svg path').first().getAttribute('d')
+    const globeMark = await guideLink.locator('svg path').first().getAttribute('d')
     expect(repoMark).not.toBe(globeMark)
     await guideLink.hover()
     expect(await styleOf(guideLink, 'text-decoration-line')).toBe('underline')
@@ -454,5 +536,31 @@ describe('web e2e: clickable links gallery', () => {
     await expect.poll(() => browserAddress.inputValue()).toBe(GUIDE_URL)
     await markdown.locator(`a[href="${HTTP_URL}"]`).click()
     await expect.poll(() => browserAddress.inputValue()).toBe(HTTP_URL)
+
+    await openSettings(page, 'en')
+    await page.getByRole('button', { name: 'In-App Sidebar', exact: true }).click()
+    await page.getByRole('menuitem', { name: 'Default Browser', exact: true }).click()
+    await expect.poll(() => scaffold.ctx.settings.describe().find(row => row.ns === 'ui-chat')?.value).toMatchObject({ linkOpening: 'new-tab' })
+    await page.keyboard.press('Escape')
+    const popupPromise = page.waitForEvent('popup')
+    await guideLink.click()
+    const popup = await popupPromise
+    try {
+      await popup.waitForURL(GUIDE_URL)
+      expect(await popup.evaluate(() => window.opener === null)).toBe(true)
+      expect(await browserAddress.inputValue()).toBe(HTTP_URL)
+    } finally {
+      await popup.close()
+    }
+
+    await page.reload()
+    await openSettings(page, 'en')
+    await page.getByRole('button', { name: 'Default Browser', exact: true }).click()
+    await page.getByRole('menuitem', { name: 'In-App Sidebar', exact: true }).click()
+    await expect.poll(() => scaffold.ctx.settings.describe().find(row => row.ns === 'ui-chat')?.value).toMatchObject({ linkOpening: 'sidebar' })
+    await page.keyboard.press('Escape')
+    await guideLink.click()
+    await expect.poll(() => browserAddress.inputValue()).toBe(GUIDE_URL)
+    expect(tripwire.pageErrors).toEqual([])
   }, 90_000)
 })

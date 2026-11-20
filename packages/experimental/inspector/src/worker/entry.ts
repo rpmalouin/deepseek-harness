@@ -9,7 +9,7 @@ import { startInspectorWorker } from './server.ts'
 if (parentPort === null) throw new Error('experimental inspector: Worker entry loaded on the main thread')
 const controlPort = parentPort
 
-const bootData = workerData as unknown
+const bootData: unknown = workerData
 if (!isPlainObject(bootData)
   || !(bootData.hostSourcePort instanceof MessagePort)) {
   throw new Error('experimental inspector: invalid Worker boot data')
@@ -43,13 +43,18 @@ controlPort.on('message', (message: unknown) => {
   }
 })
 
-try {
-  runtime = await startInspectorWorker(boot)
-  controlPort.postMessage({ type: 'ready', ...runtime.endpoint } satisfies InspectorWorkerControl)
-} catch (error) {
-  controlPort.postMessage({
-    type: 'failure',
-    message: error instanceof Error ? error.message : String(error),
-  } satisfies InspectorWorkerControl)
-  await stop()
+/** Start the Worker server and report readiness, or report the failure and stop. */
+async function main(): Promise<void> {
+  try {
+    runtime = await startInspectorWorker(boot)
+    controlPort.postMessage({ type: 'ready', ...runtime.endpoint } satisfies InspectorWorkerControl)
+  } catch (error) {
+    controlPort.postMessage({
+      type: 'failure',
+      message: error instanceof Error ? error.message : String(error),
+    } satisfies InspectorWorkerControl)
+    await stop()
+  }
 }
+
+void main()

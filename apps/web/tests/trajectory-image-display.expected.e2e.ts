@@ -77,11 +77,12 @@ it('renders durable record images in the Trajectory details panel from the share
   // The virtual ledger needs a measurable viewport; jsdom reports zero
   // heights, so pin one and neutralize the imperative tail scroll.
   vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(600)
+  vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(1000)
   Object.defineProperty(HTMLElement.prototype, 'scrollTo', {
     configurable: true,
     value: () => {},
   })
-  mountAssembledApp()
+  mountAssembledApp({ remote: { developerTools: true } })
   await openFixtureSession()
   const chatSrc = document.querySelector('[data-align="end"] img')?.getAttribute('src')
   if (chatSrc === null || chatSrc === undefined) throw new Error('chat gallery image missing')

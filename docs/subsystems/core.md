@@ -46,9 +46,9 @@ interface AgentHandle {
 }
 ```
 
-`CreateAgentOptions` carries the shared identity and everything a fresh agent needs before publication: an optional live `parentAgent`, session metadata (`meta` — validated `cwd`, fork lineage, the `isSeeded` marker, origin classification, delegation depth, and `agentPreset`), the exact fork cut in sibling field `inheritedEventCount`, an optional `seed` replay prefix, per-agent `AgentOptions`, a creation-only cancellation `signal`, and `setup`. `ResumeAgentOptions` is the persisted-identity counterpart: `resumeSessionId`, `parentAgent`, `agentOptions`, `signal`, and `setup`. The `setup` callback (`AgentSetup`) receives `(agentCtx, agent)` while both ids are still unpublished: the context owns scoped registrations, while the explicit Agent supplies the exact child Session without a reverse property on the Context. Everything registered through `agentCtx` exists before `agent/created` and the first prompt assembly. Setup may return a synchronous commit invoked immediately before publication; a setup rejection, commit throw, or owner disposal rolls the transaction back without publishing either id.
+`CreateAgentOptions` carries the shared identity and everything a fresh agent needs before publication: session metadata (`meta` — validated `cwd`, fork lineage, the `isSeeded` marker, origin classification, delegation depth, and `agentPreset`), the exact fork cut in sibling field `inheritedEventCount`, an optional `seed` history and, for a fork, the `parentSource` it shares the first `endSeq` seed events with, per-agent `AgentOptions`, a creation-only cancellation `signal`, and `setup`. `ResumeAgentOptions` is the persisted-identity counterpart: `resumeSessionId`, `agentOptions`, `signal`, and `setup`. The `setup` callback (`AgentSetup`) receives `(agentCtx, agent)` after Session store entry and completed `session/created`, before Agent registration: the context owns scoped registrations, while the explicit Agent supplies the exact child Session without a reverse property on the Context. Everything registered through `agentCtx` exists before `agent/created` and the first prompt assembly. Setup may return a synchronous commit invoked immediately before publication; a setup rejection, commit throw, or owner disposal unwinds the transaction, removes the Session, and preserves restored pending input and already stored events.
 
-`AgentFactory` is the creation interface behind the registry: the loop registers its factory via `ctx.agents.setFactory()`, so consumers use `ctx.agents` without depending on the concrete loop package. A runtime child creator sets `options.parentAgent`; the registry passes the options and caller Context to the factory without deriving one from the other. The exact `create`/`resume` signatures and rollback contracts are in the [generated section](#ctxagents--agentregistry) below.
+`AgentFactory` is the creation interface behind the registry: the loop registers its factory via `ctx.agents.setFactory()`, so consumers use `ctx.agents` without depending on the concrete loop package. The registry passes creation options and the caller Context to the factory; the caller Context owns the returned handle's lifetime. The exact `create`/`resume` signatures and rollback contracts are in the [generated section](#ctxagents--agentregistry) below.
 
 ## The agent handle
 
@@ -61,10 +61,12 @@ Source: [`packages/core/agent/src/types.ts`](../../packages/core/agent/src/types
 interface Agent {
   /** Session-backed Agent identity. */
   readonly id: SessionId
-  /** The provider route and model this agent's requests use. */
+  /** Route fallback and output controls; live accessors apply until the Session records a selection or request. */
   readonly options: AgentOptions
   /** The live session this agent drives; its log is the durable source of truth. */
   readonly session: Session
+  /** Agent-owned access to durable model selection for future steps. */
+  readonly model: Model
   /** Agent-owned access to durable pending work. */
   readonly inbox: Inbox
   /** The current lifecycle state, mirrored on every `agent/status` transition. */
@@ -76,6 +78,7 @@ interface Agent {
    * Clear queued and steering work — unless `keepInbox` — and abort the active
    * turn or between-turn task. The first cause wins for that activity. With no
    * active activity, cancellation is a no-op and does not arm later work.
+   * Queue-write failures still abort the activity and propagate to the caller.
    * @param cause - the stable caller intent carried by the active operation signal.
    * @param options - cancellation options; `keepInbox` preserves pending work.
    */
@@ -106,7 +109,7 @@ interface Agent {
    * turn and runs when the aborted activity converges to idle; a `disposed`
    * cancel leaves it parked. A wake submitted while already idle always opens
    * its turn boundary, even when its message is cleared before the driver
-   * claims ([cancel-convergence wake latch](../../../../.agents/notes/implemented/bug-fix/2026-08-07-cancel-convergence-wake-latch.md)).
+   * claims ([driver wake convergence](../../agent-loop/src/agent.ts)).
    * @param message - identified content and the source that supplied it.
    * @param target - the preferred next-turn or next-step inbox boundary.
    * @param wakeup - whether delivery may wake the driver.
@@ -193,20 +196,86 @@ type AssistantStreamFrame =
 `running` describes the driver-wide drain interval and may span consecutive queued turns; it does not prove a turn is still open. Disposal removes the agent from the registry and emits `agent/disposed`; it is not a terminal status value. `followup()` returns no handle: its `MessageId` identifies durable inbox insertion, claim, and discard facts, not a later assistant output or turn ending. `whenIdle()` observes the whole agent, so callers may call a receipt-to-idle interval a run only when they explicitly own that interval ([decision](../../.agents/notes/implemented/architecture/2026-07-30-followup-enqueue-and-owned-runs.md)).
 
 ```ts type-equiv
-/** Merge-extensible agent creation options. Persona belongs to system-prompt sections. */
+/**
+ * Merge-extensible agent options. Route fields may be live accessors until the
+ * Session records a selection or request; step preparation captures their value.
+ * Persona belongs to system-prompt sections.
+ */
 interface AgentOptions {
   /** Provider route (must have a registered adapter at call time). */
   provider?: string
   /** Model id interpreted by the selected provider adapter. */
   model?: string
   /** Adapter-owned reasoning effort for the selected provider/model route. */
-  reasoningEffort?: ReasoningEffortId
+  reasoningEffort?: ReasoningEffortId | undefined
   /** Maximum output tokens for each conversation-model request. */
   maxTokens?: number
 }
 ```
 
-Dispatch requires `provider` and `model` after `agent/request`. An explicit `reasoningEffort` seeds the first request on that route; exact-model resolution validates it, while omission allows the adapter default to materialize. When present, `maxTokens` must be a positive safe integer and caps every conversation-model request; omission allows the exact-model adapter default to materialize before the request header, or otherwise leaves provider behavior unchanged. An agent-scoped `deployment:persona-prefix` prompt section may shadow the global default persona.
+Step preparation requires `provider` and `model` before prompt assembly. The deprecated `agent/request` hook may change request controls but must preserve that route. An explicit `reasoningEffort` seeds the first request on that route; exact-model resolution validates it, while omission allows the adapter default to materialize. When present, `maxTokens` must be a positive safe integer and caps every conversation-model request; omission allows the exact-model adapter default to materialize before the request header, or otherwise leaves provider behavior unchanged. An agent-scoped `deployment:persona-prefix` prompt section may shadow the global default persona.
+
+`AgentLoop` registers `modelSelection` on `ctx.sessionProjections` and exposes selection operations through each `agent.model` instance. `model/selection` records a complete choice without entering model history. A matching request header clears `pending`; the latest request remains `lastUsed`. Adapter-defaulted effort is omitted so later requests resolve the default again. `next` is null only before either a choice or a request is recorded; in that case `AgentOptions` supplies the route. The [Agent model API](../../packages/core/agent/README.md) describes selection precedence and resume policy.
+
+```ts type-equiv
+/** Agent-owned access to the model choice for future steps. */
+interface Model {
+  /**
+   * Resolve the choice for the next step to begin preparation. Recorded choices
+   * take precedence over the last request and then the Agent's live options.
+   * This read neither starts a step nor changes an already-prepared step.
+   * @returns a detached choice, or undefined when no source names both provider and model.
+   */
+  current(): Readonly<ModelSelection> | undefined
+
+  /**
+   * Replace the next step's complete selection. Omitted effort follows adapter
+   * defaults without inheriting a previous effort or resolving defaults here.
+   * An equal recorded choice is a no-op; an options-only fallback is
+   * always recorded. Callers own model availability and capability validation.
+   * The append uses the Session's existing persistence and failure guarantees.
+   * @param selection - complete provider, model, and optional explicit effort.
+   */
+  select(selection: Readonly<ModelSelection>): void
+
+}
+```
+
+```ts type-equiv
+/** Complete provider, model, and optional reasoning effort chosen for one Session's model steps. */
+interface ModelSelection {
+  /** Registered provider route. */
+  provider: string
+  /** Provider-owned model id. */
+  model: string
+  /** Adapter-owned reasoning effort, or provider/default behavior when absent. */
+  reasoningEffort?: ReasoningEffortId
+}
+```
+
+```ts type-equiv
+/**
+ * Durable model-selection state for one Session. An effort the adapter
+ * defaulted on a recorded request is omitted, so later requests resolve the
+ * default again instead of pinning it as a choice.
+ */
+interface ModelSelectionProjectionState {
+  /** Selection used by the latest recorded model request. */
+  readonly lastUsed: ModelSelection | null
+  /** Later recorded selection not yet used by a matching model request. */
+  readonly pending: ModelSelection | null
+}
+```
+
+```ts type-equiv
+/** Client view of the durable model-selection fold. */
+interface ModelSelectionProjection {
+  /** Selection used by the latest recorded model request. */
+  readonly lastUsed: ModelSelection | null
+  /** Selection the next model step uses; null while the Agent's initial options supply the route. */
+  readonly next: ModelSelection | null
+}
+```
 
 The inbox is the delivery vocabulary — two ordered pending-message lists the agent owns as a durable projection:
 
@@ -297,7 +366,7 @@ type AgentCancelCause =
   | { readonly kind: 'disposed' }
 ```
 
-The cause is a TypeScript-enforced same-process input. An active cancellation holder copies it into the runtime-only `AbortSignal.reason`; a signal grants cooperating listeners no classification authority. Durable `turn/end` records the outcome as `{ kind: 'aborted', reason: TurnEndCancelCause }`, so the cancel cause lands in the terminal result.
+The cause is a TypeScript-enforced same-process input. An active cancellation holder exposes that same object as the runtime-only `AbortSignal.reason`; a signal grants cooperating listeners no classification authority. Durable `turn/end` records the outcome as `{ kind: 'aborted', reason: TurnEndCancelCause }`, so the cancel cause lands in the terminal result.
 
 The [event taxonomy](../architecture.md#events) owns the `agent/*` lifecycle, checkpoint, and waterfall contracts. Turn and step boundaries are durable session events rather than agent emits.
 
@@ -382,12 +451,13 @@ declare module '@deepseek-ai/dsh-llm' {
 }
 ```
 
-Five canonical maps use this pattern; a plugin author extends these:
+Six canonical maps use this pattern; a plugin author extends these:
 
 | Map | Package | Derives | Catalog |
 |---|---|---|---|
 | `ContentBlockMap` | dsh-llm | `ContentBlock` | [llm-streaming.md](llm-streaming.md#content-blocks-and-messages) |
 | `MessageSourceMap` | dsh-llm | `MessageSource` | [llm-streaming.md](llm-streaming.md#content-blocks-and-messages) |
+| `LlmRequestPurposeMap` | dsh-llm | `LlmRequestPurpose` | [llm-streaming.md](llm-streaming.md#the-model-request-and-result) |
 | `FinishReasonMap` | dsh-llm | `FinishReason` | [llm-streaming.md](llm-streaming.md#the-model-request-and-result) |
 | `TurnEndReasonMap` | dsh-session | `TurnEndReason` | [session.md](session.md) |
 | `SessionEventMap` | dsh-session | `SessionEvent` | [session.md](session.md) |
@@ -409,6 +479,26 @@ type Branded<B extends string> = string & { readonly [BRAND]: B }
 
 The two core IDs are `ToolCallId` (correlates a tool call with its result; dsh-llm) and `SessionId` (the shared live agent and durable session identity; dsh-session). Capability packages brand their own ids too, such as `JobId` in [jobs.md](jobs.md).
 
+## `TurnBoundaryProjection`
+
+`ctx.agents.turnBoundaryOf(session)` reads recorded turn and step positions without requiring a live Agent. The registry owns this state; consumers do not register its projection definition.
+
+Source: [`packages/core/agent/src/types.ts`](../../packages/core/agent/src/types.ts)
+
+```ts type-equiv
+/** Turn and step positions recorded in a Session. */
+interface TurnBoundaryProjection {
+  /** Seq of the open turn's `turn/start`, or null between turns. */
+  readonly openTurnStartSeq: OptionalSessionSeq
+  /** Seq of the latest `step/start` event, or null before the first step. */
+  readonly lastStepStartSeq: OptionalSessionSeq
+  /** The latest step boundary (`step/start` or `step/end`) and its seq, or null before the first step boundary. */
+  readonly lastStepBoundary: { readonly kind: 'start' | 'end'; readonly seq: SessionSeq } | null
+  /** Turn number of the latest `turn/start`; 0 before the first turn. */
+  readonly lastTurn: number
+}
+```
+
 <!-- BEGIN GENERATED cordis-surface (gen-cordis-catalog.ts) — do not edit between markers -->
 
 <a id="cordis-surface"></a>
@@ -421,7 +511,7 @@ Generated from source by `scripts/gen-cordis-catalog.ts` (verified fresh by `pnp
 
 ### `ctx.agentDefaultModel` — `AgentDefaultModelConfig`
 
-Owns the default model selection independently of any Host or transport. The composition entry remains usable without a settings provider; when one is mounted, its user layer is read live.
+Owns the default model selection independently of any Host or transport. Each operation reads the owning Config references.
 
 ```ts cordis-catalog
 /**
@@ -431,10 +521,11 @@ Owns the default model selection independently of any Host or transport. The com
 currentSelection(): ModelSelection
 
 /**
- * Save the complete default model selection. A deployment without a settings
- * provider keeps its composition entry.
+ * Save the complete default model selection. A deployment without a configuration
+ * editor keeps its composition entry. Saves commit in submission order; a failed
+ * save rejects its caller without blocking later saves.
  * @param next - resolved selection accepted by an entry point.
- * @returns fulfillment after the optional settings write settles.
+ * @returns fulfillment after the optional profile write settles.
  */
 async saveSelection(next: ModelSelection): Promise<void>
 ```
@@ -481,248 +572,112 @@ Types: [SessionHeader](persistence.md)
 
 Source: [`packages/core/agent-loop/src/index.ts`](../../packages/core/agent-loop/src/index.ts)
 
-<a id="ctxagentpresets--agentpresets"></a>
+<a id="ctxagentpresets--agentpresetregistry"></a>
 
-### `ctx.agentPresets` — `AgentPresets`
+### `ctx.agentPresets` — `AgentPresetRegistry`
 
-Registry over the deployment's agent presets.
-
-Discovery is unmemoized: `list()` and `resolve()` re-read the roots on every call so a preset authored while the process runs is visible immediately, and a preset deleted underneath a picker disappears from the next read.
+Registry of YAML-declared presets and the revisions live Agents retain.
 
 ```ts cordis-catalog
 /**
- * Every preset the configured roots currently supply.
- * @returns the presets, first-root-wins per id.
+ * Read the preset recorded for a Session, including selections no longer in the roster.
+ * @param session - Session whose committed preset selection is read.
+ * @returns the recorded preset, or null when none was selected.
+ */
+presetForSession(session: Session): string | null
+
+/** Register and eagerly load a definition; activation failure remains visible in the roster.
+ * @param definition Parsed configuration supplied by the declaring plugin.
+ * @returns Definition disposer after activation or its diagnostic settles; the declaring plugin owns it.
+ */
+async register(definition: PresetDefinition): Promise<() => Promise<void>>
+
+/** Inspect retained revisions, or the exact revision an Agent joined.
+ * @param ctx - optional Agent context; omission includes all retained revisions.
+ * @returns detached module references and isolation diagnostics; no match returns an empty list.
+ */
+inspectCompositions(ctx?: Context): AgentPresetInspection[]
+
+/** Read every declared preset, including activation failures.
+ * @returns Display metadata and loading diagnostics.
  */
 async list(): Promise<AgentPreset[]>
 
-/**
- * The roster off the Host: {@link list} projected to path-free rows, with
- * the policy-effective default marked, this deployment's authoring
- * capability, and its mode-selection policy beside it.
- *
- * Whether a client can open a preset's directory is the Host's own opener
- * capability, not a roster property — a caller needing both joins them.
- * @returns the rows, authoring capability, and effective selection policy.
+/** Read the selection roster.
+ * @returns Current presets, each marked when it is the default.
  */
 @Remote('list') async remoteExportList(): Promise<AgentPresetRoster>
 
-/**
- * Every preset's composition as flattened plugin rows, for plugin-listing
- * surfaces beside the roster's own picker.
- *
- * A preset with a live standing mount answers from its newest generation's
- * Loader entries — the composition new sessions join — even when the file
- * behind it has since been edited into an unreadable state: the mount is
- * what sessions actually run, so the broken verdict only applies to a
- * preset nothing composed. One never composed since boot answers from its
- * file, with `!!js` disabled gates evaluated against the Loader context so
- * both answers reflect the same host. Reading never mounts: an unmounted
- * preset is parsed, not composed, so listing a preset's plugins cannot
- * activate them early. A composition that stopped reading between
- * discovery's health verdict and this read is reported broken with the
- * raced reason rather than dropped.
- * @returns one composition per roster preset, in roster order.
- */
-async compositionInventory(): Promise<AgentPresetComposition[]>
-
-/**
- * Resolve one preset by id.
- *
- * A broken preset resolves — deleting one, reading one, and reporting one
- * all need the row — and the mounting paths refuse it AFTER resolution
- * through {@link resolveMountable}.
- * @param id - the preset id, or `undefined` for {@link defaultId}.
- * @returns the resolved preset.
- * @throws when no configured root supplies that id.
+/** Resolve an identity without starting an Agent.
+ * @param id Explicit preset or the current default.
+ * @returns Current metadata, including failure when activation failed.
  */
 async resolve(id?: string): Promise<AgentPreset>
 
-/**
- * Compose one agent from a preset: ensure the preset's standing mount, then
- * parent the agent's scope key to it so the mount's registrations and
- * listeners cover this agent.
- *
- * Call from the agent factory's `setup(agentCtx)`; a rejection there rolls
- * the agent creation back, so a broken preset never yields a half-composed
- * session.
- * @param agentCtx - the agent's scope context.
- * @param id - the preset id, or `undefined` for {@link defaultId}.
- * @returns the preset that was composed, for the caller to record.
- * @throws when the preset is unknown or its composition is unusable.
+/** Read one declaration's child plugin list as YAML, for viewing only.
+ * @param agentPreset Preset identity.
+ * @returns The declared composition beside its published metadata.
  */
-async mount(agentCtx: Context, id?: string): Promise<AgentPreset>
+@Remote('read') readDocument(agentPreset: string): Promise<AgentPresetDocument>
 
-/**
- * Join one agent to the SAME standing composition another already runs on.
- *
- * This is how a child agent inherits its parent's capabilities. It is a bind,
- * not a mount: the parent's generation is already composed, so the child gets
- * that exact instance — the same plugin objects, the same tool registrations,
- * the same prompt sections. Re-resolving the parent's preset by id instead
- * would re-read the roster, and a composition file edited since the parent
- * started would hand the child a DIFFERENT generation than the one its
- * parent's history was produced under (and a preset deleted since would fail
- * the child outright while its parent keeps running).
- *
- * Synchronous, and with no composition failure mode of its own — it reads no
- * roster, mounts nothing, and touches no file — which is what lets a child
- * creation window use it: the two in-process subagent drivers compose their
- * children inside a synchronous `setup`. It still rejects a caller error, as
- * the `@throws` below record.
- *
- * A parent that joined no preset — a rosterless deployment — yields no join
- * and no error: there, the model-facing rows sit in the host composition and
- * the child already sees them through the global layer.
- * @param agentCtx - the joining agent's scope context.
- * @param parentCtx - the scope context of the agent whose composition to join.
- * @returns the preset id joined, or undefined when the parent joined none.
- * @throws when `agentCtx` carries no scope, or has already joined a preset.
+/** Bind an unpublished Agent to the current preset revision.
+ * @param ctx Agent context from its setup callback.
+ * @param id Requested preset, or the default.
+ * @returns Bound preset identity.
  */
-composeFrom(agentCtx: Context, parentCtx: Context): string | undefined
+async mount(ctx: Context, id?: string): Promise<AgentPreset>
 
-/**
- * The preset one live agent runs on.
- *
- * Read from the live scope chain rather than from the session, so it answers
- * for an agent whose session has not recorded a preset yet — a child agent
- * whose durable header is being built from its parent's composition.
- * @param agentCtx - the agent's scope context.
- * @returns the preset id, or undefined when the agent joined none.
+/** Join a child to the exact revision retained by its parent.
+ * @param ctx Child Agent context.
+ * @param parent Parent Agent context.
+ * @returns Inherited preset id, or undefined in a preset-free composition.
  */
-composedPreset(agentCtx: Context): string | undefined
+composeFrom(ctx: Context, parent: Context): string | undefined
 
-/**
- * Read one preset's composition text.
- * @param id - the preset id.
- * @returns the composition exactly as stored.
- * @throws when no configured root supplies that id.
+/** Read the preset a live Agent uses.
+ * @param ctx Agent context.
+ * @returns Its preset id, if bound.
  */
-async read(id: string): Promise<string>
+composedPreset(ctx: Context): string | undefined
 
-/**
- * One preset's composition text with the roster row it belongs to.
- * @param agentPreset - the preset id.
- * @returns the composition beside its trust and published metadata.
- * @throws {RemoteError} `gateway/bad-request` for an empty id, or
- * `agent-preset/not-found` when no configured root supplies it.
- */
-@Remote('read') async readDocument(agentPreset: string): Promise<AgentPresetDocument>
-
-/**
- * Create a locally authored preset by copying an existing one whole.
- *
- * Copy is the only authoring write. Composition text never crosses this
- * seam: the source is named by id and its directory is copied as it stands,
- * so the copy is exactly as loadable as its source and authoring grants no
- * capability the roster did not already carry. The copy is NOT mounted to
- * validate — a source that mounts today yields a copy that mounts today.
- * @param from - the preset the copy starts from; shipped presets are the
- * primary source, so any trust is accepted.
- * @param id - the new preset's id, which becomes its directory name.
- * @param name - display name for the copy; absent falls back to the id.
- * @throws when the source is unknown, the id is unusable or already taken,
- * or the deployment configures no writable root.
- */
-async copy(from: string, id: string, name?: string): Promise<void>
-
-/**
- * Copy one preset through the Remote API.
- * @param from - the source preset id.
- * @param id - the new preset id.
- * @param name - the copy's optional display name.
- * @returns once the copy is stored.
- * @throws {RemoteError} with the corresponding stable preset code and
- * details when the copy is refused.
- */
-@Remote('copy') async remoteExportCopy(from: string, id: string, name?: string): Promise<void>
-
-/**
- * Delete a locally authored preset.
- *
- * @param id - the preset id.
- * @throws when the preset is unknown or ships with the deployment.
- */
-async remove(id: string): Promise<void>
-
-/**
- * Delete one preset through the Remote API.
- * @param id - the preset id.
- * @returns once the preset is deleted.
- * @throws {RemoteError} with the corresponding stable preset code and
- * details when deletion is refused.
- */
-@Remote('deletePreset') async remoteExportDelete(id: string): Promise<void>
-
-/**
- * One agent's instance of a service its preset mounted.
- *
- * A preset publishes services behind `isolate` realms, which are invisible
- * outside the group that declares them — including to the host. This is how a
- * caller holding the agent reads one anyway: a request that is ABOUT a
- * session but arrives from outside it, which is every browser RPC.
- *
- * Read addressing only. A host row that `inject`s a service cannot use this,
- * because injection resolves before any session exists and has no agent to
- * key by; such a service belongs on the host plane instead.
- * @param agent - the agent whose composition to look inside.
- * @param name - the service name as the preset's rows resolve it.
- * @returns the agent's instance, or undefined when its preset mounts none.
+/** Read a service supplied inside an Agent's isolated preset group.
+ * @param agent Agent whose composition is queried.
+ * @param name Cordis service name.
+ * @returns The service, or undefined.
  */
 serviceFor<K extends string & keyof Context>(agent: { ctx: Context }, name: K): Context[K] | undefined
 
-/**
- * Re-link one agent to a different preset's standing composition.
- *
- * Only valid while the agent has produced nothing: swapping tools mid
- * conversation would leave logged tool calls the new composition cannot
- * make. The CALLER owns that check — this method does not read session
- * history.
- *
- * The swap is a parent re-link, not an unmount: standing mounts are shared
- * and permanent, so the old composition stays for its other agents and the
- * new one is ensured BEFORE the link moves. An unknown or unusable preset
- * therefore throws with the agent exactly as it was — there is no torn-down
- * state to restore. The re-link runs through the binding this roster kept
- * from the agent's mount — dsh-scope's only re-link authority. An agent
- * that never composed one has nothing to re-link: the switch is then the
- * agent's first bind, exactly a mount. A committed re-link emits
- * `tools/change` because changing the parent scope changes the Agent's
- * resolved tool set without adding or removing registry entries.
- * @param agentCtx - the agent's scope context.
- * @param id - the preset to compose the agent from instead.
- * @returns the preset now installed.
- * @throws when the preset is unknown or its composition is unusable.
+/** Rebind a blank Agent; the caller owns the blank-session check.
+ * @param ctx Agent context.
+ * @param id Requested preset.
+ * @returns The bound identity.
  */
-async recompose(agentCtx: Context, id: string): Promise<AgentPreset>
+async recompose(ctx: Context, id: string): Promise<AgentPreset>
 
-/**
- * Compose a blank session's agent from a different preset and record it.
- * @param agent - the session's live agent, resolved from the wire identity.
- * @param agentPreset - the preset to compose the agent from instead.
- * @returns the preset id that was recorded.
- * @throws {RemoteError} with `gateway/bad-request`, `agent-preset/locked`,
- * `agent-preset/not-found`, or `agent-preset/invalid` when refused.
+/** Select a preset before a session starts its first turn. A Session whose
+ * log records the preset and whose Agent runs its current revision keeps its
+ * composition; nothing is logged or announced.
+ * @param agent Target Agent.
+ * @param agentPreset Requested identity.
+ * @returns Committed preset identity.
  */
 @Remote('select') async select(agent: Agent, agentPreset: string): Promise<string>
 
-/**
- * The standing scope key of one preset, for a host reader with no agent.
- *
- * A cold transcript read resolves tool presenters against the composition
- * the session recorded, and the standing mount makes that possible without
- * resuming anything: ensuring the mount composes plugins but starts no
- * agent, no session, and no turn.
- * @param id - the preset id, or `undefined` for {@link defaultId}.
- * @returns the standing scope key readers pass as a registry view scope.
- * @throws when the preset is unknown or its composition is unusable.
+/** Read current registrations for cold transcript presentation.
+ * @param id Preset identity or the default.
+ * @returns A revision lease; dispose it after the scoped read completes.
  */
-async standingKeyFor(id?: string): Promise<ScopeKey>
+async acquireScope(id?: string): Promise<{ key: ScopeKey } & AsyncDisposable>
+
+/** Read plugin rows without creating an Agent.
+ * @returns Current declaration metadata and activation states.
+ */
+compositionInventory(): Promise<AgentPresetComposition[]>
 ```
 
-Types: [ScopeKey](scope.md)
+Types: [ScopeKey](scope.md) · [Session](session.md)
 
-Source: [`packages/preset/agent-presets/src/index.ts`](../../packages/preset/agent-presets/src/index.ts)
+Source: [`packages/preset/agent-preset-registry/src/index.ts`](../../packages/preset/agent-preset-registry/src/index.ts)
 
 <a id="ctxagents--agentregistry"></a>
 
@@ -733,6 +688,13 @@ Agent service (`ctx.agents`): tracks live agents and carries the initiating Agen
 Initiator methods provide same-process causal attribution only. Ambient presence is neither liveness proof nor authorization; subjects and owners remain explicit, as does identity at worker, process, persistence, and wire boundaries. Returned Promise boundaries drain during teardown, except a nested lineage that starts an owning-fiber unload is excluded from its own drain.
 
 ```ts cordis-catalog
+/**
+ * Read the turn and step positions recorded in a Session.
+ * @param session - Session whose committed events are read.
+ * @returns the current turn and step positions; do not mutate the returned value.
+ */
+turnBoundaryOf(session: Session): TurnBoundaryProjection
+
 /**
  * Read the Agent that initiated the inherited asynchronous driver chain.
  * Use this optional form for logging, tracing, metrics, or host attribution
@@ -803,7 +765,7 @@ setFactory(factory: AgentFactory): () => void
  * agent): this constructs the agent and its session. Rejects if no factory is
  * registered or creation/setup fails. The resolved {@link AgentHandle} lets
  * the owner tear down exactly this agent.
- * @param options - shared identity, optional live parent, session seed/metadata, and agent options.
+ * @param options - shared identity, session seed/metadata, and agent options.
  * @returns the handle after setup, rollback-covered publication, and loop start complete.
  */
 async create(options: CreateAgentOptions): Promise<AgentHandle>
@@ -812,7 +774,7 @@ async create(options: CreateAgentOptions): Promise<AgentHandle>
  * Load a persisted session and resume an agent on it through the registered
  * factory. Rejects if no factory is registered; the factory rejects if
  * session persistence is not configured or persistence/setup fails.
- * @param options - persisted identity, optional live parent, configuration, and setup.
+ * @param options - persisted identity, configuration, and setup.
  * @returns the handle after setup, rollback-covered publication, and loop start complete.
  */
 async resume(options: ResumeAgentOptions): Promise<AgentHandle>
@@ -824,8 +786,7 @@ async resume(options: ResumeAgentOptions): Promise<AgentHandle>
  * (`scopeTarget(agent, agent)`): the subject is the agent in hand, so the
  * emits are scope-filtered regardless of which context invoked `register`
  * (calling through `agent.ctx` scopes EFFECTS; dispatch scoping always
- * requires passing the carrier). The entry is a runtime root; factory-backed
- * creation uses `options.parentAgent` for child ownership. Await the registration before using the agent.
+ * requires passing the carrier). Await registration before using the agent.
  * @param agent - the already-constructed agent to record in the store.
  * @returns the awaitable Cordis effect disposer (single-shot; a repeat call
  *   returns undefined without awaiting an in-flight teardown). Exact
@@ -845,15 +806,12 @@ register(agent: Agent): ReturnType<Context['effect']>
  * returned detach closure into its pre-installed composite teardown before
  * calling {@link announce}. Ordinary callers use {@link register}.
  * @param agent - the prepared, unpublished agent.
- * @param owner - explicitly supplied live runtime owner, or
- *   undefined for a top-level runtime root. This is runtime ownership, not
- *   the resumed session's durable parent lineage.
  * @returns an idempotent closure that removes this exact entry and emits
  *   `agent/disposed` with listener failures contained. When called from a
  *   `agent/created` listener, removal and disposal wait until the serial
  *   creation dispatch settles.
  */
-enter(agent: Agent, owner: Agent | undefined): () => void
+enter(agent: Agent): () => void
 
 /**
  * Announce an agent previously inserted with {@link enter}.
@@ -875,29 +833,13 @@ async announce(agent: Agent, source: SessionStartSource, signal?: AbortSignal): 
 get(id: SessionId): Agent | undefined
 
 /**
- * Test whether a live agent was created through one exact parent agent's
- * scoped context. Runtime ownership is independent of durable session
- * lineage and remains unambiguous when unrelated providers reuse an id.
- * @param id - the candidate child agent's shared agent/session id.
- * @param owner - the expected runtime creator agent.
- * @returns true only while the exact child entry is live under that owner.
- */
-isOwnedBy(id: SessionId, owner: Agent): boolean
-
-/**
  * All live agents, in registration order.
  * @returns a fresh array; mutating it does not affect the registry.
  */
 list(): Agent[]
-
-/**
- * All live top-level agents in registration order. A top-level agent was
- * created without an owning agent context; durable session lineage does not
- * affect this runtime relation, so a resumed fork may still be a root.
- * @returns a fresh array; mutating it does not affect the registry.
- */
-roots(): Agent[]
 ```
+
+Types: [Session](session.md)
 
 Source: [`packages/core/agent/src/index.ts`](../../packages/core/agent/src/index.ts)
 
@@ -1082,43 +1024,14 @@ Reject a proposed step or replace the messages that enter it. Calling `next()` p
  * @param payload.turn - the turn that will own the step.
  * @param payload.step - the step proposed by the loop.
  * @param payload.signal - the current turn's cancellation signal.
+ * @param payload.modelSelection - captured step selection, retained across retries; omitted effort uses adapter defaults.
  * Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): agent-scoped listeners receive only that agent.
  * @mode waterfall
  */
-'agent/pre-step'(this: Scoped<Agent>, payload: { agent: Agent; messages: UserMessage[]; turn: number; step: number; signal: AbortSignal }, next: () => Promise<PreStepDecision>): Promise<PreStepDecision>
+'agent/pre-step'(this: Scoped<Agent>, payload: { agent: Agent; messages: UserMessage[]; turn: number; step: number; signal: AbortSignal; modelSelection: Readonly<ModelSelection> }, next: () => Promise<PreStepDecision>): Promise<PreStepDecision>
 ```
 
 Types: [Scoped](scope.md) · [UserMessage](session.md)
-
-Source: [`packages/core/agent/src/runtime-types.ts`](../../packages/core/agent/src/runtime-types.ts)
-
-<a id="agentrequest--waterfall"></a>
-
-#### `agent/request` — waterfall
-
-Replace the frozen call configuration. `await next()` yields the config the machine would use (agent options on the first request, the logged header afterwards); return a replacement to switch. On step admission, this runs after assembly and `step/start`, before the system prompt and accepted user batch are committed. Cancellation here or during subsequent `prepareCall()` resolution commits neither. The prepared call capability governs prompt admission. Model-visible content must use logged channels; this waterfall cannot mutate messages.
-
-```ts cordis-catalog
-/**
- * Replace the frozen call configuration. `await next()` yields the config
- * the machine would use (agent options on the first request, the logged
- * header afterwards); return a replacement to switch. On step admission,
- * this runs after assembly and `step/start`, before the system prompt and
- * accepted user batch are committed. Cancellation here or during subsequent
- * `prepareCall()` resolution commits neither. The prepared call capability
- * governs prompt admission. Model-visible content must use logged channels;
- * this waterfall cannot mutate messages.
- * @param payload.agent - the agent making the model call.
- * @param payload.turn - the open turn number.
- * @param payload.step - the step whose request this is.
- * @param payload.signal - the current turn's explicit abort signal.
- * Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): agent-scoped listeners receive only that agent.
- * @mode waterfall
-*/
-'agent/request'(this: Scoped<Agent>, payload: { agent: Agent; turn: number; step: number; signal: AbortSignal }, next: () => Promise<LlmCallConfig>): Promise<LlmCallConfig>
-```
-
-Types: [LlmCallConfig](llm-streaming.md) · [Scoped](scope.md)
 
 Source: [`packages/core/agent/src/runtime-types.ts`](../../packages/core/agent/src/runtime-types.ts)
 
@@ -1251,5 +1164,5 @@ One session committed a different agent preset to its durable log. Consumers inv
 'agent-preset/selected'(sessionId: SessionId, agentPreset: string): void
 ```
 
-Source: [`packages/preset/agent-presets/src/types.ts`](../../packages/preset/agent-presets/src/types.ts)
+Source: [`packages/preset/agent-preset-registry/src/types.ts`](../../packages/preset/agent-preset-registry/src/types.ts)
 <!-- END GENERATED cordis-surface -->

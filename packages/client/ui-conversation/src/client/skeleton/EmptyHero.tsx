@@ -4,7 +4,7 @@
 import { useState } from 'react'
 import type { ReactNode, RefObject } from 'react'
 import {
-  FISH_LOGO_PATH, FISH_LOGO_VIEWBOX, IconChevronDownOutline14, IconFolderClose16, IconFolderOpen16,
+  FISH_LOGO_PATH, FISH_LOGO_VIEWBOX, IconChevronDownOutlineRegular, IconFolderCloseRegular, IconFolderOpenRegular,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { workspaceTitleOf } from '@deepseek-ai/dsh-util-workspace-path'
 import type { ConversationContentProps } from '../contract/slots.ts'
@@ -53,10 +53,10 @@ export function WorkspaceChip({ buttonRef, label, menuOpen = false, onClick, t }
       onClick={onClick}
     >
       {label === undefined
-        ? <IconFolderClose16 className={css.folder} size={16} />
-        : <IconFolderOpen16 className={css.folder} size={16} />}
+        ? <IconFolderCloseRegular className={css.folder} size={16} />
+        : <IconFolderOpenRegular className={css.folder} size={16} />}
       <span className={css.workspaceLabel}>{label ?? t('hero.chooseWorkspace')}</span>
-      <IconChevronDownOutline14 className={css.chevron} size={12} />
+      <IconChevronDownOutlineRegular className={css.chevron} size={12} />
     </button>
   )
 }
@@ -67,6 +67,8 @@ export interface HeroShellProps {
   t: HeroTranslate
   /** Authorized renderer for the hero brand-mark slot. */
   renderSlot: ConversationContentProps['renderSlot']
+  /** Text shown instead of the default headline and preview badge. */
+  headline?: string | undefined
   /** Overlay content after the stack (modals). */
   children?: ReactNode
 }
@@ -129,7 +131,7 @@ function HeroFish({ hovering }: { hovering: boolean }) {
  * @param props - see {@link HeroShellProps}.
  * @returns the centered hero element tree.
  */
-export function HeroShell({ t, renderSlot, children }: HeroShellProps) {
+export function HeroShell({ t, renderSlot, headline, children }: HeroShellProps) {
   const [hovering, setHovering] = useState(false)
   return (
     <div className={css.root}>
@@ -138,12 +140,13 @@ export function HeroShell({ t, renderSlot, children }: HeroShellProps) {
           {/* figma 34:10412: fish 34×25 leading the headline, gap 10. */}
           <span
             className={css.fishHitbox}
-            onMouseEnter={() => {
-              if (window.matchMedia('(hover: hover) and (prefers-reduced-motion: no-preference)').matches) {
+            onPointerEnter={(event) => {
+              if (event.pointerType !== 'touch'
+                && window.matchMedia('(hover: hover) and (prefers-reduced-motion: no-preference)').matches) {
                 setHovering(true)
               }
             }}
-            onMouseLeave={() => { setHovering(false) }}
+            onPointerLeave={() => { setHovering(false) }}
           >
             {renderSlot('conversation.hero.brand.mark', { size: 34, className: css.fish }, {
               fallback: <HeroFish hovering={hovering} />,
@@ -151,8 +154,8 @@ export function HeroShell({ t, renderSlot, children }: HeroShellProps) {
           </span>
           <span className={css.titleGroup}>
             {/* Own element: keeps the headline text addressable apart from the badge. */}
-            <span>{t('hero.headline')}</span>
-            <span className={css.previewBadge}>{t('hero.preview')}</span>
+            <span>{headline ?? t('hero.headline')}</span>
+            {headline === undefined && <span className={css.previewBadge}>{t('hero.preview')}</span>}
           </span>
         </div>
         <div className={css.body}>

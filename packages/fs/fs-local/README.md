@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-Use `dsh-fs-local` to read, list, atomically write, and edit files on the host filesystem. Relative paths resolve from a configurable base directory, while absolute paths and parent traversal remain unrestricted. Paths and symlinks that reach the same file share one identity. Writes preserve file permissions, and optional version guards reject stale overwrites. Choose this package for direct host access; use `fs-sandbox` for confined mutations.
+Use `dsh-fs-local` to read, list, watch, write, edit, patch, delete, and move files on the host. Relative paths use a configurable base; absolute paths and parent traversal remain unrestricted. Aliases share one identity. Optional guards reject stale versions, and text publication preserves permissions. Moves can also apply hunks and report a published destination separately from source removal. Use `fs-sandbox` when mutations need confinement.
 
 ## Table of Contents
 
@@ -33,7 +33,7 @@ Choose `fs-local` for ordinary host-file access in a single process. Choose [`fs
 
 ### Minimal configuration
 
-Load the backend with a base directory; relative paths resolve against it, and absolute paths ignore it. A relative base is anchored to the provider process working directory, and display paths remain absolute. On POSIX, resolution follows filesystem semantics before lexical normalization: `symlink/..` reaches the parent of the link target, including when the final file does not exist yet. Directory listings preserve the same physical traversal in displayed child paths. Windows retains native drive-relative normalization.
+Load the backend with a base directory; relative paths resolve against it, and absolute paths ignore it. A requested path that is `~` or starts with `~/` (or `~\` on Windows) begins at the host user's home directory; `~user`, later `~` segments, and directory entry names stay literal. A relative base is anchored to the provider process working directory, and display paths remain absolute. On POSIX, resolution follows filesystem semantics before lexical normalization: `symlink/..` reaches the parent of the link target, including when the final file does not exist yet. Directory listings preserve the same physical traversal in displayed child paths. Windows retains native drive-relative normalization.
 
 ```yaml
 - name: '@deepseek-ai/dsh-fs-local'
@@ -50,9 +50,13 @@ The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-a
 
 ### What you can do
 
-Read any regular UTF-8 text file whole or as a stream, read raw bytes up to a cap you choose or in a byte window, and list one directory level in stable name order. Create or replace a file atomically, and apply a literal text edit atomically; both mutations serialize per file, so concurrent writers never interleave. The version guard is optional: omit it for unconditional create-or-overwrite, or supply it to fail when the file changed since you last observed it.
+Read regular UTF-8 files whole or as streams, read bounded bytes, and list one directory level. Writes, literal edits, patches, and deletions serialize per target. Moves lock both targets in lexical order. `patchText` checks the version before calling `applyHunks`; `deleteFile` removes only a regular file. Missing sources use `FS_STALE_VERSION`, unmatched hunks use `FS_PATCH_MISMATCH`, and identical move targets use `FS_SAME_TARGET`.
 
-Failures are typed `FsError`s with stable codes — `FS_NOT_FOUND`, `FS_NOT_TEXT` (binary content), `FS_STALE_VERSION` (changed since observation), `FS_EDIT_NOT_FOUND` or `FS_AMBIGUOUS_EDIT` (no unique literal match), and others — so callers branch on the code, never on message text. A missing target on an edit reports `FS_STALE_VERSION` whether or not the version guard is supplied.
+Patch and move text is LF-normalized internally and restored using the source line-ending style; outcome text uses LF. Delete bases and overwritten destination bases follow `diffBasisMaxBytes`. A move checks cancellation before staging the destination, then completes both effects; a source-removal failure returns the published destination with `sourceDeleted: false`. Atomic write failures map denied directory or staging creation to `FS_PERMISSION_DENIED` and other Node I/O errors to `FS_IO_ERROR`. Resolution, metadata, read, and listing failures pass through `fsErrorFromErrno` from `dsh-fs`, so every errno becomes an `FsError` code; a thrown value without an errno code is a defect and propagates unchanged.
+
+Read, listing, and mutation failures are typed `FsError`s with stable codes — `FS_NOT_FOUND`, `FS_NOT_TEXT` (binary content), `FS_STALE_VERSION` (changed since observation), `FS_EDIT_NOT_FOUND` or `FS_AMBIGUOUS_EDIT` (no unique literal match), and others — so callers branch on the code, never on message text. A missing target on an edit reports `FS_STALE_VERSION` whether or not the version guard is supplied.
+
+Chokidar observes one file or a directory's direct entries through OS events, without polling or recursive watching. Files use a filtered parent-directory watch, so readiness also covers creation of an initially missing file. File watches cover in-place writes, atomic replacement, deletion, and same-path recreation while the parent directory remains.
 
 -----
 
@@ -90,7 +94,7 @@ Each edit probes, verifies the version guard before literal matching (so stale e
 
 ### Ownership and invariants
 
-Raw I/O is Cordis-free and independently unit-tested in `src/fsio.ts`; `src/index.ts` stays thin wiring. `config.cwd` is a resolution default only — containment is the job of `fs-sandbox` or a `tools/execute` permission plugin. Cancellation is a best-effort `AbortSignal` checked before and after each asynchronous probe.
+Raw I/O is Cordis-free and independently unit-tested in `src/fsio.ts`; `src/index.ts` stays thin wiring. `config.cwd` is a resolution default only — containment is the job of `fs-sandbox` or a `tools/execute` permission plugin. Cancellation is a best-effort `AbortSignal` checked before and after each asynchronous probe. For watches, the signal cancels initialization; after readiness, the caller must await the returned close function.
 
 </details>
 
@@ -127,6 +131,7 @@ No direct invalidation; the named consumer owns any request-prefix changes.
 These limits define when the local backend is a poor fit or needs special operational care. They are current package constraints, not a general filesystem comparison or a task backlog.
 
 - **`config.cwd` is not a sandbox** — it is a resolution default, not containment: absolute paths and `..` escape it. Enforce containment with a stricter `ctx.fs` backend or a permission plugin on the `tools/execute` waterfall.
+- **Linux parent-directory recreation** — restoring observation after a parent directory is deleted and recreated is deferred; same-path file recreation while its parent remains is supported.
 - **Version tokens depend on filesystem metadata** — they combine device, inode, size, nanosecond mtime, and nanosecond ctime; a storage layer that cannot update any of those facts for a rewrite can still defeat the stale guard.
 - **`editText` holds the whole file (plus the edited copy) in memory** — streaming exists only on the read path.
 - **A sub-limit overwrite still buffers a contextual basis** — `writeText` may retain up to just below `config.diffBasisMaxBytes` of prior text in addition to the caller-owned replacement; the bound does not cap the returned `after` value or the whole-file presentation fallback.
@@ -144,5 +149,3 @@ These limits define when the local backend is a poor fit or needs special operat
 None.
 
 </details>
-
-**Runtime invariant:** No companion is published. This package exposes no independent event sequence or mutable data relation beyond contracts enforced at its owning seam.

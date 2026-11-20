@@ -5,7 +5,9 @@ import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 import type { Browser, Page } from 'playwright'
 import { chromium } from 'playwright'
-import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, onTestFailed, onTestFinished } from 'vitest'
+import { once } from 'node:events'
+import WebSocket from 'ws'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 // Empty type import: carries the approval package's session-event merge, so
 // the decided-outcome assertion below type-checks against the real union.
@@ -30,7 +32,7 @@ const PROMPT = `Write a file named notes.txt in the workspace containing exactly
 /** Draft used to measure the composer's own text cap: enough lines to pass it. */
 const CAP_PROBE = Array.from({ length: 40 }, (_, index) => `line ${index}`).join('\n')
 
-describe('web e2e: approval takeover keeps its actions reachable', () => {
+describe.each(MODE === 'record' ? ['button'] as const : ['button', 'keyboard'] as const)('web e2e: approval takeover through %s', (method) => {
   let scaffold: WebScaffold
   let browser: Browser
   let page: Page
@@ -74,6 +76,34 @@ describe('web e2e: approval takeover keeps its actions reachable', () => {
       { timeout: 15_000 },
     ).toBe(1)
 
+    const connectUrl = new URL(scaffold.authenticatedUrl)
+    connectUrl.pathname = '/connect'
+    connectUrl.searchParams.set('interactions', 'none')
+    const connected = await fetch(connectUrl, { redirect: 'manual', headers: { accept: 'application/json' } })
+    expect(connected.status).toBe(302)
+    const cookie = connected.headers.get('set-cookie')!.split(';', 1)[0]!
+    const muxUrl = new URL(connected.headers.get('location')!, connectUrl)
+    muxUrl.protocol = muxUrl.protocol === 'https:' ? 'wss:' : 'ws:'
+    const passive = new WebSocket(muxUrl, { headers: { cookie } })
+    const passiveClosed = new Promise<void>((resolve) => { passive.once('close', resolve) })
+    passive.on('error', () => { /* The open/message waits below report carrier errors. */ })
+    onTestFinished(async () => { passive.terminate(); await passiveClosed })
+    const passiveFrames: string[] = []
+    const refused = Promise.withResolvers<string>()
+    passive.on('message', (data) => {
+      const bytes = Array.isArray(data) ? Buffer.concat(data)
+        : Buffer.from(data instanceof ArrayBuffer ? new Uint8Array(data) : data)
+      const text = bytes.toString('utf8')
+      passiveFrames.push(text)
+      refused.resolve(text)
+    })
+    await once(passive, 'open')
+    passive.once('error', (error) => { refused.reject(error) })
+    passive.send(JSON.stringify({ type: 'open', streamId: 'passive-events', endpoint: '$events', payload: { args: {} } }))
+    expect(JSON.parse(await refused.promise)).toMatchObject({
+      type: 'error', streamId: 'passive-events', error: { code: 'gateway/interactions-forbidden' },
+    })
+
     const settled = scaffold.whenTurnSettled(MODE === 'record' ? 240_000 : 60_000)
     await input.fill(PROMPT)
     await input.press('Enter')
@@ -82,6 +112,17 @@ describe('web e2e: approval takeover keeps its actions reachable', () => {
     await panel.waitFor({ timeout: MODE === 'record' ? 180_000 : 60_000 })
     const scroll = panel.locator('[data-approval-scroll]')
     await expect.poll(() => scroll.getByText(/tok/).count(), { timeout: 15_000 }).toBeGreaterThan(0)
+    const defaults = await panel.evaluate((root: HTMLElement) => {
+      const before = root.style.textAlign
+      root.style.textAlign = 'center'
+      try {
+        return {
+          alignment: getComputedStyle(root.querySelector('[data-approval-scroll]')!).textAlign,
+          wrapping: getComputedStyle(root.querySelector('button')!.parentElement!).flexWrap,
+        }
+      } finally { root.style.textAlign = before }
+    })
+    expect(defaults).toEqual({ alignment: 'center', wrapping: 'nowrap' })
 
     if (MODE !== 'record') {
       const snapshot = await captureStableAria(page, '[data-approval-key]', scaffold.workspaceCwd)
@@ -119,9 +160,14 @@ describe('web e2e: approval takeover keeps its actions reachable', () => {
       await page.setViewportSize(original)
     }
 
-    await panel.getByRole('button', { name: 'Allow once' }).click()
+    if (method === 'button') await panel.getByRole('button', { name: 'Allow once' }).click()
+    else {
+      await scroll.focus()
+      await page.keyboard.press('Enter')
+    }
 
     const sessionId = await settled
+    expect(passiveFrames).toHaveLength(1)
     if (MODE === 'record') {
       await recordFixture(scaffold, sessionId, FIXTURE)
       await assertFinalWorkspaceSnapshot(SNAPSHOT_DIR, join(scaffold.workspaceCwd, 'workspace'))

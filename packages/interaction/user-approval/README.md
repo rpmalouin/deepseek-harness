@@ -25,7 +25,7 @@ Use this package to require a one-shot decision before a sensitive tool action p
 <a id="use-this-package"></a>
 ## Use this package
 
-Compose this service when sensitive tool actions should pause for a human or machine decision instead of running unconditionally. The tools pipeline and the sandboxed bash tool route their `ask` decisions through this seam and fail closed when it is absent, so interactive deployments mount it with at least one answerer.
+Compose this service when sensitive tool actions should pause for a human or machine decision instead of running unconditionally. It requires `sessionProjections`; shipped profiles already provide that service. The tools pipeline and the sandboxed bash tool route their `ask` decisions through this seam and fail closed when it is absent, so interactive deployments mount it with at least one answerer.
 
 ### Composing answerers
 
@@ -36,6 +36,7 @@ Answerers are `approval/request` waterfall listeners: return an outcome to answe
 The effective policy is the one set for the session, falling back to the configured default. `ask` (the default) delegates to the composed answerers; `never` rejects every request deterministically before interactive dispatch — the strict headless stance for CI and unattended runs.
 
 ```yaml
+- name: '@deepseek-ai/dsh-session-projection'
 - name: '@deepseek-ai/dsh-user-approval'
   config:
     policy: ask
@@ -45,15 +46,15 @@ The effective policy is the one set for the session, falling back to the configu
 |---|---|---|
 | `policy` | `ask` | Default for sessions without an `approval/policy` override |
 
-The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-user-approval) is the exhaustive source for every accepted field and its JSDoc. `setPolicy(agent, policy)` switches a live agent and queues a "changed by the user" message for its next model step; `setApprovalPolicy(session, policy)` is the direct durable write path used by session initialization.
+The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-user-approval) is the exhaustive source for every accepted field and its JSDoc. `setPolicy(agent, policy)` switches a live agent and queues the switch notice described under Model Experience for its next model step; `setApprovalPolicy(session, policy)` is the direct durable write path used by session initialization.
 
 ### Requesting a decision
 
-`request(req)` names the agent, tool, optional call id and reason, and an abort signal. It requires an open turn: an idle or between-turn caller throws before auditing anything. Aborting withdraws the question — the request settles `cancelled` and a late answer is discarded. A failure that prevents either audit append from committing rejects instead of returning an unlogged decision.
+`request(req)` names the agent, tool, optional call id and reason, and an abort signal. Optional `displayReason` supplies localized presentation text without changing the logged reason. It requires an open turn: an idle or between-turn caller throws before auditing anything. Aborting withdraws the question — the request settles `cancelled` and a late answer is discarded. A failure that prevents either audit append from committing rejects instead of returning an unlogged decision.
 
 ### What the model and user see
 
-The model sees only the asking consumer's eventual tool outcome — allowed, rejected, cancelled, or unavailable — plus the current policy in the runtime-context snapshot; the audit events and the human permission UI are not model context. A `never` switch is announced to the model by a sourced user message, and both policies contribute their complete current meaning to the snapshot.
+The model sees only the asking consumer's eventual tool outcome — allowed, rejected, cancelled, or unavailable — plus the current policy in the runtime-context snapshot; the audit events and the human permission UI are not model context. Each policy switch is announced to the model by a sourced user message, and both policies contribute their complete current meaning to the snapshot.
 
 -----
 
@@ -69,9 +70,8 @@ The observable behavior is covered in [Use this package](#use-this-package); thi
 
 | File | Role |
 |---|---|
-| [`src/index.ts`](src/index.ts) | `ApprovalService`: request dispatch, policy fold and write path, runtime-context contribution |
+| [`src/index.ts`](src/index.ts) | `ApprovalService`: request dispatch, private approval state, policy write path, runtime-context contribution |
 | [`src/types.ts`](src/types.ts) | `ApprovalRequestId` brand and outcome types |
-| [`src/invariant.ts`](src/invariant.ts) | Invariant companion pairing `approval/asked` with `approval/decided` inside an open turn |
 
 ### Dispatch
 
@@ -79,11 +79,15 @@ The observable behavior is covered in [Use this package](#use-this-package); thi
 
 ### Policy and the runtime-context snapshot
 
+The private host-only `approvalState` projection stores the policy override and whether a turn is open. Its size does not grow with the number of events. The registry includes it in persisted checkpoints; the event log remains authoritative. Its pure updates never dispatch questions or grant permission.
+
+Service activation waits for projection registration and fails if registration fails. The service keeps the returned reader private. The host and registry own Session recovery; approval methods do not load history or call hydration from a synchronous read. See the [registration and recovery API](../../session/session-projection/README.md). Pending questions, answerers, and grants remain in the runtime.
+
 The system-prompt contribution `approval:policy` states the complete current meaning of the effective policy — `ask` with its fail-closed consequence, or `never` with its non-escalation consequence — after retained history, so switching policy appends a new full snapshot instead of rewriting the stable request header. `setPolicy()` also injects a sourced user message announcing the change for the next step.
 
 ### Audit
 
-`request()` appends `approval/asked` with the request identity and tool, then `approval/decided` with the closed outcome; the exact appended fields live in [`src/index.ts`](src/index.ts). Both are log-only; the invariant validates the pair by id within one open turn and the closed outcome vocabulary.
+`request()` appends `approval/asked` with the request identity and tool, then `approval/decided` with the closed outcome; the exact appended fields live in [`src/index.ts`](src/index.ts). Both are log-only.
 
 </details>
 
@@ -96,7 +100,7 @@ Read these pages when the package-level contract is not enough. They move from t
 
 - [Approval subsystem reference](../../../docs/subsystems/approval.md) — the shared request/outcome vocabulary and the `ctx.approval` Cordis surface.
 - [Approval seam Agent Note](../../../.agents/notes/implemented/feature/2026-07-06-approval-seam.md) — design rationale for the seam.
-- [Sandbox Agent Note](../../../.agents/notes/implemented/feature/2026-07-06-sandbox.md) — how the sandboxed bash tool consumes approvals for escalated retries.
+- [Sandbox reference](../../shell/tool-bash/README.md) — how the sandboxed bash tool consumes approvals for escalated retries.
 - [Interaction group map](../README.md) — adjacent permission preset and question packages.
 
 -----
@@ -108,18 +112,24 @@ Read these pages when the package-level contract is not enough. They move from t
 
 #### What the model sees
 
-The first request and each effective policy change append a full runtime-context snapshot after retained history. Under `ask`, the approval contribution states that configured answerers may be consulted and absence fails closed. Under `never`, it states the deterministic rejection and non-escalation consequence. Unchanged requests retain the earlier snapshot without adding another message.
+The first request and each effective policy change append a full runtime-context snapshot after retained history. Under `ask`, the approval contribution states that configured answerers may be consulted and absence fails closed. Under `never`, it states the deterministic rejection and non-escalation consequence. Unchanged requests retain the earlier snapshot without adding another message. When the user switches a live Session's policy, the next model step also receives a switch notice.
 
 ##### Ask-policy contribution
 
 ```markdown
-Approval policy: ask. Operations that require approval may ask through the configured answerers; without an available answerer, the request fails closed.
+Approval prompts are enabled in this session: operations that require approval may ask through the configured answerers; without an available answerer, the request fails closed.
 ```
 
 ##### Never-policy contribution
 
 ```markdown
 Approval prompts are disabled in this session: actions that require approval are rejected automatically — do not request sandbox escalation (do not set `sandbox_permissions`).
+```
+
+##### Switch notice
+
+```markdown
+The user changed the approval policy from "ask the user for approval" to "never ask the user for approval".
 ```
 
 #### Token effect
@@ -155,6 +165,7 @@ These limits define when the seam is a poor fit or needs special composition car
 - **Only one-shot grants exist** — the outcome vocabulary has `allowed-once` but no `allow-always`, remembered rule, revocation, or grant store; session policy is only `ask` / `never`.
 - **The request carries no tool arguments** — an answerer sees the tool name, reason, and optional call id; the ACP machine channel requires a call id and delegates requests without one.
 - **No built-in answerer** — headless or incompletely composed deployments resolve `unavailable` and fail closed; the service itself never prompts a human.
+- **Pending approvals are process-local** — checkpoints restore policy and turn state, not pending answerer promises or one-shot grants. Recovery does not resubmit questions or repeat runtime effects.
 
 <a id="dev-note"></a>
 ### Dev Note

@@ -2,13 +2,13 @@
 
 [English](compaction.md) | 中文
 
-压缩 seam 是一个[能力 seam](../../.agents/notes/implemented/architecture/2026-06-13-capability-seams.zh.md)，与 bash 一样分为 Service Definition（[dsh-compaction](../../packages/compaction/compaction)，`ctx.compaction`）、Service Provider（例如 [dsh-compaction-basic](../../packages/compaction/compaction-basic) 后端）和面向用户的 Consumer（[dsh-command-compact](../../packages/compaction/command-compact)）。压缩是**一项可选能力**，不属于 agent loop（智能体循环）主干，因此其词汇定义在此而非 [core.md](core.zh.md) 中。基于 tokenizer 或模板的后端是实现同一接口的兄弟包。与 bash 不同，该接口必然依赖 `dsh-session` 和 `dsh-llm`：其动词作用于 agent 所有的 `Session`，而其持久摘要事件使用 `ContentBlock` 词汇（见[压缩能力 seam Agent Note](../../.agents/notes/implemented/feature/2026-06-18-compaction-capability-seam.zh.md)）。
+压缩 seam 是一个[能力 seam](../../.agents/notes/implemented/architecture/2026-06-13-capability-seams.zh.md)，与 bash 一样分为 Service Definition（[dsh-compaction](../../packages/compaction/compaction)，`ctx.compaction`）、Service Provider（例如 [dsh-compaction-basic](../../packages/compaction/compaction-basic) 后端）和面向用户的 Consumer（[dsh-command-compact](../../packages/compaction/command-compact)）。压缩是**一项可选能力**，不属于 agent loop（智能体循环）主干，因此其词汇定义在此而非 [core.md](core.zh.md) 中。基于 tokenizer 或模板的后端是实现同一接口的兄弟包。与 bash 不同，该接口必然依赖 `dsh-session` 和 `dsh-llm`：其动词作用于 agent 所有的 `Session`，而其持久摘要事件使用 `ContentBlock` 词汇（见[压缩能力 seam 参考](../../packages/compaction/compaction/README.zh.md)）。
 
 源码：[`packages/compaction/compaction/src/types.ts`](../../packages/compaction/compaction/src/types.ts)
 
 ## `compaction/*` 会话事件
 
-压缩通过声明合并为 [`SessionEventMap`](session.zh.md) 扩展三种事件类型。三者都**仅写入日志**——它们记录锁、摘要、选中范围、被遮蔽事件 seq、token 数以及模型调用，绝不进入 surface。这里有意不扩展 `SurfaceEventType`（只有产生消息的事件才到达模型），因此摘要本身承载在另一条带有 `surfaceOp: { op: 'replace', startSeq, endSeq }` 的 `user/message` 上——这是摘要压缩执行的唯一 surface 变更。[Agent Note](../../.agents/notes/implemented/feature/2026-06-18-compaction-capability-seam.zh.md) 负责复用 `user/message` 的决策依据。
+压缩通过声明合并为 [`SessionEventMap`](session.zh.md) 扩展三种事件类型。三者都**仅写入日志**——它们记录锁、摘要、选中范围、被遮蔽事件 seq、token 数以及模型调用，绝不进入 surface。这里有意不扩展 `SurfaceEventType`（只有产生消息的事件才到达模型），因此摘要本身承载在另一条带有 `surfaceOp: { op: 'replace', startSeq, endSeq }` 的 `user/message` 上——这是摘要压缩执行的唯一 surface 变更。[历史Agent Note](../../.agents/notes/archived/feature/2026-06-18-compaction-capability-seam.md) 负责复用 `user/message` 的决策依据。
 
 | 事件 | 载荷 | 作用 |
 |---|---|---|
@@ -98,7 +98,7 @@ type ManualCompactionErrorCode =
 
 `changed` 和 `summary` 闭合失败尝试并将其持久化到日志，不写入摘要替换；恢复过程中记录的图片省略仍然有效。`commit` 可能发生在部分变更之后；`persistence` 表示内存中的标记对已闭合，但 flush 失败。取消独立于这些失败，并在完成必要清理后抛出原始 abort 原因。
 
-压力压缩在 `agent/pre-step` waterfall（瀑布式事件）中运行，先于请求推导。一旦压力或规范化溢出满足条件，compaction-basic 会在选择范围前调用可选的 [`ctx.toolResultPruner`](../../packages/compaction/compaction-tool-result-pruner/README.zh.md)，再通过 `ctx.tokenMeter` 重新测量，并且可以在不生成摘要的情况下推进 surface。失败请求的恢复在失败的步骤关闭后通过 `agent/request-error` 运行；仅当 surface replacement generation 前进时才返回重试动作，即便后续摘要工作在剪枝后抛异常亦如此；取消仍然优先。区域边界保持工具调用/结果配对，但不保持整个轮次，因此一个过大轮次中较早关闭的步骤可以被压缩。`dsh-compaction-basic` 拥有阈值、保留尾部策略、溢出上限与失败处理。
+压力压缩在 `agent/pre-step` 按已提交请求 header 执行，也在 `agent/request` 按已改变的目标执行，先于其 header 记入日志。除非配置了显式摘要目标，已有助手消息的会话中每次摘要都使用产生最新一条助手消息的路由，因此第一次请求就溢出的目标不会为自己的溢出生成摘要；切换失败会保留该 header 与已完成的缩减。一旦压力或规范化溢出满足条件，compaction-basic 会在选择范围前调用可选的 [`ctx.toolResultPruner`](../../packages/compaction/compaction-tool-result-pruner/README.zh.md)，再通过 `ctx.tokenMeter` 重新测量，并且可以在不生成摘要的情况下推进 surface。失败请求的恢复在失败的步骤关闭后通过 `agent/request-error` 运行；仅当 surface replacement generation 前进时才返回重试动作，即便后续摘要工作在剪枝后抛异常亦如此；取消仍然优先。区域边界保持工具调用/结果配对，但不保持整个轮次，因此一个过大轮次中较早关闭的步骤可以被压缩。`dsh-compaction-basic` 拥有阈值、保留尾部策略、溢出上限与失败处理。
 
 该 Service Definition 导出 `toolPairingBalancedBefore(session, seq)` 与 `toolPairingBalancedAfter(session, seq)`，用于检查 seq 之前与之后的工具调用/结果配对。两者都会验证当前 surface 成员关系，并拒绝缺失的 seq 与遗留结果；[包约定](../../packages/compaction/compaction/README.zh.md#tool-pairing-boundaries)定义其缓存行为。
 

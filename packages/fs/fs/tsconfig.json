@@ -7,6 +7,9 @@
   "include": ["src"],
   "references": [
     {
+      "path": "../fs-patch"
+    },
+    {
       "path": "../../../vendor/cosmokit"
     },
     {
@@ -17,9 +20,6 @@
     },
     {
       "path": "../../llm/llm"
-    },
-    {
-      "path": "../../runtime-diagnostics/invariants"
     },
     {
       "path": "../../sandbox/sandbox"

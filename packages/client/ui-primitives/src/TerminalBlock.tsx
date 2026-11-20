@@ -2,10 +2,11 @@ import { useCallback, useMemo, useState } from 'react'
 import clsx from 'clsx'
 import { parseAnsiLines, type AnsiLine } from './ansi.ts'
 import { headTailCap } from './head-tail-cap.ts'
-import { useCopyFeedback } from './use-copy-feedback.ts'
+import { useClipboardCopy } from './use-clipboard-copy.ts'
 import { Pill } from './Pill.tsx'
 import { StateDot, type StateDotState } from './StateDot.tsx'
 import css from './TerminalBlock.module.css'
+import { CommandText } from './CommandText.tsx'
 
 /** Output lines shown before the height cap collapses the middle. */
 export const DEFAULT_TERMINAL_MAX_LINES = 16
@@ -15,6 +16,8 @@ export const DEFAULT_TERMINAL_MAX_LINES = 16
  * (this package is cordis-free, so copy arrives via props).
  */
 export interface TerminalBlockLabels {
+  /** Accessible name for an overflowing authored command line, numbered from one. */
+  commandLine: (line: number) => string
   /** Status pill text for a signal-terminated command. */
   signal: (signal: string) => string
   /** Status pill text for a non-zero exit code. */
@@ -44,7 +47,7 @@ export interface TerminalBlockLabels {
 }
 
 export interface TerminalBlockProps {
-  /** The command line, rendered verbatim after the prompt label. */
+  /** The command, rendered verbatim after the prompt label; long lines scroll horizontally unless the host enables wrapping. */
   command: string
   /** Working directory for the prompt label; absent renders a plain `$`. */
   cwd?: string | undefined
@@ -57,12 +60,30 @@ export interface TerminalBlockProps {
   /** Settled terminating signal name; any value renders the status pill, taking precedence over the exit code. */
   signal?: string | undefined
   /**
-   * The command is still running: the block shows the prompt line, and the
-   * output printed so far when there is any, with no copy control until it settles.
+   * The command is still running: with no `output` the block shows the prompt
+   * line alone; with output it renders the live text under the running state.
    */
   running?: boolean | undefined
+  /**
+   * The call launches background work (default false). `running` describes the
+   * launch call only; after it returns, retain the command without job status
+   * or output. An explicit `copyText` override remains available.
+   */
+  background?: boolean | undefined
   /** Height cap in output lines before the middle collapses (default {@link DEFAULT_TERMINAL_MAX_LINES}); Infinity disables the cap. */
   maxLines?: number | undefined
+  /**
+   * Copy-control payload override; the control copies the raw output when
+   * absent. Supplying it also keeps the control rendered before any output
+   * exists — a command is copyable before it prints.
+   */
+  copyText?: string | undefined
+  /**
+   * Draw the run-state dot and its assistive label in the card gutter
+   * (default true). Hosts whose surrounding row already carries the same
+   * state omit both and reclaim the gutter via `--dsl-terminal-gutter`.
+   */
+  runStateDot?: boolean | undefined
   /** Extra class merged onto the wrapper (callers position; this component draws). */
   className?: string | undefined
   /** Localized display copy supplied by the owning render site. */
@@ -157,7 +178,10 @@ export function TerminalBlock({
   exitCode,
   signal,
   running = false,
+  background = false,
   maxLines = DEFAULT_TERMINAL_MAX_LINES,
+  copyText,
+  runStateDot = true,
   className,
   labels,
 }: TerminalBlockProps) {
@@ -169,7 +193,7 @@ export function TerminalBlock({
   // newline (`line\n\x1b[0m`) leaves the string not ending in one while still
   // producing a last line with nothing visible in it. A genuinely blank final
   // line — the double newline — survives, since it has a real empty line before
-  // the terminator. The copy control still copies `text` untouched.
+  // the terminator. The copy control's payload is unaffected.
   const lines = useMemo(() => {
     const parsed = parseAnsiLines(text)
     const last = parsed[parsed.length - 1]
@@ -178,14 +202,15 @@ export function TerminalBlock({
     return terminated ? parsed.slice(0, -1) : parsed
   }, [text])
   const [expanded, setExpanded] = useState(false)
-  // The raw output, never the rendered tree: the prompt line and the status pill
-  // are chrome the user did not run.
-  const { copied, onCopy } = useCopyFeedback(text)
+  // The raw output (or the caller's override), never the rendered tree: the
+  // prompt line and the status pill are chrome the user did not run.
+  const { copied, onCopy } = useClipboardCopy(copyText ?? text)
 
   const onToggle = useCallback(() => { setExpanded(value => !value) }, [])
 
-  const status = statusText(exitCode, signal, copy)
+  const status = background ? undefined : statusText(exitCode, signal, copy)
   const state = runState(running, exitCode, signal, copy)
+  const showState = runStateDot && (!background || running)
   // A multi-line command gets one prompt row per line, so a two-command shell
   // snippet reads as the two commands it is instead of collapsing into one
   // ellipsized row. A trailing newline is a terminator, not an empty command.
@@ -202,7 +227,7 @@ export function TerminalBlock({
   const { hidden, capped, headLines, tailLines } = headTailCap(lines.length, maxLines, expanded)
   // A running command with nothing printed yet is banner-only; once it has
   // printed, the output streams in under the banner as it would in a terminal.
-  const body = !running || !empty
+  const body = !background && (!running || !empty)
 
   return (
     <div
@@ -211,31 +236,31 @@ export function TerminalBlock({
       data-running={running ? '' : undefined}
       data-body={body ? '' : undefined}
     >
-      <div className={css.header}>
+      <div className={css.header} data-terminal-banner="">
         <div className={css.prompt}>
-          <span className={css.runStateLabel}>{state.label}</span>
+          {showState && <span className={css.runStateLabel} data-terminal-state-label="">{state.label}</span>}
           {commandLines.map((line, index) => (
             <div key={index} className={css.promptLine}>
               {/* One dot for the card, on the first row: the exit status the
                   view carries is the whole call's, and bash reports no
                   per-command status, so a dot per row would assert a
                   per-line outcome nothing here knows. */}
-              {index === 0 && <StateDot state={state.state} className={css.runState} />}
+              {index === 0 && showState && <StateDot state={state.state} className={css.runState} />}
               {/* The cwd labels the CALL, so only its first row carries it. The
                   view knows one working directory — where the call started —
                   and a later line may well run somewhere else (a `cd` in the
                   command is enough), so repeating the label down the rows would
                   assert a directory per line that nothing here knows. Later
                   rows keep a bare `$` to stay aligned as prompts. */}
-              <span className={css.cwd}>
+              <span className={css.cwd} data-terminal-prompt="">
                 {index > 0 || cwd === undefined ? '$' : promptLabel(cwd, home)}
               </span>
-              <span className={css.command}>{line}</span>
+              <CommandText className={css.command} text={line} label={copy.commandLine(index + 1)} />
             </div>
           ))}
         </div>
         {status !== undefined && <Pill className={css.status}>{status}</Pill>}
-        {!running && !empty && (
+        {(copyText !== undefined || (!background && !running && !empty)) && (
           <button type="button" className={css.copyButton} onClick={onCopy}>
             {copied ? copy.copied : copy.copy}
           </button>
@@ -244,7 +269,7 @@ export function TerminalBlock({
       {body && (empty
         ? <div className={css.empty}>{copy.noOutput}</div>
         : (
-          <div className={css.output}>
+          <div className={css.output} data-terminal-output="">
             {(capped ? lines.slice(0, headLines) : lines).map((line, index) => (
               <div key={index} className={css.line}>{renderLine(line)}</div>
             ))}

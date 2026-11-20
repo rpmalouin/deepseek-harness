@@ -10,15 +10,14 @@ The Web plugin page manages only the bundles a person installed into the profile
 
 ## Decision
 
-The launcher names in `OPTIONAL_BUNDLES` (`packages/boot/app-boot/src/profile.ts`, beside the profile templates) the bundles the installation ships for a person to switch on. Each must be a runtime dependency of `apps/cli` that declares `dsh.bundle.patch`, and no shipped profile template selects it. The plugin manager's `listBundles` reports such a bundle as `optional`: switched off until selected, never removable, resolved from the installation like any installation-supplied bundle. The Web plugin page opens its Official group with the optional bundles, tagged beta where the feature is one, ahead of the profile's own installed bundles.
+The launcher names in `OPTIONAL_BUNDLES` (`packages/util/official-bundles/src/bundles.ts`, beside the profile templates) the bundles the installation ships for a person to switch on. Each must be a runtime dependency of `apps/cli` that declares `dsh.bundle.patch`, and no shipped profile template selects it. The plugin manager's `listBundles` reports such a bundle as `optional`: switched off until selected, never removable, resolved from the installation like any installation-supplied bundle. The Web plugin page presents offered optional bundles in its Official group, tagged experimental when the package is experimental, ahead of the profile's own installed bundles.
 
 Default-product isolation keeps its rules with one declared exception: an optional bundle's dependency graph is outside the default product. The static gate skips the `dependencies` edge from `@deepseek-ai/dsh` to a listed bundle and still rejects a runtime import, a shipped composition, a preset, or a default template that names it, an experimental dependency the list does not name, and a listed name that is not a runtime dependency or not a bundle. The workspace-constraints check accepts the same `dependencies` edges and no other runtime section, and the packed-install release check skips them from the installed entry package while requiring each listed bundle to be installed.
 
-Agent Teams ships this way, as `@deepseek-ai/dsh-experimental-agent-team-profile` and `@deepseek-ai/dsh-experimental-agent-team-web-profile`. Auto review is a published experimental package the page's install guide names as its example, not an optional bundle.
 
 ## Alternatives considered
 
-**A catalog of installable official bundles.** The page would offer names to install from the registry on demand. That keeps the installation unchanged but needs network access at the moment of switching on and a version pin per release.
+**A catalog of installable official bundles.** The page would offer names to install from the registry on demand. That keeps the installation unchanged but needs network access at the moment of switching on and a version pin per release. Lightweight bundles retain the shipped policy; the [on-demand native-bundle decision](../architecture/2026-10-05-official-on-demand-bundles.md) owns the exception for costly native runtimes.
 
 **A flag on the bundle package.** A `dsh.bundle.optional` declaration would let any published bundle claim a place in the installation; the launcher's own list keeps the choice with the product.
 
@@ -26,4 +25,4 @@ Agent Teams ships this way, as `@deepseek-ai/dsh-experimental-agent-team-profile
 
 ## Consequences
 
-Optional bundles are downloaded with the product and stay inactive until selected; the runtime isolation smokes still observe no experimental module in a default composition. Switching on an optional Web layer loads its client plugin through the live client module graph. A bundle that needs a companion layer, such as the Agent Teams Web layer over its Host layer, says so in its description; the manager does not select companions automatically.
+Optional bundles are downloaded with the product and stay inactive until selected; the runtime isolation smokes still observe no experimental module in a default composition. Switching on an optional Web layer loads its client plugin through the live client module graph.

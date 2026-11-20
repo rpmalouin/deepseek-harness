@@ -1,12 +1,18 @@
 import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { createSystemMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
-import SessionStore, { SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
+import SessionStore, { type SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { Session, SurfaceIntent } from '@deepseek-ai/dsh-session'
 import { SystemPromptProjection } from '../src/runtime-context.ts'
 import type { SystemPromptCommit, SystemPromptDecisionInput } from '../src/runtime-context.ts'
+import { brandString } from '@deepseek-ai/dsh-brand'
 
-const SOURCE = '@deepseek-ai/dsh-system-prompt'
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'test-compaction': { kind: 'test-compaction' } & import('@deepseek-ai/dsh-llm').ContextFormed
+  }
+}
+
 const REPLACING: SystemPromptDecisionInput = { inHistory: false, startsSeries: false }
 const CONTINUING: SystemPromptDecisionInput = { inHistory: true, startsSeries: false }
 const NEW_SERIES: SystemPromptDecisionInput = { inHistory: true, startsSeries: true }
@@ -38,14 +44,14 @@ describe('SystemPromptProjection', () => {
   it('clears multiblock and nontext system nodes rather than treating them as dormant', async () => {
     const ctx = await sessionStore()
     try {
-      const session = ctx.sessions.create(SessionId('system-prompt-multiblock'))
-      const base = createSystemMessage('old', SOURCE)
+      const session = ctx.sessions.create(brandString<SessionId>('system-prompt-multiblock'))
+      const base = createSystemMessage('old')
       session.append('system/message', { turn: 1, step: 1, message: {
         ...base, content: [{ type: 'text', text: 'old ' }, { type: 'text', text: 'instructions' }],
       } }, { surfaceOp: 'append' })
       appendUser(session, 'hello')
       session.append('system/message', { turn: 1, step: 1, message: {
-        ...createSystemMessage('tail', SOURCE), content: [{ type: 'reasoning', text: 'retained content' }],
+        ...createSystemMessage('tail'), content: [{ type: 'reasoning', text: 'retained content' }],
       } }, { surfaceOp: 'append' })
       const projection = new SystemPromptProjection(session)
       for (const update of projection.project('', CONTINUING)) commit(session, 2, update)
@@ -58,13 +64,13 @@ describe('SystemPromptProjection', () => {
 
   it('appends the first rendered prompt, skips an unchanged one, and replaces the retained node on change', async () => {
     const ctx = await sessionStore()
-    const session = ctx.sessions.create(SessionId('system-prompt-fresh'))
+    const session = ctx.sessions.create(brandString<SessionId>('system-prompt-fresh'))
     const projection = new SystemPromptProjection(session)
 
     const first = projection.project('v1', REPLACING)[0]
     expect(first?.intent).toEqual({ surfaceOp: 'append' })
     expect(first?.message.role).toBe('system')
-    expect(first?.message.source).toEqual({ kind: 'plugin', plugin: SOURCE })
+    expect(first?.message.source).toEqual({ kind: 'system-prompt' })
     const head = commit(session, 1, first)
     appendUser(session, 'hello')
 
@@ -87,7 +93,7 @@ describe('SystemPromptProjection', () => {
   it('reserves an empty head before user history and replaces it when a prompt appears', async () => {
     const ctx = await sessionStore()
     try {
-      const session = ctx.sessions.create(SessionId('system-prompt-empty-head'))
+      const session = ctx.sessions.create(brandString<SessionId>('system-prompt-empty-head'))
       const projection = new SystemPromptProjection(session)
       const first = projection.project('', REPLACING)[0]
       expect(first?.intent).toEqual({ surfaceOp: 'append' })
@@ -113,17 +119,17 @@ describe('SystemPromptProjection', () => {
 
   it('reads the surviving system node from the log, including one restored as "no prompt"', async () => {
     const ctx = await sessionStore()
-    const session = ctx.sessions.create(SessionId('system-prompt-replay'))
-    const stale = session.append('system/message', { turn: 1, step: 1, message: createSystemMessage('stale', SOURCE) }, { surfaceOp: 'append' })
+    const session = ctx.sessions.create(brandString<SessionId>('system-prompt-replay'))
+    const stale = session.append('system/message', { turn: 1, step: 1, message: createSystemMessage('stale') }, { surfaceOp: 'append' })
     appendUser(session, 'hello')
-    const current = session.append('system/message', { turn: 2, step: 1, message: createSystemMessage('current', SOURCE) }, replaceOf(stale.seq))
+    const current = session.append('system/message', { turn: 2, step: 1, message: createSystemMessage('current') }, replaceOf(stale.seq))
 
     const projection = new SystemPromptProjection(session)
     expect(projection.project('current', REPLACING)[0]).toBeUndefined()
     expect(projection.project('next', REPLACING)[0]?.intent).toEqual(replaceOf(current.seq))
 
-    const emptySession = ctx.sessions.create(SessionId('system-prompt-empty-replay'))
-    const empty = emptySession.append('system/message', { turn: 1, step: 1, message: createSystemMessage('', SOURCE) }, { surfaceOp: 'append' })
+    const emptySession = ctx.sessions.create(brandString<SessionId>('system-prompt-empty-replay'))
+    const empty = emptySession.append('system/message', { turn: 1, step: 1, message: createSystemMessage('') }, { surfaceOp: 'append' })
     appendUser(emptySession, 'hello')
     const emptyProjection = new SystemPromptProjection(emptySession)
     expect(emptyProjection.project('', REPLACING)[0]).toBeUndefined()
@@ -132,7 +138,7 @@ describe('SystemPromptProjection', () => {
 
   it('appends again after a replacement shadowed a system node that was not the head', async () => {
     const ctx = await sessionStore()
-    const session = ctx.sessions.create(SessionId('system-prompt-shadowed'))
+    const session = ctx.sessions.create(brandString<SessionId>('system-prompt-shadowed'))
     const projection = new SystemPromptProjection(session)
     appendUser(session, 'before any prompt')
     const late = projection.project('late prompt', REPLACING)[0]
@@ -143,14 +149,14 @@ describe('SystemPromptProjection', () => {
 
     session.append('user/message', createUserMessage({
       content: [{ type: 'text', text: 'summary' }],
-      source: { kind: 'plugin', plugin: 'test-compaction' },
+      source: { kind: 'test-compaction' },
     }), replaceOf(node.seq))
     expect(projection.project('late prompt', REPLACING)[0]?.intent).toEqual({ surfaceOp: 'append' })
   })
 
   it('appends a changed prompt after cached history on an in-history route while the series continues', async () => {
     const ctx = await sessionStore()
-    const session = ctx.sessions.create(SessionId('system-prompt-in-history'))
+    const session = ctx.sessions.create(brandString<SessionId>('system-prompt-in-history'))
     const projection = new SystemPromptProjection(session)
     const head = commit(session, 1, projection.project('v1', CONTINUING)[0])
     appendUser(session, 'hello')
@@ -172,9 +178,26 @@ describe('SystemPromptProjection', () => {
       .toEqual([{ type: 'text', text: 'v1' }, { type: 'text', text: 'v2' }, { type: 'text', text: 'v3' }])
   })
 
+  it('keeps the surviving prompt node at a series start when its text already matches', async () => {
+    const ctx = await sessionStore()
+    const session = ctx.sessions.create(brandString<SessionId>('system-prompt-series-start-current'))
+    const projection = new SystemPromptProjection(session)
+    const head = commit(session, 1, projection.project('v1', CONTINUING)[0])
+    appendUser(session, 'hello')
+    const appended = commit(session, 2, projection.project('v2', CONTINUING)[0])
+
+    // The effective text is already current: re-baselining node 0 would move the same
+    // text into the request's first message and invalidate the provider prefix.
+    expect(projection.project('v2', NEW_SERIES)).toEqual([])
+    expect(session.surface.nodes[0]).toBe(head.seq)
+    expect(session.surface.nodes).toContain(appended.seq)
+    expect(session.deriveMessages().flatMap(message => message.role === 'system' ? [message.content[0]] : []))
+      .toEqual([{ type: 'text', text: 'v1' }, { type: 'text', text: 'v2' }])
+  })
+
   it('re-baselines node 0 and empties later active nodes at a series start', async () => {
     const ctx = await sessionStore()
-    const session = ctx.sessions.create(SessionId('system-prompt-series-start'))
+    const session = ctx.sessions.create(brandString<SessionId>('system-prompt-series-start'))
     const projection = new SystemPromptProjection(session)
     const head = commit(session, 1, projection.project('v1', CONTINUING)[0])
     appendUser(session, 'hello')
@@ -197,7 +220,7 @@ describe('SystemPromptProjection', () => {
 
   it('empties all active nodes when clearing an in-history prompt', async () => {
     const ctx = await sessionStore()
-    const session = ctx.sessions.create(SessionId('system-prompt-in-history-clear'))
+    const session = ctx.sessions.create(brandString<SessionId>('system-prompt-in-history-clear'))
     const projection = new SystemPromptProjection(session)
     commit(session, 1, projection.project('v1', CONTINUING)[0])
     appendUser(session, 'hello')

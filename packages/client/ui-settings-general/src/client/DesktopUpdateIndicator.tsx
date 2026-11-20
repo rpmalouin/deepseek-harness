@@ -1,8 +1,8 @@
 /** Optional Electron status presentation; the native shell owns actions and Web owns visible copy. */
-import { IconDownloadOutline16, IconLoadingOutline16, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconDownloadOutlineRegular, IconLoadingOutlineRegular, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import css from './DesktopUpdateIndicator.module.css'
-import type { DesktopUpdateFailureKind, DesktopUpdatePresentation, DesktopUpdateView } from './desktop-update-bridge.ts'
+import type { DesktopUpdateFailureKind, DesktopUpdatePresentation, DesktopUpdateView } from '../types.ts'
 import type { SettingsRootInjected } from './shell-contract.ts'
 
 type SettingsTranslate = PropsLocale<'settings'>['t']
@@ -12,6 +12,7 @@ const BUSY_PHASES: ReadonlySet<DesktopUpdatePresentation['phase']> = new Set([
 ])
 
 function updateCopy(state: DesktopUpdatePresentation, t: SettingsTranslate): { label: string; detail: string } {
+  if (state.configurationError !== undefined) return { label: t('desktop.channel.unavailable'), detail: t(`desktop.update.configuration.${state.configurationError}`) }
   const labels: Readonly<Record<DesktopUpdatePresentation['phase'], string>> = {
     idle: '',
     checking: t('desktop.update.checking'),
@@ -23,17 +24,25 @@ function updateCopy(state: DesktopUpdatePresentation, t: SettingsTranslate): { l
     error: t('desktop.update.retry'),
   }
   const label = labels[state.phase]
+  if (state.phase === 'checking' || state.phase === 'verifying' || state.phase === 'installing') {
+    return { label, detail: state.version ?? label }
+  }
   if (state.phase === 'error') {
     const failures: Readonly<Record<DesktopUpdateFailureKind, string>> = {
+      configuration: t('desktop.update.configurationFailed'),
       check: t('desktop.update.checkFailed'),
       'check-network': t('desktop.update.checkNetworkFailed'),
       download: t('desktop.update.downloadFailed'),
+      'download-space': t('desktop.update.downloadSpaceFailed'),
+      'download-permission': t('desktop.update.downloadPermissionFailed'),
+      'download-busy': t('desktop.update.downloadBusyFailed'),
       'download-network': t('desktop.update.downloadNetworkFailed'),
       install: t('desktop.update.installFailed'),
       'install-network': t('desktop.update.installNetworkFailed'),
       'stop-failed': t('desktop.update.stopFailed'),
       'tasks-changed': t('desktop.update.tasksChanged'),
       'tasks-unavailable': t('desktop.update.tasksUnavailable'),
+      'fullscreen-timeout': t('desktop.update.fullscreenTimeout'),
     }
     return { label, detail: failures[state.failure ?? 'install'] }
   }
@@ -46,6 +55,7 @@ function updateCopy(state: DesktopUpdatePresentation, t: SettingsTranslate): { l
 }
 
 /**
+ * Render update status with connection-indicator geometry and brand-blue labels, including retries.
  * @param props - Connection priority, sidebar width, and localized bridge-failure copy.
  * @returns Desktop-only status beside the account button, or nothing in browsers.
  */
@@ -57,18 +67,21 @@ export function DesktopUpdateIndicator({ wide, hidden, t, view, onOpen }: {
   onOpen: () => void
 }) {
   const { presentation: state, failed, opening } = view
-  if (!wide || hidden || (!failed && (state === undefined || state.phase === 'idle'))) return null
+  if (!wide || hidden || (!failed && (state === undefined || (state.phase === 'idle' && state.configurationError === undefined)))) return null
   const retryLabel = t('desktop.update.retry')
   const copy = state === undefined ? { label: retryLabel, detail: retryLabel } : updateCopy(state, t)
   const label = failed ? retryLabel : copy.label
-  const error = failed || state?.phase === 'error'
-  const busy = opening || (state !== undefined && BUSY_PHASES.has(state.phase))
+  const error = failed || state?.phase === 'error' || state?.configurationError !== undefined
+  const busy = opening || (state !== undefined && state.configurationError === undefined && BUSY_PHASES.has(state.phase))
+  const disabled = opening || (busy && state?.phase !== 'downloading')
   return <Tooltip label={failed ? retryLabel : copy.detail} side="top">
-    <button type="button" className={css.indicator} data-error={error || undefined}
-      aria-label={label} aria-disabled={busy} onClick={() => { if (!busy) onOpen() }}>
-      {error ? <span className={css.errorDot} aria-hidden="true" />
-        : busy ? <IconLoadingOutline16 className={css.spinner} size={16} /> : <IconDownloadOutline16 size={14} />}
-      <span>{label}</span>
+    <button type="button" className={css.indicator}
+      aria-label={label} aria-disabled={disabled} onClick={() => { if (!disabled) onOpen() }}>
+      <span className={css.icon} aria-hidden="true">
+        {error ? <span className={css.errorDot} />
+          : busy ? <IconLoadingOutlineRegular className={css.spinner} size={14} /> : <IconDownloadOutlineRegular size={14} />}
+      </span>
+      <span className={!error && state?.phase === 'downloading' ? css.progress : undefined}>{label}</span>
     </button>
   </Tooltip>
 }
@@ -78,17 +91,17 @@ type BadgeProps = PropsRuntime<'sidebar.toggle.badge'> & PropsLocale<'settings'>
 
 /**
  * @param props - Framework-bound carrier and connection state.
- * @returns A non-interactive notification on the sidebar expand button.
+ * @returns A non-interactive brand-blue notification on the sidebar expand button.
  */
 export function DesktopUpdateBadge({ useDesktopUpdate, useConnectionState, t }: BadgeProps) {
   const { presentation: state, failed } = useDesktopUpdate(value => value)
   const connection = useConnectionState(value => value)
   if (((connection === 'disconnected' || connection === 'connecting') && state?.phase !== 'installing')
-    || (!failed && (state === undefined || state.phase === 'idle'))) return null
+    || (!failed && (state === undefined || (state.phase === 'idle' && state.configurationError === undefined)))) return null
   const retryLabel = t('desktop.update.retry')
   const copy = state === undefined ? { label: retryLabel, detail: retryLabel } : updateCopy(state, t)
   const label = failed ? retryLabel : copy.label
   return <Tooltip label={failed ? label : copy.detail} side="right">
-    <span role="img" aria-label={label} className={css.badge} data-error={failed || state?.phase === 'error' || undefined} />
+    <span role="img" aria-label={label} className={css.badge} />
   </Tooltip>
 }

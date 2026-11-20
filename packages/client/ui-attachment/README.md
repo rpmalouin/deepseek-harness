@@ -25,11 +25,13 @@ This package renders everything the conversation UI shows about attachments: one
 <a id="use-this-package"></a>
 ## Use this package
 
+Image drag actions and the composer’s original-file reader arrive through slot injection from [ui-file-drag](../ui-file-drag/README.md). The image gallery Factory also receives these actions through its declared inject face; custom Factory replacements must supply that face. `MessageImage` and `ImageGallery` require the ordinary `getTriggerProps` factory; they bind each original image once and pass the same `contextMenuProps` to its thumbnail and lightbox.
+
 Mount this plugin alongside [`ui-conversation`](../ui-conversation/README.md) and [`ui-tool`](../ui-tool/README.md) when tool results need an image gallery. It waits for their slot declarations and registers its components into them. Users then see the mixed draft-attachment rail, DeepSeek Web file cards with upload controls, the drop overlay with its limits line, message images sized by count, the tool card's gallery, and the Escape/mask/close lightbox.
 
 ### Draft attachments
 
-Images and generic files retain pick order in one non-wrapping horizontal rail. Every item is 64px high: an image is a 64px square thumbnail, while a generic file is a 240px-wide DeepSeek Web card with a 16px radius, blue gradient document glyph, filename, and uppercase extension plus byte size. Edge arrows page hidden overflow, the scrollbar stays hidden, and a newly added item is revealed at the rail's end. Uploading replaces a file glyph with a spinner and shows byte progress when the carrier reports it, with an indeterminate bar before the first report; failure shows retry, and removal controls appear on hover or keyboard focus while remaining visible on touch devices. Clicking an image opens the original.
+Images and generic files retain pick order in one non-wrapping horizontal rail. Every item is 64px high: an image is a 64px square thumbnail, while a generic file is a 240px-wide DeepSeek Web card with a 16px radius, blue gradient document glyph, filename, and uppercase extension plus byte size. Edge arrows page hidden overflow, the scrollbar stays hidden, and a newly added item is revealed at the rail's end. Uploading replaces a file glyph with a spinner and shows byte progress when the carrier reports it, with an indeterminate bar before the first report; failure shows retry, and removal controls appear on hover or keyboard focus while remaining visible on touch devices. An uploading image shows the same progress bar along its thumbnail's bottom edge, and a failed image upload turns the thumbnail into its retry control, except an image the Host refused, whose thumbnail explains the refusal in a tooltip that a tap or click also pins and leaves removal as the way out. Clicking an image opens the original.
 
 ### Message images and the lightbox
 
@@ -37,9 +39,13 @@ In Chat, one user message presents files and images in a right-aligned wrapping 
 
 Trajectory attachment rows request 48px square thumbnails that contain the complete image without cropping. Loading and retry icons keep the same box, with localized tooltips and accessible names; the image opens the same lightbox. A slot owner may supply a presentation-only image label for the thumbnail and lightbox without changing the durable reference or the cache lookup.
 
+Loaded conversation images can be dragged into the composer as image attachments or to another application as original files. Dragging does not open the lightbox. The shared image-transfer owner retains Web drag bytes until the gesture ends; Desktop uses the system file drag. A failed preparation or drag keeps the image visible and reports a localized retry message.
+
+Internal Web image drags do not show the full-page overlay. A foreign or expired image token without actual files is ignored. Browser transfer limitations are documented by [ui-primitives](../ui-primitives/README.md#known-limitations-and-deferred-work).
+
 ### Drop overlay
 
-While a file drag is over the page, the full-viewport overlay announces the drop: illustration, title, and a limits line when drops are accepted. The overlay only shows state — the owner's document-level listeners decide accept or reject.
+While an external file drag is over the page, the full-viewport overlay announces the drop: illustration, title, and a limits line when drops are accepted. The overlay only shows state — the owner's document-level listeners decide accept or reject, and the drop handler reports which dropped members are directories through the entry API so the owner can cite or refuse them.
 
 -----
 
@@ -49,7 +55,7 @@ While a file drag is over the page, the full-viewport overlay announces the drop
 <details>
 <summary>Implementation internals — click to expand</summary>
 
-The plugin waits for `conversation.input.attachments`, `conversation.message.images`, `conversation.trajectory.images`, and `tool.call.images` through `ctx.slots.inject`. It then registers the composer rail, document drop target, shared history gallery for Chat, Trajectory, and Tool results, and original-image lightbox. The presentation components are driven entirely by props: the slot owner supplies attachment data, image loading, callbacks, and the locale translator; the package entry exports no components.
+The plugin provides the root-scoped `conversation.images.content` Factory. Its official `MessageImages` entries fill `conversation.chat.user.images`, `conversation.chat.message.images`, `conversation.trajectory.images`, and `tool.call.images` at priority 100 through `ctx.slots.inject`. A lower-priority entry replaces only its own position; removing it restores the official entry. All defaults reuse one gallery with explicit image references, authorized loader, layout hints, and optional complete labels. The Factory owns gallery presentation and default copy, not Session state or read authorization. Each domain owns its Slot declaration. The composer attachment rail remains a separate entry, and the package entry exports no components.
 
 | File | Role |
 |---|---|
@@ -58,7 +64,7 @@ The plugin waits for `conversation.input.attachments`, `conversation.message.ima
 | [`src/AttachmentRail.tsx`](src/AttachmentRail.tsx) | Horizontal attachment overflow, wheel translation, edge arrows |
 | [`src/client/MessageImages.tsx`](src/client/MessageImages.tsx) | Per-message gallery + lightbox assembly |
 | [`src/MessageImage.tsx`](src/MessageImage.tsx) | Single image sizing, load/retry, click-to-open; local submission-echo previews render their object URL directly |
-| [`src/ImageLightbox.tsx`](src/ImageLightbox.tsx) | Document-level modal preview over the shared mask |
+| [`ImageLightbox`](../ui-primitives/src/ImageLightbox.tsx) | Document-level modal preview over the shared mask |
 | [`src/DropOverlay.tsx`](src/DropOverlay.tsx) | Pointer-inert drag invitation portal |
 
 </details>
@@ -71,10 +77,12 @@ The plugin waits for `conversation.input.attachments`, `conversation.message.ima
 Read these pages when the attachment surface is not enough. They move from the slots this package fills to the conversation shell that owns the input flow.
 
 - [ui-conversation](../ui-conversation/README.md) — declares the attachment slots and owns the composer and image intake.
-- [Web client architecture](../../../.agents/notes/implemented/architecture/2026-07-19-gui-web-client-architecture.md) — how browser plugin rows load and register slots.
+- [Web client architecture](../../../docs/subsystems/web-client.md) — how browser plugin rows load and register slots.
 - [Client package map](../README.md) — adjacent browser UI packages.
 
 -----
+
+Message images and original previews forward context gestures through the shared gallery to [ui-context-menu](../ui-context-menu/README.md). Original authorized URLs and MIME metadata remain independent from thumbnail presentation.
 
 <a id="model-experience"></a>
 ## Model Experience
@@ -104,5 +112,3 @@ These limits define the current attachment surface. They are package constraints
 None.
 
 </details>
-
-**Runtime invariant:** No companion is published. The package contributes only effect-owned slot entries; the slot registry owns their lifecycle and validates their declarations.

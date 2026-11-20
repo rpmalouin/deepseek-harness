@@ -1,9 +1,12 @@
 /** Workspace command implementation and stable Remote failure mapping. */
 
 import type { Context } from '@deepseek-ai/cordis'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { WorkspaceId } from '@deepseek-ai/dsh-workspace/types'
 import type { Workspace } from '@deepseek-ai/dsh-workspace'
 import {
-  WorkspaceId,
+  WorkspaceActiveSessionError,
+  WorkspaceArchivedSessionPinError,
   WorkspaceMoveInvalidError,
   WorkspaceOrderInvalidError,
   WorkspaceUnknownSessionError,
@@ -20,8 +23,11 @@ import type {
   WorkspaceInsertBeforeRequest,
   WorkspaceInsertSessionBeforeRequest,
   WorkspaceOrderValue,
+  WorkspacePinSessionRequest,
+  WorkspacePinValue,
   WorkspaceRenameRequest,
   WorkspaceUnarchiveSessionRequest,
+  WorkspaceUnpinSessionRequest,
   WorkspaceValue,
 } from './types.ts'
 
@@ -92,7 +98,7 @@ export class WorkspaceCommands {
    */
   delete(request: WorkspaceDeleteRequest): Promise<WorkspaceDeleteValue> {
     return this.enqueue(async () => {
-      if (!await this.ctx.workspaceRegistry.delete(WorkspaceId(request.workspaceId))) {
+      if (!await this.ctx.workspaceRegistry.delete(brandString<WorkspaceId>(request.workspaceId))) {
         throw workspaceNotFound(request.workspaceId)
       }
       return { deleted: true }
@@ -107,10 +113,10 @@ export class WorkspaceCommands {
   async insertBefore(request: WorkspaceInsertBeforeRequest): Promise<WorkspaceOrderValue> {
     try {
       const workspaceIds = await this.ctx.workspaceRegistry.insertBefore(
-        WorkspaceId(request.workspaceId),
+        brandString<WorkspaceId>(request.workspaceId),
         request.beforeWorkspaceId === undefined
           ? undefined
-          : WorkspaceId(request.beforeWorkspaceId),
+          : brandString<WorkspaceId>(request.beforeWorkspaceId),
       )
       return { workspaceIds: [...workspaceIds] }
     } catch (error) {
@@ -147,16 +153,32 @@ export class WorkspaceCommands {
   }
 
   /**
-   * Add one known Session to the registry-global archive set.
-   * @param request - Session identity to archive.
+   * Add one known Session to the registry-global archive set. Without
+   * `stopActivity` a Session with running work is refused as
+   * `workspace/session-active` with the activity the registry's providers
+   * reported; with it, the providers stop that work first.
+   * @param request - Session identity to archive and whether to stop its work.
    * @returns the complete resulting archive set.
    */
   async archiveSession(request: WorkspaceArchiveSessionRequest): Promise<WorkspaceArchiveValue> {
     try {
-      await this.ctx.workspaceRegistry.archiveSession(request.sessionId)
+      await this.ctx.workspaceRegistry.archiveSession(
+        request.sessionId,
+        request.stopActivity === true ? { stopActivity: true } : {},
+      )
     } catch (error) {
-      if (!(error instanceof WorkspaceUnknownSessionError)) throw error
-      throw new RemoteError('session/not-found', error.message, { sessionId: request.sessionId }, { cause: error })
+      if (error instanceof WorkspaceUnknownSessionError) {
+        throw new RemoteError('session/not-found', error.message, { sessionId: request.sessionId }, { cause: error })
+      }
+      if (error instanceof WorkspaceActiveSessionError) {
+        throw new RemoteError(
+          'workspace/session-active',
+          error.message,
+          { sessionId: request.sessionId, activity: error.activity },
+          { cause: error },
+        )
+      }
+      throw error
     }
     return { archivedSessionIds: [...this.ctx.workspaceRegistry.archivedSessionIds] }
   }
@@ -173,8 +195,40 @@ export class WorkspaceCommands {
     return { archivedSessionIds: [...this.ctx.workspaceRegistry.archivedSessionIds] }
   }
 
+  /**
+   * Add one known unarchived Session to the registry-global pin set.
+   * @param request - Session identity to pin.
+   * @returns the complete resulting pin set, most recently pinned first.
+   */
+  async pinSession(request: WorkspacePinSessionRequest): Promise<WorkspacePinValue> {
+    try {
+      await this.ctx.workspaceRegistry.pinSession(request.sessionId)
+    } catch (error) {
+      if (error instanceof WorkspaceUnknownSessionError) {
+        throw new RemoteError('session/not-found', error.message, { sessionId: request.sessionId }, { cause: error })
+      }
+      if (error instanceof WorkspaceArchivedSessionPinError) {
+        throw new RemoteError('gateway/bad-request', error.message, {}, { cause: error })
+      }
+      throw error
+    }
+    return { pinnedSessionIds: [...this.ctx.workspaceRegistry.pinnedSessionIds] }
+  }
+
+  /**
+   * Drop one Session from the registry-global pin set. An id that is not
+   * pinned is not an error: the call is idempotent, so a lost race with
+   * another surface resolves as a no-op.
+   * @param request - Session identity to unpin.
+   * @returns the complete resulting pin set, most recently pinned first.
+   */
+  async unpinSession(request: WorkspaceUnpinSessionRequest): Promise<WorkspacePinValue> {
+    await this.ctx.workspaceRegistry.unpinSession(request.sessionId)
+    return { pinnedSessionIds: [...this.ctx.workspaceRegistry.pinnedSessionIds] }
+  }
+
   private requireWorkspace(workspaceId: WorkspaceId): Workspace {
-    const workspace = this.ctx.workspaceRegistry.get(WorkspaceId(workspaceId))
+    const workspace = this.ctx.workspaceRegistry.get(brandString<WorkspaceId>(workspaceId))
     if (workspace === undefined) throw workspaceNotFound(workspaceId)
     return workspace
   }

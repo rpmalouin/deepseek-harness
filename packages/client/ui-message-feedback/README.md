@@ -25,13 +25,17 @@ This package is the Web GUI's feedback surface: the Like/Dislike pair in the fin
 <a id="use-this-package"></a>
 ## Use this package
 
-Mount this plugin alongside `ui-conversation` and `ui-commands`; the Like/Dislike pair then appears in the action row of each turn's closing assistant message, between copy and branch, and the Feedback row of the composer menu opens the dialog. A recorded rating shows the filled glyph and stays visible without hover. Like and Dislike both open the dialog: seven category chips and a detail box are optional, and Submit records the selected judgment with whatever was filled in before the toast thanks the user; the conversation log travels with every feedback event. Clicking the recorded rating retracts it without opening the dialog. A bare `/feedback`, picked from the menu or typed and sent without text, opens the same dialog for the Session; `/feedback <text>` keeps the Host command path and its acknowledgement row.
+Mount this plugin alongside `ui-conversation` and `ui-commands`; the Like/Dislike pair then appears in the action row of each turn's closing assistant message, between copy and branch, and Feedback in the composer menu opens the same dialog. Mounting `session-log-export` also adds Feedback to the Session Header's more-actions menu. The rating glyphs use 16px boxes at the default content font size, matching the adjacent completion actions while retaining fixed 1px outline strokes. A recorded rating shows the filled glyph and stays visible without hover. Like and Dislike both open the dialog: seven category chips and a detail box are optional, and Submit records the selected judgment with whatever was filled in before the toast thanks the user; the conversation log travels with every feedback event. Clicking the recorded rating retracts it without opening the dialog. A bare `/feedback`, picked from the menu or typed and sent without text, opens the same dialog for the Session; `/feedback <text>` keeps the Host command path and its acknowledgement row.
 
 ### Failures
 
 A rating or list-load failure shows inline in the row; a submission failure shows in a warning toast while the dialog stays open so the draft can be corrected. Only finalized messages reach the message entry — an interruption-frozen partial carries no `messageId` and therefore no feedback controls.
 
+Access: the rating buttons render only while the current Peer may call `messageFeedback/put` on the Session; the `/feedback` decoration has no Client check, and the Host refuses a submission without access.
+
 -----
+
+The feedback dialog uses the shared modal heading spacing. Category chips form a tight group, details follow as a separate field, and the submit action has a larger separation than the gaps within either input group.
 
 <a id="understand-the-implementation"></a>
 ## Understand the implementation
@@ -39,7 +43,7 @@ A rating or list-load failure shows inline in the row; a submission failure show
 <details>
 <summary>Implementation internals — click to expand</summary>
 
-The package contributes the `feedback` entry (order 10) of `conversation.chat.assistant-actions`, declared by ui-conversation and rendered inside the finalized assistant message's IconActions row, and the `feedback-dialog` entry (order 2) of `conversation.input.overlay`, which renders the Modal and Toast primitives through body portals and centers the toast over the composer card it mounts inside. The `/feedback` decoration is an `action` registered through `ctx.commandUi.decorate`, so a menu pick or a bare Enter consumes the trigger token and opens the dialog while an argued line still reaches the Host command.
+The package contributes the `feedback` entry (order 10) of `conversation.chat.assistant-actions`, declared by ui-conversation and rendered inside the finalized assistant message's IconActions row, and the `feedback-dialog` entry (order 2) of `conversation.input.overlay`, which renders the Modal and Toast primitives through body portals and centers the toast over the composer card it mounts inside. The `feedbackUi.openSession(sessionId)` Client service opens that same Session-scoped dialog without recording feedback; the Header menu and command decoration both use it. The `/feedback` decoration is an `action` registered through `ctx.commandUi.decorate`, so a menu pick or a bare Enter consumes the trigger token and opens the dialog while an argued line still reaches the Host command.
 
 Per Session, one `MessageFeedbackController` backs every message control and one `FeedbackDialogController` owns the dialog draft, the submission, and the toast sequence. The message controller reads `messageFeedback.list` once, deferred to the first hover or focus rather than fired on mount, and serializes mutations so each carries the version last observed; a `version-conflict` reply carries the authoritative item and reconciles the view without refetching. Before either rating action proceeds, the row checks the committed item: the matching rating calls `retract`, which rechecks the rating in the serialized queue and becomes a no-op after a concurrent change, while any other state opens the dialog with the requested rating. The dialog controller submits by target: a message target puts that rating with the dialog's note and category through the message controller, and the Session target records through `ctx.remote.sessionFeedback`. Success closes the draft and raises the acknowledgement toast; a late success from a superseded draft raises that toast without closing the new draft; a failure keeps the draft open and raises a longer-lived warning toast.
 
@@ -89,5 +93,3 @@ These limits define the current feedback surface. They are current package const
 None.
 
 </details>
-
-**Runtime invariant:** No companion is published. The plugin owns two slot registrations, one command decoration, and one per-session controller-pair map, all released by the plugin fiber's effect disposers. The lifecycle spec proves the registrations are withdrawn and every controller pair is dropped when the owning fiber is disposed, so no second authority exists to check at runtime.

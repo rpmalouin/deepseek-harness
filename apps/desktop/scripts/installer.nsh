@@ -1,19 +1,32 @@
 !include "LogicLib.nsh"
+!include "${__FILEDIR__}\restart-banner.nsh"
+!include "FileFunc.nsh"
 !define INSTALLER_SOURCE_DIR "${__FILEDIR__}\..\installer"
 !define /ifndef INSTALLER_BUILD_DIR "${__FILEDIR__}\..\.desktop-build\targets\win-x64\installer-ui"
 
+ManifestDPIAware true
 !ifndef BUILD_UNINSTALLER
-  ManifestDPIAware true
   !define MUI_CUSTOMFUNCTION_GUIINIT InstallerGuiInit
 !endif
 
 !macro customHeader
-  !define /ifndef INSTALLER_STRINGS_FILE "${INSTALLER_SOURCE_DIR}\strings.nsh"
+  !define /ifndef INSTALLER_STRINGS_FILE "${INSTALLER_BUILD_DIR}\strings.nsh"
   !include "${INSTALLER_STRINGS_FILE}"
+  !ifdef BUILD_UNINSTALLER
+    BrandingText " "
+    SetFont "Segoe UI" 9
+    !ifdef LANG_SIMPCHINESE
+      SetFont /LANG=${LANG_SIMPCHINESE} "Microsoft YaHei UI" 9
+    !endif
+    !include "${INSTALLER_SOURCE_DIR}\uninstall.nsh"
+  !endif
   !ifndef BUILD_UNINSTALLER
     !include "${INSTALLER_SOURCE_DIR}\theme.nsh"
     !include "${INSTALLER_SOURCE_DIR}\pages.nsh"
     !include "${INSTALLER_SOURCE_DIR}\lifecycle.nsh"
+    Function InstallerCheckAppRunning
+      !insertmacro customCheckAppRunning
+    FunctionEnd
   !endif
 !macroend
 
@@ -55,6 +68,12 @@
   File "/oname=$PLUGINSDIR\brand-dark-2x.bmp" "${INSTALLER_BUILD_DIR}\brand-dark-2x.bmp"
   File "/oname=$PLUGINSDIR\window-frame.dll" "${INSTALLER_BUILD_DIR}\window-frame.dll"
   ${If} ${Silent}
+  ${AndIf} ${isUpdated}
+  ${AndIf} ${isForceRun}
+    !insertmacro ShowRestartBanner
+  ${EndIf}
+  Call InstallerCheckAppRunning
+  ${If} ${Silent}
     Call InstallerPreflight
     ${If} $InstallerError != ""
       SetErrorLevel 2
@@ -74,13 +93,18 @@
   Page custom InstallerWelcome InstallerWelcomeLeave
 !macroend
 
+!macro customUnInstall
+  Call un.CleanData
+!macroend
+
 !macro customPageAfterChangeDir
   !define MUI_PAGE_CUSTOMFUNCTION_PRE InstallerBeforeInstall
   !define MUI_PAGE_CUSTOMFUNCTION_SHOW InstallerProgressShow
+  !define MUI_PAGE_CUSTOMFUNCTION_LEAVE InstallerProgressLeave
 !macroend
 
 !macro customFinishPage
-  Page custom InstallerFinish InstallerFinishLeave
+  ; The final instfiles page keeps its controls until the user dismisses it.
 !macroend
 
 ; Installation work publishes stage changes without disturbing the NSIS caller.
@@ -108,16 +132,43 @@
   System::Call /NOUNLOAD '$PLUGINSDIR\window-frame.dll::InstallerExtract(p $HWNDPARENT, w "$PLUGINSDIR\dsh-7za.exe", w "${Archive}", w "$INSTDIR", w "$PLUGINSDIR\extract.log") i.s ?c'
   System::Store "L"
   Pop $R0
+  ; The failure report owns 7-Zip's UTF-8 output; the details view only needs the result code.
   StrCpy $R1 "$R0"
-  ${If} $R0 != 0
-    Push $0
-    FileOpen $0 "$PLUGINSDIR\extract.log" r
-    ${IfNot} ${Errors}
-      FileRead $0 $R1
-      FileClose $0
-    ${EndIf}
-    Pop $0
+!macroend
+
+; The report outlives $PLUGINSDIR so a user can send it; silent installs keep only the file. The updater cache
+; directory is never an installation target and leaves with the application on uninstall.
+; The directory smoke fixture predefines DSH_INSTALLER_LOG_DIR to keep reports inside its scratch tree.
+!ifndef DSH_INSTALLER_LOG_DIR
+  !define DSH_INSTALLER_LOG_DIR "$LOCALAPPDATA\${DSH_UPDATER_CACHE_NAME}\installer-logs"
+!endif
+
+!macro customInstallerExtractFailed Archive
+  Push $0
+  Push $1
+  Push $2
+  Push $3
+  Push $4
+  Push $5
+  Push $6
+  ; GetTime yields zero-padded day, month, year, weekday, hour, minute, second.
+  ${GetTime} "" "L" $0 $1 $2 $3 $4 $5 $6
+  StrCpy $0 "${DSH_INSTALLER_LOG_DIR}\extract-failure-$2$1$0-$4$5$6.log"
+  StrCpy $1 1
+  ${If} ${Silent}
+    StrCpy $1 0
   ${EndIf}
+  System::Call '$PLUGINSDIR\window-frame.dll::InstallerReportExtractFailure(p $HWNDPARENT, i R0, w "${Archive}", w "$dshNewDirectory", w "$PLUGINSDIR\extract.log", w r0, i r1, w "$(^SetupCaption)", w "$(INSTALLER_EXTRACT_FAILED)", w "$(INSTALLER_EXTRACT_HINT)", w "$(INSTALLER_EXTRACT_COPY)", w "$(INSTALLER_EXTRACT_EXPAND)", w "$(INSTALLER_EXTRACT_COLLAPSE)", w "$(INSTALLER_EXTRACT_SAVED)", w "$(INSTALLER_EXTRACT_UNSAVED)", w "$(INSTALLER_EXTRACT_COPIED)") i.r2 ?c'
+  ${If} $2 == 1
+    DetailPrint $0
+  ${EndIf}
+  Pop $6
+  Pop $5
+  Pop $4
+  Pop $3
+  Pop $2
+  Pop $1
+  Pop $0
 !macroend
 
 !macro customCheckAppRunning
@@ -151,6 +202,37 @@
   ${EndIf}
 !macroend
 
+!macro customInstallerDirectoryFailed
+  Push $0
+  Push $1
+  Push $2
+  Push $3
+  Push $4
+  Push $5
+  Push $6
+  ${GetTime} "" "L" $0 $1 $2 $3 $4 $5 $6
+  StrCpy $0 "$dshDirectoryLogDirectory\directory-failure-$2$1$0-$4$5$6.log"
+  StrCpy $1 1
+  ${If} ${Silent}
+    StrCpy $1 0
+  ${EndIf}
+  StrCpy $3 "$(INSTALLER_DIRECTORY_HINT)"
+  ${If} $dshRestoreError != 0
+    StrCpy $3 "$(INSTALLER_DIRECTORY_RESTORE_HINT)"
+  ${EndIf}
+  System::Call '$PLUGINSDIR\window-frame.dll::InstallerReportDirectoryFailure(p $HWNDPARENT, i $dshDirectoryError, w "$dshDirectorySource", w "$dshDirectoryDestination", i $dshRestoreError, w "$dshOldDirectory", w "$PLUGINSDIR\directory-operations.log", w r0, i r1, w "$(^SetupCaption)", w "$(INSTALLER_DIRECTORY_FAILED)", w r3, w "$(INSTALLER_EXTRACT_COPY)", w "$(INSTALLER_EXTRACT_EXPAND)", w "$(INSTALLER_EXTRACT_COLLAPSE)", w "$(INSTALLER_EXTRACT_SAVED)", w "$(INSTALLER_EXTRACT_UNSAVED)", w "$(INSTALLER_EXTRACT_COPIED)") i.r2 ?c'
+  ${If} $2 == 1
+    DetailPrint $0
+  ${EndIf}
+  Pop $6
+  Pop $5
+  Pop $4
+  Pop $3
+  Pop $2
+  Pop $1
+  Pop $0
+!macroend
+
 !ifndef BUILD_UNINSTALLER
   !include "${__FILEDIR__}\installer-directories.nsh"
 !endif
@@ -163,6 +245,13 @@
   ${EndIf}
   !insertmacro InstallerPublishStage 4
   !insertmacro dshFinishDirectories
+  ${If} $RestartStatusJob != ""
+  ${AndIf} $RestartStatusJob != 0
+    System::Call 'kernel32::CloseHandle(p $RestartStatusJob)'
+    StrCpy $RestartStatusJob 0
+  ${EndIf}
+  ; Standard uninstall-entry metadata read by inventory tools; the upstream template records it only under its private key.
+  WriteRegStr SHELL_CONTEXT "${UNINSTALL_REGISTRY_KEY}" InstallLocation "$INSTDIR"
   ${If} $0 == 1
     SetErrors
   ${Else}

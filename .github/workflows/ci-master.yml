@@ -13,6 +13,8 @@ on:
         options:
           - larger-runner-benchmark
           - consolidated-runner-benchmark
+          - ssh-helper
+          - wine
 
 # New master pushes and manual runs replace obsolete checks in this workflow/ref.
 # Standby drills share cancellation; use completed runs as readiness evidence.
@@ -30,6 +32,13 @@ env:
   DSH_TELEMETRY_DISABLED: '1'
 
 jobs:
+  ssh-helper:
+    if: github.event_name == 'workflow_dispatch' && inputs.suite == 'ssh-helper'
+    name: ssh helper / native artifacts
+    uses: ./.github/workflows/build-exe-for-ssh-helper.yml
+    with:
+      targets: node24-linux-x64,node24-linux-arm64,node24-macos-arm64,node24-macos-x64
+
   # These native runtime carriers are post-merge checks; release keeps all targets.
   python-runtime:
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
@@ -41,22 +50,22 @@ jobs:
     secrets:
       DEEPSEEK_API_KEY_EXTERNAL: ${{ secrets.DEEPSEEK_API_KEY_EXTERNAL }}
 
-  # Wine runs once here, independently of the native serial standby aggregates.
+  # Wine runs on master pushes or an explicit suite=wine dispatch, independently of native standbys.
   windows:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/master') || (github.event_name == 'workflow_dispatch' && inputs.suite == 'wine')
     runs-on: ubuntu-latest
     name: windows node 24 / wine
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v5.0.0
         with:
           dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ env.PRIMARY_NODE_VERSION }}
 
@@ -68,7 +77,7 @@ jobs:
           store_path=$(PNPM_CONFIG_STORE_DIR="$store_root" pnpm store path --silent)
           echo "path=$store_path" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@v6.1.0
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
           key: ${{ runner.os }}-node-${{ env.PRIMARY_NODE_VERSION }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
@@ -80,7 +89,7 @@ jobs:
         id: wine-cache-key
         run: echo "key=wine-debs-${ImageOS:-linux}-${ImageVersion:-v0}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6.1.0
         with:
           path: ~/wine-debs
           key: ${{ steps.wine-cache-key.outputs.key }}
@@ -139,21 +148,21 @@ jobs:
       # github.event.before, so full history is required: depth 2 would miss it
       # on multi-commit or force pushes; full fetch is cheap here because
       # checkout resolves against the VM's local mirror.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
       # Redirect the Node compile cache (enabled by pnpm and TypeScript) off
-      # the root partition's /tmp before the first pnpm call in this lane —
-      # see .agents/notes/implemented/process/2026-08-28-ci-node-compile-cache-data-disk.md.
+      # the root partition's /tmp before the first pnpm call in this lane.
+      # see .github/workflows/ci.yml.
       - name: Redirect Node compile cache to runner temp
         run: echo "NODE_COMPILE_CACHE=${{ runner.temp }}/node-compile-cache" >> "$GITHUB_ENV"
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v5.0.0
         with:
           dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ env.PRIMARY_NODE_VERSION }}
 
@@ -165,8 +174,8 @@ jobs:
 
       # The persistent VM image owns Playwright's Linux system packages; this
       # step also proves that browser provisioning remains usable for failover.
-      - name: Install Playwright Chromium
-        run: pnpm --filter @deepseek-ai/dsh-web-frontend exec playwright install chromium
+      - name: Install Playwright Chromium and WebKit
+        run: pnpm --filter @deepseek-ai/dsh-web-frontend exec playwright install chromium webkit
 
       - name: Prepare bubblewrap (unrestrict userns)
         run: bash scripts/prepare-ci-bubblewrap.sh
@@ -191,13 +200,13 @@ jobs:
     name: serial / macos
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v5.0.0
         with:
           dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ env.PRIMARY_NODE_VERSION }}
 
@@ -230,7 +239,7 @@ jobs:
     runs-on: [self-hosted, dsh-win-ci, windows]
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
 
       - name: Enable Developer Mode (symlink support)
         shell: pwsh
@@ -238,11 +247,11 @@ jobs:
           reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock"
           /t REG_DWORD /f /v "AllowDevelopmentWithoutDevLicense" /d "1"
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v5.0.0
         with:
           dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ env.PRIMARY_NODE_VERSION }}
 
@@ -356,15 +365,15 @@ jobs:
             blacksmith: ''
             workload: production-site
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v5.0.0
         with:
           dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}
 
       # The benchmark's Windows lanes deliberately skip the store cache like
       # the independent native Windows job; an empty input disables caching.
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ env.PRIMARY_NODE_VERSION }}
           cache: ${{ matrix.platform == 'linux' && 'pnpm' || '' }}
@@ -467,15 +476,15 @@ jobs:
             blacksmith: ''
             workers: '2'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v5.0.0
         with:
           dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}
 
       # Unlike the larger-runner suite, both platforms cache the store here:
       # the consolidated topology measures cache mechanics as workload.
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ env.PRIMARY_NODE_VERSION }}
           cache: pnpm
@@ -486,6 +495,9 @@ jobs:
           console.log(JSON.stringify({ arch: process.arch, cpus: os.cpus().length,
           memoryGiB: Math.round(os.totalmem() / 2 ** 30) }))"
 
+      # No archive cache: this manual matrix includes the persistent 64/96-core
+      # fleet rows, and a `~` cache written by an ephemeral runner does not
+      # restore into the preparation directory there.
       - name: Install and prepare Linux
         if: matrix.platform == 'linux'
         run: |

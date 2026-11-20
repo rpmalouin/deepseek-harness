@@ -1,6 +1,40 @@
-# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
-# side as of the last confirmed-consistent state. Both languages carry equal authority;
-# after editing either side, bring the other along and re-record with:
+# Bilingual-pair consistency record for README.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write packages/client/ui-schedule/README.md
-README.md: 37ffbc0ef0b4a55af3238efa700dfdd0b942dd35
-README.zh.md: e381243a5a43f2e03e53a06de2a95746eb4bddf1
+/:
+  en: b4f472194d36189e
+  zh: 9dc81770c98be03b
+/deepseek-ai-dsh-client-ui-schedule:
+  en: 862120984d5392eb
+  zh: eb3e5d5a802da592
+/deepseek-ai-dsh-client-ui-schedule/summary:
+  en: 9a690c99b0562de5
+  zh: 77a7464316afb3ed
+/deepseek-ai-dsh-client-ui-schedule/table-of-contents:
+  en: d152484eb41ac6b4
+  zh: 405b30feaf48c087
+/deepseek-ai-dsh-client-ui-schedule/use-this-package:
+  en: dcae1793d89a2976
+  zh: 9c66f7f4a1120023
+/deepseek-ai-dsh-client-ui-schedule/use-this-package/time-zone-data-source:
+  en: 4005b800e930f581
+  zh: ccb9318dad7f7e8f
+/deepseek-ai-dsh-client-ui-schedule/understand-the-implementation:
+  en: 5fde04ee7c0331ee
+  zh: 00fef5c10412079c
+/deepseek-ai-dsh-client-ui-schedule/further-exploration:
+  en: 2fd968202916b197
+  zh: f1ab66194846562b
+/deepseek-ai-dsh-client-ui-schedule/model-experience:
+  en: b75d2a967fdce99c
+  zh: f1464a27481329f2
+/deepseek-ai-dsh-client-ui-schedule/model-experience/kv-cache-effect:
+  en: 52239e5688dfebe1
+  zh: 37343f5dbde010e8
+/deepseek-ai-dsh-client-ui-schedule/known-limitations-and-deferred-work:
+  en: 6ee939ce57fcea66
+  zh: 0e99fadf1fb7ac4d
+/deepseek-ai-dsh-client-ui-schedule/known-limitations-and-deferred-work/dev-note:
+  en: 18a59ce211e19bbd
+  zh: a4b126f9a4eaca6f

@@ -1,5 +1,6 @@
 /** Plan text and resource identities derived from logged native or PTC calls. */
-import type { ToolCallId } from '@deepseek-ai/dsh-llm/brand'
+import type {} from '@deepseek-ai/dsh-tool-executor-ptc/client'
+import type { ToolCallId } from '@deepseek-ai/dsh-llm/types'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { SessionAddress } from '@deepseek-ai/dsh-api-session-controller/types'
 
@@ -74,7 +75,7 @@ export function parsePlanAddress(address: string): PlanAddress | undefined {
     if (parts.length === 2) return {
       session: { kind: 'session', sessionId: parts[0] as SessionId }, callId: parts[1] as ToolCallId,
     }
-    if (parts.length === 5 && parts[0] === 'subagent' && (parts[3] === 'one-shot' || parts[3] === 'continuable')) return {
+    if (parts.length === 5 && parts[0] === 'subagent' && (parts[3] === 'one-shot' || parts[3] === 'continuable' || parts[3] === 'unknown')) return {
       session: { kind: 'subagent', parentSessionId: parts[1] as SessionId, childSessionId: parts[2] as SessionId, mode: parts[3] },
       callId: parts[4] as ToolCallId,
     }

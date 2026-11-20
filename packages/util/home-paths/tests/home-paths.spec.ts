@@ -3,14 +3,20 @@ import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  AGENTS_HOME_DIR_NAME,
+  DEFAULT_AGENTS_HOME_DISPLAY,
   DEFAULT_DSH_HOME_DISPLAY,
   DSH_HOME_DIR_NAME,
+  agentsHomeDisplay,
   canonicalizeWatchPath,
+  defaultAgentsHome,
   defaultDshHome,
   dshCachePath,
   dshHomeDisplay,
   dshHomePath,
+  dshPath,
   expandHomePath,
+  resolveAgentsHome,
   resolveDshHome,
 } from '@deepseek-ai/dsh-home-paths'
 
@@ -57,6 +63,30 @@ describe('dsh path helpers', () => {
     expect(dshHomeDisplay('/some/other/root')).toBe('$DSH_HOME')
   })
 
+  it('owns the shared default agents home directory name', () => {
+    expect(AGENTS_HOME_DIR_NAME).toBe('.agents')
+    expect(DEFAULT_AGENTS_HOME_DISPLAY).toBe('~/.agents')
+    expect(defaultAgentsHome()).toBe(join(homedir(), '.agents'))
+  })
+
+  it('resolves an explicit agents home before DSH_AGENTS_HOME and the default', () => {
+    const envHome = join(homedir(), 'env-agents')
+
+    expect(resolveAgentsHome('/tmp/explicit-agents', { DSH_AGENTS_HOME: '~/env-agents' })).toBe(resolve('/tmp/explicit-agents'))
+    expect(resolveAgentsHome(undefined, { DSH_AGENTS_HOME: '~/env-agents' })).toBe(envHome)
+    expect(resolveAgentsHome(undefined, {})).toBe(defaultAgentsHome())
+  })
+
+  it('treats an empty or whitespace-only DSH_AGENTS_HOME as unset', () => {
+    expect(resolveAgentsHome(undefined, { DSH_AGENTS_HOME: '' })).toBe(defaultAgentsHome())
+    expect(resolveAgentsHome(undefined, { DSH_AGENTS_HOME: '   ' })).toBe(defaultAgentsHome())
+  })
+
+  it('labels a resolved agents home by whether it is the default root', () => {
+    expect(agentsHomeDisplay(resolve(defaultAgentsHome()))).toBe('~/.agents')
+    expect(agentsHomeDisplay('/some/other/root')).toBe('$DSH_AGENTS_HOME')
+  })
+
   it.each([
     [undefined, join(homedir(), '.dsh')],
     ['', join(homedir(), '.dsh')],
@@ -83,6 +113,25 @@ describe('dsh path helpers', () => {
     } finally {
       vi.unstubAllEnvs()
     }
+  })
+
+  it.each([
+    [undefined, join(homedir(), '.dsh')],
+    ['', join(homedir(), '.dsh')],
+    ['~/env-dsh', join(homedir(), 'env-dsh')],
+    ['./relative-dsh', resolve('./relative-dsh')],
+  ] as const)('resolves category paths with DSH_HOME=%j', (home, expectedHome) => {
+    vi.stubEnv('DSH_HOME', home)
+    for (const category of ['config', 'data', 'state', 'cache', 'backup'] as const) {
+      expect(dshPath(category)).toBe(join(expectedHome, category))
+      expect(dshPath(category, 'owner', 'file.json')).toBe(join(expectedHome, category, 'owner', 'file.json'))
+    }
+  })
+
+  it('resolves a configured category home before the environment', () => {
+    vi.stubEnv('DSH_HOME', '~/env-dsh')
+    expect(dshPath({ category: 'state', dshHome: '~/explicit-dsh' }, 'logs')).toBe(join(homedir(), 'explicit-dsh', 'state', 'logs'))
+    expect(dshPath({ category: 'data', dshHome: undefined })).toBe(join(homedir(), 'env-dsh', 'data'))
   })
 
   it('canonicalizes a watcher ancestor while preserving a missing suffix', async () => {

@@ -17,7 +17,7 @@ import { readdir, readFile, stat } from 'node:fs/promises'
 import { homedir, platform as osPlatform } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
 import {
-  canOpenNativePath, openNativePath, runNativeCommand, type NativeCommandRunner,
+  canOpenNativePath, openNativePath, runNativeCommand, desktopEntryFields, desktopDataDirectories, type NativeCommandRunner,
 } from '@deepseek-ai/dsh-native-command'
 import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
 import {
@@ -58,14 +58,15 @@ export type OpenInAppLaunchOutcome = 'launched' | 'missing' | 'failed'
 /**
  * Launch one application adapter detached from this process: the child gets a
  * credential-scrubbed environment (never the harness's `*KEY*`/`*SECRET*`
- * variables) plus the adapter's explicit environment entries, holds no stdio
- * pipe, and outlives dsh. Windows GUI processes remain visible unless the
- * adapter explicitly hides its own CLI process. Launch success is decoupled
- * from process exit — launchers such as kitty or the JetBrains IDEs stay in
- * the foreground for their whole window lifetime, so the watch window only
- * catches launchers that fail immediately: rejects on a spawn failure and on
- * a nonzero exit inside the window; a child still running when the window
- * closes is unrefed and counted launched, never killed.
+ * variables) without an inherited `ELECTRON_RUN_AS_NODE`, plus the adapter's
+ * explicit environment entries, holds no stdio pipe, and outlives dsh. Windows
+ * GUI processes remain visible unless the adapter explicitly hides its own CLI
+ * process. Launch success is decoupled from process exit — launchers such as
+ * kitty or the JetBrains IDEs stay in the foreground for their whole window
+ * lifetime, so the watch window only catches launchers that fail immediately:
+ * rejects on a spawn failure and on a nonzero exit inside the window; a child
+ * still running when the window closes is unrefed and counted launched, never
+ * killed.
  * @param command - executable path or PATH name.
  * @param args - argv (never a shell string).
  * @param options - watch-window length and adapter-specific process options.
@@ -73,11 +74,15 @@ export type OpenInAppLaunchOutcome = 'launched' | 'missing' | 'failed'
  */
 export const launchDetachedApp: OpenInAppLauncher = (command, args, options) =>
   new Promise((resolve, reject) => {
+    // Desktop runs the Host with ELECTRON_RUN_AS_NODE=1; inheriting it starts Electron apps such as VS Code in Node mode.
+    // Windows environment names are case-insensitive.
+    const base = Object.fromEntries(Object.entries(scrubbedParentEnv())
+      .filter(([name]) => name.toUpperCase() !== 'ELECTRON_RUN_AS_NODE'))
     const child = spawn(command, [...args], {
       detached: true,
       stdio: 'ignore',
       windowsHide: options.windowsHide,
-      env: { ...scrubbedParentEnv(), ...options.env },
+      env: { ...base, ...options.env },
     })
     let settled = false
     const settle = (outcome: () => void): void => {
@@ -168,7 +173,7 @@ export async function output(
   command: string, args: readonly string[], timeoutMs: number, internals: ResolvedInternals,
 ): Promise<string | null> {
   try {
-    const { stdout } = await internals.run(command, args, AbortSignal.timeout(timeoutMs))
+    const { stdout } = await internals.run(command, args, AbortSignal.timeout(timeoutMs), 'hidden')
     return stdout
   } catch {
     // Swallows spawn, non-zero-exit, and timeout-abort failures alike: a
@@ -379,24 +384,12 @@ export interface DesktopEntry {
  * @returns the recognized fields; keys outside the entry section are ignored.
  */
 export function parseDesktopEntry(text: string): DesktopEntry {
-  let inEntry = false
-  const fields: { exec?: string; tryExec?: string; icon?: string } = {}
-  for (const line of text.split(/\r?\n/)) {
-    const trimmed = line.trim()
-    if (trimmed.startsWith('[')) {
-      inEntry = trimmed === '[Desktop Entry]'
-      continue
-    }
-    if (!inEntry) continue
-    const separator = trimmed.indexOf('=')
-    if (separator < 0) continue
-    const key = trimmed.slice(0, separator).trim()
-    const value = trimmed.slice(separator + 1).trim()
-    if (key === 'Exec') fields.exec = value
-    else if (key === 'TryExec') fields.tryExec = value
-    else if (key === 'Icon') fields.icon = value
+  const fields = desktopEntryFields(text)
+  return {
+    ...(fields.Exec === undefined ? {} : { exec: fields.Exec }),
+    ...(fields.TryExec === undefined ? {} : { tryExec: fields.TryExec }),
+    ...(fields.Icon === undefined ? {} : { icon: fields.Icon }),
   }
-  return fields
 }
 
 /**
@@ -405,9 +398,7 @@ export function parseDesktopEntry(text: string): DesktopEntry {
  * @returns the data directories, freedesktop defaults applied.
  */
 export function xdgDataDirectories(internals: ResolvedInternals): readonly string[] {
-  const dataHome = internals.env['XDG_DATA_HOME'] ?? join(internals.home, '.local', 'share')
-  const dataDirs = internals.env['XDG_DATA_DIRS'] ?? '/usr/local/share:/usr/share'
-  return [dataHome, ...dataDirs.split(':').filter(dir => dir !== '')]
+  return desktopDataDirectories(internals.home, internals.env)
 }
 
 /**
@@ -423,7 +414,7 @@ export async function findDesktopEntry(
     const path = join(dataDir, 'applications', `${desktopId}.desktop`)
     try {
       return parseDesktopEntry(await readFile(path, 'utf8'))
-    } catch {
+    } catch (_entryUnreadable) {
       // Swallows ENOENT/EACCES: try the next data directory.
     }
   }
@@ -694,8 +685,8 @@ function isMissingExecutable(error: unknown): boolean {
  * Open one directory through the OS shell's open verb under the launch watch
  * window: the opener command completing inside the window decides the
  * outcome, and an opener still running when it closes counts as launched and
- * keeps running (a cold `powershell.exe` start can outlive the window; its
- * late settlement is swallowed because the request already answered).
+ * keeps running (a cold shell opener can outlive the window; its late
+ * settlement is swallowed because the request already answered).
  */
 function runShellOpen(
   path: string, watchMs: number, internals: ResolvedInternals,

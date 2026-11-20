@@ -1,5 +1,6 @@
+import { brandString } from '@deepseek-ai/dsh-brand'
 import {
-  ToolCallId, createMessage, createToolResultMessage, createUserMessage,
+  type ToolCallId, createMessage, createToolResultMessage, createUserMessage,
 } from '@deepseek-ai/dsh-llm'
 import { SessionSeq } from '@deepseek-ai/dsh-session/types'
 // Minimal SessionEvent builders for orchestration tests (shape mirrors what the
@@ -8,9 +9,22 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm/types'
 import type { SessionEvent } from '@deepseek-ai/dsh-session/types'
 import type {
   SessionEventEntry,
-  SessionPage,
+  SessionEventsPage,
   SessionWireEvent,
 } from '../src/types.ts'
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'compact-checkpoint': { kind: 'compact-checkpoint'; compactionId: string }
+  }
+}
+
+type CheckpointSource = { kind: 'compact-checkpoint'; compactionId: string }
+
+/** Build a typed checkpoint source for the history event script. */
+function checkpointSource(): CheckpointSource {
+  return { kind: 'compact-checkpoint', compactionId: 'event-script-compaction' }
+}
 
 /** One text content block (local helper). */
 const text = (t: string): ContentBlock[] => [{ type: 'text', text: t }]
@@ -58,7 +72,7 @@ export const ev = {
         turn,
         step,
         message: createToolResultMessage({
-          callId: ToolCallId(callId),
+          callId: brandString<ToolCallId>(callId),
           content: text(body),
           isError: false,
         }),
@@ -149,7 +163,7 @@ export const ev = {
       sourceEventSeqs: [summarySeq, start, end],
       data: createUserMessage({
         content: text('<context_checkpoint>model only</context_checkpoint>'),
-        source: { kind: 'plugin', plugin: 'compact' },
+        source: checkpointSource(),
       }),
     }),
 }
@@ -172,8 +186,9 @@ export function entries(events: readonly SessionEvent[]): SessionEventEntry[] {
 }
 
 /** Build one view-less history response value. */
-export function historyValue(events: readonly SessionEvent[], hasMore = false): SessionPage {
+export function historyValue(events: readonly SessionEvent[], hasMore = false): SessionEventsPage {
   return {
+    cursor: events.at(-1)?.seq ?? -1,
     records: entries(events),
     hasMore,
   }

@@ -8,13 +8,24 @@ import type {
 import { bindSnapshotSelector, makeTranslate } from '@deepseek-ai/dsh-client-test-runtime'
 import { en as commonEn } from '@deepseek-ai/dsh-client-locale/src/locales/en.ts'
 import { zh as commonZh } from '@deepseek-ai/dsh-client-locale/src/locales/zh.ts'
-import { StatsPills, deriveStats, formatDuration, type StatsPillsProps } from '../src/client/chat/StatsPills.tsx'
+import { PartialArguments } from '@deepseek-ai/dsh-util-values'
+import { ActivityPill, UsagePill, deriveStats, formatDuration, type StatPillProps } from '../src/client/chat/StatsPills.tsx'
 import { formatTokens } from '../src/client/chat/token-format.ts'
 import { en, zh } from '../src/client/locale.ts'
 import { chatSnapshotFixture } from './chat-snapshot-fixture.client.ts'
 
-const t: StatsPillsProps['t'] = makeTranslate(zh, commonZh)
-const tEn: StatsPillsProps['t'] = makeTranslate(en, commonEn)
+const t: StatPillProps['t'] = makeTranslate(zh, commonZh)
+const tEn: StatPillProps['t'] = makeTranslate(en, commonEn)
+
+/** Both composer-dock entries in their registered order, as the dock renders them. */
+function StatsPills(props: StatPillProps) {
+  return (
+    <>
+      <ActivityPill {...props} />
+      <UsagePill {...props} />
+    </>
+  )
+}
 
 afterEach(() => {
   cleanup()
@@ -68,6 +79,7 @@ describe('deriveStats', () => {
   it('ignores tool results with no call time', () => {
     const tool: ToolResultNode = {
       kind: 'tool-result', seq: 5, time: 5_000, callId: 'c', call: null, callTime: null, content: [],
+      name: '', args: PartialArguments.EMPTY,
       isError: false, subCalls: [],
     }
     const stats = deriveStats([tool, assistant(1, 1)])
@@ -86,6 +98,7 @@ describe('deriveStats', () => {
     }
     const tool: ToolResultNode = {
       kind: 'tool-result', seq: 5, time: 7_000, callId: 'c', call: null, callTime: 4_000, content: [],
+      name: '', args: PartialArguments.EMPTY,
       isError: false, subCalls: [],
     }
     const stats = deriveStats([timed, untimed, tool])
@@ -125,7 +138,7 @@ describe('formatters', () => {
   })
 })
 
-describe('StatsPills', () => {
+describe('composer stats pills', () => {
   const USAGE = { uncachedInputTokens: 10, outputTokens: 5, cacheReadTokens: 90, cacheWriteTokens: 0 }
 
   /** A whole-log sessionStats value: zeros plus overrides. */
@@ -137,15 +150,15 @@ describe('StatsPills', () => {
   }
 
   /** Stub the projection seat: a key-addressed table of whole values. */
-  function projections(values: Record<string, unknown>): StatsPillsProps['useProjection'] {
+  function projections(values: Record<string, unknown>): StatPillProps['useProjection'] {
     return (key: string) => values[key]
   }
 
   function props(
     source: { getSnapshot(): ChatSnapshot; subscribe(fn: () => void): () => void },
     values: Record<string, unknown> = { tokenUsage: USAGE },
-  ): StatsPillsProps {
-    return { useChat: bindSnapshotSelector(source), useProjection: projections(values), t: tEn }
+  ): StatPillProps {
+    return { usePerformanceUsage: selector => selector('detailed'), useChat: bindSnapshotSelector(source), useProjection: projections(values), t: tEn }
   }
 
   function tokenUsage(cacheReadTokens: number, uncachedInputTokens: number) {
@@ -156,6 +169,27 @@ describe('StatsPills', () => {
   const timedStep = (): AssistantMessageNode => ({
     ...assistant(1, 1, { outputTokens: 60 }),
     timing: { stepStartTime: 1_000, firstTokenTime: 1_800, completedTime: 4_800 },
+  })
+
+  it('compact keeps only speed and cache hit, with no interactive statistics', () => {
+    const { source } = makeSource({ nodes: [timedStep()] })
+    const view = render(<StatsPills {...props(source)} usePerformanceUsage={selector => selector('compact')} />)
+    expect(view.container.textContent).toBe('20 tok/sCache hit 90%')
+    expect(view.queryByRole('button')).toBeNull()
+    fireEvent.mouseOver(view.getByText('20 tok/s'))
+    expect(view.queryByRole('dialog')).toBeNull()
+    view.rerender(<StatsPills {...props(source)} />)
+    expect(view.getAllByRole('button')).toHaveLength(2)
+    fireEvent.click(view.getAllByRole('button')[0]!)
+    expect(view.getByRole('dialog')).toBeTruthy()
+    view.rerender(<StatsPills {...props(source)} usePerformanceUsage={selector => selector('compact')} />)
+    expect(view.queryByRole('dialog')).toBeNull()
+  })
+
+  it('compact omits unavailable metrics instead of showing counts', () => {
+    const { source } = makeSource({ nodes: [assistant(1, 1)] })
+    const view = render(<StatsPills {...props(source, {})} usePerformanceUsage={selector => selector('compact')} />)
+    expect(view.container.textContent).toBe('')
   })
 
   it('renders the counts reading and usage pill and hides a brand-new empty session', () => {
@@ -209,6 +243,16 @@ describe('StatsPills', () => {
     expect(timePill.getAttribute('aria-label')).toBe('1 turns 1 steps · 20 tok/s')
   })
 
+  it('marks each pill with its dock entry id', () => {
+    const { source } = makeSource({ nodes: [timedStep()] })
+    const view = render(<StatsPills {...props(source)} />)
+    const pills = [...view.container.querySelectorAll('[data-composer-stat]')]
+    expect(pills.map(pill => [pill.getAttribute('data-composer-stat'), pill.textContent])).toEqual([
+      ['activity', '1 turns 1 steps·20 tok/s'],
+      ['usage', '105 tok·Cache hit 90%'],
+    ])
+  })
+
   it('click-opens the time-and-speed dialog carrying the time split and speeds', () => {
     const { source } = makeSource({ nodes: [timedStep()] })
     const view = render(<StatsPills {...props(source)} />)
@@ -224,7 +268,7 @@ describe('StatsPills', () => {
     expect(dialog.getAttribute('aria-label')).toBe('Session statistics')
     // Portaled out of the composer dock.
     expect(dialog.parentElement).toBe(document.body)
-    expect(dialog.firstChild?.textContent).toBe('Session statistics')
+    expect(dialog.firstChild?.textContent).toBe('Session statistics1 turns 1 steps')
     const details = dialog.querySelector('[data-session-stats-details]') as HTMLElement
     expect(details).toBeTruthy()
     expect(details.textContent).toContain('LLM time3.8s')
@@ -260,7 +304,7 @@ describe('StatsPills', () => {
     expect(dialog.textContent).not.toContain('LLM time')
   })
 
-  it('closes the dialog on Escape or outside pointerdown', () => {
+  it('closes the dialog on Escape or an outside pointerdown', () => {
     const { source } = makeSource({ nodes: [timedStep()] })
     const view = render(<StatsPills {...props(source)} />)
     const timePill = view.getAllByRole('button')[0]!
@@ -286,12 +330,29 @@ describe('StatsPills', () => {
 
     fireEvent.click(timePill)
     expect(view.getByRole('dialog').getAttribute('aria-label')).toBe('Session statistics')
+    // A sibling pill's pointerdown lands outside the open dialog and closes it.
+    fireEvent.pointerDown(usagePill)
     fireEvent.click(usagePill)
     const dialogs = view.getAllByRole('dialog')
     expect(dialogs).toHaveLength(1)
     expect(dialogs[0]!.getAttribute('aria-label')).toBe('Token usage')
     expect(timePill.getAttribute('aria-expanded')).toBe('false')
     expect(usagePill.getAttribute('aria-expanded')).toBe('true')
+  })
+
+  it('swaps dialogs on keyboard activation of a sibling pill, which fires click without pointerdown', () => {
+    const { source } = makeSource({ nodes: [timedStep()] })
+    const view = render(<StatsPills {...props(source)} />)
+    const [timePill, usagePill] = [...view.getAllByRole('button')] as [HTMLElement, HTMLElement]
+    fireEvent.click(timePill)
+    // A click inside the panel keeps it open; focus moving away does not close it.
+    fireEvent.click(view.getByRole('dialog'))
+    fireEvent.focusIn(usagePill)
+    expect(view.getByRole('dialog').getAttribute('aria-label')).toBe('Session statistics')
+    fireEvent.click(usagePill)
+    const dialogs = view.getAllByRole('dialog')
+    expect(dialogs).toHaveLength(1)
+    expect(dialogs[0]!.getAttribute('aria-label')).toBe('Token usage')
   })
 
   it('takes every pill and dialog label from the active locale', () => {
@@ -312,6 +373,53 @@ describe('StatsPills', () => {
     const usageDialog = view.getByRole('dialog')
     expect(usageDialog.getAttribute('aria-label')).toBe('Token 用量')
     expect(usageDialog.textContent).toContain('未缓存输入5 tok')
+  })
+
+  describe('full reading of a cut-off pill', () => {
+    const FULL = '105 tok · Cache hit 90%'
+
+    function renderCut(overflow: boolean, mode: 'detailed' | 'compact' = 'detailed') {
+      vi.spyOn(Element.prototype, 'scrollWidth', 'get').mockReturnValue(overflow ? 200 : 80)
+      vi.spyOn(Element.prototype, 'clientWidth', 'get').mockReturnValue(80)
+      vi.useFakeTimers()
+      const { source } = makeSource({ nodes: [timedStep()] })
+      return render(<StatsPills {...props(source)} usePerformanceUsage={selector => selector(mode)} />)
+    }
+    const tooltipText = (view: ReturnType<typeof render>) => view.queryByRole('tooltip')?.textContent ?? null
+    afterEach(() => { vi.useRealTimers() })
+
+    it.each([false, true])('shows on hover after the dock delay only while the label is cut off: %s', (overflow) => {
+      const view = renderCut(overflow)
+      fireEvent.pointerEnter(view.getAllByRole('button')[1]!)
+      expect(tooltipText(view)).toBeNull()
+      act(() => { vi.advanceTimersByTime(200) })
+      expect(tooltipText(view)).toBe(overflow ? FULL : null)
+    })
+
+    it('shows on keyboard focus of a dialog pill', () => {
+      const view = renderCut(true)
+      fireEvent.keyDown(document.body, { key: 'Tab' })
+      fireEvent.focus(view.getAllByRole('button')[1]!)
+      expect(tooltipText(view)).toBe(FULL)
+    })
+
+    it('yields to the open dialog, whose head carries the counts', () => {
+      const view = renderCut(true)
+      const [timePill] = view.getAllByRole('button') as [HTMLElement]
+      fireEvent.click(timePill)
+      fireEvent.pointerEnter(timePill)
+      act(() => { vi.advanceTimersByTime(200) })
+      expect(tooltipText(view)).toBeNull()
+      expect(view.getByRole('dialog').firstChild?.textContent).toBe('Session statistics1 turns 1 steps')
+    })
+
+    it('pins a cut-off static reading on tap', () => {
+      const view = renderCut(true, 'compact')
+      const plainPill = view.getByText('Cache hit 90%').parentElement!
+      fireEvent.pointerDown(plainPill, { pointerType: 'touch' })
+      fireEvent.click(plainPill)
+      expect(tooltipText(view)).toBe('Cache hit 90%')
+    })
   })
 
   it('keeps the durable usage pill after the visible step window is empty', () => {
@@ -433,7 +541,7 @@ describe('StatsPills', () => {
   it('renders ZERO times during streaming chunk frames (RFC hard acceptance)', () => {
     const { set, source } = makeSource({ nodes: [assistant(1, 1)] })
     let renders = 0
-    function Counting(p: StatsPillsProps) {
+    function Counting(p: StatPillProps) {
       renders += 1
       return <StatsPills {...p} />
     }

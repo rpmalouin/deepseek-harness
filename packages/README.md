@@ -32,14 +32,15 @@ Every package lives in exactly one group; new packages join existing groups, and
 | [`api/`](api/README.md) | Remote BFF assembly and Typert RPC gateway |
 | [`typert/`](typert/README.md) | Type graph generation, artifact loading, and runtime registry |
 | [`goal/`](goal/README.md) | Same-session goal persistence and lifecycle |
-| [`schedule/`](schedule/README.md) | Session-local scheduled follow-ups |
+| [`schedule/`](schedule/README.md) | Host-owned scheduled follow-ups |
 | [`feedback/`](feedback/README.md) | Human feedback capture and command |
+| [`telemetry/`](telemetry/README.md) | Shared Cordis OTel reporting channels |
 | [`identity/`](identity/README.md) | Shared anonymous identity |
 | [`llm/`](llm/README.md) | LLM capability family: abstract service + provider adapters |
 | [`subprocess/`](subprocess/README.md) | Subprocess capability family: Service Definition + local process-tree provider |
 | [`ssh/`](ssh/README.md) | POSIX remote connection with paired filesystem, subprocess and sandbox providers |
 | [`shell/`](shell/README.md) | Bash capability family: executor seam, local impl, model-facing tools |
-| [`terminal/`](terminal/README.md) | Persistent PTY capability family: owner-scoped sessions, local implementation, model-facing tools |
+| [`terminal/`](terminal/README.md) | Persistent PTY service with owner-scoped sessions and a local shell backend |
 | [`ptc-runtime/`](ptc-runtime/README.md) | PTC execution capability family: Service Definition + sandboxed Node provider + PTC mode Consumer |
 | [`computer-use/`](computer-use/README.md) | Exclusive named desktop-provider registration |
 | [`browser-use/`](browser-use/README.md) | Exclusive named browser-provider registration |
@@ -48,15 +49,16 @@ Every package lives in exactly one group; new packages join existing groups, and
 | [`fs/`](fs/README.md) | Filesystem capability family: seam, local impl, model-facing file tools, discovery tools |
 | [`lsp/`](lsp/README.md) | LSP capability family: seam, generic stdio provider, and the `lsp` tool |
 | [`skill/`](skill/README.md) | Skill capability family: provider registry, local provider, model-facing catalog/loader |
+| [`connector/`](connector/README.md) | Plugins connecting third-party services through existing capabilities |
 | [`compaction/`](compaction/README.md) | Compaction capability family: Service Definition + basic provider + command Consumer |
 | [`context/`](context/README.md) | Model-visible request context: workspace instructions, time context, references |
 | [`subagent/`](subagent/README.md) | Subagent capability family: provider-registry contract and model-facing delegation tools |
+| [`team/`](team/README.md) | Team coordination: shared task boards and model-facing task tools |
 | [`jobs/`](jobs/README.md) | Generic background-job runtime and model-facing job control tools |
-| [`experimental/`](experimental/README.md) | Pre-stable prototypes with explicit private exceptions |
-| [`workflow/`](workflow/README.md) | Workflow seam, PTC process engine, and model-facing `workflow`/`ralph` tools |
-| [`webhook/`](webhook/README.md) | Verified external events, trusted rules, and fire-and-forget Workspace Sessions |
+| [`experimental/`](experimental/README.md) | Capabilities under evaluation; [status and support policy](experimental/README.md#status) |
+| [`workflow/`](workflow/README.md) | Workflow seam, PTC process engine, and the model-facing `workflow` tool |
 | [`web/`](web/README.md) | Web capability family: seam, search/fetch providers, model-facing web tools |
-| [`document/`](document/README.md) | Shared Host Office-to-PDF conversion |
+| [`document/`](document/README.md) | Shared Host Office rendering, conversion, and recalculation, the Office tools, and Kit engine resolution |
 | [`attachment/`](attachment/README.md) | Durable attachment identity, validation, local content-addressed storage |
 | [`spill/`](spill/README.md) | Spill capability family: storage seam, local impl, tool-result spill policy |
 | [`todo/`](todo/README.md) | The model-facing `todo_write` tool |
@@ -66,29 +68,28 @@ Every package lives in exactly one group; new packages join existing groups, and
 | [`bundle/`](bundle/README.md) | Installable `dsh --profile` patch layers |
 | [`extensions/`](extensions/README.md) | Agent runtime self-modification: live plugin/service inspection and model-written mount/unmount |
 | [`mcp/`](mcp/README.md) | External Model Context Protocol servers exposed as native tools |
-| [`hooks/`](hooks/README.md) | Hook bridges + the shared Claude Code / Codex wire-protocol library |
 | [`session/`](session/README.md) | Durable session data plane: persistence seam + backends, projection seam, log-backed titles, session reporting |
 | [`session-query/`](session-query/README.md) | Session retrieval family: logical corpus, bounded reads, lineage, semantic filtering, SQLite full-text search |
 | [`settings/`](settings/README.md) | User-settings seam + file-backed provider |
 | [`credentials/`](credentials/README.md) | Credential-reference and credential-record seam + env-over-`.env` provider + authorization flows that ask a human |
+| [`account/`](account/README.md) | DeepSeek account sign-in and Host-only request credentials |
 | [`storage/`](storage/README.md) | Non-session storage hub + backends + domain form |
 | [`workspace/`](workspace/README.md) | Workspace entity |
 | [`sdk/`](sdk/README.md) | Out-of-process SDK: JSON-RPC protocol and TypeScript client/server |
 | [`acp/`](acp/README.md) | Automation-only Agent Client Protocol server |
 | [`interaction/`](interaction/README.md) | Human-collaboration plane: approval/interaction seams, permission preset, commands, ask-user tool |
 | [`boot/`](boot/README.md) | Shared app-bin boot glue |
-| [`host/`](host/README.md) | Web-GUI host half: API gateway + HTTP route server |
+| [`host/`](host/README.md) | Web GUI host services, directory picking, application launch, plugin inventory, and product telemetry |
 | [`client/`](client/README.md) | Web-GUI browser half: shell, wire, object services, slots, `ui-*` plugins |
 | [`test-support/`](test-support/README.md) | Test infrastructure (testkits, replay, Loader smokes) |
-| [`runtime-diagnostics/`](runtime-diagnostics/README.md) | Runtime diagnostics: package-owned invariant checks and reports |
-| [`util/`](util/README.md) | Low-level zero-dependency utilities shared across groups (`Branded<B>`, home/path helpers, timeout, retention) |
+| [`util/`](util/README.md) | Low-level utilities and data-only package lists shared across groups (`Branded<B>`, home/path helpers, timeout, retention, official bundle lists) |
 
 -----
 
 <a id="release-expectations"></a>
 ## Release expectations
 
-Most groups are product — stable API. The exceptions: `experimental/` publishes without stability or support promises, and `test-support/`, `runtime-diagnostics/`, and `util/` are support with lower compatibility expectations.
+Product groups have maintained product roles, while their public APIs remain pre-stable. [Experimental status](experimental/README.md#status) is independent of publication, installation, and optional delivery. Nonexperimental runtime packages must have product use or an explicit [package classification](../scripts/product-package-policy.ts); SDK, build, test, and declaration infrastructure have separate classifications.
 
 -----
 
@@ -104,7 +105,7 @@ The dependency graph is generated: [docs/module-graph.md](../docs/module-graph.m
 <a id="package-readme-contracts"></a>
 ## Package README contracts
 
-Every package README covers purpose, configuration, extension points, and [Model Experience](../docs/cookbook/adding-a-package.md#4-write-the-package-readme) unless the model-agnostic [omission allowlist](../scripts/verify-package-readme-model-experience.ts) exempts it. It also carries `## Known Limitations and Deferred Work` or uses its [allowlist](../scripts/verify-package-readme-limitations.ts). Package conventions — exports, service access, invariants, tests — live in [packages/AGENTS.md](AGENTS.md).
+Every package README covers purpose, configuration, extension points, and [Model Experience](../docs/cookbook/adding-a-package.md#4-write-the-package-readme) unless the model-agnostic [omission allowlist](../scripts/verify-package-readme-model-experience.ts) exempts it. It also carries `## Known Limitations and Deferred Work` or uses its [allowlist](../scripts/verify-package-readme-limitations.ts). Package conventions — exports, service access, tests — live in [packages/AGENTS.md](AGENTS.md).
 
 -----
 

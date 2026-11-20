@@ -50,7 +50,7 @@ async function boot(): Promise<Bench> {
   // Service accessor (ctx.get reads the reflect store, which Service-class
   // plugins do not write; the accessor is the product path).
   const svc = ctx.slots
-  return { ctx, svc, erased: svc as unknown as ErasedService }
+  return { ctx, svc, erased: svc }
 }
 
 /** Engine-shaped instance stub (bare-source form: subscribe/getSnapshot + baked actions + clearPersisted). */
@@ -242,6 +242,25 @@ describe('Factory definition ledger', () => {
     expect(handle.create).toHaveBeenCalledOnce()
     expect(handle.create).toHaveBeenCalledWith('s1')
     await scope.fiber.dispose()
+  })
+})
+
+describe('registering package', () => {
+  it('stamps the nearest Loader entry name, walking up through nested plugins, and nothing outside an entry', async () => {
+    const b = await boot()
+    b.erased.register({ name: 'root', children: { 't.rows': { kind: 'list', scope: 'root' } } }, C)
+    let outer: Context | undefined, inner: Context | undefined
+    await b.ctx.plugin({ inject: ['slots'], apply: (ctx: Context) => {
+      outer = ctx
+      ctx.plugin({ inject: ['slots'], apply: (child: Context) => { inner = child } })
+    } })
+    Object.assign(outer!.fiber, { entry: { options: { name: '@acme/dsh-rows' } } })
+    inner!.slots.register({ name: 't.rows', id: 'nested' }, C)
+    outer!.slots.register({ name: 't.rows', id: 'outer' }, C)
+    b.erased.register({ name: 't.rows', id: 'root' }, C)
+    expect(b.svc.entries('t.rows').map(entry => [entry.options.id, entry.module])).toEqual([
+      ['nested', '@acme/dsh-rows'], ['outer', '@acme/dsh-rows'], ['root', undefined],
+    ])
   })
 })
 
@@ -764,6 +783,56 @@ describe('store instance axis', () => {
     await replacement.fiber.dispose()
   })
 
+  it.each(['t.panel', 't.maybe'] as const)('separates %s memory when a Session reopens before previous Context cleanup', async (slot) => {
+    const { bench, host } = await storeBench()
+    const persisted = new Map<string, number>()
+    const clearPersisted = vi.fn()
+    const handle = {
+      create: vi.fn((scopeKey?: string) => {
+        const key = scopeKey ?? 'root'
+        let expanded = false
+        let saved = persisted.get(key) ?? 0
+        return {
+          getSnapshot: () => ({ expanded, saved }),
+          subscribe: () => () => {},
+          actions: {
+            expand: () => { expanded = true },
+            save: (value: number) => { saved = value; persisted.set(key, value) },
+          },
+          clearPersisted,
+        }
+      }),
+    }
+    bench.erased.register({ name: slot, store: handle }, C)
+    const [entry] = host.entriesOf(slot)
+    const first = scopedBinding(bench.ctx, 's1')
+    const other = scopedBinding(bench.ctx, 's2')
+    const replacement = scopedBinding(bench.ctx, 's1')
+    try {
+      const before = host.storeOf(entry as never, first.binding) as ReturnType<typeof handle.create>
+      before.actions.expand()
+      before.actions.save(7)
+      const unaffected = host.storeOf(entry as never, other.binding) as ReturnType<typeof handle.create>
+      unaffected.actions.expand()
+      const after = host.storeOf(entry as never, replacement.binding) as ReturnType<typeof handle.create>
+      expect(after).not.toBe(before)
+      expect(after.getSnapshot()).toEqual({ expanded: false, saved: 7 })
+      expect(handle.create.mock.calls.map(([key]) => key)).toEqual(['s1', 's2', 's1'])
+      expect(host.storeOf(entry as never, other.binding)).toBe(unaffected)
+      expect(unaffected.getSnapshot().expanded).toBe(true)
+      after.actions.expand()
+      after.actions.save(9)
+      await first.fiber.dispose()
+      expect(host.storeOf(entry as never, replacement.binding)).toBe(after)
+      expect(after.getSnapshot()).toEqual({ expanded: true, saved: 9 })
+      expect(persisted.get('s1')).toBe(9)
+      expect(clearPersisted).not.toHaveBeenCalled()
+    } finally {
+      await Promise.all([first.fiber.dispose(), replacement.fiber.dispose(), other.fiber.dispose()])
+      await bench.ctx.fiber.dispose()
+    }
+  })
+
   it('does not materialize scoped stores solely for scope release', async () => {
     const { bench } = await storeBench()
     const root = fakeHandle()
@@ -860,7 +929,7 @@ describe('entry-unload cascade', () => {
       name: 'occupant',
       inject: ['slots'],
       apply: (pluginCtx: Context) => {
-        ;(pluginCtx.slots as unknown as ErasedService).register({ name: 't.host' }, C)
+        ;(pluginCtx.slots as ErasedService).register({ name: 't.host' }, C)
       },
     })
     await fiber.await()

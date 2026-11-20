@@ -5,6 +5,7 @@
  * Fixture Sessions have no retained Host terminals to restore.
  */
 
+import { Buffer } from 'node:buffer'
 import { readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
@@ -20,6 +21,7 @@ interface SessionSummary {
   readonly origin?: 'subagent'
   readonly cwd?: string
   readonly projections?: {
+    readonly kind: 'cached' | 'sequenced'
     readonly asOfSeq: number
     readonly values: Readonly<Record<string, unknown>>
   }
@@ -59,7 +61,6 @@ interface ControlBaseline {
   readonly type: 'baseline'
   readonly value: {
     readonly queues: Readonly<Record<string, readonly unknown[]>>
-    readonly jobs: Readonly<Record<string, readonly unknown[]>>
     readonly approvals: readonly unknown[]
     readonly questions: readonly unknown[]
     readonly projections: Readonly<Record<string, {
@@ -71,7 +72,14 @@ interface ControlBaseline {
 
 interface CapturedFixture {
   readonly sessionList: { readonly ok: true; readonly value: { readonly items: readonly SessionSummary[] } }
-  readonly settingsDescribe: unknown
+  readonly settingsDescribe: {
+    readonly ok: true
+    readonly value: {
+      readonly writable: boolean
+      readonly hasDocument: boolean
+      readonly namespaces: readonly unknown[]
+    }
+  }
   readonly credentialsDescribe: unknown
   readonly modelCatalog: unknown
   readonly agentPresets: unknown
@@ -81,6 +89,7 @@ interface CapturedFixture {
     readonly value: {
       readonly items: readonly WorkspaceView[]
       readonly archivedSessionIds: readonly string[]
+      readonly pinnedSessionIds: readonly string[]
     }
   }
   readonly control: ControlBaseline
@@ -90,12 +99,16 @@ interface CapturedFixture {
 }
 
 export interface AssembledRemoteOptions {
+  /** Override the schema-resolved Host preference for developer-tool scenarios. */
+  readonly developerTools?: boolean
   /** Return the fixture's image-dimension admission error from Session prompt. */
   readonly rejectPrompt?: boolean
 }
 
 export interface AssembledRemote {
   readonly mock: RemoteMock
+  /** Page-owned upload carrier: stages an image upload as the Host would and answers its receipt. */
+  readonly fileUpload: (input: string | URL, init: RequestInit) => Promise<Response>
 }
 
 const fixtureSource = readFileSync(
@@ -122,6 +135,7 @@ export function createAssembledRemote(options: AssembledRemoteOptions = {}): Ass
     return [sessionId, next] as const
   }))
   const attachments = new Map<string, unknown>([['fixture:image', structuredClone(fixture.attachment)]])
+  const stagedImages = new Map<string, Record<string, unknown>>()
   const blankSessionProjections = fixture.control.value.projections['fx-gamma']
   if (blankSessionProjections === undefined) {
     throw new Error('assembled fixture: blank Session projections missing')
@@ -131,15 +145,19 @@ export function createAssembledRemote(options: AssembledRemoteOptions = {}): Ass
   const mock = RemoteMock.create().load(remoteDefaultResponses)
   mock.load({
     unary: {
-      'settings/describe': structuredClone(fixture.settingsDescribe),
+      'settings/describe': ok({
+        ...fixture.settingsDescribe.value,
+        namespaces: [...fixture.settingsDescribe.value.namespaces, {
+          ns: 'ui-settings',
+          schema: { type: 'object', dict: { enabled: { type: 'boolean' } } },
+          value: { enabled: options.developerTools ?? true }, autoGenerate: false, applies: 'live', secrets: [], revision: 0,
+        }],
+      }),
       'credentials/describe': structuredClone(fixture.credentialsDescribe),
       'session/modelCatalog': structuredClone(fixture.modelCatalog),
       'agentPresets/list': structuredClone(fixture.agentPresets),
       'commands/list': structuredClone(fixture.commands),
-      'settings/canOpenAgentPresetDirectory': ok(true),
       'settings/openSettingsDocument': ok({ opened: true }),
-      'settings/openAgentPresetDirectory': ok({ opened: true }),
-      'subagents/list': ok({ entries: [], parentAvailable: true }),
       'terminal/list': ok([]),
       'skills/list': ok({ skills: [] }),
       'session/canOpenWorkspacePath': ok(true),
@@ -162,12 +180,16 @@ export function createAssembledRemote(options: AssembledRemoteOptions = {}): Ass
   mock.stream('session/control', (_args, stream) => {
     stream.push(structuredClone(fixture.control))
   })
+  mock.stream('job/list', (_args, stream) => {
+    stream.push({ type: 'rows', jobs: [] })
+  })
   mock.stream('workspace/follow', (_args, stream) => {
     stream.push({
       type: 'baseline',
       value: {
         items: structuredClone(workspaces),
         archivedSessionIds: structuredClone(fixture.workspace.value.archivedSessionIds),
+        pinnedSessionIds: structuredClone(fixture.workspace.value.pinnedSessionIds),
       },
     })
   })
@@ -204,6 +226,14 @@ export function createAssembledRemote(options: AssembledRemoteOptions = {}): Ass
     return ok(undefined)
   })
   mock.unary('session/list', () => ok({ items: structuredClone(sessions) }))
+  // The shipped composition mounts the `ui-schedule` row, so the Schedule
+  // client reads the catalog over this mock.
+  mock.unary('schedule/catalog', () => ok([]))
+  mock.unary('session/projections', (request: unknown) => {
+    const sessionId = recordString(recordValue(request, 'request'), 'sessionId')
+    const summary = sessions.find(candidate => candidate.sessionId === sessionId)
+    return ok(structuredClone(summary?.projections ?? fixture.control.value.projections[sessionId] ?? null))
+  })
   mock.unary('workspace/create', (request: unknown) => {
     const path = recordString(recordValue(request, 'request'), 'path')
     const existing = workspaces.find(workspace => workspace.path === path)
@@ -236,7 +266,9 @@ export function createAssembledRemote(options: AssembledRemoteOptions = {}): Ass
       running: false,
       blank: true,
       cwd,
-      projections: structuredClone(blankSessionProjections),
+      // The created Session is live on this fixture Host: its list block is
+      // sequenced, like the block the real live registry would serve.
+      projections: { kind: 'sequenced', ...structuredClone(blankSessionProjections) },
     }
     sessions.push(summary)
     records.set(sessionId, [])
@@ -254,8 +286,11 @@ export function createAssembledRemote(options: AssembledRemoteOptions = {}): Ass
   })
   mock.unary('session/attachment', (request: unknown) => {
     request = recordValue(request, 'request')
-    const attachmentId = recordString(request, 'attachmentId')
-    return attachments.get(attachmentId) ?? {
+    const attachment = recordValue(request, 'attachment')
+    const attachmentId = recordString(attachment, 'attachmentId')
+    const stored = attachments.get(attachmentId)
+    if (stored !== undefined) return ok({ attachment, data: recordString(recordValue(stored, 'value'), 'data') })
+    return {
       ok: false,
       error: {
         code: 'session/attachment-invalid',
@@ -282,6 +317,10 @@ export function createAssembledRemote(options: AssembledRemoteOptions = {}): Ass
     const summary = sessions.find(candidate => candidate.sessionId === sessionId)
     if (summary === undefined) throw new Error(`assembled fixture: no Session ${sessionId}`)
     const content = recordArray(request, 'content').map((part) => {
+      if (isRecord(part) && part.type === 'file') {
+        const image = stagedImages.get(recordString(part, 'receiptId'))
+        return image === undefined ? part : { type: 'image', attachment: image }
+      }
       if (!isRecord(part) || part.type !== 'image') return part
       const attachmentId = `assembled:${randomUUID()}`
       const data = recordString(part, 'data')
@@ -334,7 +373,28 @@ export function createAssembledRemote(options: AssembledRemoteOptions = {}): Ass
     })
   })
 
-  return { mock }
+  const fileUpload = async (input: string | URL, init: RequestInit): Promise<Response> => {
+    const url = new URL(String(input), 'http://assembled.test/')
+    const mediaType = url.searchParams.get('mediaType')
+    if (!url.pathname.endsWith('/api/session/uploadFileBinary') || mediaType === null || !(init.body instanceof Blob)) {
+      throw new Error(`assembled fixture: unexpected upload ${url.pathname}${url.search}`)
+    }
+    const bytes = new Uint8Array(await init.body.arrayBuffer())
+    const name = url.searchParams.get('name')
+    const image = {
+      attachmentId: `assembled:${randomUUID()}`,
+      mediaType,
+      bytes: bytes.byteLength,
+      width: 160,
+      height: 90,
+      ...name === null ? {} : { name },
+    }
+    attachments.set(image.attachmentId, ok({ attachment: image, data: Buffer.from(bytes).toString('base64') }))
+    const receiptId = `assembled-receipt:${randomUUID()}`
+    stagedImages.set(receiptId, image)
+    return new Response(JSON.stringify({ ok: true, value: { receiptId, image } }), { status: 200 })
+  }
+  return { mock, fileUpload }
 }
 
 function eventOf(

@@ -59,6 +59,32 @@ describe('resolveSpec', () => {
 })
 
 describe('layering and reads', () => {
+  it.each([
+    ['plain', '•'.repeat(5)],
+    ['abcdefghijklmnop', '•'.repeat(16)],
+    ['abcdefghijklmnopq', `abcde${'•'.repeat(8)}nopq`],
+    ['sk-abcdefghijklmn', '•'.repeat(17)],
+    ['sk-abcdefghijklmnop', '•'.repeat(19)],
+    ['sk-abcdefghijklmnopq', `sk-abcde${'•'.repeat(8)}nopq`],
+    ['vendor_abcdefghijklmnopq', `vendor_abcde${'•'.repeat(8)}nopq`],
+    ['sk-proj-abcdefghijklmnopq', `sk-proj-${'•'.repeat(13)}nopq`],
+    ['abc-def_abcdefghijklmnopq', `abc-def_a${'•'.repeat(12)}nopq`],
+    ['abcdefghijklmnop-', '•'.repeat(17)],
+    ['😀'.repeat(16), '•'.repeat(16)],
+    ['😀'.repeat(17), `${'😀'.repeat(5)}${'•'.repeat(8)}${'😀'.repeat(4)}`],
+    [`sk-${'😀'.repeat(17)}`, `sk-${'😀'.repeat(5)}${'•'.repeat(8)}${'😀'.repeat(4)}`],
+    ['😀_abcdefghijklmno😀😀', `😀_abcde${'•'.repeat(8)}no😀😀`],
+  ])('describes only the masked preview for %s', async (value, masked) => {
+    const dir = await tempDir()
+    const ctx = await boot({ path: join(dir, '.credentials.yaml'), watch: false })
+    await ctx.credentials.set(KEY, value)
+    const info = await ctx.credentials.describe(KEY)
+    expect(info).toEqual({ configured: true, source: 'file', writable: true, masked })
+    expect(Array.from(masked)).toHaveLength(Array.from(value).length)
+    expect(JSON.stringify(info)).not.toContain(value)
+    expect(await ctx.credentials.resolve(KEY)).toEqual({ value, source: 'file' })
+  })
+
   it('treats an absent file as an empty writable store', async () => {
     const dir = await tempDir()
     const ctx = await boot({ path: join(dir, '.credentials.yaml'), watch: false })
@@ -73,17 +99,17 @@ describe('layering and reads', () => {
     const ctx = await boot({ path, watch: false })
     expect(await ctx.credentials.resolve(KEY)).toEqual({ value: 'plain', source: 'file' })
     expect(await ctx.credentials.resolve(OTHER)).toEqual({ value: 'with space', source: 'file' })
-    expect(await ctx.credentials.describe(KEY)).toEqual({ configured: true, source: 'file', writable: true })
+    expect(await ctx.credentials.describe(KEY)).toEqual({ configured: true, source: 'file', writable: true, masked: '•'.repeat(5) })
   })
 
-  it('lets a non-empty process environment win read-only over the file', async () => {
+  it('lets the managed file win over a non-empty process environment', async () => {
     const dir = await tempDir()
     const path = join(dir, '.credentials.yaml')
     await writeCredentials(path, 'version: 1\nrefs:\n  DSH_CRED_TEST: from-file\n')
     const ctx = await boot({ path, watch: false })
     vi.stubEnv('DSH_CRED_TEST', 'from-env')
-    expect(await ctx.credentials.resolve(KEY)).toEqual({ value: 'from-env', source: 'env' })
-    expect(await ctx.credentials.describe(KEY)).toEqual({ configured: true, source: 'env', writable: false })
+    expect(await ctx.credentials.resolve(KEY)).toEqual({ value: 'from-file', source: 'file' })
+    expect(await ctx.credentials.describe(KEY)).toEqual({ configured: true, source: 'file', writable: true, masked: '•'.repeat(9) })
   })
 
   it('treats an empty environment value as absent, falling through to the file', async () => {
@@ -93,7 +119,7 @@ describe('layering and reads', () => {
     const ctx = await boot({ path, watch: false })
     vi.stubEnv('DSH_CRED_TEST', '')
     expect(await ctx.credentials.resolve(KEY)).toEqual({ value: 'stored', source: 'file' })
-    expect(await ctx.credentials.describe(KEY)).toEqual({ configured: true, source: 'file', writable: true })
+    expect(await ctx.credentials.describe(KEY)).toEqual({ configured: true, source: 'file', writable: true, masked: '•'.repeat(6) })
   })
 
   it('fails boot loud when the document exists but cannot be read', async () => {
@@ -106,8 +132,8 @@ describe('layering and reads', () => {
 })
 
 describe('layer ladder', () => {
-  // inherited process env > .credentials.yaml > $DSH_HOME/.env, and the
-  // invoking directory's .env supplies no credential at all.
+  // .credentials.yaml > inherited process env > invoking directory .env >
+  // $DSH_HOME/.env.
   async function bootLayered(
     path: string,
     layers: Parameters<typeof createLaunchEnvironmentSnapshot>[0],
@@ -131,9 +157,24 @@ describe('layer ladder', () => {
     expect(await ctx.credentials.resolve(KEY)).toEqual({ value: 'stored', source: 'file' })
     // A key sitting in the user's .env does not make the stored one
     // unwritable.
-    expect(await ctx.credentials.describe(KEY)).toEqual({ configured: true, source: 'file', writable: true })
+    expect(await ctx.credentials.describe(KEY)).toEqual({ configured: true, source: 'file', writable: true, masked: '•'.repeat(6) })
     await expect(ctx.credentials.set(KEY, 'rotated')).resolves.toBeUndefined()
     expect(await ctx.credentials.resolve(KEY)).toEqual({ value: 'rotated', source: 'file' })
+  })
+
+  it('stores over a launch environment value and reveals it again after unset', async () => {
+    const dir = await tempDir()
+    const ctx = await bootLayered(join(dir, '.credentials.yaml'), [
+      { source: 'process', values: { DSH_CRED_TEST: 'from-launch' } },
+    ])
+    expect(await ctx.credentials.resolve(KEY)).toEqual({ value: 'from-launch', source: 'env' })
+    expect(await ctx.credentials.describe(KEY)).toEqual({ configured: true, source: 'env', writable: true })
+    await ctx.credentials.set(KEY, 'stored')
+    expect(await ctx.credentials.resolve(KEY)).toEqual({ value: 'stored', source: 'file' })
+    expect(await ctx.credentials.describe(KEY)).toEqual({ configured: true, source: 'file', writable: true, masked: '•'.repeat(6) })
+    await ctx.credentials.unset(KEY)
+    expect(await ctx.credentials.resolve(KEY)).toEqual({ value: 'from-launch', source: 'env' })
+    expect(await ctx.credentials.describe(KEY)).toEqual({ configured: true, source: 'env', writable: true })
   })
 
   it('serves the user .env only when nothing is stored', async () => {
@@ -208,7 +249,7 @@ describe('layer ladder', () => {
     await expect(ctx.plugin(LocalCredentialProvider, { path, watch: false })).rejects.toThrow(/EISDIR/)
   })
 
-  it('lets only the inherited environment shadow the store, read-only', async () => {
+  it('keeps the managed store writable when the inherited environment also names it', async () => {
     const dir = await tempDir()
     const path = join(dir, '.credentials.yaml')
     await writeCredentials(path, 'version: 1\nrefs:\n  DSH_CRED_TEST: stored\n')
@@ -216,16 +257,18 @@ describe('layer ladder', () => {
       { source: 'process', values: { DSH_CRED_TEST: 'from-shell' } },
       { source: 'user-env', path: '/home/.dsh/.env', values: { DSH_CRED_TEST: 'from-user-env' } },
     ])
-    expect(await ctx.credentials.resolve(KEY)).toEqual({ value: 'from-shell', source: 'env' })
-    expect(await ctx.credentials.describe(KEY)).toEqual({ configured: true, source: 'env', writable: false })
-    await expect(ctx.credentials.set(KEY, 'next')).rejects.toThrow(/launching environment/)
+    expect(await ctx.credentials.resolve(KEY)).toEqual({ value: 'stored', source: 'file' })
+    expect(await ctx.credentials.describe(KEY)).toEqual({ configured: true, source: 'file', writable: true, masked: '•'.repeat(6) })
+    await expect(ctx.credentials.set(KEY, 'next')).resolves.toBeUndefined()
+    expect(await ctx.credentials.resolve(KEY)).toEqual({ value: 'next', source: 'file' })
+    expect(await ctx.credentials.describe(KEY)).toEqual({ configured: true, source: 'file', writable: true, masked: '•'.repeat(4) })
   })
 })
 
 describe('document validation', () => {
-  // Every rejection below is a boot failure rather than a skipped entry: this
-  // document holds nothing but credentials, so an ignored key would read as
-  // "the secret I stored has no effect".
+  // Every rejection below is a boot failure rather than a skipped entry: inside
+  // `refs` and `records`, an ignored entry would read as "the secret I stored
+  // has no effect". Only a foreign top-level key is tolerated.
   it.each([
     ['a non-mapping root', 'just a string\n', /must be a mapping/],
     ['a sequence root', '- DSH_CRED_TEST\n', /must be a mapping/],
@@ -243,7 +286,6 @@ describe('document validation', () => {
     ['the flat layout under document directives', '%YAML 1.2\n---\nDSH_CRED_TEST: a\n',
       /pre-release flat layout/],
     ['a future version', 'version: 2\nrefs: {}\n', /this build reads version 1/],
-    ['an unknown top-level key', 'version: 1\nsecrets: {}\n', /unknown top-level key "secrets"/],
     ['a non-mapping refs section', 'version: 1\nrefs: nope\n', /"refs" .* must be a mapping/],
     ['a key that is not a POSIX identifier', 'version: 1\nrefs:\n  not-a-ref: value\n', /credential ref/],
     ['a non-string value', 'version: 1\nrefs:\n  DSH_CRED_TEST: 123\n', /must be a string/],
@@ -301,6 +343,29 @@ describe('document validation', () => {
     expect((failure as Error).stack ?? '').not.toContain(secret)
   })
 
+  it('boots past an unknown top-level key, warns by name, and keeps it through a write', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    vi.stubEnv('GITLAB_TOKEN', '')
+    await writeCredentials(path, 'version: 1\nGITLAB_TOKEN: glpat-secret\nACCOUNT_ID: 9007199254740993\n'
+      + 'refs:\n  DSH_CRED_TEST: sk-file\n')
+    const ctx = new Context()
+    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => {})
+    const fiber = ctx.plugin(LocalCredentialProvider, { path, watch: false })
+    cleanups.push(async () => {
+      await fiber.dispose()
+    })
+    await fiber
+    expect(await ctx.credentials.resolve(KEY)).toEqual({ value: 'sk-file', source: 'file' })
+    expect(await ctx.credentials.resolve(credentialRef('GITLAB_TOKEN'))).toBeUndefined()
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('ignoring unknown top-level'), '"GITLAB_TOKEN", "ACCOUNT_ID"', path)
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('glpat-secret')
+    await ctx.credentials.set(OTHER, 'sk-other')
+    expect(await readFile(path, 'utf8')).toBe(
+      'version: 1\nGITLAB_TOKEN: glpat-secret\nACCOUNT_ID: 9007199254740993\n'
+      + 'refs:\n  DSH_CRED_TEST: sk-file\n  DSH_CRED_OTHER: sk-other\n')
+  })
+
   it('reads an empty document as an empty store', async () => {
     const dir = await tempDir()
     const path = join(dir, '.credentials.yaml')
@@ -346,7 +411,7 @@ describe('document writes', () => {
     const reread = await boot({ path, watch: false })
     expect(await reread.credentials.resolve(KEY)).toEqual({ value: multiLine, source: 'file' })
     expect(await reread.credentials.resolve(OTHER)).toEqual({ value: mixedQuotes, source: 'file' })
-    expect(await reread.credentials.describe(KEY)).toEqual({ configured: true, source: 'file', writable: true })
+    expect(await reread.credentials.describe(KEY)).toEqual({ configured: true, source: 'file', writable: true, masked: `line ${'•'.repeat(8)} two` })
   })
 
   it('unsets only the owning entry, with its own annotation, and keeps an absent unset silent', async () => {
@@ -364,7 +429,7 @@ describe('document writes', () => {
     expect(seen).toEqual([KEY])
   })
 
-  it('rejects empty values and writes the environment would shadow', async () => {
+  it('rejects empty values but lets the managed value replace the environment', async () => {
     const dir = await tempDir()
     const path = join(dir, '.credentials.yaml')
     await writeCredentials(path, 'version: 1\nrefs:\n  DSH_CRED_TEST: stored\n')
@@ -373,8 +438,10 @@ describe('document writes', () => {
     await expect(ctx.credentials.set(KEY, '')).rejects.toThrow(/empty value/)
 
     vi.stubEnv('DSH_CRED_TEST', 'shadowing')
-    await expect(ctx.credentials.set(KEY, 'next')).rejects.toThrow(/shadowed/)
-    await expect(ctx.credentials.unset(KEY)).rejects.toThrow(/shadowed/)
+    await expect(ctx.credentials.set(KEY, 'next')).resolves.toBeUndefined()
+    expect(await ctx.credentials.resolve(KEY)).toEqual({ value: 'next', source: 'file' })
+    await expect(ctx.credentials.unset(KEY)).resolves.toBeUndefined()
+    expect(await ctx.credentials.resolve(KEY)).toEqual({ value: 'shadowing', source: 'env' })
   })
 
   it('leaves an empty mapping after unsetting the only entry', async () => {

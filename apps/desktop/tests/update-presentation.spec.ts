@@ -2,7 +2,7 @@ import { expect, it } from 'vitest'
 import { desktopUpdateErrorSummary, presentDesktopUpdate } from '../src/update-presentation.ts'
 import { en, zh } from '../src/locale.ts'
 import type { DesktopUpdateState, DshDesktopProductApi } from '../src/ipc.ts'
-import type { DesktopUpdateBridge } from '../../../packages/client/ui-settings-general/src/client/desktop-update-bridge.ts'
+import type { DesktopUpdateBridge } from '@deepseek-ai/dsh-client-ui-settings-general/types'
 
 it('keeps the Electron preload assignable to the product consumer', () => {
   const assign = (bridge: DshDesktopProductApi['updates']): DesktopUpdateBridge => bridge
@@ -32,6 +32,7 @@ it('keeps raw diagnostics out of error tooltips in both locales', () => {
     expect(desktopUpdateErrorSummary({ phase: 'error', failedOperation: 'install', preparationFailure: 'stop-failed',
       message: 'translated or changed copy', technicalDetails: 'private diagnostic' }, messages)).toBe(messages.updateStopFailed)
     for (const [preparationFailure, expected] of [
+      ['fullscreen-timeout', messages.updateFullscreenTimeout],
       ['tasks-changed', messages.updateTasksChanged], ['tasks-unavailable', messages.updateTasksUnavailable],
     ] as const) {
       expect(desktopUpdateErrorSummary({ phase: 'error', failedOperation: 'install', preparationFailure,
@@ -41,5 +42,20 @@ it('keeps raw diagnostics out of error tooltips in both locales', () => {
       .toBe(messages.updateInstallFailed)
     expect(desktopUpdateErrorSummary({ phase: 'error', failedOperation: 'install', message: 'internal failure',
       technicalDetails: 'private diagnostic' }, messages)).toBe(messages.updateInstallFailed)
+  }
+})
+
+it('offers actionable filesystem recovery without exposing paths in the indicator', () => {
+  for (const messages of [en, zh]) {
+    for (const [downloadFailure, expected] of [
+      ['space', messages.updateDownloadSpaceFailed],
+      ['permission', messages.updateDownloadPermissionFailed],
+      ['busy', messages.updateDownloadBusyFailed],
+    ] as const) {
+      const state: DesktopUpdateState = { phase: 'error', failedOperation: 'download', downloadFailure,
+        technicalDetails: '/private/cache/new.zip', message: 'write failed' }
+      expect(desktopUpdateErrorSummary(state, messages)).toBe(expected)
+      expect(presentDesktopUpdate(state)).toEqual({ phase: 'error', failure: `download-${downloadFailure}` })
+    }
   }
 })

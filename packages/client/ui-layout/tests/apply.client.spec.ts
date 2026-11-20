@@ -1,16 +1,19 @@
 // @vitest-environment jsdom
 
+import ShortcutsService from '../../shortcuts/src/client/index.ts'
+import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import { Context, type Fiber } from '@deepseek-ai/cordis'
-import { stubSettingsScope } from '@deepseek-ai/dsh-client-test-runtime'
+import { stubConfigForm, syncedConfig } from '@deepseek-ai/dsh-client-test-runtime'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SlotRegistry } from '@deepseek-ai/dsh-client-ui-renderer/client'
-import type { SlotRendererHost } from '@deepseek-ai/dsh-client-ui-slots'
+import type { HostObservable, SlotRendererHost } from '@deepseek-ai/dsh-client-ui-slots'
 import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
 import { apply as themeApply, inject as themeInject, ThemeRuntime } from '@deepseek-ai/dsh-client-ui-theme/client'
 import { apply, inject, LayoutController } from '@deepseek-ai/dsh-client-ui-layout/client'
 import { apply as nodeApply } from '@deepseek-ai/dsh-client-ui-layout'
 import type { MainPanelId } from '../src/client/service.ts'
 import type { createLayoutStore } from '../src/client/stores.ts'
+import { ShortcutRegistry } from '../../shortcuts/src/client/registry.ts'
 
 const owners = new Set<Fiber>()
 let originalRootStyle: string | null
@@ -54,13 +57,11 @@ async function bench() {
   await owner.await()
   if (ctx === undefined) throw new Error('the fixture owner did not activate')
   const slotsFiber = ctx.plugin(SlotRegistry)
-  // Theme registers its Appearance settings row and requires the connection
-  // seam for persistence; model this bench as a remote, memory-only browser.
   ctx.provide('locale', new LocaleRuntime(ctx))
-  ctx.provide('connection', { api: { settings: {} }, isLoopback: false } as never)
+  await ctx.plugin(ShortcutsService, syncedConfig({})).await()
   // ui-theme's Appearance row binds a durable scope through these two.
   ctx.provide('remote', { $on: () => () => {} } as never)
-  ctx.provide('settingsScope', { bind: () => stubSettingsScope().scope } as never)
+  ctx.provide('configForms', { developerTools: { enabled: createSnapshotStore(true) }, get: () => stubConfigForm().scope } as never)
   await ctx.plugin({ inject: themeInject, apply: themeApply }).await()
   await slotsFiber.await()
   const slots = ctx.get('slots') as SlotRegistry
@@ -76,10 +77,10 @@ async function bench() {
 
 describe('ui-layout client apply', () => {
   it('declares its service dependencies', () => {
-    expect(inject).toEqual(['slots', 'theme', 'locale'])
+    expect(inject).toEqual(['slots', 'theme', 'locale', 'shortcuts'])
   })
 
-  it('provides ctx.layout and declares the four root-scoped frame slots', async () => {
+  it('provides ctx.layout and declares the root-scoped frame slots', async () => {
     const { ctx, slots } = await bench()
     const fiber = ctx.plugin({ inject: [...inject], apply })
     await fiber.await()
@@ -88,7 +89,32 @@ describe('ui-layout client apply', () => {
     expect(slots.spec('sidebar')).toEqual({ kind: 'single', scope: 'root' })
     expect(slots.spec('main')).toEqual({ kind: 'keyed', scope: 'root' })
     expect(slots.spec('rightbar')).toEqual({ kind: 'single', scope: 'root' })
+    expect(slots.spec('shell.bottom')).toEqual({ kind: 'single', scope: 'root' })
     expect(slots.spec('shell.overlay')).toEqual({ kind: 'list', scope: 'root' })
+    expect(slots.spec('shell.leading')).toEqual({ kind: 'single', scope: 'root' })
+  })
+
+  it('keeps Desktop sidebar shortcuts behind a foreground modal', async () => {
+    const { ctx, slots } = await bench()
+    const shortcuts = ctx.get('shortcuts')
+    if (shortcuts === undefined) throw new Error('shortcuts service is unavailable')
+    const register = vi.spyOn(shortcuts, 'register')
+    await ctx.plugin({ inject: [...inject], apply }).await()
+    const command = register.mock.calls.find(([entry]) => entry.id === 'sidebar.left.toggle')?.[0]
+    if (command === undefined) throw new Error('sidebar shortcut was not registered')
+    const registry = new ShortcutRegistry('desktop', 'macos')
+    registry.register(command)
+    const handle = slots.entries('root')[0]!.store as ReturnType<typeof createLayoutStore>
+    const width = () => handle.create().getSnapshot().layoutInfo.sidebar
+    const gesture = { code: 'KeyB', meta: true, control: false, alt: false, shift: false,
+      repeat: false, composing: false, defaultPrevented: false }
+    const context = { region: 'editable' as const, target: null, modal: 'settings' }
+    expect(registry.dispatch(gesture, context, vi.fn()).status).toBe('pass')
+    expect(width()).toBe(280)
+    expect(registry.dispatch(gesture, { ...context, modal: null }, vi.fn()).status).toBe('handled')
+    expect(width()).toBe(0)
+    expect(registry.dispatch(gesture, { ...context, modal: 'sidebar' }, vi.fn()).status).toBe('handled')
+    expect(width()).toBe(280)
   })
 
   it('shares a pre-created instance between service actions, root rendering, and panelInfo', async () => {
@@ -96,7 +122,7 @@ describe('ui-layout client apply', () => {
     const fiber = ctx.plugin({ inject: [...inject], apply })
     await fiber.await()
     const entry = slots.entries('root')[0]!
-    expect(entry.inject).toBeUndefined()
+    expect(entry.inject).toBeTypeOf('function')
     const handle = entry.store as ReturnType<typeof createLayoutStore>
     const instance = handle.create()
     expect(handle.create()).toBe(instance)
@@ -107,6 +133,7 @@ describe('ui-layout client apply', () => {
     const host = rendererHost()
     expect(host.storeOf(entry, undefined)).toBe(instance)
     const panelInfo = host.root.getSnapshot().hooks.panelInfo!
+    expect(panelInfo).toBe(layout.panelInfo)
     expect(panelInfo.getSnapshot()).toBe(instance.getSnapshot().panelInfo)
     const panelId = 'panel-a' as MainPanelId
     const disposePanel = slots.register({ name: 'main', key: panelId }, () => null)
@@ -146,6 +173,47 @@ describe('ui-layout client apply', () => {
     expect(document.body.hasAttribute('data-ds-dark-theme')).toBe(false)
   })
 
+  it('injects one live folded-landscape source and releases each subscription', async () => {
+    const query = Object.assign(new EventTarget(), { matches: true })
+    vi.stubGlobal('matchMedia', (media: string) => media === '(device-posture: folded) and (orientation: landscape)'
+      ? query : Object.assign(new EventTarget(), { matches: false }))
+    const { ctx, slots } = await bench()
+    const fiber = ctx.plugin({ inject: [...inject], apply })
+    await fiber.await()
+    const entry = slots.entries('root')[0]
+    if (entry?.inject === undefined) throw new Error('the root entry must inject its media source')
+    const first = entry.inject() as { hooks: { foldedLandscape: HostObservable<boolean> } }
+    const second = entry.inject() as typeof first
+    const source = first.hooks.foldedLandscape
+    expect(second.hooks.foldedLandscape).toBe(source)
+    expect(source.getSnapshot()).toBe(true)
+    const listener = vi.fn()
+    const unsubscribe = source.subscribe(listener)
+    try {
+      query.matches = false
+      query.dispatchEvent(new Event('change'))
+      expect(source.getSnapshot()).toBe(false)
+      expect(listener).toHaveBeenCalledOnce()
+    } finally { unsubscribe() }
+    query.matches = true
+    query.dispatchEvent(new Event('change'))
+    expect(listener).toHaveBeenCalledOnce()
+  })
+
+  it('provides ordinary layout when the client tree starts without browser media queries', async () => {
+    vi.stubGlobal('matchMedia', undefined)
+    const { ctx, slots } = await bench()
+    const fiber = ctx.plugin({ inject: [...inject], apply })
+    await fiber.await()
+    const entry = slots.entries('root')[0]
+    if (entry?.inject === undefined) throw new Error('the root entry must inject its media source')
+    const source = (entry.inject() as { hooks: { foldedLandscape: HostObservable<boolean> } }).hooks.foldedLandscape
+    expect(source.getSnapshot()).toBe(false)
+    const listener = vi.fn()
+    source.subscribe(listener)()
+    expect(listener).not.toHaveBeenCalled()
+  })
+
   it('teardown unwinds the service, the root registration, and the child declarations', async () => {
     const { ctx, slots, rendererHost } = await bench()
     const fiber = ctx.plugin({ inject: [...inject], apply })
@@ -158,7 +226,9 @@ describe('ui-layout client apply', () => {
     expect(slots.spec('sidebar')).toBeUndefined()
     expect(slots.spec('main')).toBeUndefined()
     expect(slots.spec('rightbar')).toBeUndefined()
+    expect(slots.spec('shell.bottom')).toBeUndefined()
     expect(slots.spec('shell.overlay')).toBeUndefined()
+    expect(slots.spec('shell.leading')).toBeUndefined()
     expect(host.root.getSnapshot().hooks.panelInfo).toBeUndefined()
     // The built-in root declaration survives entry teardown (renderer-owned).
     expect(slots.spec('root')).toEqual({ kind: 'single', scope: 'root' })
